@@ -59,3 +59,6 @@ logs/
 tmp/
 temp/
 *.tmp
+
+# Git worktrees
+.worktrees/
