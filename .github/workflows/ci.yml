@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -27,6 +27,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -36,12 +39,19 @@ jobs:
             engine
             actor
             web
-      - name: Check formatting (engine)
-        run: cargo fmt --check --all --manifest-path engine/Cargo.toml
-      - name: Check formatting (actor)
-        run: cargo fmt --check --manifest-path actor/Cargo.toml
-      - name: Check formatting (web)
-        run: cargo fmt --check --manifest-path web/Cargo.toml
+      # On PRs: auto-fix and commit. On push to main: just check.
+      - name: Format code (engine)
+        run: cargo fmt --all --manifest-path engine/Cargo.toml
+      - name: Format code (actor)
+        run: cargo fmt --manifest-path actor/Cargo.toml
+      - name: Format code (web)
+        run: cargo fmt --manifest-path web/Cargo.toml
+      - name: Commit formatting fixes
+        if: github.event_name == 'pull_request'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "style: auto-fix Rust formatting"
+          file_pattern: "*.rs"
 
   rust-clippy:
     name: Rust Clippy
@@ -113,6 +123,9 @@ jobs:
         working-directory: trainer
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -120,10 +133,17 @@ jobs:
           cache-dependency-path: trainer/pyproject.toml
       - name: Install linters
         run: pip install ruff black
-      - name: Ruff check
-        run: ruff check src/
-      - name: Black check
-        run: black --check src/
+      # Auto-fix linting issues
+      - name: Ruff fix
+        run: ruff check --fix src/
+      - name: Black format
+        run: black src/
+      - name: Commit lint fixes
+        if: github.event_name == 'pull_request'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "style: auto-fix Python formatting"
+          file_pattern: "trainer/**/*.py"
 
   python-test:
     name: Python Tests
