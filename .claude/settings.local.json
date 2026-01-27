@@ -34,7 +34,13 @@
       "Bash(cargo clean:*)",
       "Bash(rustc:*)",
       "Bash(npm run check:*)",
-      "Bash(npm run build:*)"
+      "Bash(npm run build:*)",
+      "Bash(mkdir:*)",
+      "Skill(superpowers:using-git-worktrees)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(terraform validate:*)",
+      "Bash(terraform fmt:*)"
     ],
     "deny": [],
     "ask": []

@@ -166,8 +166,8 @@ async fn main() -> Result<()> {
         shutdown_actor.shutdown();
     });
 
-    // Run the actor (with health tracking)
-    let run_result = actor.run_with_health(&health_state).await;
+    // Run the actor
+    let run_result = actor.run(&health_state).await;
 
     // Wait for shutdown to complete
     shutdown_handle.abort();

@@ -21,7 +21,43 @@ import torch.nn.functional as F
 from .game_config import get_config
 
 
-class PolicyValueNetwork(nn.Module):
+class BasePolicyValueNetwork(nn.Module):
+    """Base class for policy-value networks.
+
+    Provides the shared `predict()` method that applies legal move masking
+    and softmax to convert logits to probabilities.
+
+    Subclasses must implement `forward()` returning (policy_logits, value).
+    """
+
+    def predict(
+        self, x: torch.Tensor, legal_mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict policy probabilities and value.
+
+        Args:
+            x: Observation tensor of shape (batch, obs_size)
+            legal_mask: Optional mask of shape (batch, action_size)
+                        where 1.0 = legal, 0.0 = illegal
+
+        Returns:
+            Tuple of (policy_probs, value):
+                - policy_probs: Shape (batch, action_size) - probabilities summing to 1
+                - value: Shape (batch, 1) - value in [-1, 1]
+        """
+        policy_logits, value = self.forward(x)
+
+        # Apply legal move mask if provided
+        if legal_mask is not None:
+            # Set illegal moves to very negative value before softmax
+            policy_logits = policy_logits.masked_fill(legal_mask == 0, float("-inf"))
+
+        policy_probs = F.softmax(policy_logits, dim=-1)
+
+        return policy_probs, value
+
+
+class PolicyValueNetwork(BasePolicyValueNetwork):
     """Policy-value network for board games.
 
     Architecture:
@@ -72,32 +108,6 @@ class PolicyValueNetwork(nn.Module):
         value = torch.tanh(self.value_fc2(v))
 
         return policy_logits, value
-
-    def predict(
-        self, x: torch.Tensor, legal_mask: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Predict policy probabilities and value.
-
-        Args:
-            x: Observation tensor of shape (batch, obs_size)
-            legal_mask: Optional mask of shape (batch, action_size)
-                        where 1.0 = legal, 0.0 = illegal
-
-        Returns:
-            Tuple of (policy_probs, value):
-                - policy_probs: Shape (batch, action_size) - probabilities summing to 1
-                - value: Shape (batch, 1) - value in [-1, 1]
-        """
-        policy_logits, value = self.forward(x)
-
-        # Apply legal move mask if provided
-        if legal_mask is not None:
-            # Set illegal moves to very negative value before softmax
-            policy_logits = policy_logits.masked_fill(legal_mask == 0, float("-inf"))
-
-        policy_probs = F.softmax(policy_logits, dim=-1)
-
-        return policy_probs, value
 
 
 class AlphaZeroLoss:

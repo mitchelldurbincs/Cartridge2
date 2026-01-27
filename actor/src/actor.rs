@@ -9,7 +9,6 @@ use std::sync::{
     Mutex, MutexGuard,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 /// Get the current resident set size (RSS) in MB from /proc/self/status.
@@ -299,206 +298,14 @@ impl Actor {
         })
     }
 
-    /// Run the actor without health state tracking.
-    /// Use `run_with_health` for production deployments with Kubernetes probes.
-    #[allow(dead_code)]
-    pub async fn run(&self) -> Result<()> {
-        let initial_rss = get_rss_mb().unwrap_or(0.0);
-        info!(
-            actor_id = %self.config.actor_id,
-            max_episodes = self.config.max_episodes,
-            no_watch = self.config.no_watch,
-            initial_rss_mb = format!("{:.1}", initial_rss),
-            "Actor starting main loop"
-        );
-
-        // Create progress bar for bounded episode runs (only when stderr is a TTY)
-        let progress = if self.config.max_episodes > 0
-            && std::io::IsTerminal::is_terminal(&std::io::stderr())
-        {
-            let pb = ProgressBar::new(self.config.max_episodes as u64);
-            pb.set_style(
-                ProgressStyle::default_bar()
-                    .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} episodes ({eta})")
-                    .unwrap()
-                    .progress_chars("#>-"),
-            );
-            Some(pb)
-        } else {
-            None
-        };
-
-        // Start model watcher (only if not in no-watch mode)
-        let mut model_updates = if let Some(ref watcher) = self.model_watcher {
-            Some(watcher.start_watching().await?)
-        } else {
-            info!("Running in no-watch mode, model will not be reloaded");
-            None
-        };
-
-        // Setup flush timer for periodic database commits
-        let mut flush_timer = interval(self.config.flush_interval());
-
-        info!("Entering main event loop");
-
-        loop {
-            // Check shutdown signal
-            if self.shutdown_signal.load(Ordering::Relaxed) {
-                info!("Shutdown signal received, stopping actor");
-                break;
-            }
-
-            // Check episode limit first (non-blocking)
-            let current_episode_count = self.episode_count.load(Ordering::Relaxed);
-            if self.config.max_episodes > 0
-                && current_episode_count >= self.config.max_episodes as u32
-            {
-                info!(
-                    "Reached maximum episodes ({}), stopping",
-                    self.config.max_episodes
-                );
-                break;
-            }
-
-            // Handle model updates if watching is enabled
-            if let Some(ref mut updates) = model_updates {
-                tokio::select! {
-                    biased;  // Prioritize model updates and flush over episodes
-
-                    Some(()) = updates.recv() => {
-                        info!("Model updated, next episode will use new model");
-                        // Record model reload in Prometheus
-                        metrics::MODEL_RELOADS.inc();
-                        metrics::MODEL_LOADED.set(1);
-                        continue;
-                    }
-
-                    _ = flush_timer.tick() => {
-                        debug!("Periodic flush tick");
-                        continue;
-                    }
-
-                    _ = tokio::time::sleep(Duration::from_millis(1)) => {
-                        // Run episode below
-                    }
-                }
-            } else {
-                // No-watch mode: just check flush timer non-blockingly
-                tokio::select! {
-                    biased;
-
-                    _ = flush_timer.tick() => {
-                        debug!("Periodic flush tick");
-                        continue;
-                    }
-
-                    _ = tokio::time::sleep(Duration::from_millis(1)) => {
-                        // Run episode below
-                    }
-                }
-            }
-
-            // Run an episode
-            let episode_start = Instant::now();
-            match self.run_episode().await {
-                Ok((steps, total_reward, episode_stats)) => {
-                    let new_count = self.episode_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    let duration = episode_start.elapsed().as_secs_f64();
-                    debug!(
-                        episode = new_count,
-                        steps, total_reward, duration, "Episode completed"
-                    );
-
-                    // Record Prometheus metrics for this episode
-                    metrics::EPISODES_TOTAL.inc();
-                    metrics::EPISODE_DURATION.observe(duration);
-                    metrics::EPISODE_STEPS.observe(steps as f64);
-                    metrics::record_outcome(total_reward);
-
-                    // Update throughput gauge
-                    let elapsed = episode_start.elapsed().as_secs_f64();
-                    if elapsed > 0.0 {
-                        metrics::EPISODES_PER_SECOND.set(new_count as f64 / elapsed);
-                    }
-
-                    // Record episode in stats tracker
-                    self.stats.record_episode(steps, total_reward);
-                    self.stats.record_mcts_stats(
-                        episode_stats.search_count,
-                        episode_stats.inference_time_us,
-                    );
-
-                    // Update progress bar
-                    if let Some(ref pb) = progress {
-                        pb.inc(1);
-                    }
-
-                    if self.config.log_interval > 0
-                        && new_count.is_multiple_of(self.config.log_interval)
-                    {
-                        // Include memory diagnostics in periodic logging
-                        let rss_info = get_rss_mb()
-                            .map(|mb| format!(", RSS: {:.1} MB", mb))
-                            .unwrap_or_default();
-                        let avg_duration = duration; // Most recent episode duration
-
-                        // Suspend progress bar while logging to avoid visual glitches
-                        if let Some(ref pb) = progress {
-                            pb.suspend(|| {
-                                info!(
-                                    "Completed {} episodes (last: {:.2}s{})",
-                                    new_count, avg_duration, rss_info
-                                );
-                                // Log MCTS performance breakdown
-                                episode_stats.log_summary(new_count);
-                            });
-                        } else {
-                            info!(
-                                "Completed {} episodes (last: {:.2}s{})",
-                                new_count, avg_duration, rss_info
-                            );
-                            // Log MCTS performance breakdown
-                            episode_stats.log_summary(new_count);
-                        }
-
-                        // Write stats to file for web frontend
-                        self.stats.write_stats();
-                    }
-                }
-                Err(e) => {
-                    let count = self.episode_count.load(Ordering::Relaxed);
-                    error!("Episode {} failed: {}", count + 1, e);
-                    // Continue with next episode rather than stopping
-                }
-            }
-        }
-
-        // Finish progress bar
-        if let Some(pb) = progress {
-            pb.finish_with_message("done");
-        }
-
-        // Write final stats
-        self.stats.write_stats();
-
-        // Report final memory usage
-        let final_rss = get_rss_mb().unwrap_or(0.0);
-        let rss_growth = final_rss - initial_rss;
-        info!(
-            "Actor stopped gracefully (final RSS: {:.1} MB, growth: {:.1} MB)",
-            final_rss, rss_growth
-        );
-        Ok(())
-    }
-
     pub fn shutdown(&self) {
         self.shutdown_signal.store(true, Ordering::Relaxed);
         info!("Shutdown signal set");
     }
 
-    /// Run the actor with health state tracking for Kubernetes probes.
+    /// Run the actor main loop with health state tracking for Kubernetes probes.
     /// Records episode completions to the health state for liveness tracking.
-    pub async fn run_with_health(&self, health: &HealthState) -> Result<()> {
+    pub async fn run(&self, health: &HealthState) -> Result<()> {
         let initial_rss = get_rss_mb().unwrap_or(0.0);
         info!(
             actor_id = %self.config.actor_id,
