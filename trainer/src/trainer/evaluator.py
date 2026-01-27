@@ -273,16 +273,23 @@ def evaluate(
     return results
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Evaluate trained model against random play",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+def add_evaluate_arguments(
+    parser: argparse.ArgumentParser,
+    model_default: str = "./data/models/latest.onnx",
+) -> None:
+    """Add evaluation arguments to a parser.
 
+    This is shared between the standalone evaluator and the 'evaluate' subcommand
+    in __main__.py.
+
+    Args:
+        parser: ArgumentParser to add arguments to.
+        model_default: Default path for the model file.
+    """
     parser.add_argument(
         "--model",
         type=str,
-        default="../data/models/latest.onnx",
+        default=model_default,
         help="Path to ONNX model file",
     )
     parser.add_argument(
@@ -317,18 +324,20 @@ def main() -> int:
         help="Logging level",
     )
 
-    args = parser.parse_args()
 
-    # Configure logging
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    silence_noisy_loggers()
+def run_evaluation(args: argparse.Namespace) -> int:
+    """Run model evaluation with the given arguments.
 
+    This is the core evaluation logic shared between the standalone evaluator
+    and the 'evaluate' subcommand in __main__.py.
+
+    Args:
+        args: Parsed arguments with model, env_id, games, temperature, verbose.
+
+    Returns:
+        Exit code (0 for success, 1 for failure).
+    """
     # Load game configuration from database (preferred) or fallback to hardcoded
-    # This follows the same pattern as the Rust actor, making the evaluator self-describing
     config = get_game_metadata_or_config(args.env_id)
     logger.info(
         f"Game config for {args.env_id}: "
@@ -355,7 +364,6 @@ def main() -> int:
     logger.info(
         f"Running {args.games} games: {model_policy.name} vs {random_policy.name}"
     )
-    logger.info(f"Environment: {args.env_id}")
 
     # Run evaluation with game configuration
     results = evaluate(
@@ -371,15 +379,14 @@ def main() -> int:
     print(results.summary())
 
     # Interpretation
-    print()
     if results.player1_win_rate > 0.7:
-        print("Model is significantly better than random play!")
+        print("\nModel is significantly better than random play!")
     elif results.player1_win_rate > 0.5:
-        print("~ Model is slightly better than random play.")
+        print("\nModel is slightly better than random play.")
     elif results.player1_win_rate > 0.3:
-        print("Model is roughly equivalent to random play.")
+        print("\nModel is roughly equivalent to random play.")
     else:
-        print("Model is worse than random play!")
+        print("\nModel is worse than random play!")
 
     # Game-specific analysis
     if args.env_id == "tictactoe" and results.draw_rate > 0.8:
@@ -388,6 +395,25 @@ def main() -> int:
         )
 
     return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Evaluate trained model against random play",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    add_evaluate_arguments(parser, model_default="../data/models/latest.onnx")
+    args = parser.parse_args()
+
+    # Configure logging
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    silence_noisy_loggers()
+
+    return run_evaluation(args)
 
 
 if __name__ == "__main__":

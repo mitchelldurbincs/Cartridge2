@@ -59,64 +59,9 @@ def cmd_train(args: argparse.Namespace) -> int:
 
 def cmd_evaluate(args: argparse.Namespace) -> int:
     """Run model evaluation."""
-    from pathlib import Path
+    from .evaluator import run_evaluation
 
-    from .evaluator import (
-        OnnxPolicy,
-        RandomPolicy,
-        evaluate,
-        get_game_metadata_or_config,
-    )
-
-    logger = logging.getLogger(__name__)
-
-    # Load game configuration
-    config = get_game_metadata_or_config(args.env_id)
-    logger.info(
-        f"Game config for {args.env_id}: "
-        f"board={config.board_width}x{config.board_height}, "
-        f"actions={config.num_actions}, obs_size={config.obs_size}"
-    )
-
-    # Check model exists
-    model_path = Path(args.model)
-    if not model_path.exists():
-        logger.error(f"Model not found: {model_path}")
-        return 1
-
-    logger.info(f"Loading model: {model_path}")
-
-    try:
-        model_policy = OnnxPolicy(str(model_path), temperature=args.temperature)
-    except Exception as e:
-        logger.error(f"Failed to load model: {e}")
-        return 1
-
-    random_policy = RandomPolicy()
-
-    logger.info(
-        f"Running {args.games} games: {model_policy.name} vs {random_policy.name}"
-    )
-
-    results = evaluate(
-        player1=model_policy,
-        player2=random_policy,
-        env_id=args.env_id,
-        config=config,
-        num_games=args.games,
-        verbose=args.verbose,
-    )
-
-    print(results.summary())
-
-    if results.player1_win_rate > 0.7:
-        print("\nModel is significantly better than random play!")
-    elif results.player1_win_rate > 0.5:
-        print("\nModel is slightly better than random play.")
-    else:
-        print("\nModel needs more training.")
-
-    return 0
+    return run_evaluation(args)
 
 
 def cmd_loop(args: argparse.Namespace) -> int:
@@ -130,19 +75,18 @@ def cmd_loop(args: argparse.Namespace) -> int:
     return orchestrator_main()
 
 
-def setup_train_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Set up the train subcommand parser."""
+def _add_train_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add train command arguments to a parser.
+
+    This is shared between the 'train' subcommand and backwards-compatible
+    direct invocation mode.
+    """
     from .central_config import get_config as get_central_config
     from .trainer import TrainerConfig
 
     # Load central config for defaults
     cfg = get_central_config()
 
-    parser = subparsers.add_parser(
-        "train",
-        help="Train on replay buffer data",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
     # Configure parser with central config overrides for key settings
     TrainerConfig.configure_parser(
         parser,
@@ -172,53 +116,29 @@ def setup_train_parser(subparsers: argparse._SubParsersAction) -> None:
         default=9090,
         help="Port for Prometheus metrics server",
     )
+
+
+def setup_train_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Set up the train subcommand parser."""
+    parser = subparsers.add_parser(
+        "train",
+        help="Train on replay buffer data",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    _add_train_arguments(parser)
     parser.set_defaults(func=cmd_train)
 
 
 def setup_evaluate_parser(subparsers: argparse._SubParsersAction) -> None:
     """Set up the evaluate subcommand parser."""
+    from .evaluator import add_evaluate_arguments
+
     parser = subparsers.add_parser(
         "evaluate",
         help="Evaluate model against random baseline",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="./data/models/latest.onnx",
-        help="Path to ONNX model file",
-    )
-    parser.add_argument(
-        "--env-id",
-        type=str,
-        default="tictactoe",
-        choices=["tictactoe", "connect4"],
-        help="Game environment",
-    )
-    parser.add_argument(
-        "--games",
-        type=int,
-        default=100,
-        help="Number of games to play",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.0,
-        help="Sampling temperature (0 = greedy)",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print individual game moves",
-    )
-    parser.add_argument(
-        "--log-level",
-        type=str,
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level",
-    )
+    add_evaluate_arguments(parser)
     parser.set_defaults(func=cmd_evaluate)
 
 
@@ -284,47 +204,11 @@ def main() -> int:
 
     else:
         # Backwards compatibility: treat as 'train' command
-        from .central_config import get_config as get_central_config
-        from .trainer import TrainerConfig
-
-        # Load central config for defaults
-        cfg = get_central_config()
-
         parser = argparse.ArgumentParser(
             description="Cartridge2 AlphaZero-style Trainer",
             formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         )
-
-        # Configure parser with central config overrides for key settings
-        TrainerConfig.configure_parser(
-            parser,
-            overrides={
-                "checkpoint_interval": cfg.training.checkpoint_interval,
-                "max_checkpoints": cfg.training.max_checkpoints,
-                "batch_size": cfg.training.batch_size,
-                "learning_rate": cfg.training.learning_rate,
-                "weight_decay": cfg.training.weight_decay,
-                "grad_clip_norm": cfg.training.grad_clip_norm,
-                "device": cfg.training.device,
-                "env_id": cfg.common.env_id,
-                "model_dir": str(cfg.models_dir),
-                "stats_path": str(cfg.stats_path),
-            },
-        )
-        parser.add_argument(
-            "--log-level",
-            type=str,
-            default=cfg.common.log_level.upper(),
-            choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-            help="Logging level",
-        )
-        parser.add_argument(
-            "--metrics-port",
-            type=int,
-            default=9090,
-            help="Port for Prometheus metrics server",
-        )
-
+        _add_train_arguments(parser)
         args = parser.parse_args()
 
         # Configure structured logging (supports JSON for cloud deployments)
