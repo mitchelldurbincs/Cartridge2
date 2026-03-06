@@ -18,7 +18,7 @@ This document outlines the implementation plan for adding Prometheus metrics end
 | Slow model inference | GPU time wasted on inefficient batching | `actor_mcts_inference_seconds` histogram |
 | Training stalls | Compute running but no progress | `trainer_steps_total` counter flatlines |
 | Memory leaks | OOM kills → pod restarts → lost work | `*_memory_rss_bytes` gauge trending up |
-| Database bottlenecks | Actor waiting on SQLite writes | `actor_db_write_seconds` histogram |
+| Database bottlenecks | Actor waiting on PostgreSQL writes | `actor_db_write_seconds` histogram |
 
 ---
 
@@ -872,5 +872,5 @@ actor_episodes_per_second 8.5
 1. **Grafana Dashboards** - Pre-built dashboards for each component
 2. **Alertmanager Integration** - PagerDuty/Slack alerts
 3. **OpenTelemetry Migration** - Unified traces + metrics
-4. **Custom Exporters** - SQLite replay buffer stats
+4. **Custom Exporters** - PostgreSQL replay buffer stats
 5. **Push Gateway** - For short-lived batch jobs

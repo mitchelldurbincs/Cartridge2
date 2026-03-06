@@ -4,7 +4,7 @@ This document outlines the roadmap for migrating Cartridge2 to Kubernetes, both 
 
 ## Overview
 
-Current state: Monolithic architecture using Docker Compose with shared filesystem (SQLite + ONNX files).
+Current state: Monolithic architecture using Docker Compose with PostgreSQL replay buffer and ONNX model artifacts.
 
 Target state: Kubernetes-native deployment with proper storage abstractions, CI/CD, and cloud-ready infrastructure.
 
@@ -90,7 +90,7 @@ Options (pick one):
 - [ ] **ConfigMap**: Centralized config (from config.toml)
 - [ ] **Secrets**: Placeholder for future secrets management
 - [ ] **Storage**:
-  - PersistentVolumeClaim for SQLite database
+  - PersistentVolumeClaim for PostgreSQL data
   - PersistentVolumeClaim for ONNX models
   - Consider: Should models use object storage (S3/GCS) instead?
 
@@ -130,7 +130,7 @@ Options (pick one):
 ## Phase 5: Architecture Refactoring for K8s
 
 ### 5.1 Storage Strategy (CRITICAL)
-Current: SQLite file + ONNX files on shared filesystem
+Current: PostgreSQL replay buffer + ONNX files on shared filesystem
 
 **Problem**: Shared filesystem doesn't scale well in K8s across pods.
 
@@ -138,13 +138,13 @@ Current: SQLite file + ONNX files on shared filesystem
 
 | Option | Pros | Cons | Recommendation |
 |--------|------|------|----------------|
-| **A. Keep SQLite + PVC** | Simple, works | Single-writer limitation | Good for MVP/local |
-| **B. PostgreSQL** | Multi-writer, scalable | More infra to manage | Better for production |
+| **A. Keep single PostgreSQL + PVC** | Simple, already implemented | Limited HA/failover | Good for local/staging |
+| **B. Managed PostgreSQL** | HA, backups, scalable ops | Higher cost | Better for production |
 | **C. Redis for replay buffer** | Fast, ephemeral is OK | Data loss on restart | Good for high-throughput |
 
 **Recommendations**:
 - [ ] Short-term: Use ReadWriteOnce PVC for training jobs (single actor/trainer)
-- [ ] Medium-term: Add PostgreSQL option for replay buffer
+- [ ] Medium-term: Add managed PostgreSQL option for replay buffer
 - [ ] Model storage: Consider S3-compatible storage (MinIO locally, S3/GCS in cloud)
 
 ### 5.2 Model Storage
@@ -255,7 +255,7 @@ Current: SQLite file + ONNX files on shared filesystem
 8. Spot instance support (Phase 6.2)
 
 ### Nice to Have (Optimization)
-9. PostgreSQL replay buffer (Phase 5.1)
+9. Managed PostgreSQL replay backend (Phase 5.1)
 10. S3 model storage (Phase 5.2)
 11. Prometheus metrics (Phase 7.2)
 12. Auto-scaling (Phase 6.5)
@@ -274,7 +274,7 @@ Current: SQLite file + ONNX files on shared filesystem
 
 ## Questions to Decide
 
-1. **Storage backend**: Stick with SQLite or migrate to PostgreSQL?
+1. **Storage backend**: Self-host PostgreSQL or use managed PostgreSQL?
 2. **Model storage**: Local PVC or S3-compatible object storage?
 3. **Cloud provider**: AWS, GCP, or other?
 4. **GPU training**: Cloud GPU instances or local only?

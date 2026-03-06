@@ -394,12 +394,13 @@ docker compose up postgres -d
 | Backend | Description | Configuration |
 |---------|-------------|---------------|
 | **Filesystem** (default) | Local directory storage | `--model-dir ./data/models` |
-| **S3/MinIO** | Cloud object storage for distributed training | `CARTRIDGE_MODEL_STORAGE=s3` |
+| **S3/MinIO** | Cloud object storage for distributed training | `CARTRIDGE_STORAGE_MODEL_BACKEND=s3` |
 
 S3 connection is configured via environment variables:
 ```bash
-CARTRIDGE_S3_ENDPOINT=http://minio:9000
-CARTRIDGE_S3_BUCKET=models
+CARTRIDGE_STORAGE_S3_ENDPOINT=http://minio:9000
+CARTRIDGE_STORAGE_S3_BUCKET=cartridge-models
+CARTRIDGE_STORAGE_MODEL_BACKEND=s3
 AWS_ACCESS_KEY_ID=minioadmin
 AWS_SECRET_ACCESS_KEY=minioadmin
 ```
@@ -442,11 +443,14 @@ black .
 - `numpy>=1.24.0` - Numerical operations
 - `onnx>=1.14.0` - Model export
 - `onnxruntime>=1.15.0` - Model inference for evaluation
+- `psycopg2-binary>=2.9.0` - PostgreSQL replay buffer backend
+- `onnxscript>=0.1.0` - ONNX scripting
+- `prometheus-client>=0.20.0` - Metrics collection
+- `python-json-logger>=2.0.0` - Structured logging
 - `tomli>=2.0.0` - TOML config parsing (Python <3.11)
 
-**Optional (K8s deployment):**
-- `psycopg2-binary` - PostgreSQL backend
-- `boto3` - S3/MinIO model storage
+**Optional (S3/MinIO model storage):**
+- `boto3` - S3/MinIO model storage (not in core dependencies)
 
 ## Evaluator
 
@@ -581,7 +585,7 @@ trainer loop --iterations 100 --start-iteration 25
 trainer loop --iterations 50 --steps 500 --lr-total-steps 25000
 ```
 
-See `trainer loop --help` for all options.
+For the full loop argument reference, run `python -m trainer.orchestrator --help`.
 
 ## AlphaZero Training Tips
 

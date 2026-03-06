@@ -1089,8 +1089,11 @@ docker compose up web frontend
 # Evaluation
 python -m trainer evaluate --model ./data/models/latest.onnx --games 100
 
-# Clean data
-rm -rf ./data/replay.db ./data/models/*.onnx ./data/stats.json
+# Clean local artifacts (models + stats)
+rm -rf ./data/models/*.onnx ./data/stats.json ./data/loop_stats.json ./data/eval_stats.json ./data/best_model.json
+
+# Clean PostgreSQL replay buffer volume (removes all compose volumes)
+docker compose down -v
 ```
 
 ### File Locations
@@ -1110,5 +1113,5 @@ rm -rf ./data/replay.db ./data/models/*.onnx ./data/stats.json
 | `CARTRIDGE_COMMON_ENV_ID` | Game to train |
 | `CARTRIDGE_TRAINING_DEVICE` | cpu, cuda, mps |
 | `CARTRIDGE_MCTS_NUM_SIMULATIONS` | MCTS simulations |
-| `CARTRIDGE_STORAGE_REPLAY_BACKEND` | postgres |
+| `CARTRIDGE_STORAGE_MODEL_BACKEND` | filesystem, s3 |
 | `CARTRIDGE_STORAGE_POSTGRES_URL` | PostgreSQL connection |

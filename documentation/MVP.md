@@ -7,9 +7,9 @@ Big Game Goals:
 * Connect 4 (COMPLETE)
 * Othello
 
-Here is your rewritten design document, streamlined for the **Monolithic/Filesystem MVP** approach (v2).
+Here is your rewritten design document, streamlined for the **Monolithic MVP** approach (v2).
 
-### Cartridge 2 (Filesystem MVP)
+### Cartridge 2 (Monolithic MVP)
 
 Be able to visualize training of AlphaZero AND be able to play against it (without the DevOps headache).
 
@@ -30,8 +30,8 @@ I will reuse the engine-rust code, but refactor it from a Service into a Library
 
 **Components**
 
-- **Shared Filesystem** - The "glue" between processes (`./data/replays/` and `./data/models/`).
-- **Rust Monolith** - Handles Game Logic, MCTS, Self-Play, and serving the Web API.
+- **Shared Resources** - PostgreSQL replay buffer + filesystem/S3 model storage (`./data/models/`).
+- **Rust Services** - Engine library + Actor (self-play) + Web server (play API/UI backend).
 - **Python Trainer** - Handles the Neural Network training loop.
 
 **MVP:**
@@ -59,7 +59,7 @@ A long-running process that:
 
 1. Watches `./data/models/latest.onnx` for updates (hot-reload).
 2. Runs MCTS self-play loops using the Engine and ONNX model.
-3. Saves completed games to `./data/replay.db` (SQLite).
+3. Saves completed games to PostgreSQL replay buffer.
 4. Stores MCTS visit distributions as policy targets.
 5. Backfills game outcomes to all positions in each episode.
     
@@ -87,9 +87,9 @@ let step = ctx.step(&reset.state, &action).unwrap();
 
 **Status: COMPLETE**
 
-SQLite Database (`./data/replay.db`) - A single SQLite database file acting as a concurrent, persistent buffer.
+PostgreSQL Database - A shared concurrent replay buffer for actor and trainer.
 
-- **Actor (Rust):** Connects to `replay.db` and inserts transitions with:
+- **Actor (Rust):** Connects to PostgreSQL and inserts transitions with:
   - Game state and observations
   - MCTS policy distributions (visit counts normalized)
   - Game outcomes backfilled after episode completion
@@ -111,10 +111,10 @@ A single file: `./data/models/latest.onnx`
 
 **Status: COMPLETE**
 
-Python training loop that trains the network on data from SQLite and publishes versioned models safely.
+Python training loop that trains the network on data from PostgreSQL and publishes versioned models safely.
 
 **Process:**
-1. **Data Loading (SQLite):** Runs SQL queries to fetch randomized batches of transitions with MCTS policy targets and game outcomes.
+1. **Data Loading (PostgreSQL):** Runs SQL queries to fetch randomized batches of transitions with MCTS policy targets and game outcomes.
 2. **Training:** Updates the PyTorch model parameters θ to minimize the combined AlphaZero loss:
    - Policy: Cross-entropy with soft MCTS visit distribution targets
    - Value: MSE with propagated game outcomes

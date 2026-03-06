@@ -1,6 +1,6 @@
 # Actor
 
-Self-play episode runner for Cartridge2. Generates game experience data by running continuous episodes and storing transitions in SQLite for training.
+Self-play episode runner for Cartridge2. Generates game experience data by running continuous episodes and storing transitions in PostgreSQL for training.
 
 ## Overview
 
@@ -9,7 +9,7 @@ The Actor is a long-running Rust binary that:
 1. Runs game episodes using the engine-core library directly (no gRPC)
 2. Selects actions using MCTS with ONNX neural network evaluation
 3. Hot-reloads the model when `latest.onnx` changes
-4. Stores transitions with MCTS policy distributions and game outcomes in SQLite
+4. Stores transitions with MCTS policy distributions and game outcomes in PostgreSQL
 5. Supports graceful shutdown via Ctrl+C
 6. Can run multiple instances in parallel for faster data generation
 
@@ -36,10 +36,12 @@ cargo run -- --actor-id actor-3 &
 | `--env-id` | `ACTOR_ENV_ID` | `tictactoe` | Game environment to run |
 | `--max-episodes` | `ACTOR_MAX_EPISODES` | `-1` | Max episodes (-1 = unlimited) |
 | `--episode-timeout-secs` | `ACTOR_EPISODE_TIMEOUT` | `30` | Per-episode timeout |
-| `--flush-interval-secs` | `ACTOR_FLUSH_INTERVAL` | `5` | SQLite flush interval |
+| `--flush-interval-secs` | `ACTOR_FLUSH_INTERVAL` | `5` | Buffer flush interval |
 | `--log-level` | `ACTOR_LOG_LEVEL` | `info` | Logging level |
-| `--replay-db-path` | `ACTOR_REPLAY_DB_PATH` | `./data/replay.db` | SQLite database path |
 | `--data-dir` | `ACTOR_DATA_DIR` | `./data` | Data directory for models |
+| `--postgres-url` | `CARTRIDGE_STORAGE_POSTGRES_URL` | `postgresql://cartridge:cartridge@localhost:5432/cartridge` | PostgreSQL connection string |
+
+Configuration is loaded from `config.toml` at the project root, with environment variables taking precedence.
 
 ## Architecture
 
@@ -49,6 +51,7 @@ cargo run -- --actor-id actor-3 &
 ├─────────────────────────────────────────────────────────┤
 │  main()                                                  │
 │    ├─ Parse CLI args (clap)                             │
+│    ├─ Load config from config.toml                       │
 │    ├─ Validate config                                   │
 │    ├─ Load GameConfig from metadata                     │
 │    ├─ Init model watcher                                │
@@ -66,9 +69,9 @@ cargo run -- --actor-id actor-3 &
 │            ├─ replay.store(transition)                  │
 │            └─ break if done                             │
 └─────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-              ./data/replay.db (SQLite)
+                             │
+                             ▼
+               PostgreSQL (cartridge.transitions)
 ```
 
 ## Components
@@ -82,7 +85,7 @@ pub struct Actor {
     config: Config,
     engine: Mutex<EngineContext>,      // Game simulation
     mcts_policy: Mutex<MctsPolicy>,    // Action selection
-    replay: Mutex<ReplayBuffer>,       // SQLite storage
+    replay: Mutex<ReplayStore>,       // PostgreSQL storage
     episode_count: AtomicU32,
     shutdown_signal: AtomicBool,
 }
@@ -121,22 +124,21 @@ Game-specific configuration derived from GameMetadata:
 - Supports TicTacToe and Connect 4
 - No hardcoded game parameters
 
-### Replay Buffer (`src/replay.rs`)
+### Replay Buffer (`src/storage/postgres.rs`)
 
-SQLite-backed storage for transitions:
+PostgreSQL-backed storage for transitions:
 
 ```rust
-pub struct ReplayBuffer {
-    conn: Connection,
+pub struct PostgresReplayStore {
+    pool: deadpool_postgres::Pool,
 }
 
-impl ReplayBuffer {
-    pub fn new(db_path: &str) -> Result<Self>;
-    pub fn store(&self, transition: &Transition) -> Result<()>;
-    pub fn store_batch(&self, transitions: &[Transition]) -> Result<()>;
-    pub fn sample(&self, batch_size: usize) -> Result<Vec<Transition>>;
-    pub fn count(&self) -> Result<usize>;
-    pub fn cleanup(&self, window_size: usize) -> Result<usize>;
+impl ReplayStore for PostgresReplayStore {
+    async fn store(&self, transition: &Transition) -> Result<()>;
+    async fn store_batch(&self, transitions: &[Transition]) -> Result<()>;
+    async fn count(&self) -> Result<usize>;
+    async fn clear(&self) -> Result<()>;
+    async fn store_metadata(&self, metadata: &GameMetadata) -> Result<()>;
 }
 ```
 
@@ -195,14 +197,14 @@ CREATE INDEX idx_transitions_episode ON transitions(episode_id);
 ### Basic Usage
 
 ```bash
-# Default configuration
+# Default configuration (requires PostgreSQL running)
 cargo run
 
 # Specific actor ID and episode limit
 cargo run -- --actor-id actor-1 --max-episodes 1000
 
-# Custom database location
-cargo run -- --replay-db-path /data/replay.db --data-dir /data
+# Custom PostgreSQL connection
+cargo run -- --postgres-url "postgresql://user:pass@host:5432/cartridge"
 ```
 
 ### Environment Variables
@@ -212,6 +214,17 @@ export ACTOR_ACTOR_ID=distributed-1
 export ACTOR_ENV_ID=tictactoe
 export ACTOR_MAX_EPISODES=10000
 export ACTOR_LOG_LEVEL=info
+export CARTRIDGE_STORAGE_POSTGRES_URL="postgresql://user:pass@localhost:5432/cartridge"
+cargo run
+```
+
+### Docker Compose (Recommended)
+
+```bash
+# Start PostgreSQL
+docker compose up postgres -d
+
+# Run actor
 cargo run
 ```
 
@@ -228,12 +241,16 @@ wait
 ### Integration with Trainer
 
 ```bash
-# Terminal 1: Actor generates data
-cargo run -- --actor-id actor-1 --replay-db-path ./data/replay.db
+# Terminal 1: Start PostgreSQL
+docker compose up postgres -d
 
-# Terminal 2: Python trainer consumes data
+# Terminal 2: Actor generates data
+cargo run -- --actor-id actor-1
+
+# Terminal 3: Python trainer consumes data
 cd ../trainer
-python -m trainer --db ../data/replay.db
+# Uses CARTRIDGE_STORAGE_POSTGRES_URL from environment or config.toml
+python -m trainer train
 ```
 
 ## Testing
@@ -262,35 +279,42 @@ cargo bench
 | Crate | Purpose |
 |-------|---------|
 | `engine-core` | Game simulation API |
-| `games-tictactoe` | TicTacToe game |
+| `engine-config` | Centralized configuration |
+| `engine-games` | Game registration |
 | `mcts` | Monte Carlo Tree Search |
-| `ort` | ONNX Runtime bindings |
+| `tokio-postgres` | PostgreSQL client |
+| `deadpool-postgres` | PostgreSQL connection pool |
 | `tokio` | Async runtime |
 | `clap` | CLI argument parsing |
-| `rusqlite` | SQLite interface |
 | `rand_chacha` | Deterministic RNG |
 | `tracing` | Structured logging |
 | `notify` | File watching for model hot-reload |
+| `prometheus` | Metrics collection |
 
 ## Performance
 
 - **Zero-copy buffers** - Efficient handling of state/action/observation data
 - **Async I/O** - Non-blocking episode execution
 - **Deterministic RNG** - ChaCha20Rng for reproducible randomness
-- **SQLite bundled** - No external database server required
+- **Pooled PostgreSQL writes** - Concurrent actor-safe replay buffer ingestion
 
 ## Troubleshooting
 
 ### Common Issues
 
 1. **Unknown env_id** - Ensure game is registered with engine-core
-2. **Database locked** - Only one writer at a time; use separate DB files for parallel actors
+2. **PostgreSQL connection failed** - Check `CARTRIDGE_STORAGE_POSTGRES_URL` and that PostgreSQL is running
 3. **Permission denied** - Check write permissions on data directory
 
 ### Debug Mode
 
 ```bash
+# Enable debug logging
 RUST_LOG=debug cargo run -- --log-level debug
+
+# Check database connection
+docker compose ps postgres
+docker compose logs postgres
 ```
 
 ## Future Work

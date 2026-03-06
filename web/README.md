@@ -23,11 +23,15 @@ Minimal web interface for playing TicTacToe against the AI and monitoring traini
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check |
+| `/metrics` | GET | Prometheus metrics |
+| `/games` | GET | List available games |
+| `/game-info/:id` | GET | Get metadata for a specific game |
 | `/game/state` | GET | Get current board state |
 | `/game/new` | POST | Start a new game |
 | `/move` | POST | Make a move (player + bot response) |
 | `/stats` | GET | Read training stats from stats.json |
-| `/selfplay` | POST | Start/stop self-play (placeholder) |
+| `/actor-stats` | GET | Read actor self-play stats |
+| `/model` | GET | Get info about the loaded model |
 
 ## Quick Start
 
@@ -72,16 +76,19 @@ The frontend builds to `frontend/dist/` which can be served by the Rust backend.
 ### Run tests
 
 ```bash
-cargo test  # 22 tests
+cargo test  # ~27 tests
 ```
 
 ## Configuration
 
-The web server uses `config.toml` from the project root for centralized configuration via `central_config.rs`.
+The web server uses `config.toml` from the project root for centralized configuration. Settings can be overridden with environment variables:
 
-Environment variables:
+- `CARTRIDGE_WEB_HOST` - Server bind address (default: `0.0.0.0`)
+- `CARTRIDGE_WEB_PORT` - Server port (default: `8080`)
+- `CARTRIDGE_COMMON_ENV_ID` - Default game environment (default: `tictactoe`)
+- `CARTRIDGE_COMMON_DATA_DIR` - Base data directory for stats.json (default: `./data`)
 
-- `DATA_DIR` - Directory for stats.json (default: `./data`)
+For full configuration options, see `config.toml` and `config.defaults.toml`.
 
 ## API Examples
 
