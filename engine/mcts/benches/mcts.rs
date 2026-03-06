@@ -262,20 +262,11 @@ fn bench_tree_operations(c: &mut Criterion) {
     // Benchmark node allocation
     group.bench_function("allocate_node", |b| {
         b.iter(|| {
-            let mut tree = MctsTree::new(vec![0u8; 16], vec![0u8; 32], 0b111111111);
+            let mut tree = MctsTree::new(0b111111111);
 
             // Allocate 100 child nodes
             for i in 0..100u8 {
-                tree.add_child(
-                    tree.root(),
-                    i % 9,
-                    0.11,
-                    vec![i; 16],
-                    vec![i; 32],
-                    0b111111111,
-                    false,
-                    0.0,
-                );
+                tree.add_child(tree.root(), i % 9, 0.11, 0b111111111, false, 0.0);
             }
 
             black_box(tree.len())
@@ -285,7 +276,7 @@ fn bench_tree_operations(c: &mut Criterion) {
     // Benchmark child selection (UCB calculation)
     group.bench_function("select_child", |b| {
         // Pre-build a tree with children
-        let mut tree = MctsTree::new(vec![0u8; 16], vec![0u8; 32], 0b111111111);
+        let mut tree = MctsTree::new(0b111111111);
 
         // Add 9 children with varying priors and visit counts
         for i in 0..9u8 {
@@ -293,8 +284,6 @@ fn bench_tree_operations(c: &mut Criterion) {
                 tree.root(),
                 i,
                 (i as f32 + 1.0) / 45.0, // Varying priors
-                vec![i; 16],
-                vec![i; 32],
                 0b111111111,
                 false,
                 0.0,
@@ -316,7 +305,7 @@ fn bench_tree_operations(c: &mut Criterion) {
         b.iter_batched(
             || {
                 // Setup: create a tree with depth 5
-                let mut tree = MctsTree::new(vec![0u8; 16], vec![0u8; 32], 0b111111111);
+                let mut tree = MctsTree::new(0b111111111);
                 let mut parent = tree.root();
 
                 for i in 0..5 {
@@ -324,8 +313,6 @@ fn bench_tree_operations(c: &mut Criterion) {
                         parent,
                         i,
                         0.5,
-                        vec![i; 16],
-                        vec![i; 32],
                         0b111111111,
                         i == 4, // Last one is terminal
                         if i == 4 { 1.0 } else { 0.0 },
@@ -346,19 +333,10 @@ fn bench_tree_operations(c: &mut Criterion) {
     // Benchmark policy extraction
     group.bench_function("root_policy", |b| {
         // Pre-build a tree with children
-        let mut tree = MctsTree::new(vec![0u8; 16], vec![0u8; 32], 0b111111111);
+        let mut tree = MctsTree::new(0b111111111);
 
         for i in 0..9u8 {
-            let child_id = tree.add_child(
-                tree.root(),
-                i,
-                1.0 / 9.0,
-                vec![i; 16],
-                vec![i; 32],
-                0b111111111,
-                false,
-                0.0,
-            );
+            let child_id = tree.add_child(tree.root(), i, 1.0 / 9.0, 0b111111111, false, 0.0);
             tree.get_mut(child_id).visit_count = (i as u32 + 1) * 50;
         }
 
@@ -367,19 +345,10 @@ fn bench_tree_operations(c: &mut Criterion) {
 
     // Benchmark policy extraction with temperature scaling
     group.bench_function("root_policy_temperature", |b| {
-        let mut tree = MctsTree::new(vec![0u8; 16], vec![0u8; 32], 0b111111111);
+        let mut tree = MctsTree::new(0b111111111);
 
         for i in 0..9u8 {
-            let child_id = tree.add_child(
-                tree.root(),
-                i,
-                1.0 / 9.0,
-                vec![i; 16],
-                vec![i; 32],
-                0b111111111,
-                false,
-                0.0,
-            );
+            let child_id = tree.add_child(tree.root(), i, 1.0 / 9.0, 0b111111111, false, 0.0);
             tree.get_mut(child_id).visit_count = (i as u32 + 1) * 50;
         }
 

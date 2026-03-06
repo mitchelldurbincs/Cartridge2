@@ -112,6 +112,10 @@ pub struct MctsSearch<'a, E: Evaluator> {
     evaluator: &'a E,
     config: MctsConfig,
     num_actions: usize,
+    root_state: Vec<u8>,
+    root_obs: Vec<u8>,
+    step_state_buf: Vec<u8>,
+    step_obs_buf: Vec<u8>,
 }
 
 impl<'a, E: Evaluator> MctsSearch<'a, E> {
@@ -129,7 +133,9 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             _ => return Err(SearchError::UnsupportedActionSpace),
         };
 
-        let tree = MctsTree::new(state, obs, legal_moves_mask);
+        let tree = MctsTree::new(legal_moves_mask);
+        let state_capacity = state.len().max(64);
+        let obs_capacity = obs.len().max(64);
 
         Ok(Self {
             tree,
@@ -137,6 +143,10 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             evaluator,
             config,
             num_actions,
+            root_state: state,
+            root_obs: obs,
+            step_state_buf: Vec::with_capacity(state_capacity),
+            step_obs_buf: Vec::with_capacity(obs_capacity),
         })
     }
 
@@ -150,7 +160,11 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
 
         // First, expand the root if needed (single NN call, special case)
         if !self.tree.get(self.tree.root()).is_expanded() {
-            self.expand_node(self.tree.root(), rng)?;
+            let root_id = self.tree.root();
+            let legal_mask = self.tree.get(root_id).legal_moves_mask;
+            let root_state = self.root_state.clone();
+            let root_obs = self.root_obs.clone();
+            self.expand_node(root_id, &root_state, &root_obs, legal_mask)?;
         }
 
         // Add Dirichlet noise to root if configured
@@ -169,7 +183,7 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             let selection_start = Instant::now();
             let remaining = target_simulations - completed_simulations - pending.len() as u32;
             while pending.len() < batch_size && remaining > 0 {
-                match self.select_leaf() {
+                match self.select_leaf()? {
                     LeafResult::Terminal { node_id, value } => {
                         // Terminal nodes don't need NN - backprop immediately
                         let backprop_start = Instant::now();
@@ -267,32 +281,40 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
     /// Run a single simulation (select -> expand -> evaluate -> backpropagate).
     /// NOTE: This method is kept for reference but replaced by batched evaluation in `run()`.
     #[allow(dead_code)]
-    fn simulate(&mut self, rng: &mut ChaCha20Rng) -> Result<(), SearchError> {
+    fn simulate(&mut self, _rng: &mut ChaCha20Rng) -> Result<(), SearchError> {
         // Selection: traverse to a leaf
         let (leaf_id, path) = self.select();
 
-        let leaf = self.tree.get(leaf_id);
+        let (is_terminal, terminal_value, is_expanded, legal_mask) = {
+            let leaf = self.tree.get(leaf_id);
+            (
+                leaf.is_terminal,
+                leaf.terminal_value,
+                leaf.is_expanded(),
+                leaf.legal_moves_mask,
+            )
+        };
 
         // If terminal, backpropagate the terminal value
-        if leaf.is_terminal {
-            let value = leaf.terminal_value;
-            self.tree.backpropagate(leaf_id, value);
+        if is_terminal {
+            self.tree.backpropagate(leaf_id, terminal_value);
             return Ok(());
         }
 
+        let (state, obs) = self.reconstruct_position(&path)?;
+
         // Expansion + Evaluation: expand the node and get value estimate
         // We call the evaluator ONCE and use its policy for priors and its value for backprop
-        let value = if !leaf.is_expanded() {
+        let value = if !is_expanded {
             // Expand and get the value from the same evaluation
-            self.expand_node(leaf_id, rng)?
+            self.expand_node(leaf_id, &state, &obs, legal_mask)?
         } else {
             // Already expanded (shouldn't happen in standard MCTS, but handle gracefully)
             // This can occur if we select an expanded node that has no children
             // (e.g., all children were pruned due to zero priors)
-            let leaf = self.tree.get(leaf_id);
-            let eval =
-                self.evaluator
-                    .evaluate(&leaf.obs, leaf.legal_moves_mask, self.num_actions)?;
+            let eval = self
+                .evaluator
+                .evaluate(&obs, legal_mask, self.num_actions)?;
             eval.value
         };
 
@@ -337,28 +359,33 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
 
     /// Select a leaf node and return its evaluation requirements.
     /// This is used in batched evaluation mode to collect leaves before evaluating.
-    fn select_leaf(&mut self) -> LeafResult {
-        let (leaf_id, _path) = self.select();
+    fn select_leaf(&mut self) -> Result<LeafResult, SearchError> {
+        let (leaf_id, path) = self.select();
 
         // Check terminal/expanded status first (no cloning needed for early returns)
-        {
+        let (is_terminal, terminal_value, is_expanded, legal_mask) = {
             let leaf = self.tree.get(leaf_id);
-            if leaf.is_terminal {
-                return LeafResult::Terminal {
-                    node_id: leaf_id,
-                    value: leaf.terminal_value,
-                };
-            }
-            if leaf.is_expanded() {
-                return LeafResult::AlreadyExpanded;
-            }
+            (
+                leaf.is_terminal,
+                leaf.terminal_value,
+                leaf.is_expanded(),
+                leaf.legal_moves_mask,
+            )
+        };
+
+        if is_terminal {
+            return Ok(LeafResult::Terminal {
+                node_id: leaf_id,
+                value: terminal_value,
+            });
         }
 
-        // Only clone state/obs if we actually need them for evaluation
-        let (state, obs, legal_mask) = {
-            let leaf = self.tree.get(leaf_id);
-            (leaf.state.clone(), leaf.obs.clone(), leaf.legal_moves_mask)
-        };
+        if is_expanded {
+            return Ok(LeafResult::AlreadyExpanded);
+        }
+
+        // Reconstruct state/obs for this path on demand.
+        let (state, obs) = self.reconstruct_position(&path)?;
 
         // Apply virtual loss to discourage selecting this node again
         // before it's been evaluated (prevents duplicate selection in batch)
@@ -366,17 +393,46 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
         leaf_mut.visit_count += 1;
         leaf_mut.value_sum -= self.config.virtual_loss;
 
-        LeafResult::NeedsEvaluation {
+        Ok(LeafResult::NeedsEvaluation {
             node_id: leaf_id,
             state,
             obs,
             legal_mask,
+        })
+    }
+
+    /// Reconstruct state/observation at a path by replaying actions from root.
+    fn reconstruct_position(&mut self, path: &[NodeId]) -> Result<(Vec<u8>, Vec<u8>), SearchError> {
+        let mut state = self.root_state.clone();
+        let mut obs = self.root_obs.clone();
+
+        for &node_id in path.iter().skip(1) {
+            let action_bytes = (self.tree.get(node_id).action as u32).to_le_bytes();
+            self.ctx
+                .step_into(
+                    &state,
+                    &action_bytes,
+                    &mut self.step_state_buf,
+                    &mut self.step_obs_buf,
+                )
+                .map_err(|e| SearchError::EngineError(e.to_string()))?;
+
+            std::mem::swap(&mut state, &mut self.step_state_buf);
+            std::mem::swap(&mut obs, &mut self.step_obs_buf);
         }
+
+        Ok((state, obs))
     }
 
     /// Expand a node by adding all legal children.
     /// Returns the value estimate from the evaluator (to be used for backpropagation).
-    fn expand_node(&mut self, node_id: NodeId, _rng: &mut ChaCha20Rng) -> Result<f32, SearchError> {
+    fn expand_node(
+        &mut self,
+        node_id: NodeId,
+        parent_state: &[u8],
+        parent_obs: &[u8],
+        legal_mask: u64,
+    ) -> Result<f32, SearchError> {
         let node = self.tree.get(node_id);
 
         // Don't expand terminal nodes
@@ -384,68 +440,12 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             return Ok(node.terminal_value);
         }
 
-        let state = node.state.clone();
-        let obs = node.obs.clone();
-        let legal_mask = node.legal_moves_mask;
-
         // Get policy AND value from evaluator (single NN call)
         // We use the policy for child priors and return the value for backpropagation
         let eval = self
             .evaluator
-            .evaluate(&obs, legal_mask, self.num_actions)?;
-
-        // Add children for each legal action
-        for action in 0..self.num_actions {
-            if (legal_mask >> action) & 1 == 0 {
-                continue; // Illegal action
-            }
-
-            let prior = eval.policy[action];
-            if prior < 1e-8 {
-                continue; // Skip zero-prior actions
-            }
-
-            // Simulate the action to get new state
-            let action_bytes = (action as u32).to_le_bytes().to_vec();
-            let step_result = self
-                .ctx
-                .step(&state, &action_bytes)
-                .map_err(|e| SearchError::EngineError(e.to_string()))?;
-
-            // Extract legal moves from info bits (num_actions bits)
-            let child_legal_mask =
-                info_bits::extract_legal_mask(step_result.info, self.num_actions as u32);
-
-            // Determine terminal value:
-            // The reward is from the perspective of the player who just moved (the parent).
-            // The child node represents the resulting state where the OPPONENT would move next.
-            // We store the NEGATED reward because:
-            // - When we backpropagate from this terminal child, the first thing we do is
-            //   add value_sum to the child, then negate for the parent.
-            // - If we store +reward, parent gets -reward (WRONG: parent chose winning move!)
-            // - If we store -reward, parent gets +reward (CORRECT: winning action is good)
-            //
-            // Example: X wins by moving to position 2
-            // - step_result.reward = +1 (X won)
-            // - terminal_value stored = -1 (from O's perspective, this state is losing)
-            // - backprop: child gets -1, parent (X's move) gets -(-1) = +1 ✓
-            let terminal_value = if step_result.done {
-                -step_result.reward
-            } else {
-                0.0
-            };
-
-            self.tree.add_child(
-                node_id,
-                action as u8,
-                prior,
-                step_result.state,
-                step_result.obs,
-                child_legal_mask,
-                step_result.done,
-                terminal_value,
-            );
-        }
+            .evaluate(parent_obs, legal_mask, self.num_actions)?;
+        self.expand_node_with_eval_counted(node_id, parent_state, legal_mask, &eval)?;
 
         // Return the value estimate from this single evaluation
         Ok(eval.value)
@@ -521,33 +521,31 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
                 continue; // Skip zero-prior actions
             }
 
-            // Simulate the action to get new state
-            let action_bytes = (action as u32).to_le_bytes().to_vec();
-            let step_result = self
+            // Simulate the action using zero-copy buffers.
+            let action_bytes = (action as u32).to_le_bytes();
+            let (reward, done, info) = self
                 .ctx
-                .step(parent_state, &action_bytes)
+                .step_into(
+                    parent_state,
+                    &action_bytes,
+                    &mut self.step_state_buf,
+                    &mut self.step_obs_buf,
+                )
                 .map_err(|e| SearchError::EngineError(e.to_string()))?;
             step_count += 1;
 
             // Extract legal moves from info bits
-            let child_legal_mask =
-                info_bits::extract_legal_mask(step_result.info, self.num_actions as u32);
+            let child_legal_mask = info_bits::extract_legal_mask(info, self.num_actions as u32);
 
             // Terminal value (negated for opponent's perspective)
-            let terminal_value = if step_result.done {
-                -step_result.reward
-            } else {
-                0.0
-            };
+            let terminal_value = if done { -reward } else { 0.0 };
 
             self.tree.add_child(
                 node_id,
                 action as u8,
                 prior,
-                step_result.state,
-                step_result.obs,
                 child_legal_mask,
-                step_result.done,
+                done,
                 terminal_value,
             );
         }

@@ -28,12 +28,6 @@ pub struct MctsNode {
     /// Action that led to this node from parent (0-indexed)
     pub action: u8,
 
-    /// Encoded game state at this node
-    pub state: Vec<u8>,
-
-    /// Encoded observation at this node (for neural network input)
-    pub obs: Vec<u8>,
-
     /// Number of times this node has been visited
     pub visit_count: u32,
 
@@ -64,12 +58,10 @@ pub struct MctsNode {
 
 impl MctsNode {
     /// Create a new root node.
-    pub fn new_root(state: Vec<u8>, obs: Vec<u8>, legal_moves_mask: u64) -> Self {
+    pub fn new_root(legal_moves_mask: u64) -> Self {
         Self {
             parent: NodeId::NONE,
             action: 0,
-            state,
-            obs,
             visit_count: 0,
             value_sum: 0.0,
             prior: 1.0, // Root has prior 1.0
@@ -87,8 +79,6 @@ impl MctsNode {
         parent: NodeId,
         action: u8,
         prior: f32,
-        state: Vec<u8>,
-        obs: Vec<u8>,
         legal_moves_mask: u64,
         is_terminal: bool,
         terminal_value: f32,
@@ -96,8 +86,6 @@ impl MctsNode {
         Self {
             parent,
             action,
-            state,
-            obs,
             visit_count: 0,
             value_sum: 0.0,
             prior,
@@ -206,20 +194,18 @@ mod tests {
 
     #[test]
     fn test_new_root() {
-        let node = MctsNode::new_root(vec![1, 2, 3], vec![4, 5, 6], 0b111);
+        let node = MctsNode::new_root(0b111);
 
         assert!(node.parent.is_none());
         assert_eq!(node.visit_count, 0);
         assert!((node.prior - 1.0).abs() < 1e-6);
         assert!(!node.is_terminal);
         assert!(node.children.is_empty());
-        assert_eq!(node.state, vec![1, 2, 3]);
-        assert_eq!(node.obs, vec![4, 5, 6]);
     }
 
     #[test]
     fn test_mean_value() {
-        let mut node = MctsNode::new_root(vec![], vec![], 0);
+        let mut node = MctsNode::new_root(0);
 
         // Unvisited
         assert!((node.mean_value()).abs() < 1e-6);
@@ -232,7 +218,7 @@ mod tests {
 
     #[test]
     fn test_ucb_score() {
-        let mut node = MctsNode::new_root(vec![], vec![], 0);
+        let mut node = MctsNode::new_root(0);
         node.prior = 0.5;
         node.visit_count = 10;
         node.value_sum = 5.0; // Q from child's perspective = 0.5
@@ -254,7 +240,7 @@ mod tests {
 
     #[test]
     fn test_is_leaf() {
-        let mut node = MctsNode::new_root(vec![], vec![], 0);
+        let mut node = MctsNode::new_root(0);
 
         // Initially a leaf (no children)
         assert!(node.is_leaf());
@@ -264,7 +250,7 @@ mod tests {
         assert!(!node.is_leaf());
 
         // Terminal nodes are always leaves
-        let mut terminal = MctsNode::new_root(vec![], vec![], 0);
+        let mut terminal = MctsNode::new_root(0);
         terminal.is_terminal = true;
         terminal.children.push((0, NodeId(1)));
         assert!(terminal.is_leaf());
