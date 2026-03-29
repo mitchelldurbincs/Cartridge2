@@ -135,27 +135,9 @@ pub fn create_app_with_cors(state: Arc<AppState>, allowed_origins: &[String]) ->
 }
 
 /// Create the application router with the given state.
-/// Uses permissive CORS for backwards compatibility in testing.
+/// Uses permissive CORS (empty allowed_origins = development mode).
 pub fn create_app(state: Arc<AppState>) -> Router {
-    // For backwards compatibility, use empty allowed_origins (development mode)
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::CONTENT_TYPE, header::ACCEPT]);
-
-    Router::new()
-        .route("/health", get(health))
-        .route("/metrics", get(metrics_handler))
-        .route("/games", get(list_games))
-        .route("/game-info/:id", get(get_game_info))
-        .route("/game/new", post(new_game))
-        .route("/game/state", get(get_game_state))
-        .route("/move", post(make_move))
-        .route("/stats", get(get_stats))
-        .route("/actor-stats", get(get_actor_stats))
-        .route("/model", get(get_model_info))
-        .layer(cors)
-        .with_state(state)
+    create_app_with_cors(state, &[])
 }
 
 /// Create application state for testing (no model watcher, no logging)
@@ -286,7 +268,7 @@ async fn main() -> anyhow::Result<()> {
             "Model watcher initialized"
         );
 
-        // Create model watcher
+        // Create model watcher with metadata tracking for the web UI
         // Use 1 intra-op thread since web server does single-threaded inference for play
         let model_watcher = ModelWatcher::new(
             &model_dir,
@@ -294,7 +276,8 @@ async fn main() -> anyhow::Result<()> {
             obs_size,
             1,
             Arc::clone(&evaluator),
-        );
+        )
+        .with_metadata();
 
         // Try to load existing model
         match model_watcher.try_load_existing() {

@@ -453,8 +453,7 @@ impl S3ModelWatcher {
     ) -> Result<()> {
         let training_step = Self::extract_training_step(path);
 
-        let new_evaluator =
-            OnnxEvaluator::load(path, obs_size, DEFAULT_ONNX_INTRA_THREADS)
+        let new_evaluator = OnnxEvaluator::load(path, obs_size, DEFAULT_ONNX_INTRA_THREADS)
             .map_err(|e| anyhow!("Failed to load ONNX model: {}", e))?;
 
         {
@@ -493,8 +492,7 @@ impl S3ModelWatcher {
         obs_size: usize,
         evaluator: &Arc<RwLock<Option<OnnxEvaluator>>>,
     ) -> Result<()> {
-        let new_evaluator =
-            OnnxEvaluator::load(path, obs_size, DEFAULT_ONNX_INTRA_THREADS)
+        let new_evaluator = OnnxEvaluator::load(path, obs_size, DEFAULT_ONNX_INTRA_THREADS)
             .map_err(|e| anyhow!("Failed to load ONNX model: {}", e))?;
 
         {
