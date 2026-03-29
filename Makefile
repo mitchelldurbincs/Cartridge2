@@ -20,6 +20,7 @@
 PYTHON           ?= python3
 CARGO            ?= cargo
 NPM              ?= npm
+VENV_DIR         ?= .venv
 
 # Detect OS for platform-specific defaults
 UNAME            := $(shell uname -s)
@@ -98,7 +99,11 @@ endif
 
 setup-trainer:
 	@echo "--- Installing trainer ---"
-	cd trainer && $(PYTHON) -m pip install -e ".[dev]"
+	@if [ ! -d "$(VENV_DIR)" ]; then \
+		$(PYTHON) -m venv $(VENV_DIR); \
+		echo "Created virtual environment at $(VENV_DIR)"; \
+	fi
+	$(VENV_DIR)/bin/pip install -e "trainer/.[dev]"
 
 setup-actor: build-actor
 
@@ -124,7 +129,7 @@ data:
 	@mkdir -p data data/models
 
 train: data
-	$(PYTHON) -m trainer loop \
+	$(VENV_DIR)/bin/python -m trainer loop \
 		--iterations $(ITERATIONS) \
 		--episodes $(EPISODES) \
 		--steps $(STEPS)
@@ -156,7 +161,7 @@ test-web:
 	$(CARGO) test --manifest-path web/Cargo.toml
 
 test-trainer:
-	cd trainer && $(PYTHON) -m pytest tests/ -v --tb=short
+	$(VENV_DIR)/bin/python -m pytest trainer/tests/ -v --tb=short
 
 # --- Linting ---
 
@@ -171,8 +176,8 @@ lint-rust:
 	$(CARGO) clippy --manifest-path web/Cargo.toml --all-targets -- -D warnings
 
 lint-python:
-	cd trainer && $(PYTHON) -m ruff check src/
-	cd trainer && $(PYTHON) -m black --check src/
+	$(VENV_DIR)/bin/python -m ruff check trainer/src/
+	$(VENV_DIR)/bin/python -m black --check trainer/src/
 
 lint-frontend:
 	cd web/frontend && $(NPM) run check
