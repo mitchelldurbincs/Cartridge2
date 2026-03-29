@@ -52,7 +52,7 @@ weight_decay = 0.0001
 grad_clip_norm = 1.0
 
 # Device for training: cpu, cuda, mps
-device = "cpu"
+device = "mps"
 
 # Steps between checkpoint saves
 checkpoint_interval = 250 

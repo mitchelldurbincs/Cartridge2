@@ -25,6 +25,12 @@ use crate::ModelInfo;
 /// Default polling interval for S3 model checks.
 const DEFAULT_S3_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Default ONNX intra-op thread setting for S3-backed model loading.
+///
+/// `0` delegates to the evaluator's auto-detection logic, which matches the
+/// behavior of the filesystem watcher when no explicit thread count is wired in.
+const DEFAULT_ONNX_INTRA_THREADS: usize = 0;
+
 /// S3-backed model watcher for Kubernetes deployments.
 ///
 /// Polls an S3 bucket for model updates and hot-reloads them.
@@ -246,7 +252,7 @@ impl S3ModelWatcher {
         #[cfg(feature = "metadata")]
         let training_step = Self::extract_training_step(path);
 
-        let new_evaluator = OnnxEvaluator::load(path, self.obs_size)
+        let new_evaluator = OnnxEvaluator::load(path, self.obs_size, DEFAULT_ONNX_INTRA_THREADS)
             .map_err(|e| anyhow!("Failed to load ONNX model: {}", e))?;
 
         {
@@ -447,7 +453,8 @@ impl S3ModelWatcher {
     ) -> Result<()> {
         let training_step = Self::extract_training_step(path);
 
-        let new_evaluator = OnnxEvaluator::load(path, obs_size)
+        let new_evaluator =
+            OnnxEvaluator::load(path, obs_size, DEFAULT_ONNX_INTRA_THREADS)
             .map_err(|e| anyhow!("Failed to load ONNX model: {}", e))?;
 
         {
@@ -486,7 +493,8 @@ impl S3ModelWatcher {
         obs_size: usize,
         evaluator: &Arc<RwLock<Option<OnnxEvaluator>>>,
     ) -> Result<()> {
-        let new_evaluator = OnnxEvaluator::load(path, obs_size)
+        let new_evaluator =
+            OnnxEvaluator::load(path, obs_size, DEFAULT_ONNX_INTRA_THREADS)
             .map_err(|e| anyhow!("Failed to load ONNX model: {}", e))?;
 
         {

@@ -28,7 +28,7 @@ Usage:
 import logging
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -311,14 +311,28 @@ def _convert_value(value: str, section: str, key: str, data: dict) -> Any:
 
 def _dict_to_config(data: dict[str, Any]) -> Config:
     """Convert a dictionary to a Config object."""
+
+    def build_section(cls: type, section_name: str) -> Any:
+        section_data = data.get(section_name, {})
+        valid_fields = {f.name for f in fields(cls)}
+        filtered = {k: v for k, v in section_data.items() if k in valid_fields}
+        ignored = sorted(k for k in section_data if k not in valid_fields)
+        if ignored:
+            logger.debug(
+                "Ignoring unsupported config keys for %s: %s",
+                section_name,
+                ", ".join(ignored),
+            )
+        return cls(**filtered)
+
     return Config(
-        common=CommonConfig(**data.get("common", {})),
-        training=TrainingConfig(**data.get("training", {})),
-        evaluation=EvaluationConfig(**data.get("evaluation", {})),
-        actor=ActorConfig(**data.get("actor", {})),
-        web=WebConfig(**data.get("web", {})),
-        mcts=MctsConfig(**data.get("mcts", {})),
-        storage=StorageConfig(**data.get("storage", {})),
+        common=build_section(CommonConfig, "common"),
+        training=build_section(TrainingConfig, "training"),
+        evaluation=build_section(EvaluationConfig, "evaluation"),
+        actor=build_section(ActorConfig, "actor"),
+        web=build_section(WebConfig, "web"),
+        mcts=build_section(MctsConfig, "mcts"),
+        storage=build_section(StorageConfig, "storage"),
     )
 
 
