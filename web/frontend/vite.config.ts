@@ -12,6 +12,9 @@ export default defineConfig({
       '/model': 'http://localhost:8080',
       '/selfplay': 'http://localhost:8080',
       '/game': 'http://localhost:8080',
+      '/actor-stats': 'http://localhost:8080',
+      '/games': 'http://localhost:8080',
+      '/game-info': 'http://localhost:8080',
     },
   },
 });
