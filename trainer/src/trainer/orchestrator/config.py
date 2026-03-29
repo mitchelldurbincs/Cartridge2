@@ -97,6 +97,21 @@ class LoopConfig:
     def best_model_info_path(self) -> Path:
         return self.data_dir / "best_model.json"
 
+    def resolve_device(self) -> str:
+        """Resolve 'auto' device to the best available: cuda > mps > cpu."""
+        if self.device != "auto":
+            return self.device
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return "cuda"
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                return "mps"
+        except ImportError:
+            pass
+        return "cpu"
+
     def get_num_simulations(self, iteration: int) -> int:
         """Calculate MCTS simulations for given iteration (ramping schedule).
 
