@@ -189,11 +189,16 @@ def main() -> int:
         setup_evaluate_parser(subparsers)
         setup_loop_parser(subparsers)
 
-        args = parser.parse_args()
+        args, remaining = parser.parse_known_args()
 
         if args.command is None:
             parser.print_help()
             return 0
+
+        # For non-loop commands, unknown args are an error
+        if args.command != "loop" and remaining:
+            parser.error(f"unrecognized arguments: {' '.join(remaining)}")
+
 
         # Configure structured logging (supports JSON for cloud deployments)
         log_level = getattr(args, "log_level", "INFO")
