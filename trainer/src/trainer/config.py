@@ -173,12 +173,30 @@ class TrainerConfig:
     # Environment
     env_id: str = cli_field("tictactoe", cli="--env-id", help="Environment ID")
     device: str = cli_field(
-        "cpu", cli="--device", choices=["cpu", "cuda", "mps"], help="Device to train on"
+        "auto",
+        cli="--device",
+        choices=["auto", "cpu", "cuda", "mps"],
+        help="Device to train on (auto = detect best available: cuda > mps > cpu)",
     )
 
     # Shutdown callback (not exposed to CLI, set programmatically)
     # Returns True if shutdown was requested
     shutdown_check: Callable[[], bool] | None = field(default=None, repr=False)
+
+    def resolve_device(self) -> str:
+        """Resolve 'auto' device to the best available: cuda > mps > cpu."""
+        if self.device != "auto":
+            return self.device
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return "cuda"
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                return "mps"
+        except ImportError:
+            pass
+        return "cpu"
 
     @classmethod
     def configure_parser(

@@ -132,7 +132,7 @@ class Orchestrator:
             batch_size=self.config.batch_size,
             learning_rate=self.config.learning_rate,
             checkpoint_interval=self.config.checkpoint_interval,
-            device=self.config.device,
+            device=self.config.resolve_device(),
             max_wait=60.0,  # Short timeout since we know data exists
             eval_interval=0,  # Disable trainer's built-in eval, we do it ourselves
             lr_total_steps=lr_total_steps,  # Continuous LR decay across iterations

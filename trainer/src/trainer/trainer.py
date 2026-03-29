@@ -50,7 +50,8 @@ class Trainer:
 
     def __init__(self, config: TrainerConfig):
         self.config = config
-        self.device = torch.device(config.device)
+        resolved_device = config.resolve_device()
+        self.device = torch.device(resolved_device)
 
         # Get game configuration
         self.game_config = get_config(config.env_id)
