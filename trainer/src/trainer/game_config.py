@@ -89,8 +89,8 @@ GAME_CONFIGS: dict[str, GameConfig] = {
         display_name="Othello",
         board_width=8,
         board_height=8,
-        num_actions=64,
-        obs_size=195,  # 128 (board: 64*2) + 64 (legal) + 3 (player + pass)
+        num_actions=65,  # 64 board positions + 1 pass action
+        obs_size=195,  # 128 (board: 64*2) + 65 (legal) + 2 (player) = 195
         legal_mask_offset=128,
         hidden_size=512,
         network_type="resnet",

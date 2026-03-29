@@ -169,9 +169,10 @@ impl GameSession {
     /// Parse state bytes into board, current_player, winner
     fn parse_state(state: &[u8], board_size: usize) -> Result<(Vec<u8>, u8, u8)> {
         let expected_len = board_size + 2; // board + current_player + winner
-        if state.len() != expected_len {
+                                           // Use <= to allow games with extra state fields (like pass_count in Othello)
+        if state.len() < expected_len {
             return Err(anyhow!(
-                "Invalid state length: expected {}, got {}",
+                "Invalid state length: expected at least {}, got {}",
                 expected_len,
                 state.len()
             ));

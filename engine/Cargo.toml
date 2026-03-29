@@ -5,6 +5,7 @@ members = [
     "engine-games",
     "games-tictactoe",
     "games-connect4",
+    "games-othello",
     "mcts",
     "model-watcher"
 ]

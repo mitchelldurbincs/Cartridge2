@@ -4,7 +4,7 @@
 
 Cartridge2 is a simplified AlphaZero training and visualization platform. It enables training neural network game agents via self-play and lets users play against trained models through a web interface.
 
-**Target Games:** TicTacToe (complete), Connect 4 (complete), Othello (planned)
+**Target Games:** TicTacToe (complete), Connect 4 (complete), Othello (complete)
 
 **Key Difference from Cartridge1:** This is a monolithic/filesystem approach vs. Cartridge1's microservices architecture. No Kubernetes, no gRPC between services—just shared filesystem and local processes.
 
@@ -13,9 +13,9 @@ Cartridge2 is a simplified AlphaZero training and visualization platform. It ena
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    Shared Filesystem                         │
-│  ./data/replay.db     - SQLite replay buffer                │
-│  ./data/models/       - ONNX model files                    │
-│  ./data/stats.json    - Training telemetry                  │
+│  PostgreSQL (replay)   - Concurrent replay buffer           │
+│  ./data/models/        - ONNX model files                   │
+│  ./data/stats.json     - Training telemetry                 │
 └─────────────────────────────────────────────────────────────┘
          ▲                    ▲                    ▲
          │                    │                    │
@@ -23,7 +23,7 @@ Cartridge2 is a simplified AlphaZero training and visualization platform. It ena
 │  Web Server     │  │ Python Trainer│  │  Svelte Frontend│
 │  (Axum :8080)   │  │ (Learner)     │  │  (Vite :5173)   │
 │  - Engine lib   │  │ - PyTorch     │  │  - Play UI      │
-│  - Game API     │  │ - SQLite      │  │  - Stats display│
+│  - Game API     │  │ - PostgreSQL  │  │  - Stats display│
 │  - Stats API    │  │ - ONNX export │  │                 │
 └─────────────────┘  └───────────────┘  └─────────────────┘
 ```
@@ -82,6 +82,7 @@ Pure game logic library. No network I/O. Library-only design (no gRPC).
 - `engine-config/` - Centralized configuration loading from config.toml (19 tests)
 - `games-tictactoe/` - TicTacToe implementation (26 tests)
 - `games-connect4/` - Connect 4 implementation (20 tests)
+- `games-othello/` - Othello implementation (25 tests)
 - `mcts/` - Monte Carlo Tree Search implementation (22 tests)
 - `model-watcher/` - Shared model hot-reload utilities (2 tests)
 
@@ -90,7 +91,7 @@ Pure game logic library. No network I/O. Library-only design (no gRPC).
 
 Self-play episode runner using engine-core directly:
 - Uses `EngineContext` for game simulation (no gRPC)
-- Pluggable storage backends (SQLite for local, PostgreSQL for K8s)
+- PostgreSQL storage backend (local development or K8s)
 - MCTS policy with ONNX neural network evaluation
 - Hot-reloads model when `latest.onnx` changes (via model_watcher)
 - Stores MCTS visit distributions as policy targets
@@ -132,7 +133,7 @@ PyTorch training with AlphaZero-style learning and orchestration:
 - `python -m trainer loop` - Synchronized AlphaZero training (actor + trainer + eval)
 
 **Features:**
-- Reads transitions from SQLite replay buffer
+- Reads transitions from PostgreSQL replay buffer
 - MCTS policy distributions as soft targets
 - Game outcome propagation for value targets
 - Exports ONNX models with atomic write-then-rename
@@ -154,7 +155,7 @@ cartridge2/
 │       ├── game_config.rs  # Game-specific config derived from metadata
 │       ├── mcts_policy.rs  # MCTS policy implementation
 │       ├── model_watcher.rs # ONNX model hot-reload via file watching
-│       └── storage/        # Storage backends (SQLite, PostgreSQL)
+│       └── storage/        # Storage backends (PostgreSQL)
 ├── engine/                 # Rust workspace
 │   ├── Cargo.toml         # Workspace config
 │   ├── engine-core/       # Core Game trait + EngineContext API
@@ -175,6 +176,7 @@ cartridge2/
 │   │   └── SCHEMA.md       # Configuration schema documentation
 │   ├── games-tictactoe/   # TicTacToe implementation
 │   ├── games-connect4/    # Connect 4 implementation
+│   ├── games-othello/    # Othello implementation
 │   ├── mcts/              # Monte Carlo Tree Search
 │   │   └── src/
 │   │       ├── config.rs   # MctsConfig
@@ -217,13 +219,13 @@ cartridge2/
 │       ├── checkpoint.py  # Checkpoint save/load utilities
 │       ├── backoff.py     # Wait-with-backoff utilities
 │       ├── central_config.py # Central config.toml loading
-│       └── storage/       # Storage backends (SQLite, PostgreSQL, S3, filesystem)
+│       └── storage/       # Storage backends (PostgreSQL, S3, filesystem)
 ├── Dockerfile.alphazero   # Combined actor+trainer image for Docker
 ├── config.toml            # Central configuration file
-├── docs/
+├── documentation/
 │   └── MVP.md             # Design document
 ├── data/                  # Runtime data (gitignored)
-│   ├── replay.db          # SQLite replay buffer
+│   ├── replay.db          # (Legacy) SQLite replay buffer - now using PostgreSQL
 │   ├── models/            # ONNX model files
 │   └── stats.json         # Training telemetry
 └── CLAUDE.md              # This file
@@ -362,7 +364,7 @@ cd actor && cargo build --release
 cd web && cargo build --release
 
 # Run all tests
-cd engine && cargo test   # 159 tests (70 + 19 + 26 + 20 + 22 + 2)
+cd engine && cargo test   # 184 tests (70 + 19 + 26 + 20 + 25 + 22 + 2)
 cd actor && cargo test    # 29 tests
 cd web && cargo test      # 27 tests
 
@@ -402,8 +404,8 @@ python -m trainer loop --iterations 100 --start-iteration 25
 
 # ======= Standalone Commands =======
 
-# Train on existing replay buffer data
-python -m trainer train --db ./data/replay.db --steps 1000
+# Train on existing replay buffer data (requires PostgreSQL)
+python -m trainer train --steps 1000
 
 # Evaluate model against random play
 python -m trainer evaluate --model ./data/models/latest.onnx --games 100
@@ -416,7 +418,7 @@ python -m trainer evaluate --model ./data/models/latest.onnx --games 100
 cd actor && cargo run -- --env-id tictactoe --max-episodes 1000
 
 # Train the model (in separate terminal)
-python -m trainer train --db ./data/replay.db --steps 1000
+python -m trainer train --steps 1000
 ```
 
 ## Current Status
@@ -435,8 +437,8 @@ python -m trainer train --db ./data/replay.db --steps 1000
 - [x] MCTS implementation - 22 tests
 - [x] Python trainer (PyTorch, ONNX export, evaluator)
 - [x] MCTS policy targets + game outcome propagation
-- [x] Storage backends (SQLite, PostgreSQL, S3, filesystem)
-- [ ] Othello game
+- [x] Storage backends (PostgreSQL, S3, filesystem)
+- [x] Othello game
 
 ## API Endpoints
 
@@ -519,7 +521,7 @@ pub fn register_connect4() {
 |--------|------------|------------|
 | Architecture | 7 microservices | Monolith + Python |
 | Communication | gRPC everywhere | Filesystem + HTTP |
-| Replay Buffer | Go service + Redis | SQLite file |
+| Replay Buffer | Go service + Redis | PostgreSQL |
 | Model Storage | Go service + MinIO | Single ONNX file |
 | Orchestration | K8s/Docker Compose | Python package |
 | Complexity | Production-grade | MVP-focused |
@@ -577,9 +579,9 @@ engine/mcts/src/
 
 ## Next Steps
 
-1. **Othello Game** - Add third game implementation
+1. **Analysis/Replay Mode** - Add a page to step through saved games and see MCTS visit counts
 
 ## Reference
 
 - [alpha-zero-general](https://github.com/suragnair/alpha-zero-general) - Python AlphaZero reference
-- MVP.md in docs/ - Full design document
+- MVP.md in documentation/ - Full design document

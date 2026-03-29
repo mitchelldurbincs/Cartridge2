@@ -280,17 +280,17 @@ class TestOthelloConfig:
         """Test Othello action space."""
         config = get_config("othello")
 
-        assert config.num_actions == 64
-        assert config.legal_mask_bits == (1 << 64) - 1  # Very large number
+        assert config.num_actions == 65  # 64 positions + 1 pass
+        assert config.legal_mask_bits == (1 << 65) - 1  # Very large number
 
     def test_othello_observation(self):
         """Test Othello observation structure."""
         config = get_config("othello")
 
-        # obs_size = 128 (board: 64*2) + 64 (legal) + 3 (player + pass) = 195
+        # obs_size = 128 (board: 64*2) + 65 (legal) + 2 (player) = 195
         assert config.obs_size == 195
         assert config.legal_mask_offset == 128  # After board encoding
-        assert config.legal_mask_end == 192  # 128 + 64
+        assert config.legal_mask_end == 193  # 128 + 65
 
     def test_othello_network_type(self):
         """Test Othello uses ResNet."""

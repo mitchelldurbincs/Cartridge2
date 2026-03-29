@@ -695,12 +695,6 @@ impl Actor {
 
         Ok((steps_taken, total_reward, episode_stats))
     }
-
-    /// Get current episode count (for testing)
-    #[allow(dead_code)]
-    pub fn episode_count(&self) -> u32 {
-        self.episode_count.load(Ordering::Relaxed)
-    }
 }
 
 #[cfg(test)]

@@ -213,7 +213,7 @@ impl Config {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn episode_timeout(&self) -> Duration {
         Duration::from_secs(self.episode_timeout_secs)
     }
@@ -222,7 +222,7 @@ impl Config {
         Duration::from_secs(self.flush_interval_secs)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn model_path(&self) -> String {
         format!("{}/models/latest.onnx", self.data_dir)
     }

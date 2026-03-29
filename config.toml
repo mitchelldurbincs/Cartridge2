@@ -15,7 +15,7 @@
 # Base data directory for all runtime files (replay.db, models/, stats.json)
 data_dir = "./data"
 
-# Game environment: tictactoe, connect4
+# Game environment: tictactoe, connect4, othello
 env_id = "connect4"
 
 # Logging level: trace, debug, info, warn, error

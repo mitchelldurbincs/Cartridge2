@@ -6,7 +6,7 @@
 
 A simplified AlphaZero training and visualization platform for board games. Train neural network agents via self-play and play against them through a web interface.
 
-**Games:** TicTacToe (complete), Connect 4 (complete), Othello (planned)
+**Games:** TicTacToe (complete), Connect 4 (complete), Othello (complete)
 
 **Why the name?**
 I love history (Hannibal Barca is my goat) and it also just happens to be close to cartridge which is a goal of this project - being able to easily add new games.

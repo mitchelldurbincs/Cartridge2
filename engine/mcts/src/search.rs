@@ -13,7 +13,9 @@ use engine_core::{ActionSpace, EngineContext};
 use rand::Rng;
 use rand_chacha::ChaCha20Rng;
 use thiserror::Error;
-use tracing::{debug, trace};
+use tracing::debug;
+#[cfg(test)]
+use tracing::trace;
 
 use crate::config::MctsConfig;
 use crate::evaluator::{Evaluator, EvaluatorError};
@@ -262,51 +264,6 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             simulations: root.visit_count,
             stats,
         })
-    }
-
-    /// Run a single simulation (select -> expand -> evaluate -> backpropagate).
-    /// NOTE: This method is kept for reference but replaced by batched evaluation in `run()`.
-    #[allow(dead_code)]
-    fn simulate(&mut self, rng: &mut ChaCha20Rng) -> Result<(), SearchError> {
-        // Selection: traverse to a leaf
-        let (leaf_id, path) = self.select();
-
-        let leaf = self.tree.get(leaf_id);
-
-        // If terminal, backpropagate the terminal value
-        if leaf.is_terminal {
-            let value = leaf.terminal_value;
-            self.tree.backpropagate(leaf_id, value);
-            return Ok(());
-        }
-
-        // Expansion + Evaluation: expand the node and get value estimate
-        // We call the evaluator ONCE and use its policy for priors and its value for backprop
-        let value = if !leaf.is_expanded() {
-            // Expand and get the value from the same evaluation
-            self.expand_node(leaf_id, rng)?
-        } else {
-            // Already expanded (shouldn't happen in standard MCTS, but handle gracefully)
-            // This can occur if we select an expanded node that has no children
-            // (e.g., all children were pruned due to zero priors)
-            let leaf = self.tree.get(leaf_id);
-            let eval =
-                self.evaluator
-                    .evaluate(&leaf.obs, leaf.legal_moves_mask, self.num_actions)?;
-            eval.value
-        };
-
-        // Backpropagation
-        self.tree.backpropagate(leaf_id, value);
-
-        trace!(
-            leaf = leaf_id.0,
-            path_len = path.len(),
-            value = value,
-            "MCTS simulation complete"
-        );
-
-        Ok(())
     }
 
     /// Select a leaf node by traversing the tree using UCB.

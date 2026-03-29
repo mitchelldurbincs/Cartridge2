@@ -149,6 +149,15 @@ class StorageConfig:
 
 
 @dataclass
+class LoggingConfig:
+    """Logging format settings."""
+
+    format: str = "text"  # "text" or "json"
+    include_timestamps: bool = True
+    include_target: bool = True
+
+
+@dataclass
 class Config:
     """Root configuration container."""
 
@@ -159,6 +168,7 @@ class Config:
     web: WebConfig = field(default_factory=WebConfig)
     mcts: MctsConfig = field(default_factory=MctsConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
 
     # Convenience properties for commonly accessed paths
     @property

@@ -181,29 +181,6 @@ impl PostgresReplayStore {
         tracing::info!("PostgreSQL schema validated/created");
         Ok(())
     }
-
-    /// Get current pool statistics for monitoring.
-    #[allow(dead_code)]
-    pub fn pool_status(&self) -> PoolStatus {
-        let status = self.pool.status();
-        PoolStatus {
-            size: status.size,
-            available: status.available,
-            waiting: status.waiting,
-        }
-    }
-}
-
-/// Pool status for monitoring and debugging.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct PoolStatus {
-    /// Current number of connections in the pool.
-    pub size: usize,
-    /// Number of available (idle) connections.
-    pub available: usize,
-    /// Number of tasks waiting for a connection.
-    pub waiting: usize,
 }
 
 #[async_trait]

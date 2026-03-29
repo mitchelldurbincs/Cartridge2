@@ -193,10 +193,10 @@ def get_logging_format() -> str:
 
     # Try to load from config.toml
     try:
-        from .central_config import load_central_config
+        from .central_config import get_config
 
-        config = load_central_config()
-        return config.get("logging", {}).get("format", "text").lower()
+        config = get_config()
+        return config.logging.format.lower()
     except Exception:
         return "text"
 
