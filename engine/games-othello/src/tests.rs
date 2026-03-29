@@ -100,12 +100,12 @@ fn test_multi_direction_flip() {
 
         // Check how many pieces changed
         let current_player = if state.current_player == 1 { 2 } else { 1 };
-        let (orig_curr, orig_opp) = if current_player == 1 {
+        let (orig_curr, _orig_opp) = if current_player == 1 {
             orig_counts
         } else {
             (orig_counts.1, orig_counts.0)
         };
-        let (new_curr, new_opp) = if current_player == 1 {
+        let (new_curr, _new_opp) = if current_player == 1 {
             new_counts
         } else {
             (new_counts.1, new_counts.0)
@@ -159,8 +159,8 @@ fn test_two_consecutive_passes_ends_game() {
         board: {
             let mut b = [0u8; BOARD_SIZE];
             // Fill with alternating pattern so no moves possible
-            for i in 0..BOARD_SIZE {
-                b[i] = ((i % 2) + 1) as u8;
+            for (i, cell) in b.iter_mut().enumerate() {
+                *cell = ((i % 2) + 1) as u8;
             }
             b
         },
@@ -224,11 +224,11 @@ fn test_winner_by_piece_count() {
         board: {
             let mut b = [0u8; BOARD_SIZE];
             // Black has 33, White has 31
-            for i in 0..33 {
-                b[i] = 1;
+            for cell in b.iter_mut().take(33) {
+                *cell = 1;
             }
-            for i in 33..64 {
-                b[i] = 2;
+            for cell in b.iter_mut().skip(33) {
+                *cell = 2;
             }
             b
         },
@@ -245,11 +245,11 @@ fn test_winner_by_piece_count() {
         board: {
             let mut b = [0u8; BOARD_SIZE];
             // 32 each
-            for i in 0..32 {
-                b[i] = 1;
+            for cell in b.iter_mut().take(32) {
+                *cell = 1;
             }
-            for i in 32..64 {
-                b[i] = 2;
+            for cell in b.iter_mut().skip(32) {
+                *cell = 2;
             }
             b
         },
@@ -561,7 +561,7 @@ fn test_info_bits_computation() {
     let mut game = Othello::new();
     let mut rng = ChaCha20Rng::seed_from_u64(42);
 
-    let (mut state, _) = game.reset(&mut rng, &[]);
+    let (state, _) = game.reset(&mut rng, &[]);
     let info = Othello::compute_info_bits(&state);
 
     // Check that legal moves are encoded
