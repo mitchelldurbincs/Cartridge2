@@ -27,7 +27,7 @@
 //! use std::sync::{Arc, RwLock};
 //!
 //! let evaluator = Arc::new(RwLock::new(None));
-//! let watcher = ModelWatcher::new("./data/models", "latest.onnx", 29, evaluator);
+//! let watcher = ModelWatcher::new("./data/models", "latest.onnx", 29, 1, evaluator);
 //!
 //! // Try to load existing model
 //! watcher.try_load_existing()?;
@@ -68,12 +68,9 @@ use mcts::OnnxEvaluator;
 use notify::{recommended_watcher, Event, EventKind, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
-
-#[cfg(feature = "metadata")]
-use std::time::UNIX_EPOCH;
 
 /// S3/MinIO backend for model watching (requires `s3` feature).
 #[cfg(feature = "s3")]
@@ -81,8 +78,8 @@ pub mod s3;
 
 /// Information about the currently loaded model.
 ///
-/// Only available with the `metadata` feature enabled.
-#[cfg(feature = "metadata")]
+/// Always available. Use [`ModelWatcher::model_info`] to get a shared reference
+/// that is updated on each model reload.
 #[derive(Debug, Clone, Default)]
 pub struct ModelInfo {
     /// Whether a model is currently loaded
@@ -124,13 +121,12 @@ pub struct ModelWatcher {
     last_mtime: Arc<RwLock<Option<SystemTime>>>,
     /// Polling interval for checking file changes
     poll_interval: Duration,
-    /// Current model info (only with metadata feature)
-    #[cfg(feature = "metadata")]
-    model_info: Arc<RwLock<ModelInfo>>,
+    /// Current model info (None = metadata tracking disabled)
+    model_info: Option<Arc<RwLock<ModelInfo>>>,
 }
 
 impl ModelWatcher {
-    /// Create a new model watcher.
+    /// Create a new model watcher without metadata tracking.
     ///
     /// # Arguments
     /// * `model_dir` - Directory to watch for model files
@@ -153,9 +149,17 @@ impl ModelWatcher {
             evaluator,
             last_mtime: Arc::new(RwLock::new(None)),
             poll_interval: DEFAULT_POLL_INTERVAL,
-            #[cfg(feature = "metadata")]
-            model_info: Arc::new(RwLock::new(ModelInfo::default())),
+            model_info: None,
         }
+    }
+
+    /// Enable metadata tracking and return `self` for chaining.
+    ///
+    /// When enabled, the watcher tracks model info (path, modification time,
+    /// training step) that can be queried via [`model_info`](Self::model_info).
+    pub fn with_metadata(mut self) -> Self {
+        self.model_info = Some(Arc::new(RwLock::new(ModelInfo::default())));
+        self
     }
 
     /// Set a custom polling interval.
@@ -163,12 +167,6 @@ impl ModelWatcher {
     /// The default is 5 seconds. Shorter intervals provide faster detection
     /// but use more CPU. Longer intervals are more efficient but slower to
     /// detect changes.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let watcher = ModelWatcher::new(dir, "latest.onnx", 29, evaluator)
-    ///     .with_poll_interval(Duration::from_secs(2));
-    /// ```
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
         self
@@ -179,12 +177,11 @@ impl ModelWatcher {
         self.model_dir.join(&self.model_filename)
     }
 
-    /// Get the current model info.
-    ///
-    /// Only available with the `metadata` feature enabled.
-    #[cfg(feature = "metadata")]
+    /// Get the current model info (if metadata tracking is enabled).
     pub fn model_info(&self) -> Arc<RwLock<ModelInfo>> {
-        Arc::clone(&self.model_info)
+        self.model_info
+            .clone()
+            .unwrap_or_else(|| Arc::new(RwLock::new(ModelInfo::default())))
     }
 
     /// Try to load the model if it exists.
@@ -202,73 +199,7 @@ impl ModelWatcher {
         }
     }
 
-    /// Load a model from the given path.
-    fn load_model(&self, path: &Path) -> Result<()> {
-        info!(
-            "Loading model from {:?} (intra_threads={})",
-            path, self.intra_threads
-        );
-
-        // Get the file modification time for polling comparison
-        let file_mtime = path.metadata().and_then(|m| m.modified()).ok();
-
-        #[cfg(feature = "metadata")]
-        let (file_modified, training_step) = Self::extract_metadata(path);
-
-        // Load the new model
-        let new_evaluator = OnnxEvaluator::load(path, self.obs_size, self.intra_threads)
-            .map_err(|e| anyhow!("Failed to load ONNX model: {}", e))?;
-
-        // Swap in the new model
-        {
-            let mut guard = self
-                .evaluator
-                .write()
-                .map_err(|e| anyhow!("Failed to acquire evaluator write lock: {}", e))?;
-            *guard = Some(new_evaluator);
-        }
-
-        // Update the last known modification time (for polling)
-        {
-            let mut mtime_guard = self
-                .last_mtime
-                .write()
-                .map_err(|e| anyhow!("Failed to acquire last_mtime write lock: {}", e))?;
-            *mtime_guard = file_mtime;
-        }
-
-        #[cfg(feature = "metadata")]
-        {
-            let mut info = self
-                .model_info
-                .write()
-                .map_err(|e| anyhow!("Failed to acquire model_info write lock: {}", e))?;
-            *info = ModelInfo {
-                loaded: true,
-                path: Some(path.to_string_lossy().to_string()),
-                file_modified,
-                loaded_at: Some(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
-                ),
-                training_step,
-            };
-            info!(
-                "Model loaded successfully from {:?} (modified: {:?}, step: {:?})",
-                path, file_modified, training_step
-            );
-        }
-
-        #[cfg(not(feature = "metadata"))]
-        info!("Model loaded successfully from {:?}", path);
-
-        Ok(())
-    }
-
     /// Extract metadata from a model file path.
-    #[cfg(feature = "metadata")]
     fn extract_metadata(path: &Path) -> (Option<u64>, Option<u32>) {
         // Get file modification time
         let file_modified = path
@@ -286,6 +217,18 @@ impl ModelWatcher {
         });
 
         (file_modified, training_step)
+    }
+
+    /// Load a model from the given path.
+    fn load_model(&self, path: &Path) -> Result<()> {
+        Self::load_model_static(
+            path,
+            self.obs_size,
+            self.intra_threads,
+            &self.evaluator,
+            &self.last_mtime,
+            self.model_info.as_ref(),
+        )
     }
 
     /// Start watching for model changes.
@@ -307,9 +250,7 @@ impl ModelWatcher {
         let evaluator = Arc::clone(&self.evaluator);
         let last_mtime = Arc::clone(&self.last_mtime);
         let poll_interval = self.poll_interval;
-
-        #[cfg(feature = "metadata")]
-        let model_info = Arc::clone(&self.model_info);
+        let model_info = self.model_info.clone();
 
         // Create channel for file system events
         let (fs_tx, mut fs_rx) = mpsc::channel(100);
@@ -347,8 +288,7 @@ impl ModelWatcher {
         let inotify_model_filename = model_filename.clone();
         let inotify_evaluator = Arc::clone(&evaluator);
         let inotify_last_mtime = Arc::clone(&last_mtime);
-        #[cfg(feature = "metadata")]
-        let inotify_model_info = Arc::clone(&model_info);
+        let inotify_model_info = model_info.clone();
 
         // Spawn task to handle inotify file events
         tokio::spawn(async move {
@@ -397,29 +337,16 @@ impl ModelWatcher {
                 // Try to load the model
                 info!("Model file changed (inotify), reloading {:?}", model_path);
 
-                #[cfg(feature = "metadata")]
-                let result = Self::load_model_static(
+                match Self::load_model_static(
                     &model_path,
                     obs_size,
                     intra_threads,
                     &inotify_evaluator,
                     &inotify_last_mtime,
-                    &inotify_model_info,
-                );
-
-                #[cfg(not(feature = "metadata"))]
-                let result = Self::load_model_static(
-                    &model_path,
-                    obs_size,
-                    intra_threads,
-                    &inotify_evaluator,
-                    &inotify_last_mtime,
-                );
-
-                match result {
+                    inotify_model_info.as_ref(),
+                ) {
                     Ok(()) => {
                         last_reload = std::time::Instant::now();
-                        // Notify listeners
                         let _ = inotify_tx.send(()).await;
                     }
                     Err(e) => {
@@ -435,7 +362,6 @@ impl ModelWatcher {
         let poll_model_filename = model_filename;
         let poll_evaluator = evaluator;
         let poll_last_mtime = last_mtime;
-        #[cfg(feature = "metadata")]
         let poll_model_info = model_info;
 
         tokio::spawn(async move {
@@ -491,28 +417,15 @@ impl ModelWatcher {
 
                 info!("Model file changed (polling), reloading {:?}", model_path);
 
-                #[cfg(feature = "metadata")]
-                let result = Self::load_model_static(
+                match Self::load_model_static(
                     &model_path,
                     obs_size,
                     intra_threads,
                     &poll_evaluator,
                     &poll_last_mtime,
-                    &poll_model_info,
-                );
-
-                #[cfg(not(feature = "metadata"))]
-                let result = Self::load_model_static(
-                    &model_path,
-                    obs_size,
-                    intra_threads,
-                    &poll_evaluator,
-                    &poll_last_mtime,
-                );
-
-                match result {
+                    poll_model_info.as_ref(),
+                ) {
                     Ok(()) => {
-                        // Notify listeners
                         let _ = poll_tx.send(()).await;
                     }
                     Err(e) => {
@@ -525,20 +438,20 @@ impl ModelWatcher {
         Ok(rx)
     }
 
-    /// Static method to load model (for use in spawned task).
-    #[cfg(feature = "metadata")]
+    /// Load a model and update shared state.
+    ///
+    /// This is a static method so it can be called from spawned tasks that
+    /// don't hold a reference to `self`.
     fn load_model_static(
         path: &Path,
         obs_size: usize,
         intra_threads: usize,
         evaluator: &Arc<RwLock<Option<OnnxEvaluator>>>,
         last_mtime: &Arc<RwLock<Option<SystemTime>>>,
-        model_info: &Arc<RwLock<ModelInfo>>,
+        model_info: Option<&Arc<RwLock<ModelInfo>>>,
     ) -> Result<()> {
         // Get file modification time for polling comparison
         let file_mtime = path.metadata().and_then(|m| m.modified()).ok();
-
-        let (file_modified, training_step) = Self::extract_metadata(path);
 
         let new_evaluator = OnnxEvaluator::load(path, obs_size, intra_threads)
             .map_err(|e| anyhow!("Failed to load ONNX model: {}", e))?;
@@ -558,8 +471,10 @@ impl ModelWatcher {
             *mtime_guard = file_mtime;
         }
 
-        {
-            let mut info = model_info
+        // Update model info if metadata tracking is enabled
+        if let Some(info_lock) = model_info {
+            let (file_modified, training_step) = Self::extract_metadata(path);
+            let mut info = info_lock
                 .write()
                 .map_err(|e| anyhow!("Failed to acquire model_info write lock: {}", e))?;
             *info = ModelInfo {
@@ -574,43 +489,14 @@ impl ModelWatcher {
                 ),
                 training_step,
             };
+            info!(
+                "Model loaded successfully from {:?} (modified: {:?}, step: {:?})",
+                path, file_modified, training_step
+            );
+        } else {
+            info!("Model loaded successfully from {:?}", path);
         }
 
-        info!("Model reloaded successfully (step: {:?})", training_step);
-        Ok(())
-    }
-
-    /// Static method to load model (for use in spawned task) - without metadata.
-    #[cfg(not(feature = "metadata"))]
-    fn load_model_static(
-        path: &Path,
-        obs_size: usize,
-        intra_threads: usize,
-        evaluator: &Arc<RwLock<Option<OnnxEvaluator>>>,
-        last_mtime: &Arc<RwLock<Option<SystemTime>>>,
-    ) -> Result<()> {
-        // Get file modification time for polling comparison
-        let file_mtime = path.metadata().and_then(|m| m.modified()).ok();
-
-        let new_evaluator = OnnxEvaluator::load(path, obs_size, intra_threads)
-            .map_err(|e| anyhow!("Failed to load ONNX model: {}", e))?;
-
-        {
-            let mut guard = evaluator
-                .write()
-                .map_err(|e| anyhow!("Failed to acquire write lock: {}", e))?;
-            *guard = Some(new_evaluator);
-        }
-
-        // Update last modification time (for polling)
-        {
-            let mut mtime_guard = last_mtime
-                .write()
-                .map_err(|e| anyhow!("Failed to acquire last_mtime write lock: {}", e))?;
-            *mtime_guard = file_mtime;
-        }
-
-        info!("Model reloaded successfully");
         Ok(())
     }
 }
@@ -652,7 +538,6 @@ mod tests {
         assert!(guard.is_none());
     }
 
-    #[cfg(feature = "metadata")]
     #[test]
     fn test_model_info_default() {
         let info = ModelInfo::default();
@@ -663,11 +548,8 @@ mod tests {
         assert!(info.training_step.is_none());
     }
 
-    #[cfg(feature = "metadata")]
     #[test]
     fn test_extract_metadata_training_step() {
-        use std::path::Path;
-
         // Test with step in filename
         let path = Path::new("/tmp/models/model_step_000100.onnx");
         let (_, training_step) = ModelWatcher::extract_metadata(path);
@@ -677,5 +559,17 @@ mod tests {
         let path = Path::new("/tmp/models/latest.onnx");
         let (_, training_step) = ModelWatcher::extract_metadata(path);
         assert!(training_step.is_none());
+    }
+
+    #[test]
+    fn test_with_metadata_creates_model_info() {
+        let evaluator = Arc::new(RwLock::new(None));
+        let watcher = ModelWatcher::new("/tmp/models", "latest.onnx", 29, 1, evaluator);
+        assert!(watcher.model_info.is_none());
+
+        let evaluator2 = Arc::new(RwLock::new(None));
+        let watcher2 =
+            ModelWatcher::new("/tmp/models", "latest.onnx", 29, 1, evaluator2).with_metadata();
+        assert!(watcher2.model_info.is_some());
     }
 }

@@ -8,7 +8,13 @@ via ReplayBuffer.get_metadata(). The hardcoded values here are fallbacks
 for backward compatibility with databases that don't have metadata.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass
@@ -55,6 +61,34 @@ class GameConfig:
     def legal_mask_end(self) -> int:
         """End index of legal mask in observation."""
         return self.legal_mask_offset + self.num_actions
+
+    @property
+    def player_indicator_offset(self) -> int:
+        """Start index of the 2-element player one-hot in observation."""
+        return self.legal_mask_end
+
+    def extract_legal_mask(self, obs: torch.Tensor) -> torch.Tensor:
+        """Extract the legal move mask from a batch of observations.
+
+        Args:
+            obs: Observation tensor of shape (batch, obs_size).
+
+        Returns:
+            Legal mask tensor of shape (batch, num_actions).
+        """
+        return obs[:, self.legal_mask_offset : self.legal_mask_end]  # type: ignore[index]
+
+    def extract_player_indicator(self, obs: torch.Tensor) -> torch.Tensor:
+        """Extract the 2-element player one-hot from a batch of observations.
+
+        Args:
+            obs: Observation tensor of shape (batch, obs_size).
+
+        Returns:
+            Player indicator tensor of shape (batch, 2).
+        """
+        offset = self.player_indicator_offset
+        return obs[:, offset : offset + 2]  # type: ignore[index]
 
 
 # Game configuration registry (fallback values - prefer reading from DB)

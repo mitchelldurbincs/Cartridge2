@@ -130,6 +130,11 @@ class TrainerConfig:
         cli="--max-wait",
         help="Max seconds to wait for DB/data (0 = wait forever)",
     )
+    max_consecutive_empty_batches: int = cli_field(
+        500,
+        cli="--max-empty-batches",
+        help="Max consecutive empty batches before raising an error (0 = unlimited)",
+    )
 
     # Replay buffer management
     clear_replay_on_start: bool = cli_field(

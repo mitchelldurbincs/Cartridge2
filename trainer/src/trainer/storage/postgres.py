@@ -175,11 +175,9 @@ class PostgresReplayBuffer(ReplayBufferBase):
         """List all game metadata in the database."""
         with self._connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """SELECT env_id, display_name, board_width, board_height,
+                cur.execute("""SELECT env_id, display_name, board_width, board_height,
                               num_actions, obs_size, legal_mask_offset, player_count
-                       FROM game_metadata"""
-                )
+                       FROM game_metadata""")
 
                 return [
                     GameMetadata(
