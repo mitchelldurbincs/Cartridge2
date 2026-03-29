@@ -11,6 +11,8 @@ path = "src/main.rs"
 default = []
 # Enable S3/MinIO model storage for K8s deployments
 s3 = ["model-watcher/s3"]
+# Enable CoreML execution provider for ONNX on Apple Silicon (macOS)
+coreml = ["mcts/coreml"]
 
 [dependencies]
 # Engine library (local)

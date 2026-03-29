@@ -7,6 +7,7 @@ description = "Monte Carlo Tree Search implementation for AlphaZero-style game p
 [features]
 default = []
 onnx = ["ort", "ndarray"]
+coreml = ["ort/coreml"]
 
 [dependencies]
 # Engine core for game abstraction

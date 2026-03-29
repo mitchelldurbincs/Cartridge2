@@ -79,7 +79,7 @@ class TrainingConfig:
     learning_rate: float = 0.001
     weight_decay: float = 0.0001
     grad_clip_norm: float = 1.0
-    device: str = "cpu"
+    device: str = "auto"
     checkpoint_interval: int = 100
     max_checkpoints: int = 10
     num_actors: int = 1  # Number of parallel actor processes for self-play

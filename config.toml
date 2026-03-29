@@ -7,6 +7,17 @@
 #   CARTRIDGE_<SECTION>_<KEY> (e.g., CARTRIDGE_TRAINING_ITERATIONS=50)
 #
 # For Docker, mount this file to /app/config.toml
+#
+# ---- macOS Native Setup (Apple Silicon) ----
+#   1. Install PostgreSQL: brew install postgresql@16 && brew services start postgresql@16
+#   2. Create DB: createdb cartridge
+#      psql cartridge -c "CREATE USER cartridge WITH PASSWORD 'cartridge'; GRANT ALL ON DATABASE cartridge TO cartridge;"
+#   3. Install trainer: cd trainer && pip install -e ".[dev]"
+#   4. Build actor with CoreML: cd actor && cargo build --release --features coreml
+#   5. Run training: python -m trainer loop
+#   Device auto-detection uses MPS (Metal) for PyTorch training.
+#   Actors use CoreML for ONNX inference when built with --features coreml.
+#   Recommended: num_actors = 6 for 8-core, 8-10 for M2/M3/M4 Pro/Max.
 
 # =============================================================================
 # Common Settings
@@ -51,8 +62,9 @@ weight_decay = 0.0001
 # Gradient clipping max norm (0 to disable)
 grad_clip_norm = 1.0
 
-# Device for training: cpu, cuda, mps
-device = "mps"
+# Device for training: auto, cpu, cuda, mps
+# "auto" detects the best available device (cuda > mps > cpu)
+device = "auto"
 
 # Steps between checkpoint saves
 checkpoint_interval = 250 
@@ -62,7 +74,8 @@ max_checkpoints = 10
 
 # Number of parallel actor processes for self-play
 # More actors = faster episode generation (scales well with CPU cores)
-num_actors = 3
+# Recommended: 6 for 8-core, 8-10 for 10+ core machines
+num_actors = 6
 
 # =============================================================================
 # Evaluation Settings
