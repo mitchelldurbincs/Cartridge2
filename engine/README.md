@@ -10,8 +10,9 @@ Rust workspace containing the core game engine, game implementations, and MCTS s
 | `engine-config` | Centralized configuration loading from config.toml (19 tests) |
 | `games-tictactoe` | TicTacToe reference implementation (26 tests) |
 | `games-connect4` | Connect 4 implementation (20 tests) |
+| `games-othello` | Othello (Reversi) implementation (25 tests) |
 | `mcts` | Monte Carlo Tree Search for AlphaZero-style play (22 tests) |
-| `model-watcher` | Shared model hot-reload utilities (2 tests) |
+| `model-watcher` | Shared model hot-reload utilities (5 tests) |
 
 ## Quick Start
 
@@ -35,6 +36,10 @@ cargo build --release --features mcts/onnx
                                ^
 +------------------+           |
 |  games-connect4  |-----------|
++------------------+           |
+                               |
++------------------+           |
+|  games-othello   |-----------|
 +------------------+           |
                                |
 +------------------+           |
