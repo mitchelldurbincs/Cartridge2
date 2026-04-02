@@ -37,20 +37,12 @@ def create_replay_buffer(
         CARTRIDGE_STORAGE_POSTGRES_URL
         CARTRIDGE_POSTGRES_URL
     """
-    # Get connection string from argument, env, or central config
+    # Get connection string from argument or environment
     if connection_string is None:
         connection_string = os.environ.get(
             "CARTRIDGE_STORAGE_POSTGRES_URL",
             os.environ.get("CARTRIDGE_POSTGRES_URL"),
         )
-
-    if connection_string is None:
-        try:
-            from trainer.central_config import get_config as get_central_config
-
-            connection_string = get_central_config().storage.postgres_url
-        except Exception:
-            pass
 
     if connection_string is None:
         raise ValueError(
