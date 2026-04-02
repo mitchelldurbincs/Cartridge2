@@ -38,9 +38,10 @@ Training loop configuration (used by trainer).
 | `learning_rate` | f64 | `0.001` | Initial learning rate |
 | `weight_decay` | f64 | `0.0001` | L2 regularization weight decay |
 | `grad_clip_norm` | f64 | `1.0` | Gradient clipping norm |
-| `device` | string | `"cpu"` | Device: cpu, cuda, mps |
+| `device` | string | `"cpu"` | Device: auto, cpu, cuda, mps |
 | `checkpoint_interval` | i32 | `100` | Steps between checkpoints |
 | `max_checkpoints` | i32 | `10` | Maximum checkpoints to keep |
+| `num_actors` | i32 | `6` | Parallel actor processes for self-play |
 
 ### [evaluation]
 
@@ -50,6 +51,8 @@ Model evaluation configuration.
 |-------|------|---------|-------------|
 | `interval` | i32 | `1` | Evaluate every N iterations (0 = disable) |
 | `games` | i32 | `50` | Games per evaluation |
+| `win_threshold` | f64 | `0.55` | Win rate to become new best model |
+| `eval_vs_random` | bool | `true` | Also evaluate against random baseline |
 
 ### [actor]
 
@@ -78,13 +81,27 @@ Monte Carlo Tree Search configuration.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `num_simulations` | u32 | `800` | MCTS simulations per move |
+| `start_sims` | u32 | `50` | Simulations for first iteration (ramping start) |
+| `max_sims` | u32 | `250` | Maximum simulations after ramping completes |
+| `sim_ramp_rate` | u32 | `10` | Simulations added per iteration |
+| `num_simulations` | u32 | `800` | Legacy: MCTS simulations per move (used if ramping not configured) |
 | `c_puct` | f64 | `1.4` | Exploration constant |
 | `temperature` | f64 | `1.0` | Action selection temperature |
+| `temp_threshold` | u32 | `15` | Move number after which to reduce temperature (0 = disabled) |
 | `dirichlet_alpha` | f64 | `0.3` | Dirichlet noise alpha |
 | `dirichlet_weight` | f64 | `0.25` | Dirichlet noise weight |
-| `eval_batch_size` | usize | `32` | Batch size for ONNX evaluation |
+| `eval_batch_size` | usize | `32` | Batch size for ONNX evaluation during MCTS |
 | `onnx_intra_threads` | usize | `1` | ONNX intra-op parallelism threads |
+
+### [logging]
+
+Structured logging configuration.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `format` | string | `"text"` | Log format: "text" (human-readable) or "json" (structured for cloud) |
+| `include_timestamps` | bool | `true` | Include timestamps in log output |
+| `include_target` | bool | `true` | Include module target in log output |
 
 ### [storage]
 

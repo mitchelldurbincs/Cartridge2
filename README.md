@@ -407,8 +407,9 @@ cd web && cargo fmt && cargo clippy
 - [x] Docker Compose (PostgreSQL, optional MinIO for S3)
 - [x] Horizontal actor scaling via `--scale`
 
+- [x] Othello game implementation
+
 **Planned:**
-- [ ] Othello game
 - [ ] Kubernetes manifests (Helm/Kustomize)
 
 ## Design Decisions
