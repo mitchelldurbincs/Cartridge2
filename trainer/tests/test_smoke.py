@@ -161,7 +161,7 @@ class TestTrainer:
 
     @pytest.mark.skipif(
         not os.environ.get("CARTRIDGE_STORAGE_POSTGRES_URL"),
-        reason="PostgreSQL not configured (set CARTRIDGE_STORAGE_POSTGRES_URL)"
+        reason="PostgreSQL not configured (set CARTRIDGE_STORAGE_POSTGRES_URL)",
     )
     def test_trainer_with_postgres(self):
         """Integration test with real PostgreSQL connection."""
@@ -187,14 +187,19 @@ class TestStorageFactory:
         """Test that factory raises error without PostgreSQL URL."""
         from trainer.storage import create_replay_buffer
 
-        # Clear any existing env vars
-        with patch.dict(os.environ, {}, clear=True):
-            with pytest.raises(ValueError, match="PostgreSQL connection string required"):
+        # Clear any existing env vars and prevent central config fallback
+        # (config.toml may provide a postgres_url, so we must block that path too)
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "trainer.central_config.get_config", side_effect=Exception("no config")
+        ):
+            with pytest.raises(
+                ValueError, match="PostgreSQL connection string required"
+            ):
                 create_replay_buffer()
 
     @pytest.mark.skipif(
         not os.environ.get("CARTRIDGE_STORAGE_POSTGRES_URL"),
-        reason="PostgreSQL not configured"
+        reason="PostgreSQL not configured",
     )
     def test_factory_with_postgres(self):
         """Test factory creates PostgresReplayBuffer with valid URL."""
