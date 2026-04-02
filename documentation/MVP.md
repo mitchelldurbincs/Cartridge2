@@ -5,7 +5,7 @@ I think I can reuse the engine-rust and the actor from Cartridge
 Big Game Goals:
 * Tic tac toe (COMPLETE)
 * Connect 4 (COMPLETE)
-* Othello
+* Othello (COMPLETE)
 
 Here is your rewritten design document, streamlined for the **Monolithic/Filesystem MVP** approach (v2).
 
@@ -19,7 +19,7 @@ I will reuse the engine-rust code, but refactor it from a Service into a Library
 
 - Tic tac toe (COMPLETE)
 - Connect 4 (COMPLETE)
-- Othello
+- Othello (COMPLETE)
 
 **I want to:**
 
@@ -59,7 +59,7 @@ A long-running process that:
 
 1. Watches `./data/models/latest.onnx` for updates (hot-reload).
 2. Runs MCTS self-play loops using the Engine and ONNX model.
-3. Saves completed games to `./data/replay.db` (SQLite).
+3. Saves completed games to PostgreSQL replay buffer.
 4. Stores MCTS visit distributions as policy targets.
 5. Backfills game outcomes to all positions in each episode.
     
@@ -87,16 +87,16 @@ let step = ctx.step(&reset.state, &action).unwrap();
 
 **Status: COMPLETE**
 
-SQLite Database (`./data/replay.db`) - A single SQLite database file acting as a concurrent, persistent buffer.
+PostgreSQL database - A concurrent, persistent replay buffer shared by actors and the trainer.
 
-- **Actor (Rust):** Connects to `replay.db` and inserts transitions with:
+- **Actor (Rust):** Connects to PostgreSQL and inserts transitions with:
   - Game state and observations
   - MCTS policy distributions (visit counts normalized)
   - Game outcomes backfilled after episode completion
 
 - **Learner (Python):**
     - **Sampling:** Fetches randomized batches of transitions with policy targets and game outcomes.
-    - **Window Management:** Periodically cleans up old transitions to bound buffer size.
+    - **Buffer clearing:** In synchronized mode, the buffer is cleared each iteration so training data comes from the current model only.
 ## Weights
 
 **Status: COMPLETE**
@@ -111,10 +111,10 @@ A single file: `./data/models/latest.onnx`
 
 **Status: COMPLETE**
 
-Python training loop that trains the network on data from SQLite and publishes versioned models safely.
+Python training loop that trains the network on data from PostgreSQL and publishes versioned models safely.
 
 **Process:**
-1. **Data Loading (SQLite):** Runs SQL queries to fetch randomized batches of transitions with MCTS policy targets and game outcomes.
+1. **Data Loading (PostgreSQL):** Fetches randomized batches of transitions with MCTS policy targets and game outcomes.
 2. **Training:** Updates the PyTorch model parameters θ to minimize the combined AlphaZero loss:
    - Policy: Cross-entropy with soft MCTS visit distribution targets
    - Value: MSE with propagated game outcomes
