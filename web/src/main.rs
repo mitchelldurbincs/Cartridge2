@@ -26,7 +26,7 @@ use std::sync::Arc;
 // `current_game` uses tokio::sync::RwLock since it's owned entirely by AppState.
 use std::sync::RwLock as StdRwLock;
 use tokio::sync::{Mutex, RwLock};
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{info, warn};
 
 mod game;

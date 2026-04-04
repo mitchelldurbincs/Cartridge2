@@ -67,7 +67,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user for security
-RUN useradd -m -u 1000 cartridge
+# Let system assign UID automatically to avoid conflicts with existing UIDs
+RUN useradd -m cartridge
 
 # Create symlinks for python/pip commands
 RUN ln -sf /usr/bin/python3 /usr/bin/python
