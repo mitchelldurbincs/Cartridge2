@@ -28,6 +28,7 @@ Usage:
 import logging
 import os
 import sys
+import threading
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,9 @@ else:
     import tomli as tomllib
 
 logger = logging.getLogger(__name__)
+
+# Thread-safe lock for config cache access
+_config_lock = threading.Lock()
 
 # Project root (where config.defaults.toml lives)
 _PROJECT_ROOT = Path(__file__).parent.parent.parent.parent.parent
@@ -358,6 +362,8 @@ def get_config(reload: bool = False) -> Config:
         2. User configuration (config.toml)
         3. Default configuration (config.defaults.toml)
 
+    This function is thread-safe and caches the configuration after first load.
+
     Args:
         reload: Force reload from file even if cached.
 
@@ -366,35 +372,46 @@ def get_config(reload: bool = False) -> Config:
     """
     global _cached_config
 
+    # Fast path: check cache without locking
     if _cached_config is not None and not reload:
         return _cached_config
 
-    # Step 1: Load defaults from config.defaults.toml
-    defaults_path = _find_defaults_file()
-    if defaults_path is not None:
-        logger.debug(f"Loading defaults from {defaults_path}")
-        with open(defaults_path, "rb") as f:
-            data = tomllib.load(f)
-    else:
-        logger.warning("No config.defaults.toml found, using hardcoded defaults")
-        data = {}
+    # Slow path: load config with lock
+    with _config_lock:
+        # Double-check after acquiring lock
+        if _cached_config is not None and not reload:
+            return _cached_config
 
-    # Step 2: Overlay user configuration from config.toml
-    config_path = _find_config_file()
-    if config_path is not None:
-        logger.info(f"Loading user configuration from {config_path}")
-        with open(config_path, "rb") as f:
-            user_data = tomllib.load(f)
-        data = _deep_merge(data, user_data)
+        # Step 1: Load defaults from config.defaults.toml
+        defaults_path = _find_defaults_file()
+        if defaults_path is not None:
+            logger.debug(f"Loading defaults from {defaults_path}")
+            with open(defaults_path, "rb") as f:
+                data = tomllib.load(f)
+        else:
+            logger.warning("No config.defaults.toml found, using hardcoded defaults")
+            data = {}
 
-    # Step 3: Apply environment variable overrides
-    data = _apply_env_overrides(data)
+        # Step 2: Overlay user configuration from config.toml
+        config_path = _find_config_file()
+        if config_path is not None:
+            logger.info(f"Loading user configuration from {config_path}")
+            with open(config_path, "rb") as f:
+                user_data = tomllib.load(f)
+            data = _deep_merge(data, user_data)
 
-    _cached_config = _dict_to_config(data)
-    return _cached_config
+        # Step 3: Apply environment variable overrides
+        data = _apply_env_overrides(data)
+
+        _cached_config = _dict_to_config(data)
+        return _cached_config
 
 
 def reset_config() -> None:
-    """Reset the cached config (mainly for testing)."""
+    """Reset the cached config (mainly for testing).
+
+    This function is thread-safe.
+    """
     global _cached_config
-    _cached_config = None
+    with _config_lock:
+        _cached_config = None

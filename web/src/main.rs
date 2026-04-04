@@ -26,7 +26,7 @@ use std::sync::Arc;
 // `current_game` uses tokio::sync::RwLock since it's owned entirely by AppState.
 use std::sync::RwLock as StdRwLock;
 use tokio::sync::{Mutex, RwLock};
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{info, warn};
 
 mod game;
@@ -78,20 +78,34 @@ pub struct AppState {
 
 /// Configure CORS based on allowed origins.
 ///
-/// If `allowed_origins` is empty, allows all origins (development mode) with a warning.
+/// If `allowed_origins` is empty, only allows localhost origins (secure development mode).
 /// Otherwise, restricts to the specified origins (production mode).
+/// This is deny-by-default behavior to prevent accidental insecure configurations.
 fn configure_cors(allowed_origins: &[String]) -> CorsLayer {
     if allowed_origins.is_empty() {
-        // Development mode: allow all origins with a warning
+        // Deny-by-default: only allow localhost origins when none configured
         warn!(
             component = "web",
-            event = "cors_insecure",
-            "CORS: No allowed_origins configured - allowing all origins (insecure for production)"
+            event = "cors_localhost_fallback",
+            "CORS: No allowed_origins configured - restricting to localhost only"
         );
+        let localhost_origins = vec![
+            "http://localhost".parse().ok(),
+            "http://localhost:3000".parse().ok(),
+            "http://localhost:5173".parse().ok(),
+            "http://localhost:8080".parse().ok(),
+            "http://127.0.0.1".parse().ok(),
+            "http://127.0.0.1:3000".parse().ok(),
+            "http://127.0.0.1:5173".parse().ok(),
+            "http://127.0.0.1:8080".parse().ok(),
+        ];
+        let origins: Vec<HeaderValue> = localhost_origins.into_iter().flatten().collect();
+
         CorsLayer::new()
-            .allow_origin(Any)
+            .allow_origin(AllowOrigin::list(origins))
             .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
             .allow_headers([header::CONTENT_TYPE, header::ACCEPT])
+            .allow_credentials(true)
     } else {
         // Production mode: restrict to configured origins
         let origins: Vec<HeaderValue> = allowed_origins
@@ -809,9 +823,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cors_allows_any_origin_in_development_mode() {
+    async fn test_cors_allows_localhost_in_development_mode() {
         let state = create_test_state();
-        // Empty allowed_origins = development mode
+        // Empty allowed_origins = development mode (localhost only)
         let allowed: Vec<String> = vec![];
         let app = create_app_with_cors(state, &allowed);
 
@@ -819,7 +833,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/health")
-                    .header("Origin", "https://any-origin.example.com")
+                    .header("Origin", "http://localhost:3000")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -827,13 +841,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        // In development mode, any origin should be allowed
+        // In development mode, localhost origins should be allowed
         assert_eq!(
             response
                 .headers()
                 .get("access-control-allow-origin")
                 .unwrap(),
-            "*"
+            "http://localhost:3000"
         );
     }
 
