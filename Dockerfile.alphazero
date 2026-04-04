@@ -66,6 +66,9 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
+# Create non-root user for security
+RUN useradd -m -u 1000 cartridge
+
 # Create symlinks for python/pip commands
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
@@ -90,8 +93,8 @@ RUN pip install --no-cache-dir --break-system-packages torch --index-url https:/
 # Install trainer package
 RUN pip install --no-cache-dir --break-system-packages ./trainer
 
-# Create data directory
-RUN mkdir -p /app/data/models
+# Create data directory with correct permissions
+RUN mkdir -p /app/data/models && chown -R cartridge:cartridge /app/data
 
 # ============================================
 # Environment Configuration
@@ -119,6 +122,9 @@ ENV ALPHAZERO_EVAL_GAMES="50"
 
 ENV ALPHAZERO_CHECKPOINT_INTERVAL="100"
 ENV ALPHAZERO_START_ITERATION="1"
+
+# Run as non-root user
+USER cartridge
 
 # Run the synchronized training loop
 ENTRYPOINT ["python", "-m", "trainer", "loop"]

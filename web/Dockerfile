@@ -53,13 +53,16 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Create non-root user for security
+RUN useradd -m -u 1000 cartridge
+
 WORKDIR /app
 
 # Copy the compiled binary from builder
 COPY --from=builder /app/web/target/release/web /app/web
 
-# Create data directory
-RUN mkdir -p /app/data/models
+# Create data directory with correct permissions
+RUN mkdir -p /app/data/models && chown -R cartridge:cartridge /app
 
 # Environment variables with defaults
 ENV DATA_DIR="/app/data"
@@ -68,6 +71,9 @@ ENV RUST_LOG="info"
 
 # Expose the web server port
 EXPOSE 8080
+
+# Run as non-root user
+USER cartridge
 
 # Healthcheck using the /health endpoint
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \

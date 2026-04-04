@@ -78,20 +78,34 @@ pub struct AppState {
 
 /// Configure CORS based on allowed origins.
 ///
-/// If `allowed_origins` is empty, allows all origins (development mode) with a warning.
+/// If `allowed_origins` is empty, only allows localhost origins (secure development mode).
 /// Otherwise, restricts to the specified origins (production mode).
+/// This is deny-by-default behavior to prevent accidental insecure configurations.
 fn configure_cors(allowed_origins: &[String]) -> CorsLayer {
     if allowed_origins.is_empty() {
-        // Development mode: allow all origins with a warning
+        // Deny-by-default: only allow localhost origins when none configured
         warn!(
             component = "web",
-            event = "cors_insecure",
-            "CORS: No allowed_origins configured - allowing all origins (insecure for production)"
+            event = "cors_localhost_fallback",
+            "CORS: No allowed_origins configured - restricting to localhost only"
         );
+        let localhost_origins = vec![
+            "http://localhost".parse().ok(),
+            "http://localhost:3000".parse().ok(),
+            "http://localhost:5173".parse().ok(),
+            "http://localhost:8080".parse().ok(),
+            "http://127.0.0.1".parse().ok(),
+            "http://127.0.0.1:3000".parse().ok(),
+            "http://127.0.0.1:5173".parse().ok(),
+            "http://127.0.0.1:8080".parse().ok(),
+        ];
+        let origins: Vec<HeaderValue> = localhost_origins.into_iter().flatten().collect();
+
         CorsLayer::new()
-            .allow_origin(Any)
+            .allow_origin(AllowOrigin::list(origins))
             .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
             .allow_headers([header::CONTENT_TYPE, header::ACCEPT])
+            .allow_credentials(true)
     } else {
         // Production mode: restrict to configured origins
         let origins: Vec<HeaderValue> = allowed_origins
