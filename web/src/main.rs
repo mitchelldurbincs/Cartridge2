@@ -823,9 +823,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cors_allows_any_origin_in_development_mode() {
+    async fn test_cors_allows_localhost_in_development_mode() {
         let state = create_test_state();
-        // Empty allowed_origins = development mode
+        // Empty allowed_origins = development mode (localhost only)
         let allowed: Vec<String> = vec![];
         let app = create_app_with_cors(state, &allowed);
 
@@ -833,7 +833,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/health")
-                    .header("Origin", "https://any-origin.example.com")
+                    .header("Origin", "http://localhost:3000")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -841,13 +841,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        // In development mode, any origin should be allowed
+        // In development mode, localhost origins should be allowed
         assert_eq!(
             response
                 .headers()
                 .get("access-control-allow-origin")
                 .unwrap(),
-            "*"
+            "http://localhost:3000"
         );
     }
 
