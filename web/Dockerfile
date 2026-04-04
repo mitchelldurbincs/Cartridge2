@@ -54,7 +54,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user for security
-RUN useradd -m -u 1000 cartridge
+RUN useradd -m cartridge
 
 WORKDIR /app
 
