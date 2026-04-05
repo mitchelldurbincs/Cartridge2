@@ -311,6 +311,43 @@ docker compose -f docker-compose.yml -f docker-compose.k8s.yml up --scale actor=
 | `CARTRIDGE_STORAGE_S3_BUCKET` | S3 bucket for models | - |
 | `CARTRIDGE_STORAGE_S3_ENDPOINT` | S3-compatible endpoint (MinIO) | - |
 
+## Security Configuration
+
+### CORS (Cross-Origin Resource Sharing)
+
+The web server implements **deny-by-default** CORS behavior for security:
+
+- **Development mode**: When `CARTRIDGE_WEB_ALLOWED_ORIGINS` is empty, only localhost origins are allowed (`http://localhost:*`, `http://127.0.0.1:*`)
+- **Production mode**: Set explicit allowed origins via environment variable:
+  ```bash
+  CARTRIDGE_WEB_ALLOWED_ORIGINS=https://yourdomain.com,https://www.yourdomain.com
+  ```
+
+### Credential Management
+
+**MinIO/S3 Credentials:**
+- Never commit credentials to version control
+- Use `.env` file for local development (copy from `.env.example`)
+- In production, use proper secret management (Kubernetes secrets, AWS Secrets Manager, etc.)
+- Default MinIO credentials for local development: `minioadmin` / `changeme` (change for production!)
+
+**PostgreSQL Credentials:**
+- Default local development password is `cartridge` (configured in `docker-compose.yml`)
+- Use strong passwords in production
+- Configure via `CARTRIDGE_STORAGE_POSTGRES_URL` environment variable
+
+### Container Security
+
+All Docker containers run as non-root user `cartridge` (UID 1000) for improved security. Container images include:
+- Minimal attack surface (Ubuntu 24.04 base)
+- No unnecessary packages
+- Health checks configured
+- Read-only filesystem where possible
+
+### Secrets Scanning
+
+The CI pipeline includes automated secrets scanning with GitLeaks to prevent accidental credential commits.
+
 ## Adding a New Game
 
 1. Create a new crate in `engine/games-{name}/`
