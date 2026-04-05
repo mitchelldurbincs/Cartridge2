@@ -93,7 +93,9 @@ Metrics scraped from:
 
 ### MinIO Console
 
-Access at http://localhost:9001 with credentials `aspect` / `password123`. Models are stored in the `cartridge-models` bucket.
+Access at http://localhost:9001 with credentials from your `.env` file (`MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`). Default values are `minioadmin` / `changeme` for local development only. Models are stored in the `cartridge-models` bucket.
+
+**Security Note:** Always change default MinIO credentials in production by setting `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD` environment variables.
 
 ### Environment Variable Overrides
 
