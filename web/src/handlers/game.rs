@@ -48,12 +48,8 @@ pub async fn get_game_info(
         ));
     }
 
-    let game = create_game(&id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("Game not found: {}", id),
-        )
-    })?;
+    let game = create_game(&id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Game not found: {}", id)))?;
 
     let metadata = game.metadata();
     Ok(Json(metadata.into()))
