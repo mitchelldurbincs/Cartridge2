@@ -113,6 +113,81 @@ Axum HTTP server for frontend interaction:
 - `/actor-stats` - Read actor self-play stats
 - `/model` - Get info about loaded model
 
+#### API Endpoints Documentation
+
+**Health Check**
+```
+GET /health
+Response: {"status": "ok"}
+```
+
+**List Games**
+```
+GET /games
+Response: {"games": ["tictactoe", "connect4", "othello"]}
+```
+
+**Get Game Info**
+```
+GET /game-info/:id
+Response: {
+  "id": "tictactoe",
+  "board_width": 3,
+  "board_height": 3,
+  "num_actions": 9,
+  "obs_size": 27
+}
+```
+
+**Start New Game**
+```
+POST /game/new
+Body: {"first": "player"}  // or "bot"
+Response: GameStateResponse
+```
+
+**Get Game State**
+```
+GET /game/state
+Response: {
+  "board": [0,0,0,0,0,0,0,0,0],
+  "current_player": 1,
+  "winner": 0,
+  "game_over": false,
+  "legal_moves": [0,1,2,3,4,5,6,7,8]
+}
+```
+
+**Make Move**
+```
+POST /move
+Body: {"action": 4}
+Response: {
+  "player_action": 4,
+  "bot_action": 0,
+  "state": GameStateResponse,
+  "game_over": false
+}
+```
+
+**Get Training Stats**
+```
+GET /stats
+Response: {
+  "iterations_completed": 10,
+  "episodes_generated": 5000,
+  "policy_loss": 1.2,
+  "value_loss": 0.5,
+  "current_learning_rate": 0.001
+}
+```
+
+**Prometheus Metrics**
+```
+GET /metrics
+Response: Prometheus-format metrics
+```
+
 ### Web Frontend (Svelte + TypeScript) - `web/frontend/`
 **Status: COMPLETE**
 
