@@ -23,14 +23,17 @@ from trainer.central_config import (
     get_config,
     reset_config,
     _config_lock,
+    _cached_config,
 )
 
 
 class TestConfigLoading:
     """Test configuration loading from files."""
 
-    def test_load_default_config(self):
+    def test_load_default_config(self, monkeypatch, tmp_path):
         """Test that default config loads successfully."""
+        # Isolate from repo's config.toml by changing to temp directory
+        monkeypatch.chdir(tmp_path)
         reset_config()
 
         config = get_config()
@@ -120,8 +123,10 @@ class TestEnvironmentVariableOverrides:
         assert config.common.env_id == "connect4"
         assert config.training.iterations == 75
 
-    def test_empty_env_var_ignored(self, monkeypatch):
+    def test_empty_env_var_ignored(self, monkeypatch, tmp_path):
         """Test that empty environment variables are ignored."""
+        # Isolate from repo's config.toml by changing to temp directory
+        monkeypatch.chdir(tmp_path)
         reset_config()
         monkeypatch.setenv("CARTRIDGE_COMMON_ENV_ID", "")
 
@@ -317,8 +322,10 @@ class TestThreadSafety:
 class TestConfigEdgeCases:
     """Test edge cases and error handling."""
 
-    def test_invalid_env_var_for_int_uses_string(self, monkeypatch):
+    def test_invalid_env_var_for_int_uses_string(self, monkeypatch, tmp_path):
         """Test that invalid int env var gets stored as string (may cause errors later)."""
+        # Isolate from repo's config.toml by changing to temp directory
+        monkeypatch.chdir(tmp_path)
         reset_config()
         # Invalid integer - code currently stores it as string
         monkeypatch.setenv("CARTRIDGE_TRAINING_ITERATIONS", "not_a_number")
