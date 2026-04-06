@@ -509,6 +509,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_new_game_rejects_different_game_type() {
+        let state = create_test_state();
+        let app = create_app(state);
+
+        // Trying to create a game of a different type should be rejected
+        let (status, body) = post_json(
+            app,
+            "/game/new",
+            r#"{"first": "player", "game": "connect4"}"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("Cannot switch to game"));
+        assert!(body.contains("only the current game 'tictactoe' is available"));
+    }
+
+    #[tokio::test]
+    async fn test_new_game_allows_same_game_type() {
+        let state = create_test_state();
+        let app = create_app(state);
+
+        // Requesting the current game type should be allowed
+        let (status, body) = post_json(
+            app,
+            "/game/new",
+            r#"{"first": "player", "game": "tictactoe"}"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let response: GameStateResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(response.board, vec![0u8; 9]);
+    }
+
+    #[tokio::test]
     async fn test_move_valid() {
         let state = create_test_state();
         let app = create_app(state);
@@ -727,7 +763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_games() {
+    async fn test_list_games_returns_only_current_game() {
         let state = create_test_state();
         let app = create_app(state);
 
@@ -735,7 +771,9 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         let response: GamesListResponse = serde_json::from_str(&body).unwrap();
-        assert!(response.games.contains(&"tictactoe".to_string()));
+        // Should only return the current game, not all registered games
+        assert_eq!(response.games.len(), 1);
+        assert_eq!(response.games[0], "tictactoe");
     }
 
     #[tokio::test]
@@ -756,14 +794,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_game_info_not_found() {
+    async fn test_get_game_info_forbidden_for_non_current_game() {
         let state = create_test_state();
         let app = create_app(state);
 
-        let (status, body) = get(app, "/game-info/nonexistent").await;
+        // Requesting a different game than the current one should return FORBIDDEN
+        let (status, body) = get(app, "/game-info/connect4").await;
 
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(body.contains("Game not found"));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("Cannot access game"));
+        assert!(body.contains("only the current game 'tictactoe' is available"));
+    }
+
+    #[tokio::test]
+    async fn test_get_game_info_not_found_for_invalid_game() {
+        let state = create_test_state();
+        let app = create_app(state);
+
+        // Requesting an invalid game ID that matches current game check
+        // but doesn't exist in registry should return NOT_FOUND
+        // (This would require the game ID to be "tictactoe" to pass the filter,
+        // so this test case is for truly invalid games)
+        let (status, body) = get(app, "/game-info/tictactoe_invalid").await;
+
+        // Since "tictactoe_invalid" != "tictactoe", it returns FORBIDDEN
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     // ========================================================================

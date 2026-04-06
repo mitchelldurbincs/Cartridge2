@@ -5,7 +5,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use engine_core::{create_game, list_registered_games};
+use engine_core::create_game;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -17,24 +17,41 @@ use crate::types::{
 };
 use crate::AppState;
 
-/// List all available games.
-pub async fn list_games() -> Json<GamesListResponse> {
+/// List available games.
+/// Only returns the currently configured game to prevent users from
+/// selecting games that don't match the loaded model.
+pub async fn list_games(State(state): State<Arc<AppState>>) -> Json<GamesListResponse> {
+    // Only return the current game - users can't play other games
+    // since the model is trained for a specific game
+    let current_game = state.current_game.read().await;
     Json(GamesListResponse {
-        games: list_registered_games(),
+        games: vec![current_game.clone()],
     })
 }
 
-/// Get metadata for a specific game.
+/// Get metadata for the current game.
+/// Only returns info for the currently configured game to ensure
+/// the frontend only shows the game the model is trained for.
 pub async fn get_game_info(
+    State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<GameInfoResponse>, (StatusCode, String)> {
+    // Only allow access to the current game
+    let current_game = state.current_game.read().await;
+    if id != *current_game {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "Cannot access game '{}': only the current game '{}' is available",
+                id, current_game
+            ),
+        ));
+    }
+
     let game = create_game(&id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
-            format!(
-                "Game not found: {}. Use /games to list available games.",
-                id
-            ),
+            format!("Game not found: {}", id),
         )
     })?;
 
@@ -51,6 +68,9 @@ pub async fn get_game_state(
 }
 
 /// Start a new game.
+/// Only allows creating the currently configured game type.
+/// Rejects requests to switch to a different game since the model
+/// is trained for a specific game.
 pub async fn new_game(
     State(state): State<Arc<AppState>>,
     Json(req): Json<NewGameRequest>,
@@ -61,15 +81,24 @@ pub async fn new_game(
     metrics::GAMES_CREATED.inc();
     metrics::GAMES_ACTIVE.inc();
 
-    // Determine which game to use
-    let game_id = if let Some(ref game) = req.game {
-        // Update current game if specified (async RwLock)
-        *state.current_game.write().await = game.clone();
-        game.clone()
-    } else {
-        // Use current game (async RwLock)
-        state.current_game.read().await.clone()
-    };
+    // Get the current configured game
+    let current_game = state.current_game.read().await.clone();
+
+    // Reject requests trying to switch to a different game
+    if let Some(ref requested_game) = req.game {
+        if requested_game != &current_game {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!(
+                    "Cannot switch to game '{}': only the current game '{}' is available",
+                    requested_game, current_game
+                ),
+            ));
+        }
+    }
+
+    // Use the current game (cannot be changed)
+    let game_id = current_game;
 
     // Reset the game with shared evaluator (for hot-reloading)
     *session =
