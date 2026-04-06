@@ -32,15 +32,18 @@ mod tests {
         let evaluator = Arc::new(RwLock::new(None));
         let watcher = ModelWatcher::new("/tmp/models", "latest.onnx", 29, 1, evaluator);
 
-        assert_eq!(watcher.model_path().to_string_lossy(), "/tmp/models/latest.onnx");
+        assert_eq!(
+            watcher.model_path().to_string_lossy(),
+            "/tmp/models/latest.onnx"
+        );
     }
 
     /// Test that with_metadata method works through web re-export
     #[test]
     fn test_model_watcher_reexport_with_metadata_web() {
         let evaluator = Arc::new(RwLock::new(None));
-        let watcher = ModelWatcher::new("/tmp/models", "latest.onnx", 29, 1, evaluator)
-            .with_metadata();
+        let watcher =
+            ModelWatcher::new("/tmp/models", "latest.onnx", 29, 1, evaluator).with_metadata();
 
         let info = watcher.model_info();
         let guard = info.read().unwrap();
@@ -58,8 +61,14 @@ mod tests {
         let evaluator2 = Arc::new(RwLock::new(None));
         let watcher2 = ModelWatcher::new("/tmp/models2", "connect4.onnx", 116, 1, evaluator2);
 
-        assert_eq!(watcher1.model_path().to_string_lossy(), "/tmp/models1/tictactoe.onnx");
-        assert_eq!(watcher2.model_path().to_string_lossy(), "/tmp/models2/connect4.onnx");
+        assert_eq!(
+            watcher1.model_path().to_string_lossy(),
+            "/tmp/models1/tictactoe.onnx"
+        );
+        assert_eq!(
+            watcher2.model_path().to_string_lossy(),
+            "/tmp/models2/connect4.onnx"
+        );
     }
 
     /// Test try_load_existing returns Ok for non-existent model
@@ -67,13 +76,7 @@ mod tests {
     fn test_model_watcher_reexport_try_load_nonexistent_web() {
         let temp_dir = tempfile::tempdir().unwrap();
         let evaluator = Arc::new(RwLock::new(None));
-        let watcher = ModelWatcher::new(
-            temp_dir.path(),
-            "nonexistent.onnx",
-            29,
-            1,
-            evaluator,
-        );
+        let watcher = ModelWatcher::new(temp_dir.path(), "nonexistent.onnx", 29, 1, evaluator);
 
         let result = watcher.try_load_existing();
         assert!(result.is_ok());
@@ -84,7 +87,7 @@ mod tests {
     #[test]
     fn test_model_info_manual_update() {
         let info = Arc::new(RwLock::new(ModelInfo::default()));
-        
+
         {
             let mut guard = info.write().unwrap();
             guard.loaded = true;
@@ -93,7 +96,7 @@ mod tests {
             guard.loaded_at = Some(1234567891);
             guard.training_step = Some(500);
         }
-        
+
         let guard = info.read().unwrap();
         assert!(guard.loaded);
         assert_eq!(guard.path, Some("/models/test.onnx".to_string()));

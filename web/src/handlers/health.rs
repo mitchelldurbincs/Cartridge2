@@ -57,7 +57,7 @@ mod tests {
         // Should be able to serialize to string
         let json_str = serde_json::to_string(&json_response.0);
         assert!(json_str.is_ok());
-        
+
         let json_str = json_str.unwrap();
         assert!(json_str.contains("status"));
         assert!(json_str.contains("version"));
@@ -68,9 +68,9 @@ mod tests {
     async fn test_metrics_handler_returns_success() {
         // Initialize metrics first
         metrics::init_metrics();
-        
+
         let (status, _headers, body) = metrics_handler().await;
-        
+
         assert_eq!(status, StatusCode::OK);
         assert!(!body.is_empty());
     }
@@ -78,9 +78,9 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_handler_returns_correct_content_type() {
         metrics::init_metrics();
-        
+
         let (_status, headers, _body) = metrics_handler().await;
-        
+
         assert_eq!(headers[0].0, header::CONTENT_TYPE);
         assert!(headers[0].1.contains("text/plain"));
         assert!(headers[0].1.contains("version=0.0.4"));
@@ -89,13 +89,13 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_handler_includes_expected_metrics() {
         metrics::init_metrics();
-        
+
         // Increment some metrics to ensure they appear
         metrics::GAMES_CREATED.inc();
         metrics::MOVES_PLAYED.inc_by(5);
-        
+
         let (_status, _headers, body) = metrics_handler().await;
-        
+
         // Should contain standard metric names
         assert!(body.contains("web_games_created_total"));
         assert!(body.contains("web_moves_played_total"));

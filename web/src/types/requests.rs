@@ -46,7 +46,7 @@ mod tests {
     fn test_new_game_request_deserialization_empty() {
         let json = r#"{}"#;
         let request: NewGameRequest = serde_json::from_str(json).unwrap();
-        
+
         // Should use defaults
         assert_eq!(request.first, "player");
         assert!(request.game.is_none());
@@ -56,7 +56,7 @@ mod tests {
     fn test_new_game_request_deserialization_with_first() {
         let json = r#"{"first": "bot"}"#;
         let request: NewGameRequest = serde_json::from_str(json).unwrap();
-        
+
         assert_eq!(request.first, "bot");
         assert!(request.game.is_none());
     }
@@ -65,7 +65,7 @@ mod tests {
     fn test_new_game_request_deserialization_with_game() {
         let json = r#"{"first": "player", "game": "tictactoe"}"#;
         let request: NewGameRequest = serde_json::from_str(json).unwrap();
-        
+
         assert_eq!(request.first, "player");
         assert_eq!(request.game, Some("tictactoe".to_string()));
     }
@@ -74,7 +74,7 @@ mod tests {
     fn test_new_game_request_deserialization_full() {
         let json = r#"{"first": "bot", "game": "connect4"}"#;
         let request: NewGameRequest = serde_json::from_str(json).unwrap();
-        
+
         assert_eq!(request.first, "bot");
         assert_eq!(request.game, Some("connect4".to_string()));
     }
@@ -105,7 +105,7 @@ mod tests {
     fn test_move_request_deserialization() {
         let json = r#"{"position": 4}"#;
         let request: MoveRequest = serde_json::from_str(json).unwrap();
-        
+
         assert_eq!(request.position, 4);
     }
 
@@ -113,7 +113,7 @@ mod tests {
     fn test_move_request_deserialization_zero() {
         let json = r#"{"position": 0}"#;
         let request: MoveRequest = serde_json::from_str(json).unwrap();
-        
+
         assert_eq!(request.position, 0);
     }
 
@@ -121,7 +121,7 @@ mod tests {
     fn test_move_request_deserialization_max_u8() {
         let json = r#"{"position": 255}"#;
         let request: MoveRequest = serde_json::from_str(json).unwrap();
-        
+
         assert_eq!(request.position, 255);
     }
 
@@ -151,7 +151,7 @@ mod tests {
         // Serde ignores unknown fields by default
         let json = r#"{"first": "player", "unknown_field": "value"}"#;
         let request: NewGameRequest = serde_json::from_str(json).unwrap();
-        
+
         assert_eq!(request.first, "player");
     }
 
@@ -159,7 +159,7 @@ mod tests {
     fn test_move_request_extra_fields_ignored() {
         let json = r#"{"position": 4, "extra": "ignored"}"#;
         let request: MoveRequest = serde_json::from_str(json).unwrap();
-        
+
         assert_eq!(request.position, 4);
     }
 
@@ -168,7 +168,7 @@ mod tests {
         // Explicit null should work
         let json = r#"{"first": "bot", "game": null}"#;
         let request: NewGameRequest = serde_json::from_str(json).unwrap();
-        
+
         assert_eq!(request.first, "bot");
         assert!(request.game.is_none());
     }
@@ -178,7 +178,7 @@ mod tests {
         // Position is required - missing it should fail
         let json = r#"{}"#;
         let result: Result<MoveRequest, _> = serde_json::from_str(json);
-        
+
         assert!(result.is_err());
     }
 }

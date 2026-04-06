@@ -281,7 +281,11 @@ mod tests {
             .with_board(5, 5)
             .with_actions(25)
             .with_observation(50, 25)
-            .with_players(2, vec!["Player A".to_string(), "Player B".to_string()], vec!['A', 'B']);
+            .with_players(
+                2,
+                vec!["Player A".to_string(), "Player B".to_string()],
+                vec!['A', 'B'],
+            );
 
         let response: GameInfoResponse = metadata.into();
 

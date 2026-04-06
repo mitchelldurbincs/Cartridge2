@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn test_training_stats_default() {
         let stats = TrainingStats::default();
-        
+
         assert_eq!(stats.step, 0);
         assert_eq!(stats.total_steps, 0);
         assert_eq!(stats.total_loss, 0.0);
@@ -164,7 +164,7 @@ mod tests {
         assert_eq!(stats.total_steps, 1000);
         assert!((stats.total_loss - 0.5).abs() < f64::EPSILON);
         assert!(stats.last_eval.is_some());
-        
+
         let last_eval = stats.last_eval.unwrap();
         assert!((last_eval.win_rate - 0.6).abs() < f64::EPSILON);
     }
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn test_actor_stats_default() {
         let stats = ActorStats::default();
-        
+
         assert_eq!(stats.env_id, "");
         assert_eq!(stats.episodes_completed, 0);
         assert_eq!(stats.total_steps, 0);
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn test_history_entry_default() {
         let entry = HistoryEntry::default();
-        
+
         assert_eq!(entry.step, 0);
         assert_eq!(entry.total_loss, 0.0);
         assert_eq!(entry.value_loss, 0.0);
@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn test_eval_stats_default() {
         let eval = EvalStats::default();
-        
+
         assert_eq!(eval.step, 0);
         assert_eq!(eval.win_rate, 0.0);
         assert_eq!(eval.draw_rate, 0.0);

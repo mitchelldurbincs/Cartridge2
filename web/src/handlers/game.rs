@@ -48,12 +48,8 @@ pub async fn get_game_info(
         ));
     }
 
-    let game = create_game(&id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("Game not found: {}", id),
-        )
-    })?;
+    let game = create_game(&id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Game not found: {}", id)))?;
 
     let metadata = game.metadata();
     Ok(Json(metadata.into()))
@@ -205,7 +201,10 @@ pub async fn make_move(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{GameInfoResponse, GameStateResponse, GamesListResponse, MoveRequest, MoveResponse, NewGameRequest};
+    use crate::types::{
+        GameInfoResponse, GameStateResponse, GamesListResponse, MoveRequest, MoveResponse,
+        NewGameRequest,
+    };
     use engine_core::GameMetadata;
 
     #[test]
@@ -253,7 +252,11 @@ mod tests {
             .with_board(7, 6)
             .with_actions(7)
             .with_observation(93, 84)
-            .with_players(2, vec!["Red".to_string(), "Yellow".to_string()], vec!['R', 'Y']);
+            .with_players(
+                2,
+                vec!["Red".to_string(), "Yellow".to_string()],
+                vec!['R', 'Y'],
+            );
 
         let response: GameInfoResponse = metadata.into();
 
@@ -388,7 +391,7 @@ mod tests {
 
         let json = serde_json::to_string(&response);
         assert!(json.is_ok());
-        
+
         let json_str = json.unwrap();
         assert!(json_str.contains("board"));
         assert!(json_str.contains("current_player"));
@@ -402,7 +405,7 @@ mod tests {
     fn test_move_request_deserialization() {
         let json = r#"{"position": 4}"#;
         let result: Result<MoveRequest, _> = serde_json::from_str(json);
-        
+
         assert!(result.is_ok());
         assert_eq!(result.unwrap().position, 4);
     }
@@ -412,7 +415,7 @@ mod tests {
         // Test that deserializing with default values works
         let json = r#"{}"#;
         let result: Result<NewGameRequest, _> = serde_json::from_str(json);
-        
+
         assert!(result.is_ok());
         let req = result.unwrap();
         assert_eq!(req.first, "player"); // Default value
@@ -423,7 +426,7 @@ mod tests {
     fn test_new_game_request_deserialization_with_fields() {
         let json = r#"{"first": "bot", "game": "connect4"}"#;
         let result: Result<NewGameRequest, _> = serde_json::from_str(json);
-        
+
         assert!(result.is_ok());
         let req = result.unwrap();
         assert_eq!(req.first, "bot");
@@ -449,7 +452,7 @@ mod tests {
 
         let json = serde_json::to_string(&response);
         assert!(json.is_ok());
-        
+
         // The response should be flattened with state fields at top level
         let json_str = json.unwrap();
         assert!(json_str.contains("bot_move"));
