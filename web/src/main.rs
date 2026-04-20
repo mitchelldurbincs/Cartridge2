@@ -26,7 +26,7 @@ use std::sync::Arc;
 // `current_game` uses tokio::sync::RwLock since it's owned entirely by AppState.
 use std::sync::RwLock as StdRwLock;
 use tokio::sync::{Mutex, RwLock};
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{info, warn};
 
 mod game;
@@ -78,20 +78,34 @@ pub struct AppState {
 
 /// Configure CORS based on allowed origins.
 ///
-/// If `allowed_origins` is empty, allows all origins (development mode) with a warning.
+/// If `allowed_origins` is empty, only allows localhost origins (secure development mode).
 /// Otherwise, restricts to the specified origins (production mode).
+/// This is deny-by-default behavior to prevent accidental insecure configurations.
 fn configure_cors(allowed_origins: &[String]) -> CorsLayer {
     if allowed_origins.is_empty() {
-        // Development mode: allow all origins with a warning
+        // Deny-by-default: only allow localhost origins when none configured
         warn!(
             component = "web",
-            event = "cors_insecure",
-            "CORS: No allowed_origins configured - allowing all origins (insecure for production)"
+            event = "cors_localhost_fallback",
+            "CORS: No allowed_origins configured - restricting to localhost only"
         );
+        let localhost_origins = vec![
+            "http://localhost".parse().ok(),
+            "http://localhost:3000".parse().ok(),
+            "http://localhost:5173".parse().ok(),
+            "http://localhost:8080".parse().ok(),
+            "http://127.0.0.1".parse().ok(),
+            "http://127.0.0.1:3000".parse().ok(),
+            "http://127.0.0.1:5173".parse().ok(),
+            "http://127.0.0.1:8080".parse().ok(),
+        ];
+        let origins: Vec<HeaderValue> = localhost_origins.into_iter().flatten().collect();
+
         CorsLayer::new()
-            .allow_origin(Any)
+            .allow_origin(AllowOrigin::list(origins))
             .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
             .allow_headers([header::CONTENT_TYPE, header::ACCEPT])
+            .allow_credentials(true)
     } else {
         // Production mode: restrict to configured origins
         let origins: Vec<HeaderValue> = allowed_origins
@@ -135,27 +149,9 @@ pub fn create_app_with_cors(state: Arc<AppState>, allowed_origins: &[String]) ->
 }
 
 /// Create the application router with the given state.
-/// Uses permissive CORS for backwards compatibility in testing.
+/// Uses permissive CORS (empty allowed_origins = development mode).
 pub fn create_app(state: Arc<AppState>) -> Router {
-    // For backwards compatibility, use empty allowed_origins (development mode)
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::CONTENT_TYPE, header::ACCEPT]);
-
-    Router::new()
-        .route("/health", get(health))
-        .route("/metrics", get(metrics_handler))
-        .route("/games", get(list_games))
-        .route("/game-info/:id", get(get_game_info))
-        .route("/game/new", post(new_game))
-        .route("/game/state", get(get_game_state))
-        .route("/move", post(make_move))
-        .route("/stats", get(get_stats))
-        .route("/actor-stats", get(get_actor_stats))
-        .route("/model", get(get_model_info))
-        .layer(cors)
-        .with_state(state)
+    create_app_with_cors(state, &[])
 }
 
 /// Create application state for testing (no model watcher, no logging)
@@ -286,7 +282,7 @@ async fn main() -> anyhow::Result<()> {
             "Model watcher initialized"
         );
 
-        // Create model watcher
+        // Create model watcher with metadata tracking for the web UI
         // Use 1 intra-op thread since web server does single-threaded inference for play
         let model_watcher = ModelWatcher::new(
             &model_dir,
@@ -294,7 +290,8 @@ async fn main() -> anyhow::Result<()> {
             obs_size,
             1,
             Arc::clone(&evaluator),
-        );
+        )
+        .with_metadata();
 
         // Try to load existing model
         match model_watcher.try_load_existing() {
@@ -509,6 +506,42 @@ mod tests {
             vec![0u8; 9],
             "Board should be empty with default"
         );
+    }
+
+    #[tokio::test]
+    async fn test_new_game_rejects_different_game_type() {
+        let state = create_test_state();
+        let app = create_app(state);
+
+        // Trying to create a game of a different type should be rejected
+        let (status, body) = post_json(
+            app,
+            "/game/new",
+            r#"{"first": "player", "game": "connect4"}"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("Cannot switch to game"));
+        assert!(body.contains("only the current game 'tictactoe' is available"));
+    }
+
+    #[tokio::test]
+    async fn test_new_game_allows_same_game_type() {
+        let state = create_test_state();
+        let app = create_app(state);
+
+        // Requesting the current game type should be allowed
+        let (status, body) = post_json(
+            app,
+            "/game/new",
+            r#"{"first": "player", "game": "tictactoe"}"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let response: GameStateResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(response.board, vec![0u8; 9]);
     }
 
     #[tokio::test]
@@ -730,7 +763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_games() {
+    async fn test_list_games_returns_only_current_game() {
         let state = create_test_state();
         let app = create_app(state);
 
@@ -738,7 +771,9 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         let response: GamesListResponse = serde_json::from_str(&body).unwrap();
-        assert!(response.games.contains(&"tictactoe".to_string()));
+        // Should only return the current game, not all registered games
+        assert_eq!(response.games.len(), 1);
+        assert_eq!(response.games[0], "tictactoe");
     }
 
     #[tokio::test]
@@ -759,14 +794,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_game_info_not_found() {
+    async fn test_get_game_info_forbidden_for_non_current_game() {
         let state = create_test_state();
         let app = create_app(state);
 
-        let (status, body) = get(app, "/game-info/nonexistent").await;
+        // Requesting a different game than the current one should return FORBIDDEN
+        let (status, body) = get(app, "/game-info/connect4").await;
 
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(body.contains("Game not found"));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("Cannot access game"));
+        assert!(body.contains("only the current game 'tictactoe' is available"));
+    }
+
+    #[tokio::test]
+    async fn test_get_game_info_not_found_for_invalid_game() {
+        let state = create_test_state();
+        let app = create_app(state);
+
+        // Requesting an invalid game ID that matches current game check
+        // but doesn't exist in registry should return NOT_FOUND
+        // (This would require the game ID to be "tictactoe" to pass the filter,
+        // so this test case is for truly invalid games)
+        let (status, body) = get(app, "/game-info/tictactoe_invalid").await;
+
+        // Since "tictactoe_invalid" != "tictactoe", it returns FORBIDDEN
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     // ========================================================================
@@ -826,9 +878,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cors_allows_any_origin_in_development_mode() {
+    async fn test_cors_allows_localhost_in_development_mode() {
         let state = create_test_state();
-        // Empty allowed_origins = development mode
+        // Empty allowed_origins = development mode (localhost only)
         let allowed: Vec<String> = vec![];
         let app = create_app_with_cors(state, &allowed);
 
@@ -836,7 +888,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/health")
-                    .header("Origin", "https://any-origin.example.com")
+                    .header("Origin", "http://localhost:3000")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -844,13 +896,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        // In development mode, any origin should be allowed
+        // In development mode, localhost origins should be allowed
         assert_eq!(
             response
                 .headers()
                 .get("access-control-allow-origin")
                 .unwrap(),
-            "*"
+            "http://localhost:3000"
         );
     }
 

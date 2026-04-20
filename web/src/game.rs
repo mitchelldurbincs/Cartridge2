@@ -169,9 +169,10 @@ impl GameSession {
     /// Parse state bytes into board, current_player, winner
     fn parse_state(state: &[u8], board_size: usize) -> Result<(Vec<u8>, u8, u8)> {
         let expected_len = board_size + 2; // board + current_player + winner
-        if state.len() != expected_len {
+                                           // Use <= to allow games with extra state fields (like pass_count in Othello)
+        if state.len() < expected_len {
             return Err(anyhow!(
-                "Invalid state length: expected {}, got {}",
+                "Invalid state length: expected at least {}, got {}",
                 expected_len,
                 state.len()
             ));
@@ -433,12 +434,10 @@ mod tests {
         // Corrupt the observation buffer to simulate a mismatch with metadata
         session.obs.truncate(4);
 
-        // With short observation, GameMetadata::extract_legal_mask uses permissive fallback
-        // (all moves legal) to prevent MCTS from getting stuck. This is safer than
-        // returning empty since the game's step() will reject invalid moves anyway.
-        assert_eq!(session.legal_moves().len(), 9); // All 9 moves as fallback
-
-        // is_action_legal checks bounds and returns false for short observation
+        // With short observation, is_action_legal returns false for all actions
+        // because the byte offsets are out of bounds. This means legal_moves()
+        // returns empty and is_legal_move() returns false.
+        assert_eq!(session.legal_moves().len(), 0);
         assert!(!session.is_legal_move(0));
     }
 }

@@ -172,9 +172,10 @@ impl GameMetadata {
     /// # Returns
     /// A vector of action indices that are legal.
     pub fn extract_legal_moves(&self, obs: &[u8]) -> Vec<usize> {
-        let mask = self.extract_legal_mask(obs);
+        // For games with >64 actions (like Othello with 65), we can't use u64 bitmask
+        // without overflow. Read directly from observation array instead.
         (0..self.num_actions)
-            .filter(|&i| (mask & (1u64 << i)) != 0)
+            .filter(|&i| self.is_action_legal(obs, i))
             .collect()
     }
 

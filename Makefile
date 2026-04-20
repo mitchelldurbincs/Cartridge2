@@ -1,93 +1,218 @@
-# Helpers for Cartridge2 development
+# Cartridge2 Makefile
 #
-# PostgreSQL is required for the replay buffer.
-# Set CARTRIDGE_STORAGE_POSTGRES_URL env var or use Docker Compose.
+# Quick start (macOS Apple Silicon):
+#   make setup        # one-time: install deps, create DB, build everything
+#   make train        # run AlphaZero training loop
+#
+# Quick start (Linux / Docker):
+#   docker compose up alphazero
+#
+# Common targets:
+#   make setup        - One-time setup (postgres, trainer, actor build)
+#   make train        - Run synchronized AlphaZero training loop
+#   make play         - Start web server + frontend to play against model
+#   make test         - Run all tests
+#   make lint         - Run all linters
+#   make clean        - Remove training artifacts
 
-ENV_ID                ?= tictactoe
-ACTOR_EPISODES        ?= 50
-ACTOR_LOG_INTERVAL    ?= 10
-TRAIN_STEPS           ?= 50
-TRAIN_BATCH           ?= 32
-TRAIN_DEVICE          ?= cpu
+# --- Configuration (override with env vars or `make VAR=value`) ---
 
-PYTHON                ?= python3
-CARGO                 ?= cargo
-NPM                   ?= npm
-VENV                  := $(HOME)/venvs/cartridge2
-VENV_PIP              := $(VENV)/bin/pip
-VENV_PYTHON           := $(VENV)/bin/python
+PYTHON           ?= python3
+CARGO            ?= cargo
+NPM              ?= npm
+VENV_DIR         ?= .venv
 
-# AlphaZero training iterations (actor + trainer cycles)
-ITERATIONS            ?= 5
+# Detect OS for platform-specific defaults
+UNAME            := $(shell uname -s)
+ARCH             := $(shell uname -m)
 
-.PHONY: data actor trainer web-backend frontend-dev full-loop train-loop trainer-install venv clean-data clean-models clean-all \
-        actor-tictactoe actor-connect4 train-loop-tictactoe train-loop-connect4 postgres-up postgres-down
+# CoreML feature flag: auto-enable on Apple Silicon
+ifeq ($(UNAME)-$(ARCH),Darwin-arm64)
+  CARGO_FEATURES ?= --features coreml
+else
+  CARGO_FEATURES ?=
+endif
 
-# Data directory setup
+# Training defaults (override via config.toml or env vars)
+ITERATIONS       ?= 50
+EPISODES         ?= 500
+STEPS            ?= 400
+
+.PHONY: help setup setup-db setup-trainer setup-actor setup-frontend \
+        train play web frontend \
+        test test-engine test-actor test-web test-trainer \
+        lint lint-rust lint-python lint-frontend \
+        build build-actor build-web \
+        clean clean-data clean-models clean-all \
+        db-start db-stop db-reset
+
+# --- Help ---
+
+help:
+	@echo "Cartridge2 - AlphaZero Training Platform"
+	@echo ""
+	@echo "Setup (run once):"
+	@echo "  make setup          - Full setup: DB + trainer + actor + frontend"
+	@echo "  make setup-db       - Create PostgreSQL database"
+	@echo "  make setup-trainer  - Install Python trainer package"
+	@echo "  make setup-actor    - Build actor binary (release)"
+	@echo "  make setup-frontend - Install frontend npm packages"
+	@echo ""
+	@echo "Training:"
+	@echo "  make train          - Run AlphaZero training loop"
+	@echo "  make train ITERATIONS=100 EPISODES=1000 STEPS=800"
+	@echo ""
+	@echo "Play:"
+	@echo "  make play           - Start web server + frontend dev server"
+	@echo ""
+	@echo "Development:"
+	@echo "  make test           - Run all tests"
+	@echo "  make lint           - Run all linters"
+	@echo "  make build          - Build all Rust binaries (release)"
+	@echo ""
+	@echo "Cleanup:"
+	@echo "  make clean          - Remove training data and models"
+	@echo "  make db-reset       - Clear replay buffer in PostgreSQL"
+
+# --- One-time setup ---
+
+setup: setup-db setup-trainer setup-actor setup-frontend
+	@echo ""
+	@echo "Setup complete! Run 'make train' to start training."
+
+setup-db:
+	@echo "--- Setting up PostgreSQL ---"
+ifeq ($(UNAME),Darwin)
+	@brew list postgresql@16 >/dev/null 2>&1 || brew install postgresql@16
+	@brew services start postgresql@16 2>/dev/null || true
+	@sleep 1
+endif
+	@createdb cartridge 2>/dev/null || true
+	@psql cartridge -c "DO \$$\$$ BEGIN \
+		IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'cartridge') THEN \
+			CREATE ROLE cartridge WITH LOGIN PASSWORD 'cartridge'; \
+		END IF; \
+	END \$$\$$;" 2>/dev/null || true
+	@psql cartridge -c "GRANT ALL PRIVILEGES ON DATABASE cartridge TO cartridge;" 2>/dev/null || true
+	@psql cartridge -c "GRANT ALL ON SCHEMA public TO cartridge;" 2>/dev/null || true
+	@echo "PostgreSQL ready."
+
+setup-trainer:
+	@echo "--- Installing trainer ---"
+	@if [ ! -d "$(VENV_DIR)" ]; then \
+		$(PYTHON) -m venv $(VENV_DIR); \
+		echo "Created virtual environment at $(VENV_DIR)"; \
+	fi
+	$(VENV_DIR)/bin/pip install -e "trainer/.[dev]"
+
+setup-actor: build-actor
+
+setup-frontend:
+	@echo "--- Installing frontend ---"
+	cd web/frontend && $(NPM) install
+
+# --- Build ---
+
+build: build-actor build-web
+
+build-actor:
+	@echo "--- Building actor (release) $(CARGO_FEATURES) ---"
+	cd actor && $(CARGO) build --release $(CARGO_FEATURES)
+
+build-web:
+	@echo "--- Building web server (release) ---"
+	cd web && $(CARGO) build --release
+
+# --- Training ---
+
 data:
-	mkdir -p data data/models
+	@mkdir -p data data/models
 
-# PostgreSQL management (convenience targets)
-postgres-up:
-	docker compose up postgres -d
+train: data
+	$(VENV_DIR)/bin/python -m trainer loop \
+		--iterations $(ITERATIONS) \
+		--episodes $(EPISODES) \
+		--steps $(STEPS)
 
-postgres-down:
-	docker compose down postgres
+# --- Play ---
 
-# Clean targets
-clean-data:
-	rm -f ./data/stats.json ./data/loop_stats.json ./data/eval_stats.json ./data/best_model.json
-	# Note: PostgreSQL data persists in volume, use 'docker compose down -v' to clear
+play:
+	@echo "Starting web server and frontend..."
+	@echo "Open http://localhost:5173 in your browser"
+	@$(MAKE) -j2 web frontend
 
-clean-models:
-	rm -f ./data/models/*.onnx ./data/models/*.onnx.data ./data/models/*.pt
-
-clean-all: clean-data clean-models
-	rm -rf ./data/
-
-# Virtual environment setup
-$(VENV):
-	$(PYTHON) -m venv $(VENV)
-
-# Run self-play to populate replay buffer (requires PostgreSQL)
-actor: data postgres-up
-	cd actor && $(CARGO) run -- --env-id $(ENV_ID) --max-episodes $(ACTOR_EPISODES) --log-interval $(ACTOR_LOG_INTERVAL) --data-dir ../data
-
-# Game-specific actor shortcuts
-actor-tictactoe: data postgres-up
-	$(MAKE) actor ENV_ID=tictactoe
-
-actor-connect4: data postgres-up
-	$(MAKE) actor ENV_ID=connect4
-
-# Install trainer dependencies
-trainer-install: $(VENV)
-	$(VENV_PIP) install -e trainer/
-
-# Train on replay buffer data (requires PostgreSQL)
-trainer: data postgres-up
-	$(VENV_PYTHON) -m trainer train --steps $(TRAIN_STEPS) --batch-size $(TRAIN_BATCH) --device $(TRAIN_DEVICE) --env-id $(ENV_ID)
-
-# Start the Rust backend (Axum)
-web-backend: data
+web:
 	cd web && $(CARGO) run
 
-# Start the Svelte frontend dev server
-frontend-dev:
-	cd web/frontend && $(NPM) install && $(NPM) run dev
+frontend:
+	cd web/frontend && $(NPM) run dev
 
-# Convenience: run actor then trainer with small defaults
-full-loop: actor trainer
+# --- Testing ---
 
-# AlphaZero training loop: synchronized actor + trainer + evaluation
-# Usage: make train-loop ITERATIONS=5 ACTOR_EPISODES=500 TRAIN_STEPS=1000
-train-loop: data postgres-up
-	@echo "Starting synchronized AlphaZero training loop..."
-	$(VENV_PYTHON) -m trainer loop --iterations $(ITERATIONS) --episodes $(ACTOR_EPISODES) --steps $(TRAIN_STEPS) --device $(TRAIN_DEVICE) --env-id $(ENV_ID)
+test: test-engine test-actor test-web test-trainer
 
-# Game-specific training loop shortcuts
-train-loop-tictactoe: data postgres-up
-	$(MAKE) train-loop ENV_ID=tictactoe
+test-engine:
+	$(CARGO) test --manifest-path engine/Cargo.toml
 
-train-loop-connect4: data postgres-up
-	$(MAKE) train-loop ENV_ID=connect4
+test-actor:
+	$(CARGO) test --manifest-path actor/Cargo.toml
+
+test-web:
+	$(CARGO) test --manifest-path web/Cargo.toml
+
+test-trainer:
+	$(VENV_DIR)/bin/python -m pytest trainer/tests/ -v --tb=short
+
+# --- Linting ---
+
+lint: lint-rust lint-python
+
+lint-rust:
+	$(CARGO) fmt --check --manifest-path engine/Cargo.toml
+	$(CARGO) fmt --check --manifest-path actor/Cargo.toml
+	$(CARGO) fmt --check --manifest-path web/Cargo.toml
+	$(CARGO) clippy --manifest-path engine/Cargo.toml --all-targets -- -D warnings
+	$(CARGO) clippy --manifest-path actor/Cargo.toml --all-targets -- -D warnings
+	$(CARGO) clippy --manifest-path web/Cargo.toml --all-targets -- -D warnings
+
+lint-python:
+	$(VENV_DIR)/bin/python -m ruff check trainer/src/
+	$(VENV_DIR)/bin/python -m black --check trainer/src/
+
+lint-frontend:
+	cd web/frontend && $(NPM) run check
+
+# --- Database ---
+
+db-start:
+ifeq ($(UNAME),Darwin)
+	brew services start postgresql@16
+else
+	@echo "Start PostgreSQL with: sudo systemctl start postgresql"
+endif
+
+db-stop:
+ifeq ($(UNAME),Darwin)
+	brew services stop postgresql@16
+else
+	@echo "Stop PostgreSQL with: sudo systemctl stop postgresql"
+endif
+
+db-reset:
+	@echo "Clearing replay buffer..."
+	psql postgresql://cartridge:cartridge@localhost:5432/cartridge \
+		-c "DELETE FROM transitions;" 2>/dev/null || true
+	@echo "Replay buffer cleared."
+
+# --- Cleanup ---
+
+clean: clean-data clean-models
+
+clean-data:
+	rm -f data/stats.json data/loop_stats.json data/eval_stats.json data/best_model.json
+
+clean-models:
+	rm -f data/models/*.onnx data/models/*.onnx.data data/models/*.pt
+
+clean-all: clean-data clean-models
+	rm -rf data/

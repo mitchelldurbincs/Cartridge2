@@ -18,7 +18,7 @@ def test_configure_parser_adds_expected_arguments():
     assert config.grad_clip_norm == 1.0
     assert config.use_lr_scheduler is True
     assert config.total_steps == 1000
-    assert config.device == "cpu"
+    assert config.device == "auto"
 
 
 def test_from_args_overrides_defaults_and_actions():

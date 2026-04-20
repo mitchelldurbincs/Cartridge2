@@ -75,6 +75,28 @@ impl OnnxEvaluator {
         }
     }
 
+    /// Register CoreML execution provider if the `coreml` feature is enabled.
+    /// Falls back silently to CPU if CoreML is unavailable (e.g. on non-Apple platforms).
+    fn register_coreml_ep(
+        builder: ort::session::builder::SessionBuilder,
+    ) -> Result<ort::session::builder::SessionBuilder, EvaluatorError> {
+        #[cfg(feature = "coreml")]
+        {
+            let coreml_ep = ort::ep::CoreML::default().build();
+            debug!("Attempting to register CoreML execution provider");
+            return builder.with_execution_providers([coreml_ep]).map_err(|e| {
+                EvaluatorError::ModelError(format!(
+                    "Failed to register CoreML execution provider: {}",
+                    e
+                ))
+            });
+        }
+        #[cfg(not(feature = "coreml"))]
+        {
+            Ok(builder)
+        }
+    }
+
     /// Load an ONNX model from the given path.
     ///
     /// # Arguments
@@ -87,12 +109,18 @@ impl OnnxEvaluator {
         intra_threads: usize,
     ) -> Result<Self, EvaluatorError> {
         let threads = Self::resolve_intra_threads(intra_threads);
-        let session = Session::builder()
+        let builder = Session::builder()
             .map_err(|e| {
                 EvaluatorError::ModelError(format!("Failed to create session builder: {}", e))
             })?
             .with_intra_threads(threads)
-            .map_err(|e| EvaluatorError::ModelError(format!("Failed to set intra threads: {}", e)))?
+            .map_err(|e| {
+                EvaluatorError::ModelError(format!("Failed to set intra threads: {}", e))
+            })?;
+
+        let mut builder = Self::register_coreml_ep(builder)?;
+
+        let session = builder
             .commit_from_file(model_path)
             .map_err(|e| EvaluatorError::ModelError(format!("Failed to load model: {}", e)))?;
 
@@ -118,16 +146,20 @@ impl OnnxEvaluator {
         intra_threads: usize,
     ) -> Result<Self, EvaluatorError> {
         let threads = Self::resolve_intra_threads(intra_threads);
-        let session = Session::builder()
+        let builder = Session::builder()
             .map_err(|e| {
                 EvaluatorError::ModelError(format!("Failed to create session builder: {}", e))
             })?
             .with_intra_threads(threads)
-            .map_err(|e| EvaluatorError::ModelError(format!("Failed to set intra threads: {}", e)))?
-            .commit_from_memory(model_data)
             .map_err(|e| {
-                EvaluatorError::ModelError(format!("Failed to load model from memory: {}", e))
+                EvaluatorError::ModelError(format!("Failed to set intra threads: {}", e))
             })?;
+
+        let mut builder = Self::register_coreml_ep(builder)?;
+
+        let session = builder.commit_from_memory(model_data).map_err(|e| {
+            EvaluatorError::ModelError(format!("Failed to load model from memory: {}", e))
+        })?;
 
         Ok(Self {
             session: Mutex::new(session),

@@ -37,7 +37,7 @@ def create_replay_buffer(
         CARTRIDGE_STORAGE_POSTGRES_URL
         CARTRIDGE_POSTGRES_URL
     """
-    # Get connection string from argument or env
+    # Get connection string from argument or environment
     if connection_string is None:
         connection_string = os.environ.get(
             "CARTRIDGE_STORAGE_POSTGRES_URL",

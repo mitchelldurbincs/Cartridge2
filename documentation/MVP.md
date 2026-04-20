@@ -5,11 +5,11 @@ I think I can reuse the engine-rust and the actor from Cartridge
 Big Game Goals:
 * Tic tac toe (COMPLETE)
 * Connect 4 (COMPLETE)
-* Othello
+* Othello (COMPLETE)
 
-Here is your rewritten design document, streamlined for the **Monolithic MVP** approach (v2).
+Here is your rewritten design document, streamlined for the **Monolithic/Filesystem MVP** approach (v2).
 
-### Cartridge 2 (Monolithic MVP)
+### Cartridge 2 (Filesystem MVP)
 
 Be able to visualize training of AlphaZero AND be able to play against it (without the DevOps headache).
 
@@ -19,7 +19,7 @@ I will reuse the engine-rust code, but refactor it from a Service into a Library
 
 - Tic tac toe (COMPLETE)
 - Connect 4 (COMPLETE)
-- Othello
+- Othello (COMPLETE)
 
 **I want to:**
 
@@ -30,8 +30,8 @@ I will reuse the engine-rust code, but refactor it from a Service into a Library
 
 **Components**
 
-- **Shared Resources** - PostgreSQL replay buffer + filesystem/S3 model storage (`./data/models/`).
-- **Rust Services** - Engine library + Actor (self-play) + Web server (play API/UI backend).
+- **Shared Filesystem** - The "glue" between processes (`./data/replays/` and `./data/models/`).
+- **Rust Monolith** - Handles Game Logic, MCTS, Self-Play, and serving the Web API.
 - **Python Trainer** - Handles the Neural Network training loop.
 
 **MVP:**
@@ -87,7 +87,7 @@ let step = ctx.step(&reset.state, &action).unwrap();
 
 **Status: COMPLETE**
 
-PostgreSQL Database - A shared concurrent replay buffer for actor and trainer.
+PostgreSQL database - A concurrent, persistent replay buffer shared by actors and the trainer.
 
 - **Actor (Rust):** Connects to PostgreSQL and inserts transitions with:
   - Game state and observations
@@ -96,7 +96,7 @@ PostgreSQL Database - A shared concurrent replay buffer for actor and trainer.
 
 - **Learner (Python):**
     - **Sampling:** Fetches randomized batches of transitions with policy targets and game outcomes.
-    - **Window Management:** Periodically cleans up old transitions to bound buffer size.
+    - **Buffer clearing:** In synchronized mode, the buffer is cleared each iteration so training data comes from the current model only.
 ## Weights
 
 **Status: COMPLETE**
@@ -114,7 +114,7 @@ A single file: `./data/models/latest.onnx`
 Python training loop that trains the network on data from PostgreSQL and publishes versioned models safely.
 
 **Process:**
-1. **Data Loading (PostgreSQL):** Runs SQL queries to fetch randomized batches of transitions with MCTS policy targets and game outcomes.
+1. **Data Loading (PostgreSQL):** Fetches randomized batches of transitions with MCTS policy targets and game outcomes.
 2. **Training:** Updates the PyTorch model parameters θ to minimize the combined AlphaZero loss:
    - Policy: Cross-entropy with soft MCTS visit distribution targets
    - Value: MSE with propagated game outcomes

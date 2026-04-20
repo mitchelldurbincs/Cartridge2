@@ -169,8 +169,8 @@ Examples:
         "--device",
         type=str,
         default=cfg.training.device,
-        choices=["cpu", "cuda", "mps"],
-        help="Training device",
+        choices=["auto", "cpu", "cuda", "mps"],
+        help="Training device (auto = detect best available)",
     )
 
     # Evaluation settings

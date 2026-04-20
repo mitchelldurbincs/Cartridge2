@@ -17,6 +17,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Use defaults for CI to avoid needing .env file
+  MINIO_ROOT_USER: minioadmin
+  MINIO_ROOT_PASSWORD: testpassword123
 
 jobs:
   # ============================================
@@ -112,6 +115,30 @@ jobs:
       - name: Build web
         run: cargo build --release --manifest-path web/Cargo.toml
 
+  rust-security-audit:
+    name: Rust Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            engine
+            actor
+            web
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+      - name: Run cargo audit (engine)
+        run: cargo audit --manifest-path engine/Cargo.toml
+        continue-on-error: true
+      - name: Run cargo audit (actor)
+        run: cargo audit --manifest-path actor/Cargo.toml
+        continue-on-error: true
+      - name: Run cargo audit (web)
+        run: cargo audit --manifest-path web/Cargo.toml
+        continue-on-error: true
+
   # ============================================
   # Python Jobs (Trainer)
   # ============================================
@@ -163,6 +190,25 @@ jobs:
       - name: Run pytest
         run: pytest
 
+  python-security-audit:
+    name: Python Security Audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: trainer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: trainer/pyproject.toml
+      - name: Install pip-audit
+        run: pip install pip-audit
+      - name: Run pip-audit
+        run: pip-audit
+        continue-on-error: true
+
   # ============================================
   # Frontend Jobs (Svelte/TypeScript)
   # ============================================
@@ -181,7 +227,64 @@ jobs:
           cache-dependency-path: web/frontend/package-lock.json
       - name: Install dependencies
         run: npm ci
+      - name: Run npm audit
+        run: npm audit
+        continue-on-error: true
       - name: Svelte check (TypeScript)
         run: npm run check
       - name: Build
         run: npm run build
+
+  # ============================================
+  # Docker Build Validation
+  # ============================================
+  docker-build:
+    name: Docker Build Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build AlphaZero image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.alphazero
+          push: false
+          tags: cartridge-alphazero:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build Web image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./web/Dockerfile
+          push: false
+          tags: cartridge-web:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build Frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./web/frontend
+          file: ./web/frontend/Dockerfile
+          push: false
+          tags: cartridge-frontend:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ============================================
+  # Secrets Scanning
+  # ============================================
+  secrets-scan:
+    name: Secrets Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run GitLeaks
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

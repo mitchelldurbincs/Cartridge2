@@ -8,7 +8,13 @@ via ReplayBuffer.get_metadata(). The hardcoded values here are fallbacks
 for backward compatibility with databases that don't have metadata.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass
@@ -56,6 +62,34 @@ class GameConfig:
         """End index of legal mask in observation."""
         return self.legal_mask_offset + self.num_actions
 
+    @property
+    def player_indicator_offset(self) -> int:
+        """Start index of the 2-element player one-hot in observation."""
+        return self.legal_mask_end
+
+    def extract_legal_mask(self, obs: torch.Tensor) -> torch.Tensor:
+        """Extract the legal move mask from a batch of observations.
+
+        Args:
+            obs: Observation tensor of shape (batch, obs_size).
+
+        Returns:
+            Legal mask tensor of shape (batch, num_actions).
+        """
+        return obs[:, self.legal_mask_offset : self.legal_mask_end]  # type: ignore[index]
+
+    def extract_player_indicator(self, obs: torch.Tensor) -> torch.Tensor:
+        """Extract the 2-element player one-hot from a batch of observations.
+
+        Args:
+            obs: Observation tensor of shape (batch, obs_size).
+
+        Returns:
+            Player indicator tensor of shape (batch, 2).
+        """
+        offset = self.player_indicator_offset
+        return obs[:, offset : offset + 2]  # type: ignore[index]
+
 
 # Game configuration registry (fallback values - prefer reading from DB)
 # These values MUST match the Rust engine implementations exactly.
@@ -89,8 +123,8 @@ GAME_CONFIGS: dict[str, GameConfig] = {
         display_name="Othello",
         board_width=8,
         board_height=8,
-        num_actions=64,
-        obs_size=195,  # 128 (board: 64*2) + 64 (legal) + 3 (player + pass)
+        num_actions=65,  # 64 board positions + 1 pass action
+        obs_size=195,  # 128 (board: 64*2) + 65 (legal) + 2 (player) = 195
         legal_mask_offset=128,
         hidden_size=512,
         network_type="resnet",

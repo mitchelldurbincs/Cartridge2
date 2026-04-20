@@ -148,8 +148,7 @@ class ConvPolicyValueNetwork(BasePolicyValueNetwork):
             planes.append(plane)
 
         # Current player plane: 1 for first player, -1 for second
-        player_offset = self.config.legal_mask_offset + self.config.num_actions
-        player_one_hot = x[:, player_offset : player_offset + 2]
+        player_one_hot = self.config.extract_player_indicator(x)
         current_player = player_one_hot[:, :1] - player_one_hot[:, 1:]
         player_plane = current_player.view(batch_size, 1, 1).expand(
             batch_size, self.board_height, self.board_width

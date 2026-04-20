@@ -50,7 +50,8 @@ class Trainer:
 
     def __init__(self, config: TrainerConfig):
         self.config = config
-        self.device = torch.device(config.device)
+        resolved_device = config.resolve_device()
+        self.device = torch.device(resolved_device)
 
         # Get game configuration
         self.game_config = get_config(config.env_id)
@@ -209,6 +210,191 @@ class Trainer:
         logger.info("Connecting to PostgreSQL replay buffer...")
         return create_replay_buffer()
 
+    def _setup_replay(self, replay, env_id: str) -> None:
+        """Set up the replay buffer: clear if needed, load metadata, wait for data.
+
+        Args:
+            replay: The replay buffer instance.
+            env_id: Environment identifier for filtering.
+
+        Raises:
+            WaitTimeout: If max_wait is exceeded waiting for data.
+        """
+        if self.config.clear_replay_on_start:
+            deleted = replay.clear_transitions()
+            logger.info(
+                f"Cleared {deleted} transitions from replay buffer before training"
+            )
+
+        # Try to get game metadata from database (preferred, self-describing)
+        db_metadata = replay.get_metadata(env_id)
+        if db_metadata:
+            logger.info(f"Using game metadata from database for {env_id}")
+            self.game_config = GameConfig(
+                env_id=db_metadata.env_id,
+                display_name=db_metadata.display_name,
+                board_width=db_metadata.board_width,
+                board_height=db_metadata.board_height,
+                num_actions=db_metadata.num_actions,
+                obs_size=db_metadata.obs_size,
+                legal_mask_offset=db_metadata.legal_mask_offset,
+            )
+        else:
+            logger.warning(
+                f"No metadata in database for {env_id}, using fallback config"
+            )
+
+        buffer_size = replay.count(env_id=env_id)
+        logger.info(f"Replay buffer contains {buffer_size} transitions for {env_id}")
+
+        # Wait for enough data with proper backoff
+        if buffer_size < self.config.batch_size:
+            self._wait_with_backoff(
+                lambda: replay.count(env_id=env_id) >= self.config.batch_size,
+                f"sufficient data ({self.config.batch_size} samples for {env_id})",
+            )
+            buffer_size = replay.count(env_id=env_id)
+            logger.info(f"Replay buffer now has {buffer_size} transitions for {env_id}")
+
+        self._buffer_size_cache = buffer_size
+        self.stats.replay_buffer_size = buffer_size
+
+    def _record_step_metrics(
+        self,
+        step: int,
+        global_step: int,
+        metrics: dict[str, float],
+        step_duration: float,
+        batch_size: int,
+        replay,
+        env_id: str,
+    ) -> None:
+        """Update stats, Prometheus metrics, rolling losses, and log progress.
+
+        Args:
+            step: Local step within this training run.
+            global_step: Global step across all training runs.
+            metrics: Loss metrics from the training step.
+            step_duration: Wall-clock time for the training step.
+            batch_size: Number of samples in the batch.
+            replay: Replay buffer (for periodic buffer size updates).
+            env_id: Environment identifier.
+        """
+        # Update stats
+        self.stats.total_loss = metrics["loss/total"]
+        self.stats.value_loss = metrics["loss/value"]
+        self.stats.policy_loss = metrics["loss/policy"]
+        self.stats.learning_rate = self.optimizer.param_groups[0]["lr"]
+        self.stats.samples_seen = self.samples_seen
+        self.stats.timestamp = time.time()
+
+        # Record Prometheus metrics
+        prom_metrics.record_training_step(
+            step=global_step,
+            total_loss=metrics["loss/total"],
+            value_loss=metrics["loss/value"],
+            policy_loss=metrics["loss/policy"],
+            learning_rate=self.optimizer.param_groups[0]["lr"],
+            duration_seconds=step_duration,
+            batch_size=batch_size,
+        )
+
+        # Update cached buffer size periodically
+        if step % self._buffer_size_update_interval == 0:
+            self._buffer_size_cache = replay.count(env_id=env_id)
+            prom_metrics.update_replay_buffer_size(self._buffer_size_cache)
+            prom_metrics.update_gpu_memory()
+        self.stats.replay_buffer_size = self._buffer_size_cache
+
+        # Track recent losses for rolling average
+        self._recent_losses.append(
+            {
+                "total": metrics["loss/total"],
+                "value": metrics["loss/value"],
+                "policy": metrics["loss/policy"],
+            }
+        )
+        if len(self._recent_losses) > self._rolling_window:
+            self._recent_losses.pop(0)
+
+        # Log progress
+        if step % self.config.log_interval == 0:
+            lr = self.optimizer.param_groups[0]["lr"]
+            n = len(self._recent_losses)
+            avg_total = sum(x["total"] for x in self._recent_losses) / n
+            avg_value = sum(x["value"] for x in self._recent_losses) / n
+            avg_policy = sum(x["policy"] for x in self._recent_losses) / n
+            logger.info(
+                f"Step {global_step} ({step}/{self.config.total_steps}): "
+                f"loss={metrics['loss/total']:.4f} "
+                f"(v={metrics['loss/value']:.4f}, p={metrics['loss/policy']:.4f}) "
+                f"avg100={avg_total:.4f} (v={avg_value:.4f}, p={avg_policy:.4f}) "
+                f"lr={lr:.2e}"
+            )
+
+        # Save stats (uses bounded append)
+        if step % self.config.stats_interval == 0:
+            history_entry = {
+                "step": global_step,
+                "total_loss": metrics["loss/total"],
+                "value_loss": metrics["loss/value"],
+                "policy_loss": metrics["loss/policy"],
+                "learning_rate": self.optimizer.param_groups[0]["lr"],
+            }
+            if "grad_norm" in metrics:
+                history_entry["grad_norm"] = metrics["grad_norm"]
+            self.stats.append_history(history_entry)
+            self._write_stats()
+
+    def _handle_replay_cleanup(self, global_step: int, replay, env_id: str) -> None:
+        """Clean up old replay transitions if configured.
+
+        Args:
+            global_step: Current global step.
+            replay: Replay buffer instance.
+            env_id: Environment identifier.
+        """
+        if (
+            self.config.replay_window > 0
+            and global_step % self._replay_cleanup_every == 0
+        ):
+            deleted = replay.cleanup(self.config.replay_window)
+            if deleted > 0:
+                logger.info(
+                    f"Replay cleanup removed {deleted} old transitions "
+                    f"(window={self.config.replay_window})"
+                )
+            self._buffer_size_cache = replay.count(env_id=env_id)
+            self.stats.replay_buffer_size = self._buffer_size_cache
+
+    def _handle_checkpoint_and_eval(self, step: int, global_step: int) -> None:
+        """Save checkpoint and run evaluation if due.
+
+        Args:
+            step: Local step within this training run.
+            global_step: Global step across all training runs.
+        """
+        checkpoint_path: Path | None = None
+
+        if step % self.config.checkpoint_interval == 0:
+            ckpt_start = time.time()
+            checkpoint_path = self._save_checkpoint(global_step)
+            ckpt_duration = time.time() - ckpt_start
+            prom_metrics.record_checkpoint(ckpt_duration)
+            self.stats.last_checkpoint = str(checkpoint_path)
+            logger.info(f"Saved checkpoint: {checkpoint_path}")
+
+        if (
+            self.config.eval_interval > 0
+            and global_step % self.config.eval_interval == 0
+        ):
+            if checkpoint_path is None:
+                checkpoint_path = self._save_checkpoint(global_step)
+                self.stats.last_checkpoint = str(checkpoint_path)
+                logger.info(f"Saved checkpoint for evaluation: {checkpoint_path}")
+            self._evaluate_checkpoint(checkpoint_path, global_step)
+            self._write_stats()
+
     def train(self) -> TrainerStats:
         """Run the training loop.
 
@@ -226,7 +412,6 @@ class Trainer:
         if self.lr_scheduler.config.enabled:
             logger.info(f"LR scheduler: {self.lr_scheduler}")
 
-        # Set Prometheus trainer info
         prom_metrics.set_trainer_info(
             env_id=self.config.env_id,
             device=self.config.device,
@@ -236,66 +421,17 @@ class Trainer:
         replay = self._create_replay_buffer()
         try:
             env_id = self.config.env_id
+            self._setup_replay(replay, env_id)
 
-            if self.config.clear_replay_on_start:
-                deleted = replay.clear_transitions()
-                logger.info(
-                    f"Cleared {deleted} transitions from replay buffer before training"
-                )
-
-            # Try to get game metadata from database (preferred, self-describing)
-            db_metadata = replay.get_metadata(env_id)
-            if db_metadata:
-                logger.info(f"Using game metadata from database for {env_id}")
-                # Override game_config with values from database
-                self.game_config = GameConfig(
-                    env_id=db_metadata.env_id,
-                    display_name=db_metadata.display_name,
-                    board_width=db_metadata.board_width,
-                    board_height=db_metadata.board_height,
-                    num_actions=db_metadata.num_actions,
-                    obs_size=db_metadata.obs_size,
-                    legal_mask_offset=db_metadata.legal_mask_offset,
-                )
-            else:
-                logger.warning(
-                    f"No metadata in database for {env_id}, using fallback config"
-                )
-
-            buffer_size = replay.count(env_id=env_id)
-            logger.info(
-                f"Replay buffer contains {buffer_size} transitions for {env_id}"
-            )
-
-            # Wait for enough data with proper backoff
-            if buffer_size < self.config.batch_size:
-                self._wait_with_backoff(
-                    lambda: replay.count(env_id=env_id) >= self.config.batch_size,
-                    f"sufficient data ({self.config.batch_size} samples for {env_id})",
-                )
-                buffer_size = replay.count(env_id=env_id)
-                logger.info(
-                    f"Replay buffer now has {buffer_size} transitions for {env_id}"
-                )
-
-            # Initialize buffer size cache
-            self._buffer_size_cache = buffer_size
-            self.stats.replay_buffer_size = buffer_size
-
-            # Training loop
-            # NOTE: We use a while loop instead of for loop so that the step counter
-            # only increments after successful training. This prevents the LR scheduler
-            # and checkpoint naming from advancing when batches are unavailable.
+            # Training loop — while loop so step only increments after successful training
             consecutive_skips = 0
             start_step = self.config.start_step
             step = 0
             while step < self.config.total_steps:
-                # Check for shutdown request
                 if self.config.shutdown_check and self.config.shutdown_check():
                     logger.info("Shutdown requested, stopping training early")
                     break
 
-                # Sample batch (filter by env_id and use correct num_actions)
                 batch = replay.sample_batch_tensors(
                     self.config.batch_size,
                     num_actions=self.game_config.num_actions,
@@ -306,133 +442,47 @@ class Trainer:
                     if consecutive_skips % LOG_EVERY_N_WAITS == 1:
                         logger.warning(
                             f"Not enough data for batch (need {self.config.batch_size}), "
-                            f"sleeping {self.config.wait_interval}s..."
+                            f"sleeping {self.config.wait_interval}s... "
+                            f"(skip {consecutive_skips}"
+                            f"/{self.config.max_consecutive_empty_batches or 'inf'})"
+                        )
+                    if (
+                        self.config.max_consecutive_empty_batches > 0
+                        and consecutive_skips
+                        >= self.config.max_consecutive_empty_batches
+                    ):
+                        raise RuntimeError(
+                            f"Replay buffer returned {consecutive_skips} consecutive "
+                            f"empty batches. The buffer may be empty or corrupted. "
+                            f"Increase --max-empty-batches or check data pipeline."
                         )
                     time.sleep(self.config.wait_interval)
-                    continue  # Don't increment step - retry until we get a batch
+                    continue
 
-                # Successfully got a batch - now increment step
                 step += 1
                 global_step = start_step + step
                 self.stats.step = global_step
-                checkpoint_path: Path | None = None
                 consecutive_skips = 0
                 observations, policy_targets, value_targets = batch
                 self.samples_seen += len(observations)
 
-                # Train step with timing
                 step_start = time.time()
                 metrics = self._train_step(observations, policy_targets, value_targets)
                 step_duration = time.time() - step_start
 
-                # Update learning rate (warmup then cosine annealing)
                 self.lr_scheduler.step()
 
-                # Update stats
-                self.stats.total_loss = metrics["loss/total"]
-                self.stats.value_loss = metrics["loss/value"]
-                self.stats.policy_loss = metrics["loss/policy"]
-                self.stats.learning_rate = self.optimizer.param_groups[0]["lr"]
-                self.stats.samples_seen = self.samples_seen
-                self.stats.timestamp = time.time()
-
-                # Record Prometheus metrics for this training step
-                prom_metrics.record_training_step(
-                    step=global_step,
-                    total_loss=metrics["loss/total"],
-                    value_loss=metrics["loss/value"],
-                    policy_loss=metrics["loss/policy"],
-                    learning_rate=self.optimizer.param_groups[0]["lr"],
-                    duration_seconds=step_duration,
-                    batch_size=len(observations),
+                self._record_step_metrics(
+                    step,
+                    global_step,
+                    metrics,
+                    step_duration,
+                    len(observations),
+                    replay,
+                    env_id,
                 )
-
-                # Use cached buffer size (update periodically to avoid expensive count() every step)
-                if step % self._buffer_size_update_interval == 0:
-                    self._buffer_size_cache = replay.count(env_id=env_id)
-                    prom_metrics.update_replay_buffer_size(self._buffer_size_cache)
-                    prom_metrics.update_gpu_memory()
-                self.stats.replay_buffer_size = self._buffer_size_cache
-
-                # Track recent losses for rolling average
-                self._recent_losses.append(
-                    {
-                        "total": metrics["loss/total"],
-                        "value": metrics["loss/value"],
-                        "policy": metrics["loss/policy"],
-                    }
-                )
-                if len(self._recent_losses) > self._rolling_window:
-                    self._recent_losses.pop(0)
-
-                # Log progress
-                if step % self.config.log_interval == 0:
-                    lr = self.optimizer.param_groups[0]["lr"]
-                    # Compute rolling averages
-                    n = len(self._recent_losses)
-                    avg_total = sum(x["total"] for x in self._recent_losses) / n
-                    avg_value = sum(x["value"] for x in self._recent_losses) / n
-                    avg_policy = sum(x["policy"] for x in self._recent_losses) / n
-                    logger.info(
-                        f"Step {global_step} ({step}/{self.config.total_steps}): "
-                        f"loss={metrics['loss/total']:.4f} "
-                        f"(v={metrics['loss/value']:.4f}, p={metrics['loss/policy']:.4f}) "
-                        f"avg100={avg_total:.4f} (v={avg_value:.4f}, p={avg_policy:.4f}) "
-                        f"lr={lr:.2e}"
-                    )
-
-                # Save stats (uses bounded append)
-                if step % self.config.stats_interval == 0:
-                    history_entry = {
-                        "step": global_step,
-                        "total_loss": metrics["loss/total"],
-                        "value_loss": metrics["loss/value"],
-                        "policy_loss": metrics["loss/policy"],
-                        "learning_rate": self.optimizer.param_groups[0]["lr"],
-                    }
-                    # Include gradient norm if available (when grad clipping is enabled)
-                    if "grad_norm" in metrics:
-                        history_entry["grad_norm"] = metrics["grad_norm"]
-                    self.stats.append_history(history_entry)
-                    self._write_stats()
-
-                if (
-                    self.config.replay_window > 0
-                    and global_step % self._replay_cleanup_every == 0
-                ):
-                    deleted = replay.cleanup(self.config.replay_window)
-                    if deleted > 0:
-                        logger.info(
-                            f"Replay cleanup removed {deleted} old transitions "
-                            f"(window={self.config.replay_window})"
-                        )
-                    # Update cache after cleanup (buffer size changed)
-                    self._buffer_size_cache = replay.count(env_id=env_id)
-                    self.stats.replay_buffer_size = self._buffer_size_cache
-
-                # Save checkpoint
-                if step % self.config.checkpoint_interval == 0:
-                    ckpt_start = time.time()
-                    checkpoint_path = self._save_checkpoint(global_step)
-                    ckpt_duration = time.time() - ckpt_start
-                    prom_metrics.record_checkpoint(ckpt_duration)
-                    self.stats.last_checkpoint = str(checkpoint_path)
-                    logger.info(f"Saved checkpoint: {checkpoint_path}")
-
-                # Run evaluation (based on global step count)
-                if (
-                    self.config.eval_interval > 0
-                    and global_step % self.config.eval_interval == 0
-                ):
-                    if checkpoint_path is None:
-                        checkpoint_path = self._save_checkpoint(global_step)
-                        self.stats.last_checkpoint = str(checkpoint_path)
-                        logger.info(
-                            f"Saved checkpoint for evaluation: {checkpoint_path}"
-                        )
-
-                    self._evaluate_checkpoint(checkpoint_path, global_step)
-                    self._write_stats()
+                self._handle_replay_cleanup(global_step, replay, env_id)
+                self._handle_checkpoint_and_eval(step, global_step)
 
             # Final checkpoint
             final_global_step = start_step + self.config.total_steps
@@ -466,9 +516,7 @@ class Trainer:
         value_targets_t = torch.from_numpy(value_targets).to(self.device)
 
         # Extract legal mask from observations using game-specific offsets
-        mask_start = self.game_config.legal_mask_offset
-        mask_end = mask_start + self.game_config.num_actions
-        legal_mask = obs_t[:, mask_start:mask_end]
+        legal_mask = self.game_config.extract_legal_mask(obs_t)
 
         # Forward pass
         policy_logits, value_pred = self.network(obs_t)

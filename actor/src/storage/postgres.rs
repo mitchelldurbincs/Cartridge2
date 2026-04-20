@@ -181,29 +181,6 @@ impl PostgresReplayStore {
         tracing::info!("PostgreSQL schema validated/created");
         Ok(())
     }
-
-    /// Get current pool statistics for monitoring.
-    #[allow(dead_code)]
-    pub fn pool_status(&self) -> PoolStatus {
-        let status = self.pool.status();
-        PoolStatus {
-            size: status.size,
-            available: status.available,
-            waiting: status.waiting,
-        }
-    }
-}
-
-/// Pool status for monitoring and debugging.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct PoolStatus {
-    /// Current number of connections in the pool.
-    pub size: usize,
-    /// Number of available (idle) connections.
-    pub available: usize,
-    /// Number of tasks waiting for a connection.
-    pub waiting: usize,
 }
 
 #[async_trait]
@@ -340,5 +317,101 @@ impl ReplayStore for PostgresReplayStore {
         let client = self.pool.get().await?;
         client.execute("DELETE FROM transitions", &[]).await?;
         Ok(())
+    }
+}
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pool_config_default() {
+        let config = PoolConfig::default();
+        assert_eq!(config.max_size, 16);
+        assert_eq!(config.connect_timeout_secs, 30);
+        assert_eq!(config.idle_timeout_secs, Some(300));
+    }
+
+    #[test]
+    fn test_pool_config_clone() {
+        let config = PoolConfig::default();
+        let cloned = config.clone();
+        assert_eq!(cloned.max_size, config.max_size);
+        assert_eq!(cloned.connect_timeout_secs, config.connect_timeout_secs);
+        assert_eq!(cloned.idle_timeout_secs, config.idle_timeout_secs);
+    }
+
+    #[test]
+    fn test_build_batch_insert_sql_single() {
+        let sql = build_batch_insert_sql(1);
+        assert!(sql.contains("INSERT INTO transitions"));
+        assert!(sql.contains("VALUES ($1"));
+        assert!(sql.contains("ON CONFLICT (id) DO UPDATE SET"));
+        // Should have 15 parameters for single row
+        assert!(sql.contains("$15)"));
+    }
+
+    #[test]
+    fn test_build_batch_insert_sql_multiple() {
+        let sql = build_batch_insert_sql(3);
+        assert!(sql.contains("INSERT INTO transitions"));
+        // Should have 3 value groups for 3 rows
+        assert!(sql.contains("($1"));
+        assert!(sql.contains("$16")); // Start of second row (15 + 1)
+        assert!(sql.contains("$31")); // Start of third row (30 + 1)
+        assert!(sql.contains("$45)")); // End of third row (3 * 15)
+    }
+
+    #[test]
+    fn test_build_batch_insert_sql_empty() {
+        let sql = build_batch_insert_sql(0);
+        assert!(sql.contains("INSERT INTO transitions"));
+        // No VALUES clause for empty batch
+        assert!(!sql.contains("VALUES"));
+    }
+
+    #[test]
+    fn test_build_batch_insert_sql_large_batch() {
+        let sql = build_batch_insert_sql(100);
+        assert!(sql.contains("INSERT INTO transitions"));
+        // Should have correct parameter count for 100 rows
+        assert!(sql.contains(&format!("${})", 100 * 15)));
+    }
+
+    #[test]
+    fn test_build_batch_insert_sql_includes_all_columns() {
+        let sql = build_batch_insert_sql(1);
+        // Verify all column names are present
+        assert!(sql.contains("id"));
+        assert!(sql.contains("env_id"));
+        assert!(sql.contains("episode_id"));
+        assert!(sql.contains("step_number"));
+        assert!(sql.contains("state"));
+        assert!(sql.contains("action"));
+        assert!(sql.contains("next_state"));
+        assert!(sql.contains("observation"));
+        assert!(sql.contains("next_observation"));
+        assert!(sql.contains("reward"));
+        assert!(sql.contains("done"));
+        assert!(sql.contains("timestamp"));
+        assert!(sql.contains("policy_probs"));
+        assert!(sql.contains("mcts_value"));
+        assert!(sql.contains("game_outcome"));
+    }
+
+    #[test]
+    fn test_build_batch_insert_sql_on_conflict_clause() {
+        let sql = build_batch_insert_sql(1);
+        // Verify the upsert behavior - only game_outcome and mcts_value should be updated
+        assert!(sql.contains("ON CONFLICT (id) DO UPDATE SET"));
+        assert!(sql.contains("game_outcome = EXCLUDED.game_outcome"));
+        assert!(sql.contains("mcts_value = EXCLUDED.mcts_value"));
+        // These should NOT be in the update clause
+        assert!(!sql.contains("env_id = EXCLUDED.env_id"));
+        assert!(!sql.contains("state = EXCLUDED.state"));
     }
 }

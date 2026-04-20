@@ -209,60 +209,40 @@ impl Actor {
             config.num_simulations, config.eval_batch_size, config.temp_threshold
         );
 
-        // Create model watcher (optional when --no-watch is set)
+        // Create model watcher and try to load existing model
         let model_dir = format!("{}/models", config.data_dir);
-        let model_watcher = if config.no_watch {
-            // No-watch mode: load model once at startup, no file watching
-            // Create a temporary watcher just to load the model, then discard it
-            let temp_watcher = ModelWatcher::new(
-                &model_dir,
-                "latest.onnx",
-                obs_size,
-                config.onnx_intra_threads,
-                mcts_policy.evaluator_ref(),
-            );
-            match temp_watcher.try_load_existing() {
-                Ok(true) => {
-                    info!("Loaded existing model (no-watch mode)");
-                    metrics::MODEL_LOADED.set(1);
-                    metrics::MODEL_RELOADS.inc();
-                }
-                Ok(false) => {
-                    info!("No existing model found, will use random policy (no-watch mode)");
-                    metrics::MODEL_LOADED.set(0);
-                }
-                Err(e) => {
-                    warn!("Failed to load existing model: {}", e);
-                    metrics::MODEL_LOADED.set(0);
-                }
-            }
-            None
+        let watcher = ModelWatcher::new(
+            &model_dir,
+            "latest.onnx",
+            obs_size,
+            config.onnx_intra_threads,
+            mcts_policy.evaluator_ref(),
+        );
+        let mode_label = if config.no_watch {
+            "no-watch mode"
         } else {
-            // Normal mode: create watcher for hot-reload
-            let watcher = ModelWatcher::new(
-                &model_dir,
-                "latest.onnx",
-                obs_size,
-                config.onnx_intra_threads,
-                mcts_policy.evaluator_ref(),
-            );
-            match watcher.try_load_existing() {
-                Ok(true) => {
-                    info!("Loaded existing model");
-                    metrics::MODEL_LOADED.set(1);
-                    metrics::MODEL_RELOADS.inc();
-                }
-                Ok(false) => {
-                    info!("No existing model found, will use random policy until model available");
-                    metrics::MODEL_LOADED.set(0);
-                }
-                Err(e) => {
-                    warn!("Failed to load existing model: {}", e);
-                    metrics::MODEL_LOADED.set(0);
-                }
-            }
-            Some(watcher)
+            "watch mode"
         };
+        match watcher.try_load_existing() {
+            Ok(true) => {
+                info!("Loaded existing model ({})", mode_label);
+                metrics::MODEL_LOADED.set(1);
+                metrics::MODEL_RELOADS.inc();
+            }
+            Ok(false) => {
+                info!(
+                    "No existing model found, will use random policy ({})",
+                    mode_label
+                );
+                metrics::MODEL_LOADED.set(0);
+            }
+            Err(e) => {
+                warn!("Failed to load existing model: {}", e);
+                metrics::MODEL_LOADED.set(0);
+            }
+        }
+        // In no-watch mode, discard the watcher (model loaded once at startup)
+        let model_watcher = if config.no_watch { None } else { Some(watcher) };
 
         // Initialize replay buffer (PostgreSQL with connection pooling)
         let storage_config = StorageConfig {
@@ -418,10 +398,9 @@ impl Actor {
                     metrics::EPISODE_STEPS.observe(steps as f64);
                     metrics::record_outcome(total_reward);
 
-                    // Update throughput gauge
-                    let elapsed = episode_start.elapsed().as_secs_f64();
-                    if elapsed > 0.0 {
-                        metrics::EPISODES_PER_SECOND.set(new_count as f64 / elapsed);
+                    // Update throughput gauge (episodes per second based on last episode duration)
+                    if duration > 0.0 {
+                        metrics::EPISODES_PER_SECOND.set(1.0 / duration);
                     }
 
                     // Record episode completion for health tracking
@@ -694,12 +673,6 @@ impl Actor {
         }
 
         Ok((steps_taken, total_reward, episode_stats))
-    }
-
-    /// Get current episode count (for testing)
-    #[allow(dead_code)]
-    pub fn episode_count(&self) -> u32 {
-        self.episode_count.load(Ordering::Relaxed)
     }
 }
 

@@ -28,7 +28,8 @@ Usage:
 import logging
 import os
 import sys
-from dataclasses import dataclass, field
+import threading
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,9 @@ else:
     import tomli as tomllib
 
 logger = logging.getLogger(__name__)
+
+# Thread-safe lock for config cache access
+_config_lock = threading.Lock()
 
 # Project root (where config.defaults.toml lives)
 _PROJECT_ROOT = Path(__file__).parent.parent.parent.parent.parent
@@ -79,7 +83,7 @@ class TrainingConfig:
     learning_rate: float = 0.001
     weight_decay: float = 0.0001
     grad_clip_norm: float = 1.0
-    device: str = "cpu"
+    device: str = "auto"
     checkpoint_interval: int = 100
     max_checkpoints: int = 10
     num_actors: int = 1  # Number of parallel actor processes for self-play
@@ -149,6 +153,15 @@ class StorageConfig:
 
 
 @dataclass
+class LoggingConfig:
+    """Logging format settings."""
+
+    format: str = "text"  # "text" or "json"
+    include_timestamps: bool = True
+    include_target: bool = True
+
+
+@dataclass
 class Config:
     """Root configuration container."""
 
@@ -159,6 +172,7 @@ class Config:
     web: WebConfig = field(default_factory=WebConfig)
     mcts: MctsConfig = field(default_factory=MctsConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
 
     # Convenience properties for commonly accessed paths
     @property
@@ -311,14 +325,28 @@ def _convert_value(value: str, section: str, key: str, data: dict) -> Any:
 
 def _dict_to_config(data: dict[str, Any]) -> Config:
     """Convert a dictionary to a Config object."""
+
+    def build_section(cls: type, section_name: str) -> Any:
+        section_data = data.get(section_name, {})
+        valid_fields = {f.name for f in fields(cls)}
+        filtered = {k: v for k, v in section_data.items() if k in valid_fields}
+        ignored = sorted(k for k in section_data if k not in valid_fields)
+        if ignored:
+            logger.debug(
+                "Ignoring unsupported config keys for %s: %s",
+                section_name,
+                ", ".join(ignored),
+            )
+        return cls(**filtered)
+
     return Config(
-        common=CommonConfig(**data.get("common", {})),
-        training=TrainingConfig(**data.get("training", {})),
-        evaluation=EvaluationConfig(**data.get("evaluation", {})),
-        actor=ActorConfig(**data.get("actor", {})),
-        web=WebConfig(**data.get("web", {})),
-        mcts=MctsConfig(**data.get("mcts", {})),
-        storage=StorageConfig(**data.get("storage", {})),
+        common=build_section(CommonConfig, "common"),
+        training=build_section(TrainingConfig, "training"),
+        evaluation=build_section(EvaluationConfig, "evaluation"),
+        actor=build_section(ActorConfig, "actor"),
+        web=build_section(WebConfig, "web"),
+        mcts=build_section(MctsConfig, "mcts"),
+        storage=build_section(StorageConfig, "storage"),
     )
 
 
@@ -334,6 +362,8 @@ def get_config(reload: bool = False) -> Config:
         2. User configuration (config.toml)
         3. Default configuration (config.defaults.toml)
 
+    This function is thread-safe and caches the configuration after first load.
+
     Args:
         reload: Force reload from file even if cached.
 
@@ -342,35 +372,46 @@ def get_config(reload: bool = False) -> Config:
     """
     global _cached_config
 
+    # Fast path: check cache without locking
     if _cached_config is not None and not reload:
         return _cached_config
 
-    # Step 1: Load defaults from config.defaults.toml
-    defaults_path = _find_defaults_file()
-    if defaults_path is not None:
-        logger.debug(f"Loading defaults from {defaults_path}")
-        with open(defaults_path, "rb") as f:
-            data = tomllib.load(f)
-    else:
-        logger.warning("No config.defaults.toml found, using hardcoded defaults")
-        data = {}
+    # Slow path: load config with lock
+    with _config_lock:
+        # Double-check after acquiring lock
+        if _cached_config is not None and not reload:
+            return _cached_config
 
-    # Step 2: Overlay user configuration from config.toml
-    config_path = _find_config_file()
-    if config_path is not None:
-        logger.info(f"Loading user configuration from {config_path}")
-        with open(config_path, "rb") as f:
-            user_data = tomllib.load(f)
-        data = _deep_merge(data, user_data)
+        # Step 1: Load defaults from config.defaults.toml
+        defaults_path = _find_defaults_file()
+        if defaults_path is not None:
+            logger.debug(f"Loading defaults from {defaults_path}")
+            with open(defaults_path, "rb") as f:
+                data = tomllib.load(f)
+        else:
+            logger.warning("No config.defaults.toml found, using hardcoded defaults")
+            data = {}
 
-    # Step 3: Apply environment variable overrides
-    data = _apply_env_overrides(data)
+        # Step 2: Overlay user configuration from config.toml
+        config_path = _find_config_file()
+        if config_path is not None:
+            logger.info(f"Loading user configuration from {config_path}")
+            with open(config_path, "rb") as f:
+                user_data = tomllib.load(f)
+            data = _deep_merge(data, user_data)
 
-    _cached_config = _dict_to_config(data)
-    return _cached_config
+        # Step 3: Apply environment variable overrides
+        data = _apply_env_overrides(data)
+
+        _cached_config = _dict_to_config(data)
+        return _cached_config
 
 
 def reset_config() -> None:
-    """Reset the cached config (mainly for testing)."""
+    """Reset the cached config (mainly for testing).
+
+    This function is thread-safe.
+    """
     global _cached_config
-    _cached_config = None
+    with _config_lock:
+        _cached_config = None

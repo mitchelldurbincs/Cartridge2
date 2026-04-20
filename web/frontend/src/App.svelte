@@ -84,6 +84,35 @@
     }
     loading = false;
   }
+
+  // Check if pass action is available (for games like Othello)
+  function canPass(): boolean {
+    if (!gameState || gameState.game_over) return false;
+    if (gameState.current_player !== gameState.human_player) return false;
+    // Pass action is typically the last action index (e.g., 64 for Othello's 65 actions)
+    const passAction = (gameInfo?.num_actions ?? 0) - 1;
+    return gameState.legal_moves.includes(passAction);
+  }
+
+  // Handle pass action
+  async function handlePass() {
+    if (loading || !gameState || gameState.game_over) return;
+    if (gameState.current_player !== gameState.human_player) return;
+    
+    const passAction = (gameInfo?.num_actions ?? 0) - 1;
+    if (!gameState.legal_moves.includes(passAction)) return;
+
+    loading = true;
+    error = null;
+    try {
+      const response: MoveResponse = await makeMove(passAction);
+      gameState = response;
+      lastBotMove = response.bot_move;
+    } catch (e) {
+      error = String(e);
+    }
+    loading = false;
+  }
 </script>
 
 <main>
@@ -133,6 +162,14 @@
 
           {#if error}
             <div class="error">{error}</div>
+          {/if}
+
+          {#if canPass()}
+            <div class="pass-section">
+              <button class="pass-button" onclick={handlePass} disabled={loading}>
+                Pass (No legal moves)
+              </button>
+            </div>
           {/if}
 
           <div class="controls">
@@ -289,5 +326,33 @@
   button:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+
+  /* Pass button styling */
+  .pass-section {
+    margin: 0.5rem 0;
+  }
+
+  .pass-button {
+    background: #ffa500;
+    color: #1a1a2e;
+    font-weight: bold;
+    animation: pulse 2s infinite;
+  }
+
+  .pass-button:hover:not(:disabled) {
+    background: #ff8c00;
+  }
+
+  @keyframes pulse {
+    0% {
+      box-shadow: 0 0 0 0 rgba(255, 165, 0, 0.7);
+    }
+    70% {
+      box-shadow: 0 0 0 10px rgba(255, 165, 0, 0);
+    }
+    100% {
+      box-shadow: 0 0 0 0 rgba(255, 165, 0, 0);
+    }
   }
 </style>
