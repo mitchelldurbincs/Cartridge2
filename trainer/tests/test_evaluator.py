@@ -319,6 +319,67 @@ class TestEvaluate:
         assert results8.games_played == 8
 
 
+class TestPlayGameOnMoveHook:
+    """Test the optional on_move callback of play_game."""
+
+    def test_hook_called_once_per_move_with_legal_action(self):
+        """Hook fires once per move; the action is legal in the pre-move state."""
+        calls = []
+
+        def hook(state, action, policy):
+            # Checked at call time: pre-move state must not be terminal and
+            # the chosen action must be legal in it.
+            assert not state.done
+            assert action in state.legal_moves()
+            calls.append((action, policy.name))
+
+        result = play_game(
+            player1=RandomPolicy(),
+            player2=RandomPolicy(),
+            player1_as=Player.FIRST,
+            env_id="tictactoe",
+            config=create_test_config("tictactoe"),
+            verbose=False,
+            on_move=hook,
+        )
+
+        assert len(calls) == result.moves
+
+    def test_hook_receives_acting_policy_alternation(self):
+        """The acting policy alternates, starting with the first player."""
+        recorded_names = []
+
+        def hook(state, action, policy):
+            recorded_names.append(policy.name)
+
+        play_game(
+            player1=MockPolicy("p1"),
+            player2=MockPolicy("p2"),
+            player1_as=Player.FIRST,
+            env_id="tictactoe",
+            config=create_test_config("tictactoe"),
+            verbose=False,
+            on_move=hook,
+        )
+
+        expected = ["p1" if i % 2 == 0 else "p2" for i in range(len(recorded_names))]
+        assert recorded_names == expected
+
+    def test_play_game_without_hook_unchanged(self):
+        """Explicit on_move=None behaves like the default."""
+        result = play_game(
+            player1=MockPolicy("p1", [4, 0, 8]),
+            player2=MockPolicy("p2", [1, 3]),
+            player1_as=Player.FIRST,
+            env_id="tictactoe",
+            config=create_test_config("tictactoe"),
+            verbose=False,
+            on_move=None,
+        )
+
+        assert result.moves >= 5
+
+
 class TestRandomPolicy:
     """Test RandomPolicy."""
 
