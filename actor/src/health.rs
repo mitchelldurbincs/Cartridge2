@@ -256,6 +256,11 @@ mod tests {
         assert!(state.is_making_progress(1));
     }
 
+    /// The bind tests occupy and release OS-assigned ports, which the OS hands
+    /// out roughly sequentially — run concurrently, one test's fallback scan can
+    /// steal the port another test just released. Serialize them.
+    static PORT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Bind an OS-assigned port, keeping the listener alive so the port stays taken.
     /// Retries until the port is low enough that the fallback scan cannot overflow u16.
     async fn occupy_free_port() -> (TcpListener, u16) {
@@ -270,6 +275,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bind_health_listener_uses_preferred_port() {
+        let _guard = PORT_TEST_LOCK.lock().await;
         // Find a free port, release it, then ask for it explicitly
         let (listener, port) = occupy_free_port().await;
         drop(listener);
@@ -280,6 +286,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bind_health_listener_falls_back_when_port_taken() {
+        let _guard = PORT_TEST_LOCK.lock().await;
         // Hold the preferred port so the fallback scan must kick in
         let (_held, port) = occupy_free_port().await;
 
@@ -297,6 +304,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bind_health_listener_two_actors_get_distinct_ports() {
+        let _guard = PORT_TEST_LOCK.lock().await;
         // Simulates two actors launched with the same --health-port
         let (first, port) = occupy_free_port().await;
         let second = bind_health_listener(port).await.unwrap();
