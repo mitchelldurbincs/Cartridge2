@@ -14,6 +14,7 @@ dependencies = [
     "tomli>=2.0.0;python_version<'3.11'",
     "prometheus-client>=0.20.0",
     "python-json-logger>=2.0.0",
+    "bitbully>=0.0.79",
 ]
 
 [project.optional-dependencies]
@@ -27,6 +28,7 @@ dev = [
 trainer = "trainer.__main__:main"
 trainer-loop = "trainer.orchestrator:main"
 trainer-evaluate = "trainer.evaluator:main"
+trainer-solver-eval = "trainer.solver_eval:main"
 # Legacy alias
 evaluator = "trainer.evaluator:main"
 
