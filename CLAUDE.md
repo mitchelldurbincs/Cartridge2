@@ -206,6 +206,7 @@ PyTorch training with AlphaZero-style learning and orchestration:
 - `python -m trainer train` - Train on replay buffer data
 - `python -m trainer evaluate` - Evaluate model against random baseline
 - `python -m trainer loop` - Synchronized AlphaZero training (actor + trainer + eval)
+- `python -m trainer solver-eval` - Score Connect4 model moves against the bitbully perfect solver
 
 **Features:**
 - Reads transitions from PostgreSQL replay buffer
@@ -303,6 +304,7 @@ cartridge2/
 │       ├── resnet.py      # ResNet architecture (used for Connect4, Othello)
 │       ├── replay.py      # Replay buffer interface
 │       ├── evaluator.py   # Model evaluation
+│       ├── solver_eval.py # Perfect-solver move-quality evaluation (Connect4)
 │       ├── game_config.py # Game-specific configs (auto-selects network type)
 │       ├── stats.py       # Training statistics
 │       ├── config.py      # TrainerConfig dataclass
@@ -556,6 +558,12 @@ python -m trainer train --steps 1000
 
 # Evaluate model against random play
 python -m trainer evaluate --model ./data/models/latest.onnx --games 100
+
+# Score Connect4 model decisions against a perfect solver (bitbully)
+# Metrics: value-optimal-move rate, blunder rate, exact-best rate
+# (overall / by ply bucket / by seat); appends to data/solver_stats.json
+python -m trainer solver-eval --model ./data/models/latest.onnx --games 100
+python -m trainer solver-eval --all-checkpoints --games 100   # progression across checkpoints
 
 # ======= Alternative: Continuous (non-synchronized) training =======
 # Actor and trainer run concurrently - mixes data from multiple model versions
