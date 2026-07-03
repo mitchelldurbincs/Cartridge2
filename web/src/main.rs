@@ -815,7 +815,7 @@ mod tests {
         // but doesn't exist in registry should return NOT_FOUND
         // (This would require the game ID to be "tictactoe" to pass the filter,
         // so this test case is for truly invalid games)
-        let (status, body) = get(app, "/game-info/tictactoe_invalid").await;
+        let (status, _body) = get(app, "/game-info/tictactoe_invalid").await;
 
         // Since "tictactoe_invalid" != "tictactoe", it returns FORBIDDEN
         assert_eq!(status, StatusCode::FORBIDDEN);

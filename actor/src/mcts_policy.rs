@@ -213,11 +213,10 @@ impl MctsPolicy {
                     (stats.expansion_time_us as f64 / stats.total_time_us as f64 * 100.0) as u32,
                 game_steps = stats.game_steps,
                 num_batches = stats.num_batches,
-                avg_batch_size = if stats.num_batches > 0 {
-                    stats.total_evals / stats.num_batches
-                } else {
-                    0
-                },
+                avg_batch_size = stats
+                    .total_evals
+                    .checked_div(stats.num_batches)
+                    .unwrap_or(0),
                 "MCTS step took >2s - performance issue detected"
             );
         }

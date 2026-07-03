@@ -79,7 +79,6 @@ pub async fn get_actor_stats(State(state): State<Arc<AppState>>) -> Json<ActorSt
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::types::{ActorStats, EvalStats, HistoryEntry, ModelInfoResponse, TrainingStats};
 
     #[test]

@@ -200,7 +200,6 @@ pub async fn make_move(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::types::{
         GameInfoResponse, GameStateResponse, GamesListResponse, MoveRequest, MoveResponse,
         NewGameRequest,
