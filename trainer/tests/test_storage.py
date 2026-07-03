@@ -533,6 +533,13 @@ class TestBufferManagement:
         assert metadata is not None
         assert metadata.env_id == "testgame"
 
+    def test_vacuum_runs_without_error(self, replay_buffer):
+        """VACUUM must run outside a transaction; exercise the autocommit toggle."""
+        replay_buffer.vacuum()
+
+        # Buffer is still usable afterwards
+        assert replay_buffer.count() == 0
+
 
 @requires_postgres
 class TestSampleBatchTensors:
