@@ -16,6 +16,7 @@ import pytest
 
 try:
     import torch
+
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
@@ -165,7 +166,9 @@ class TestTrainerTrainingStep:
         observations = np.random.randn(batch_size, obs_size).astype(np.float32)
         policy_targets = np.random.randn(batch_size, num_actions).astype(np.float32)
         # Softmax normalization for policy targets
-        policy_targets = np.exp(policy_targets) / np.exp(policy_targets).sum(axis=1, keepdims=True)
+        policy_targets = np.exp(policy_targets) / np.exp(policy_targets).sum(
+            axis=1, keepdims=True
+        )
         value_targets = np.random.randn(batch_size).astype(np.float32)
 
         # Execute training step (new signature takes numpy arrays)
@@ -198,7 +201,9 @@ class TestTrainerTrainingStep:
         # Create batch data as numpy arrays
         observations = np.random.randn(batch_size, obs_size).astype(np.float32)
         policy_targets = np.random.randn(batch_size, num_actions).astype(np.float32)
-        policy_targets = np.exp(policy_targets) / np.exp(policy_targets).sum(axis=1, keepdims=True)
+        policy_targets = np.exp(policy_targets) / np.exp(policy_targets).sum(
+            axis=1, keepdims=True
+        )
         value_targets = np.random.randn(batch_size).astype(np.float32)
 
         # Should not raise error (mask is extracted from observations internally)
@@ -352,3 +357,78 @@ class TestTrainerGameConfigs:
         assert trainer.game_config.board_width == 7
         assert trainer.game_config.board_height == 6
         assert trainer.game_config.num_actions == 7
+
+
+class TestMetricsHook:
+    """Test the per-step metrics_hook callback."""
+
+    def _make_trainer(self, tmp_path, hook):
+        config = TrainerConfig(
+            env_id="tictactoe",
+            model_dir=str(tmp_path / "models"),
+            stats_path=str(tmp_path / "stats.json"),
+            stats_interval=10,
+            metrics_hook=hook,
+        )
+        return Trainer(config)
+
+    def _step_metrics(self):
+        return {"loss/total": 1.5, "loss/value": 0.5, "loss/policy": 1.0}
+
+    def test_hook_called_at_stats_interval(self, tmp_path):
+        calls = []
+        trainer = self._make_trainer(
+            tmp_path, lambda payload, step: calls.append((payload, step))
+        )
+
+        trainer._record_step_metrics(
+            step=10,
+            global_step=410,
+            metrics=self._step_metrics(),
+            step_duration=0.01,
+            batch_size=8,
+            replay=MagicMock(),
+            env_id="tictactoe",
+        )
+
+        assert len(calls) == 1
+        payload, step = calls[0]
+        assert step == 410
+        assert payload["total_loss"] == 1.5
+        assert payload["value_loss"] == 0.5
+        assert payload["policy_loss"] == 1.0
+        assert "learning_rate" in payload
+        assert "samples_seen" in payload
+
+    def test_hook_not_called_off_interval(self, tmp_path):
+        calls = []
+        trainer = self._make_trainer(tmp_path, lambda payload, step: calls.append(step))
+
+        trainer._record_step_metrics(
+            step=7,  # not a multiple of stats_interval=10
+            global_step=407,
+            metrics=self._step_metrics(),
+            step_duration=0.01,
+            batch_size=8,
+            replay=MagicMock(),
+            env_id="tictactoe",
+        )
+
+        assert calls == []
+
+    def test_raising_hook_does_not_propagate(self, tmp_path):
+        def bad_hook(payload, step):
+            raise RuntimeError("hook exploded")
+
+        trainer = self._make_trainer(tmp_path, bad_hook)
+
+        # Must not raise
+        trainer._record_step_metrics(
+            step=10,
+            global_step=410,
+            metrics=self._step_metrics(),
+            step_duration=0.01,
+            batch_size=8,
+            replay=MagicMock(),
+            env_id="tictactoe",
+        )

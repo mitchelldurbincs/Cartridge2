@@ -8,11 +8,15 @@ import logging
 import shutil
 import time
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from ..evaluator import OnnxPolicy, RandomPolicy
 from ..evaluator import evaluate as run_eval
 from ..game_config import get_config as get_game_config
 from .config import LoopConfig
+
+if TYPE_CHECKING:
+    from ..wandb_logger import WandbLogger
 
 logger = logging.getLogger(__name__)
 
@@ -20,13 +24,15 @@ logger = logging.getLogger(__name__)
 class EvalRunner:
     """Manages model evaluation and best model (gatekeeper) tracking."""
 
-    def __init__(self, config: LoopConfig):
+    def __init__(self, config: LoopConfig, wandb_logger: "WandbLogger | None" = None):
         """Initialize the evaluation runner.
 
         Args:
             config: Loop configuration.
+            wandb_logger: Optional W&B logger for eval metrics.
         """
         self.config = config
+        self.wandb_logger = wandb_logger
         self.best_model_iteration: int | None = None
         self._load_best_model_info()
 
@@ -201,6 +207,20 @@ class EvalRunner:
                 "timestamp": datetime.now().isoformat(),
             }
             eval_history.append(eval_record)
+
+            if self.wandb_logger is not None:
+                wandb_metrics = {
+                    "eval/vs_best_win_rate": vs_best_win_rate,
+                    "eval/vs_best_draw_rate": vs_best_draw_rate,
+                    "eval/became_new_best": int(became_new_best),
+                    "eval/best_model_iteration": self.best_model_iteration,
+                    "eval/vs_random_win_rate": vs_random_win_rate,
+                    "eval/vs_random_draw_rate": vs_random_draw_rate,
+                }
+                self.wandb_logger.log(
+                    {k: v for k, v in wandb_metrics.items() if v is not None},
+                    step=iteration * self.config.steps_per_iteration,
+                )
 
             return vs_best_win_rate, vs_best_draw_rate, elapsed
 

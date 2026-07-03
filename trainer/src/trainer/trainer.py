@@ -346,6 +346,14 @@ class Trainer:
             self.stats.append_history(history_entry)
             self._write_stats()
 
+            if self.config.metrics_hook is not None:
+                try:
+                    payload = dict(history_entry)
+                    payload["samples_seen"] = self.samples_seen
+                    self.config.metrics_hook(payload, global_step)
+                except Exception as e:
+                    logger.warning(f"metrics_hook failed: {e}")
+
     def _handle_replay_cleanup(self, global_step: int, replay, env_id: str) -> None:
         """Clean up old replay transitions if configured.
 
