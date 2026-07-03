@@ -366,6 +366,7 @@ def _dict_to_config(data: dict[str, Any]) -> Config:
         web=build_section(WebConfig, "web"),
         mcts=build_section(MctsConfig, "mcts"),
         storage=build_section(StorageConfig, "storage"),
+        logging=build_section(LoggingConfig, "logging"),
         wandb=build_section(WandbConfig, "wandb"),
     )
 

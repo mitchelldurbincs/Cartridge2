@@ -7,23 +7,19 @@ This module tests:
 - Config reload functionality
 """
 
-import os
-import tempfile
 import threading
 import time
 from pathlib import Path
 
-import pytest
-
 from trainer.central_config import (
-    Config,
     CommonConfig,
-    TrainingConfig,
+    Config,
     EvaluationConfig,
+    LoggingConfig,
+    TrainingConfig,
+    _config_lock,
     get_config,
     reset_config,
-    _config_lock,
-    _cached_config,
 )
 
 
@@ -355,6 +351,53 @@ class TestConfigEdgeCases:
         assert all(isinstance(p, Path) for p in DEFAULTS_SEARCH_PATHS)
 
 
+class TestLoggingConfigSection:
+    """Regression tests for the [logging] section.
+
+    _dict_to_config() used to omit the logging section, so [logging] values
+    from config.toml (and CARTRIDGE_LOGGING_* overrides) never reached
+    Config.logging.
+    """
+
+    def test_logging_defaults(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+
+        config = get_config(reload=True)
+
+        assert isinstance(config.logging, LoggingConfig)
+        assert config.logging.format == "text"
+        assert config.logging.include_timestamps is True
+        assert config.logging.include_target is True
+
+    def test_toml_parses_logging_section(self, monkeypatch, tmp_path):
+        (tmp_path / "config.toml").write_text("""
+[logging]
+format = "json"
+include_timestamps = false
+include_target = false
+""")
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+
+        config = get_config(reload=True)
+
+        assert config.logging.format == "json"
+        assert config.logging.include_timestamps is False
+        assert config.logging.include_target is False
+
+    def test_env_overrides_logging_section(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+        monkeypatch.setenv("CARTRIDGE_LOGGING_FORMAT", "json")
+        monkeypatch.setenv("CARTRIDGE_LOGGING_INCLUDE_TIMESTAMPS", "false")
+
+        config = get_config(reload=True)
+
+        assert config.logging.format == "json"
+        assert config.logging.include_timestamps is False
+
+
 class TestWandbAndSolverConfig:
     """Test the [wandb] section and the new [evaluation] solver/promotion keys."""
 
@@ -384,8 +427,7 @@ class TestWandbAndSolverConfig:
         assert config.evaluation.promotion_margin == 0.01
 
     def test_toml_parses_wandb_and_solver_keys(self, monkeypatch, tmp_path):
-        (tmp_path / "config.toml").write_text(
-            """
+        (tmp_path / "config.toml").write_text("""
 [evaluation]
 solver_games = 25
 solver_seed = 7
@@ -398,8 +440,7 @@ project = "my-project"
 entity = "my-entity"
 group = "exp-group"
 tags = ["a", "b"]
-"""
-        )
+""")
         monkeypatch.chdir(tmp_path)
         reset_config()
         config = get_config(reload=True)
