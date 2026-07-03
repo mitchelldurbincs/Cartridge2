@@ -13,9 +13,11 @@ from typing import TYPE_CHECKING
 from ..evaluator import OnnxPolicy, RandomPolicy
 from ..evaluator import evaluate as run_eval
 from ..game_config import get_config as get_game_config
+from ..solver_eval import SolverScorer, append_solver_stats, solver_evaluate
 from .config import LoopConfig
 
 if TYPE_CHECKING:
+    from ..solver_eval import SolverEvalResults
     from ..wandb_logger import WandbLogger
 
 logger = logging.getLogger(__name__)
@@ -34,7 +36,54 @@ class EvalRunner:
         self.config = config
         self.wandb_logger = wandb_logger
         self.best_model_iteration: int | None = None
+        # Perfect-solver scoring: one scorer for the whole run (its position
+        # cache persists across iterations), disabled permanently on failure.
+        self._solver_scorer: SolverScorer | None = None
+        self._solver_disabled: bool = False
         self._load_best_model_info()
+
+    def _solver_enabled(self) -> bool:
+        """Solver eval runs only for connect4, when configured and healthy."""
+        return (
+            self.config.env_id == "connect4"
+            and self.config.solver_games > 0
+            and not self._solver_disabled
+        )
+
+    def _run_solver_eval(self, model_path, game_config) -> "SolverEvalResults | None":
+        """Score the candidate model's moves against the perfect solver.
+
+        Fail-soft: any solver problem (bitbully missing, calibration or
+        desync failure) logs a warning and disables solver eval for the
+        rest of the run — training must never crash over metrics.
+        """
+        if not self._solver_enabled():
+            return None
+
+        try:
+            if self._solver_scorer is None:
+                self._solver_scorer = SolverScorer()
+            model = OnnxPolicy(str(model_path), temperature=0.0)
+            results = solver_evaluate(
+                model=model,
+                opponent=RandomPolicy(),
+                scorer=self._solver_scorer,
+                env_id=self.config.env_id,
+                config=game_config,
+                num_games=self.config.solver_games,
+                seed=self.config.solver_seed,
+            )
+            logger.info(
+                f"Solver eval: value-optimal {results.overall.value_optimal_rate:.1%}, "
+                f"exact-best {results.overall.exact_best_rate:.1%}, "
+                f"blunders {results.overall.blunder_rate:.1%} "
+                f"({results.overall.positions} positions)"
+            )
+            return results
+        except (ImportError, RuntimeError) as e:
+            logger.warning(f"Solver eval unavailable, disabling for this run: {e}")
+            self._solver_disabled = True
+            return None
 
     @property
     def best_iteration(self) -> int | None:
@@ -111,6 +160,12 @@ class EvalRunner:
             # With temp=0, identical models play the exact same game 50 times
             eval_temperature = 0.2
             current_policy = OnnxPolicy(str(model_path), temperature=eval_temperature)
+
+            # --- Perfect-solver move scoring (connect4 only) ---
+            # Runs before promotion so the candidate's rate is available to
+            # the promotion decision and gets recorded even on the very
+            # first promotion.
+            solver_results = self._run_solver_eval(model_path, config)
 
             # --- Model vs Best (Gatekeeper) Evaluation ---
             vs_best_win_rate = None
@@ -202,11 +257,37 @@ class EvalRunner:
                 # Model vs Random results (if enabled)
                 "vs_random_win_rate": vs_random_win_rate,
                 "vs_random_draw_rate": vs_random_draw_rate,
+                # Perfect-solver move scoring (None when skipped/unavailable)
+                "solver_value_optimal_rate": (
+                    solver_results.overall.value_optimal_rate
+                    if solver_results
+                    else None
+                ),
+                "solver_exact_best_rate": (
+                    solver_results.overall.exact_best_rate if solver_results else None
+                ),
+                "solver_blunder_rate": (
+                    solver_results.overall.blunder_rate if solver_results else None
+                ),
+                "solver_positions": (
+                    solver_results.overall.positions if solver_results else None
+                ),
                 # Metadata
                 "games": self.config.eval_games,
                 "timestamp": datetime.now().isoformat(),
             }
             eval_history.append(eval_record)
+
+            if solver_results is not None:
+                solver_entry = solver_results.to_dict()
+                solver_entry.update(
+                    {
+                        "iteration": iteration,
+                        "global_step": iteration * self.config.steps_per_iteration,
+                        "context": "loop",
+                    }
+                )
+                append_solver_stats(solver_entry, self.config.solver_stats_path)
 
             if self.wandb_logger is not None:
                 wandb_metrics = {
@@ -217,6 +298,25 @@ class EvalRunner:
                     "eval/vs_random_win_rate": vs_random_win_rate,
                     "eval/vs_random_draw_rate": vs_random_draw_rate,
                 }
+                if solver_results is not None:
+                    overall = solver_results.overall
+                    wandb_metrics.update(
+                        {
+                            "solver/value_optimal_rate": overall.value_optimal_rate,
+                            "solver/exact_best_rate": overall.exact_best_rate,
+                            "solver/blunder_rate": overall.blunder_rate,
+                            "solver/blunders_win_to_draw": overall.blunders_win_to_draw,
+                            "solver/blunders_win_to_loss": overall.blunders_win_to_loss,
+                            "solver/blunders_draw_to_loss": overall.blunders_draw_to_loss,
+                            "solver/positions_scored": overall.positions,
+                            "solver/model_win_rate_vs_random": (
+                                solver_results.model_wins / solver_results.games
+                                if solver_results.games
+                                else 0.0
+                            ),
+                            "solver/eval_seconds": solver_results.wall_time_seconds,
+                        }
+                    )
                 self.wandb_logger.log(
                     {k: v for k, v in wandb_metrics.items() if v is not None},
                     step=iteration * self.config.steps_per_iteration,
