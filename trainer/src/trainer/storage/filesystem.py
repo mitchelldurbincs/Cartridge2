@@ -5,6 +5,7 @@ and PyTorch checkpoints in the local filesystem.
 """
 
 import glob
+import json
 import logging
 import os
 import re
@@ -56,8 +57,6 @@ class FilesystemModelStore(ModelStore):
         """Load best model metadata from file."""
         meta_path = self.model_dir / "best_model.json"
         if meta_path.exists():
-            import json
-
             try:
                 with open(meta_path) as f:
                     data = json.load(f)
@@ -67,8 +66,6 @@ class FilesystemModelStore(ModelStore):
 
     def _save_best_metadata(self, step: int) -> None:
         """Save best model metadata to file."""
-        import json
-
         meta_path = self.model_dir / "best_model.json"
         temp_fd, temp_path = tempfile.mkstemp(suffix=".json", dir=self.model_dir)
         os.close(temp_fd)

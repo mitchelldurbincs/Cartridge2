@@ -83,13 +83,6 @@ def get_trace_context() -> dict[str, str | None]:
     return ctx
 
 
-def clear_trace_context() -> None:
-    """Clear the current trace context."""
-    _trace_id.set(None)
-    _span_id.set(None)
-    _parent_span.set(None)
-
-
 def format_gcp_trace(project_id: str, trace_id: str) -> str:
     """Format trace ID for Google Cloud Logging.
 
@@ -249,38 +242,3 @@ def setup_logging(
         from .logging_utils import silence_noisy_loggers
 
         silence_noisy_loggers()
-
-
-def get_logger(name: str) -> logging.Logger:
-    """Get a logger instance.
-
-    Args:
-        name: Logger name (typically __name__)
-
-    Returns:
-        Logger instance
-    """
-    return logging.getLogger(name)
-
-
-class StructuredLoggerAdapter(logging.LoggerAdapter):
-    """Logger adapter that adds structured fields to log messages.
-
-    This adapter allows adding extra fields to log messages that will be
-    properly formatted as JSON fields when using the JSON formatter.
-
-    Usage:
-        logger = StructuredLoggerAdapter(
-            logging.getLogger(__name__),
-            {"component": "trainer", "env_id": "tictactoe"}
-        )
-        logger.info("Training started", extra={"step": 100, "loss": 0.5})
-    """
-
-    def process(self, msg: str, kwargs: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        """Process the logging message and keyword arguments."""
-        extra = kwargs.get("extra", {})
-        # Merge adapter extra with call extra
-        merged_extra = {**self.extra, **extra}
-        kwargs["extra"] = merged_extra
-        return msg, kwargs

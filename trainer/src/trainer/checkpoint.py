@@ -106,11 +106,11 @@ def save_onnx_checkpoint(
 
         return checkpoint_path
 
-    except Exception as e:
+    except Exception:
         # Clean up temp file on error
         if os.path.exists(temp_path):
             os.unlink(temp_path)
-        raise e
+        raise
 
 
 def save_pytorch_checkpoint(
@@ -155,10 +155,10 @@ def save_pytorch_checkpoint(
         logger.debug(f"Saved PyTorch checkpoint: {checkpoint_path}")
         return checkpoint_path
 
-    except Exception as e:
+    except Exception:
         if os.path.exists(temp_path):
             os.unlink(temp_path)
-        raise e
+        raise
 
 
 def load_pytorch_checkpoint(

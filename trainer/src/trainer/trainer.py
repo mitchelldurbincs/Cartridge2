@@ -143,7 +143,6 @@ class Trainer:
 
         # Checkpoint tracking - discover existing checkpoints on disk
         self.checkpoints: list[Path] = self._discover_existing_checkpoints()
-        self.latest_checkpoint: Path | None = None
 
     def _discover_existing_checkpoints(self) -> list[Path]:
         """Scan model directory for existing checkpoint files.
@@ -494,7 +493,7 @@ class Trainer:
 
             # Final checkpoint
             final_global_step = start_step + self.config.total_steps
-            self._save_checkpoint(final_global_step, is_final=True)
+            self._save_checkpoint(final_global_step)
             self._write_stats()
         finally:
             replay.close()
@@ -604,14 +603,13 @@ class Trainer:
         except Exception as e:
             logger.warning(f"Evaluation failed: {e}")
 
-    def _save_checkpoint(self, step: int, is_final: bool = False) -> Path:
+    def _save_checkpoint(self, step: int) -> Path:
         """Save model checkpoint with atomic write-then-rename.
 
         Saves both ONNX (for actor inference) and PyTorch (for training continuity).
 
         Args:
             step: Current training step.
-            is_final: Whether this is the final checkpoint (unused, for future use).
 
         Returns:
             Path to the saved ONNX checkpoint.
@@ -641,7 +639,6 @@ class Trainer:
         self.checkpoints = cleanup_old_checkpoints(
             self.checkpoints, self.config.max_checkpoints
         )
-        self.latest_checkpoint = checkpoint_path
 
         # Clean up orphaned .onnx.data files from PyTorch exporter
         cleanup_temp_onnx_data(model_dir)
