@@ -79,7 +79,6 @@ pub async fn get_actor_stats(State(state): State<Arc<AppState>>) -> Json<ActorSt
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::types::{ActorStats, EvalStats, HistoryEntry, ModelInfoResponse, TrainingStats};
 
     #[test]
@@ -137,6 +136,7 @@ mod tests {
             games_played: 50,
             avg_game_length: 15.5,
             timestamp: 1234567890.0,
+            ..Default::default()
         };
 
         let stats = TrainingStats {
@@ -157,6 +157,7 @@ mod tests {
                 value_loss: 0.2,
                 policy_loss: 0.3,
                 learning_rate: 0.001,
+                grad_norm: None,
             }],
         };
 
@@ -238,6 +239,7 @@ mod tests {
             games_played: 100,
             avg_game_length: 20.0,
             timestamp: 1234567890.0,
+            ..Default::default()
         };
 
         let sum = eval.win_rate + eval.draw_rate + eval.loss_rate;

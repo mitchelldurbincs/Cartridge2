@@ -261,7 +261,6 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "onnx")]
     let model_info = {
         use engine_core::EngineContext;
-        use tracing::warn;
         let model_dir = format!("{}/models", data_dir);
         // Get obs_size from the configured game, falling back to tictactoe if not found
         let obs_size = EngineContext::new(&default_game)
@@ -807,18 +806,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_game_info_not_found_for_invalid_game() {
+    async fn test_get_game_info_forbidden_for_unknown_game() {
         let state = create_test_state();
         let app = create_app(state);
 
-        // Requesting an invalid game ID that matches current game check
-        // but doesn't exist in registry should return NOT_FOUND
-        // (This would require the game ID to be "tictactoe" to pass the filter,
-        // so this test case is for truly invalid games)
+        // Unknown game IDs hit the current-game filter before the registry
+        // lookup, so they are rejected as FORBIDDEN rather than NOT_FOUND
         let (status, body) = get(app, "/game-info/tictactoe_invalid").await;
 
-        // Since "tictactoe_invalid" != "tictactoe", it returns FORBIDDEN
         assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("only the current game 'tictactoe' is available"));
     }
 
     // ========================================================================

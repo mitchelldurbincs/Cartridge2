@@ -73,10 +73,6 @@ pub async fn new_game(
 ) -> Result<Json<GameStateResponse>, (StatusCode, String)> {
     let mut session = state.session.lock().await;
 
-    // Record metrics for new game
-    metrics::GAMES_CREATED.inc();
-    metrics::GAMES_ACTIVE.inc();
-
     // Get the current configured game
     let current_game = state.current_game.read().await.clone();
 
@@ -93,17 +89,18 @@ pub async fn new_game(
         }
     }
 
-    // Use the current game (cannot be changed)
-    let game_id = current_game;
-
     // Reset the game with shared evaluator (for hot-reloading)
     *session =
-        GameSession::with_evaluator(&game_id, Arc::clone(&state.evaluator)).map_err(|e| {
+        GameSession::with_evaluator(&current_game, Arc::clone(&state.evaluator)).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to create game '{}': {}", game_id, e),
+                format!("Failed to create game '{}': {}", current_game, e),
             )
         })?;
+
+    // Record metrics only for games that were actually created
+    metrics::GAMES_CREATED.inc();
+    metrics::GAMES_ACTIVE.inc();
 
     // If bot goes first, bot is player 1, human is player 2
     // If player goes first, human is player 1, bot is player 2
@@ -176,14 +173,11 @@ pub async fn make_move(
         metrics::MOVES_PLAYED.inc(); // Count bot move too
         Some(pos)
     } else {
-        // Game ended - record completion
-        metrics::GAMES_COMPLETED.inc();
-        metrics::GAMES_ACTIVE.dec();
         None
     };
 
-    // Check if game is now over after bot move
-    if bot_move.is_some() && session.is_game_over() {
+    // Record completion whether the player's or the bot's move ended the game
+    if session.is_game_over() {
         metrics::GAMES_COMPLETED.inc();
         metrics::GAMES_ACTIVE.dec();
     }
@@ -200,7 +194,6 @@ pub async fn make_move(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::types::{
         GameInfoResponse, GameStateResponse, GamesListResponse, MoveRequest, MoveResponse,
         NewGameRequest,

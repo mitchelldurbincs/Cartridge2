@@ -24,8 +24,8 @@ Minimal web interface for playing TicTacToe against the AI and monitoring traini
 |----------|--------|-------------|
 | `/health` | GET | Health check |
 | `/metrics` | GET | Prometheus metrics |
-| `/games` | GET | List available games |
-| `/game-info/:id` | GET | Get metadata for a specific game |
+| `/games` | GET | List playable games (only the configured current game) |
+| `/game-info/:id` | GET | Get metadata for the current game (other IDs are rejected) |
 | `/game/state` | GET | Get current board state |
 | `/game/new` | POST | Start a new game |
 | `/move` | POST | Make a move (player + bot response) |

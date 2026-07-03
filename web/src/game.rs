@@ -58,12 +58,9 @@ pub struct GameSession {
     human_player: u8,
     /// RNG for bot moves
     rng: ChaCha20Rng,
-    /// Shared evaluator for MCTS (loaded from model file)
-    #[cfg(feature = "onnx")]
-    evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,
-    /// Stub evaluator when ONNX is disabled
-    #[cfg(not(feature = "onnx"))]
-    #[allow(dead_code)]
+    /// Shared evaluator for MCTS (hot-reloaded from the model file).
+    /// Never read when ONNX is disabled: the bot falls back to random moves.
+    #[cfg_attr(not(feature = "onnx"), allow(dead_code))]
     evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,
     /// MCTS configuration for bot play
     #[cfg(feature = "onnx")]
@@ -83,54 +80,6 @@ impl GameSession {
     }
 
     /// Create a new game session with a shared evaluator (for hot-reloading)
-    #[cfg(feature = "onnx")]
-    pub fn with_evaluator(
-        env_id: &str,
-        evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,
-    ) -> Result<Self> {
-        let mut ctx = EngineContext::new(env_id)
-            .ok_or_else(|| anyhow!("Game '{}' not registered", env_id))?;
-
-        // Get game metadata
-        let metadata = ctx.metadata();
-        let board_size = metadata.board_size();
-
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-
-        let reset = ctx.reset(seed, &[])?;
-
-        // Parse the state (board_size + current_player + winner bytes)
-        let (board, current_player, winner) = Self::parse_state(&reset.state, board_size)?;
-
-        // Configure MCTS for playing (less exploration than training)
-        let mcts_config = MctsConfig::for_evaluation()
-            .with_simulations(MCTS_SIMULATIONS)
-            .with_temperature(MCTS_TEMPERATURE);
-
-        // Pre-create simulation context for MCTS (avoids repeated registry lookups)
-        let mcts_sim_ctx = EngineContext::new(env_id);
-
-        Ok(Self {
-            ctx,
-            metadata,
-            state: reset.state,
-            obs: reset.obs,
-            board,
-            current_player,
-            winner,
-            human_player: DEFAULT_HUMAN_PLAYER,
-            rng: ChaCha20Rng::seed_from_u64(seed),
-            evaluator,
-            mcts_config,
-            mcts_sim_ctx,
-        })
-    }
-
-    /// Create a new game session with a shared evaluator (stub when ONNX disabled)
-    #[cfg(not(feature = "onnx"))]
     pub fn with_evaluator(
         env_id: &str,
         evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,
@@ -163,6 +112,14 @@ impl GameSession {
             human_player: DEFAULT_HUMAN_PLAYER,
             rng: ChaCha20Rng::seed_from_u64(seed),
             evaluator,
+            // Configure MCTS for playing (less exploration than training)
+            #[cfg(feature = "onnx")]
+            mcts_config: MctsConfig::for_evaluation()
+                .with_simulations(MCTS_SIMULATIONS)
+                .with_temperature(MCTS_TEMPERATURE),
+            // Pre-create simulation context for MCTS (avoids repeated registry lookups)
+            #[cfg(feature = "onnx")]
+            mcts_sim_ctx: EngineContext::new(env_id),
         })
     }
 
@@ -229,7 +186,7 @@ impl GameSession {
         self.make_move(position)
     }
 
-    /// Make a bot move using MCTS if model is available, otherwise random
+    /// Make a bot move using MCTS if a model is loaded, otherwise random
     #[cfg(feature = "onnx")]
     pub fn bot_move(&mut self) -> Result<u8> {
         let legal = self.legal_moves();
@@ -240,67 +197,48 @@ impl GameSession {
         // Build legal moves mask
         let legal_mask: u64 = legal.iter().fold(0u64, |acc, &pos| acc | (1u64 << pos));
 
-        // Check if we have a model
-        let has_model = {
+        // Try MCTS with the neural network; any failure (no model loaded yet,
+        // model incompatible with the current game, ...) falls back to random
+        let mcts_result = (|| -> Result<u8> {
             let guard = self
                 .evaluator
                 .read()
                 .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
-            guard.is_some()
-        };
+            let evaluator = guard.as_ref().ok_or_else(|| anyhow!("No model loaded"))?;
 
-        let position = if has_model {
-            // Try to use MCTS with neural network
-            debug!("Attempting MCTS for bot move");
+            // Use pre-created simulation context (avoids repeated registry lookups)
+            let sim_ctx = self
+                .mcts_sim_ctx
+                .as_mut()
+                .ok_or_else(|| anyhow!("Simulation context not available"))?;
 
-            let mcts_result = (|| -> Result<u8> {
-                let guard = self
-                    .evaluator
-                    .read()
-                    .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
-                let evaluator = guard.as_ref().unwrap();
+            let result = run_mcts(
+                sim_ctx,
+                evaluator,
+                self.mcts_config.clone(),
+                self.state.clone(),
+                self.obs.clone(),
+                legal_mask,
+                &mut self.rng,
+            )?;
 
-                // Use pre-created simulation context (avoids repeated registry lookups)
-                let sim_ctx = self
-                    .mcts_sim_ctx
-                    .as_mut()
-                    .ok_or_else(|| anyhow!("Simulation context not available"))?;
+            debug!(
+                action = result.action,
+                value = result.value,
+                simulations = result.simulations,
+                "MCTS selected move"
+            );
 
-                let result = run_mcts(
-                    sim_ctx,
-                    evaluator,
-                    self.mcts_config.clone(),
-                    self.state.clone(),
-                    self.obs.clone(),
-                    legal_mask,
-                    &mut self.rng,
-                )?;
+            Ok(result.action as u8)
+        })();
 
-                debug!(
-                    action = result.action,
-                    value = result.value,
-                    simulations = result.simulations,
-                    "MCTS selected move"
-                );
-
-                Ok(result.action as u8)
-            })();
-
-            match mcts_result {
-                Ok(action) => action,
-                Err(e) => {
-                    // MCTS failed (e.g., model incompatible with current game)
-                    // Fall back to random move
-                    debug!("MCTS failed ({}), falling back to random move", e);
-                    use rand::seq::SliceRandom;
-                    *legal.choose(&mut self.rng).unwrap()
-                }
+        let position = match mcts_result {
+            Ok(action) => action,
+            Err(e) => {
+                debug!("MCTS unavailable ({}), using random move", e);
+                use rand::seq::SliceRandom;
+                *legal.choose(&mut self.rng).unwrap()
             }
-        } else {
-            // Fall back to random move
-            debug!("No model loaded, using random move");
-            use rand::seq::SliceRandom;
-            *legal.choose(&mut self.rng).unwrap()
         };
 
         self.make_move(position)?;

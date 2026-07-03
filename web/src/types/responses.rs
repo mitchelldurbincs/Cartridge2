@@ -82,6 +82,10 @@ pub struct MoveResponse {
 }
 
 /// Training history entry for loss visualization.
+///
+/// Mirrors the entries the trainer appends to `history` in `stats.json`
+/// (see `trainer/src/trainer/stats.py`). Fields missing here would be
+/// silently dropped when relaying stats to the frontend.
 #[derive(Deserialize, Serialize, Clone, Default)]
 pub struct HistoryEntry {
     #[serde(default)]
@@ -94,9 +98,17 @@ pub struct HistoryEntry {
     pub policy_loss: f64,
     #[serde(default)]
     pub learning_rate: f64,
+    /// Gradient norm; the trainer only writes it when gradient clipping is
+    /// enabled, so omit it from the JSON when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grad_norm: Option<f64>,
 }
 
 /// Evaluation stats from a single evaluation run.
+///
+/// Mirrors the `last_eval` / `eval_history` entries in `stats.json`, which
+/// are written both by the trainer (`trainer/src/trainer/stats.py`) and the
+/// orchestrator (`trainer/src/trainer/orchestrator/stats_manager.py`).
 #[derive(Deserialize, Serialize, Clone, Default)]
 pub struct EvalStats {
     #[serde(default)]
@@ -113,6 +125,24 @@ pub struct EvalStats {
     pub avg_game_length: f64,
     #[serde(default)]
     pub timestamp: f64,
+    /// Which opponent was evaluated against: "best" or "random"
+    #[serde(default)]
+    pub opponent: String,
+    /// Iteration the best (gatekeeper) model came from, when playing vs best
+    #[serde(default)]
+    pub opponent_iteration: Option<u32>,
+    /// Whether the evaluated model was promoted to new best
+    #[serde(default)]
+    pub became_new_best: bool,
+    /// Iteration of the evaluated model
+    #[serde(default)]
+    pub current_iteration: u32,
+    /// Win rate vs the random baseline (when `eval_vs_random` is enabled)
+    #[serde(default)]
+    pub vs_random_win_rate: Option<f64>,
+    /// Draw rate vs the random baseline (when `eval_vs_random` is enabled)
+    #[serde(default)]
+    pub vs_random_draw_rate: Option<f64>,
 }
 
 /// Training stats read from Python trainer and sent to frontend.
@@ -426,6 +456,7 @@ mod tests {
             value_loss: 0.2,
             policy_loss: 0.3,
             learning_rate: 0.001,
+            grad_norm: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -446,6 +477,24 @@ mod tests {
         assert_eq!(entry.value_loss, 0.0); // default
         assert_eq!(entry.policy_loss, 0.0); // default
         assert_eq!(entry.learning_rate, 0.0); // default
+        assert_eq!(entry.grad_norm, None); // default
+    }
+
+    #[test]
+    fn test_history_entry_grad_norm_passthrough() {
+        // The trainer only writes grad_norm when gradient clipping is enabled;
+        // the relay must preserve it so the frontend can display it
+        let json = r#"{"step": 10, "total_loss": 1.0, "grad_norm": 0.75}"#;
+        let entry: HistoryEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.grad_norm, Some(0.75));
+
+        let out = serde_json::to_string(&entry).unwrap();
+        assert!(out.contains("\"grad_norm\":0.75"));
+
+        // ...and entries without it must stay without it
+        let entry: HistoryEntry = serde_json::from_str(r#"{"step": 10}"#).unwrap();
+        let out = serde_json::to_string(&entry).unwrap();
+        assert!(!out.contains("grad_norm"));
     }
 
     // ========================================
@@ -462,6 +511,7 @@ mod tests {
             games_played: 100,
             avg_game_length: 15.5,
             timestamp: 1234567890.0,
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&eval).unwrap();
@@ -480,6 +530,65 @@ mod tests {
         assert!((eval.win_rate - 0.55).abs() < f64::EPSILON);
         assert_eq!(eval.draw_rate, 0.0); // default
         assert_eq!(eval.games_played, 0); // default
+        assert_eq!(eval.opponent, ""); // default
+        assert_eq!(eval.opponent_iteration, None); // default
+        assert!(!eval.became_new_best); // default
+        assert_eq!(eval.vs_random_win_rate, None); // default
+    }
+
+    #[test]
+    fn test_eval_stats_passthrough_of_orchestrator_fields() {
+        // Shaped exactly like the last_eval / eval_history entries the
+        // orchestrator writes to stats.json
+        // (trainer/src/trainer/orchestrator/stats_manager.py)
+        let json = r#"{
+            "step": 3000,
+            "current_iteration": 3,
+            "opponent": "best",
+            "opponent_iteration": 2,
+            "win_rate": 0.62,
+            "draw_rate": 0.2,
+            "loss_rate": 0.18,
+            "became_new_best": true,
+            "vs_random_win_rate": 0.97,
+            "vs_random_draw_rate": 0.02,
+            "games_played": 50,
+            "timestamp": 1234567890.0
+        }"#;
+
+        let eval: EvalStats = serde_json::from_str(json).unwrap();
+        assert_eq!(eval.opponent, "best");
+        assert_eq!(eval.opponent_iteration, Some(2));
+        assert!(eval.became_new_best);
+        assert_eq!(eval.current_iteration, 3);
+        assert_eq!(eval.vs_random_win_rate, Some(0.97));
+        assert_eq!(eval.vs_random_draw_rate, Some(0.02));
+
+        // Re-serialization must keep the fields so they reach the frontend
+        let out = serde_json::to_string(&eval).unwrap();
+        assert!(out.contains("\"opponent\":\"best\""));
+        assert!(out.contains("\"opponent_iteration\":2"));
+        assert!(out.contains("\"became_new_best\":true"));
+        assert!(out.contains("\"current_iteration\":3"));
+        assert!(out.contains("\"vs_random_win_rate\":0.97"));
+    }
+
+    #[test]
+    fn test_eval_stats_null_optional_fields() {
+        // vs_random_* are written as explicit nulls when eval_vs_random is
+        // disabled; opponent_iteration is null before a best model exists
+        let json = r#"{
+            "step": 100,
+            "opponent": "best",
+            "opponent_iteration": null,
+            "vs_random_win_rate": null,
+            "vs_random_draw_rate": null
+        }"#;
+        let eval: EvalStats = serde_json::from_str(json).unwrap();
+
+        assert_eq!(eval.opponent_iteration, None);
+        assert_eq!(eval.vs_random_win_rate, None);
+        assert_eq!(eval.vs_random_draw_rate, None);
     }
 
     // ========================================
@@ -520,6 +629,7 @@ mod tests {
             games_played: 50,
             avg_game_length: 12.0,
             timestamp: 1234567890.0,
+            ..Default::default()
         };
 
         let stats = TrainingStats {
@@ -540,6 +650,7 @@ mod tests {
                 value_loss: 0.1,
                 policy_loss: 0.2,
                 learning_rate: 0.001,
+                grad_norm: None,
             }],
         };
 
