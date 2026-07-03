@@ -7,11 +7,6 @@ This module tests:
 - Evaluation with mock ONNX models
 """
 
-from dataclasses import dataclass
-from unittest.mock import MagicMock, patch
-
-import pytest
-
 from trainer.evaluator import EvalResults, MatchResult, evaluate, play_game
 from trainer.game_config import GameConfig
 from trainer.games import Player, create_game_state

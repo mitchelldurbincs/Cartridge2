@@ -168,7 +168,9 @@ class TestCosineAnnealing:
     def test_cosine_reaches_min_lr(self):
         """Test that cosine annealing ends at min_lr."""
         optimizer = Adam([torch.randn(10, requires_grad=True)], lr=0.001)
-        config = LRConfig(target_lr=0.001, warmup_steps=0, total_steps=10, min_ratio=0.1)
+        config = LRConfig(
+            target_lr=0.001, warmup_steps=0, total_steps=10, min_ratio=0.1
+        )
         scheduler = WarmupCosineScheduler(optimizer, config)
 
         # Step through entire schedule
@@ -334,7 +336,9 @@ class TestEdgeCases:
     def test_load_past_end_of_schedule(self):
         """Test loading when schedule has completed."""
         optimizer = Adam([torch.randn(10, requires_grad=True)], lr=0.001)
-        config = LRConfig(target_lr=0.001, warmup_steps=0, total_steps=10, min_ratio=0.1)
+        config = LRConfig(
+            target_lr=0.001, warmup_steps=0, total_steps=10, min_ratio=0.1
+        )
         scheduler = WarmupCosineScheduler(optimizer, config)
 
         # Run past completion (T_max = 10, so 11 steps completes the cosine schedule)

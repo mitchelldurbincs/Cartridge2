@@ -6,13 +6,11 @@ Note: Tests requiring the replay buffer need PostgreSQL running.
 Set CARTRIDGE_STORAGE_POSTGRES_URL environment variable to run integration tests.
 """
 
-import json
 import os
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import numpy as np
 import pytest
 import torch
 

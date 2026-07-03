@@ -7,26 +7,13 @@ This module tests the Trainer class including:
 - Evaluation metrics computation
 """
 
-import tempfile
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
-import pytest
-
-try:
-    import torch
-
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
-    torch = None  # type: ignore
-
-pytestmark = pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+import torch
 
 from trainer.config import TrainerConfig
 from trainer.evaluator import EvalResults
-from trainer.game_config import GameConfig
 from trainer.stats import EvalStats, TrainerStats
 from trainer.trainer import Trainer
 
