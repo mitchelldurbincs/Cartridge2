@@ -6,31 +6,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 use mcts::{MctsConfig, SearchStats};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
-    Mutex, MutexGuard,
+    Arc, Mutex, MutexGuard,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
-
-/// Get the current resident set size (RSS) in MB from /proc/self/status.
-/// Returns None if unable to read (e.g., on non-Linux systems).
-fn get_rss_mb() -> Option<f64> {
-    use std::fs;
-    // Read /proc/self/status and find VmRSS line
-    if let Ok(contents) = fs::read_to_string("/proc/self/status") {
-        for line in contents.lines() {
-            if line.starts_with("VmRSS:") {
-                // Format: "VmRSS:    12345 kB"
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let Ok(kb) = parts[1].parse::<f64>() {
-                        return Some(kb / 1024.0); // Convert to MB
-                    }
-                }
-            }
-        }
-    }
-    None
-}
 
 use crate::config::Config;
 use crate::game_config::{get_config, GameConfig};
@@ -40,7 +19,6 @@ use crate::metrics;
 use crate::model_watcher::ModelWatcher;
 use crate::stats::ActorStats;
 use crate::storage::{create_replay_store, ReplayStore, StorageConfig, Transition};
-use std::sync::Arc;
 
 /// Context for a single episode, containing metadata and timing information.
 struct EpisodeContext {
@@ -286,7 +264,7 @@ impl Actor {
     /// Run the actor main loop with health state tracking for Kubernetes probes.
     /// Records episode completions to the health state for liveness tracking.
     pub async fn run(&self, health: &HealthState) -> Result<()> {
-        let initial_rss = get_rss_mb().unwrap_or(0.0);
+        let initial_rss = metrics::rss_mb().unwrap_or(0.0);
         info!(
             actor_id = %self.config.actor_id,
             max_episodes = self.config.max_episodes,
@@ -343,41 +321,32 @@ impl Actor {
                 break;
             }
 
-            // Handle model updates if watching is enabled
-            if let Some(ref mut updates) = model_updates {
-                tokio::select! {
-                    biased;  // Prioritize model updates and flush over episodes
-
-                    Some(()) = updates.recv() => {
-                        info!("Model updated, next episode will use new model");
-                        // Record model reload in Prometheus
-                        metrics::MODEL_RELOADS.inc();
-                        metrics::MODEL_LOADED.set(1);
-                        continue;
-                    }
-
-                    _ = flush_timer.tick() => {
-                        debug!("Periodic flush tick");
-                        continue;
-                    }
-
-                    _ = tokio::time::sleep(Duration::from_millis(1)) => {
-                        // Run episode below
-                    }
+            // In no-watch mode the model-update branch never fires
+            let model_update = async {
+                match model_updates.as_mut() {
+                    Some(updates) => updates.recv().await,
+                    None => std::future::pending().await,
                 }
-            } else {
-                // No-watch mode: just check flush timer non-blockingly
-                tokio::select! {
-                    biased;
+            };
 
-                    _ = flush_timer.tick() => {
-                        debug!("Periodic flush tick");
-                        continue;
-                    }
+            tokio::select! {
+                biased;  // Prioritize model updates and flush over episodes
 
-                    _ = tokio::time::sleep(Duration::from_millis(1)) => {
-                        // Run episode below
-                    }
+                Some(()) = model_update => {
+                    info!("Model updated, next episode will use new model");
+                    // Record model reload in Prometheus
+                    metrics::MODEL_RELOADS.inc();
+                    metrics::MODEL_LOADED.set(1);
+                    continue;
+                }
+
+                _ = flush_timer.tick() => {
+                    debug!("Periodic flush tick");
+                    continue;
+                }
+
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                    // Run episode below
                 }
             }
 
@@ -422,28 +391,23 @@ impl Actor {
                         && new_count.is_multiple_of(self.config.log_interval)
                     {
                         // Include memory diagnostics in periodic logging
-                        let rss_info = get_rss_mb()
+                        let rss_info = metrics::rss_mb()
                             .map(|mb| format!(", RSS: {:.1} MB", mb))
                             .unwrap_or_default();
-                        let avg_duration = duration; // Most recent episode duration
 
-                        // Suspend progress bar while logging to avoid visual glitches
-                        if let Some(ref pb) = progress {
-                            pb.suspend(|| {
-                                info!(
-                                    "Completed {} episodes (last: {:.2}s{})",
-                                    new_count, avg_duration, rss_info
-                                );
-                                // Log MCTS performance breakdown
-                                episode_stats.log_summary(new_count);
-                            });
-                        } else {
+                        let log_progress = || {
                             info!(
                                 "Completed {} episodes (last: {:.2}s{})",
-                                new_count, avg_duration, rss_info
+                                new_count, duration, rss_info
                             );
                             // Log MCTS performance breakdown
                             episode_stats.log_summary(new_count);
+                        };
+
+                        // Suspend progress bar while logging to avoid visual glitches
+                        match &progress {
+                            Some(pb) => pb.suspend(log_progress),
+                            None => log_progress(),
                         }
 
                         // Write stats to file for web frontend
@@ -467,7 +431,7 @@ impl Actor {
         self.stats.write_stats();
 
         // Report final memory usage
-        let final_rss = get_rss_mb().unwrap_or(0.0);
+        let final_rss = metrics::rss_mb().unwrap_or(0.0);
         let rss_growth = final_rss - initial_rss;
         info!(
             "Actor stopped gracefully (final RSS: {:.1} MB, growth: {:.1} MB)",

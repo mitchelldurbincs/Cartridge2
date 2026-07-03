@@ -4,9 +4,9 @@
 //! Supports concurrent writes from multiple actor instances.
 //! Uses connection pooling via deadpool-postgres for improved throughput.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
-use deadpool_postgres::{Config, Pool, Runtime};
+use deadpool_postgres::{Config, Object, Pool, Runtime};
 use engine_core::GameMetadata;
 use std::time::{Duration, Instant};
 use tokio_postgres::types::ToSql;
@@ -19,7 +19,28 @@ use crate::metrics;
 const SCHEMA_SQL: &str = include_str!("../../../sql/schema.sql");
 
 /// Number of columns in the transitions table INSERT.
+///
+/// Note: PostgreSQL caps a statement at 65535 bind parameters, so a single
+/// batch is limited to ~4369 transitions. Batches are per-episode (game
+/// length), far below that limit.
 const COLS_PER_TRANSITION: usize = 15;
+
+/// Split a SQL script into executable statements.
+///
+/// Strips `--` line comments, splits on `;`, and drops empty statements.
+/// This intentionally does not handle `;` inside string literals or
+/// dollar-quoted bodies — the shared schema file contains neither.
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    sql.lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .split(';')
+        .map(str::trim)
+        .filter(|stmt| !stmt.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
 
 /// Build a multi-row INSERT statement for batch inserts.
 ///
@@ -164,18 +185,26 @@ impl PostgresReplayStore {
         Ok(store)
     }
 
+    /// Get a connection from the pool, with context on failure
+    /// (pool exhaustion, connect timeout, unreachable database).
+    async fn client(&self) -> Result<Object> {
+        self.pool
+            .get()
+            .await
+            .context("failed to get PostgreSQL connection from pool")
+    }
+
     async fn ensure_schema(&self) -> Result<()> {
-        let client = self.pool.get().await?;
+        let client = self.client().await?;
 
         // Execute each statement from the shared schema file
-        // Split on semicolons and execute non-empty statements
-        for statement in SCHEMA_SQL.split(';') {
-            let stmt = statement.trim();
-            // Skip empty statements and comments
-            if stmt.is_empty() || stmt.starts_with("--") {
-                continue;
-            }
-            client.execute(stmt, &[]).await?;
+        for stmt in split_sql_statements(SCHEMA_SQL) {
+            client.execute(&stmt as &str, &[]).await.with_context(|| {
+                format!(
+                    "failed to execute schema statement starting with {:?}",
+                    stmt.lines().next().unwrap_or("")
+                )
+            })?;
         }
 
         tracing::info!("PostgreSQL schema validated/created");
@@ -186,37 +215,7 @@ impl PostgresReplayStore {
 #[async_trait]
 impl ReplayStore for PostgresReplayStore {
     async fn store(&self, transition: &Transition) -> Result<()> {
-        let client = self.pool.get().await?;
-        client
-            .execute(
-                "INSERT INTO transitions
-                 (id, env_id, episode_id, step_number, state, action, next_state,
-                  observation, next_observation, reward, done, timestamp,
-                  policy_probs, mcts_value, game_outcome)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-                 ON CONFLICT (id) DO UPDATE SET
-                     game_outcome = EXCLUDED.game_outcome,
-                     mcts_value = EXCLUDED.mcts_value",
-                &[
-                    &transition.id,
-                    &transition.env_id,
-                    &transition.episode_id,
-                    &(transition.step_number as i32),
-                    &transition.state,
-                    &transition.action,
-                    &transition.next_state,
-                    &transition.observation,
-                    &transition.next_observation,
-                    &transition.reward,
-                    &transition.done,
-                    &(transition.timestamp as i64),
-                    &transition.policy_probs,
-                    &transition.mcts_value,
-                    &transition.game_outcome,
-                ],
-            )
-            .await?;
-        Ok(())
+        self.store_batch(std::slice::from_ref(transition)).await
     }
 
     async fn store_batch(&self, transitions: &[Transition]) -> Result<()> {
@@ -228,7 +227,7 @@ impl ReplayStore for PostgresReplayStore {
 
         // Build single multi-row INSERT statement (reduces N round-trips to 1)
         let sql = build_batch_insert_sql(transitions.len());
-        let client = self.pool.get().await?;
+        let client = self.client().await?;
 
         // Update pool metrics
         let pool_status = self.pool.status();
@@ -262,7 +261,15 @@ impl ReplayStore for PostgresReplayStore {
             params.push(&t.game_outcome);
         }
 
-        client.execute(&sql as &str, &params).await?;
+        client
+            .execute(&sql as &str, &params)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to insert batch of {} transitions",
+                    transitions.len()
+                )
+            })?;
 
         // Record metrics
         let duration = start.elapsed().as_secs_f64();
@@ -273,16 +280,17 @@ impl ReplayStore for PostgresReplayStore {
     }
 
     async fn count(&self) -> Result<usize> {
-        let client = self.pool.get().await?;
+        let client = self.client().await?;
         let row = client
             .query_one("SELECT COUNT(*) FROM transitions", &[])
-            .await?;
+            .await
+            .context("failed to count transitions")?;
         let count: i64 = row.get(0);
         Ok(count as usize)
     }
 
     async fn store_metadata(&self, metadata: &GameMetadata) -> Result<()> {
-        let client = self.pool.get().await?;
+        let client = self.client().await?;
         client
             .execute(
                 "INSERT INTO game_metadata
@@ -309,13 +317,17 @@ impl ReplayStore for PostgresReplayStore {
                     &(metadata.player_count as i32),
                 ],
             )
-            .await?;
+            .await
+            .with_context(|| format!("failed to upsert metadata for game '{}'", metadata.env_id))?;
         Ok(())
     }
 
     async fn clear(&self) -> Result<()> {
-        let client = self.pool.get().await?;
-        client.execute("DELETE FROM transitions", &[]).await?;
+        let client = self.client().await?;
+        client
+            .execute("DELETE FROM transitions", &[])
+            .await
+            .context("failed to clear transitions")?;
         Ok(())
     }
 }
@@ -327,6 +339,43 @@ impl ReplayStore for PostgresReplayStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_split_sql_statements_strips_comments() {
+        let sql =
+            "-- leading comment\nCREATE TABLE a (x INT);\n-- another\nCREATE INDEX i ON a(x);";
+        let stmts = split_sql_statements(sql);
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].starts_with("CREATE TABLE a"));
+        assert!(stmts[1].starts_with("CREATE INDEX i"));
+    }
+
+    #[test]
+    fn test_split_sql_statements_drops_empty() {
+        let stmts = split_sql_statements("  ;; \n -- only a comment\n ;");
+        assert!(stmts.is_empty());
+    }
+
+    /// Regression test: statements preceded by comment lines used to be
+    /// skipped entirely, so a fresh database never got its tables created.
+    #[test]
+    fn test_schema_sql_yields_all_statements() {
+        let stmts = split_sql_statements(SCHEMA_SQL);
+
+        let tables = stmts
+            .iter()
+            .filter(|s| s.starts_with("CREATE TABLE"))
+            .count();
+        let indices = stmts
+            .iter()
+            .filter(|s| s.starts_with("CREATE INDEX"))
+            .count();
+
+        assert_eq!(tables, 2, "expected transitions + game_metadata tables");
+        assert_eq!(indices, 3, "expected three transitions indices");
+        assert_eq!(stmts.len(), tables + indices);
+        assert!(stmts.iter().all(|s| !s.contains("--")));
+    }
 
     #[test]
     fn test_pool_config_default() {
@@ -366,12 +415,15 @@ mod tests {
         assert!(sql.contains("$45)")); // End of third row (3 * 15)
     }
 
+    /// An empty batch never reaches the builder (`store_batch` returns early),
+    /// so the only guarantee here is that no parameter placeholders are emitted.
+    /// The previous assertion (no VALUES keyword at all) never matched the
+    /// implementation and failed whenever this test actually ran.
     #[test]
     fn test_build_batch_insert_sql_empty() {
         let sql = build_batch_insert_sql(0);
         assert!(sql.contains("INSERT INTO transitions"));
-        // No VALUES clause for empty batch
-        assert!(!sql.contains("VALUES"));
+        assert!(!sql.contains('$'));
     }
 
     #[test]

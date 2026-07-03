@@ -27,8 +27,6 @@ pub struct ActorStats {
     player2_wins: AtomicU32,
     /// Episodes that ended in draw (reward == 0)
     draws: AtomicU32,
-    /// Sum of episode lengths for average calculation
-    total_episode_length: AtomicU64,
     /// Start time for rate calculations
     start_time: Instant,
     /// Path to write stats file
@@ -73,7 +71,6 @@ impl ActorStats {
             player1_wins: AtomicU32::new(0),
             player2_wins: AtomicU32::new(0),
             draws: AtomicU32::new(0),
-            total_episode_length: AtomicU64::new(0),
             start_time: Instant::now(),
             stats_path,
             env_id: env_id.to_string(),
@@ -86,8 +83,6 @@ impl ActorStats {
     pub fn record_episode(&self, steps: u32, final_reward: f32) {
         self.episodes_completed.fetch_add(1, Ordering::Relaxed);
         self.total_steps.fetch_add(steps as u64, Ordering::Relaxed);
-        self.total_episode_length
-            .fetch_add(steps as u64, Ordering::Relaxed);
 
         // Categorize outcome based on final reward
         // Positive = player 1 wins, negative = player 2 wins, zero = draw
@@ -111,13 +106,13 @@ impl ActorStats {
     /// Get a snapshot of current stats.
     pub fn snapshot(&self) -> ActorStatsSnapshot {
         let episodes = self.episodes_completed.load(Ordering::Relaxed);
-        let total_length = self.total_episode_length.load(Ordering::Relaxed);
+        let total_steps = self.total_steps.load(Ordering::Relaxed);
         let runtime = self.start_time.elapsed().as_secs_f64();
         let searches = self.mcts_searches.load(Ordering::Relaxed);
         let inference_us = self.mcts_inference_us.load(Ordering::Relaxed);
 
         let avg_episode_length = if episodes > 0 {
-            total_length as f64 / episodes as f64
+            total_steps as f64 / episodes as f64
         } else {
             0.0
         };
@@ -137,7 +132,7 @@ impl ActorStats {
         ActorStatsSnapshot {
             env_id: self.env_id.clone(),
             episodes_completed: episodes,
-            total_steps: self.total_steps.load(Ordering::Relaxed),
+            total_steps,
             player1_wins: self.player1_wins.load(Ordering::Relaxed),
             player2_wins: self.player2_wins.load(Ordering::Relaxed),
             draws: self.draws.load(Ordering::Relaxed),
@@ -190,7 +185,7 @@ impl ActorStats {
         debug!("Wrote actor stats to {}", self.stats_path);
     }
 
-    /// Check if stats file path exists.
+    /// Path of the JSON stats file this tracker writes to.
     pub fn stats_path(&self) -> &str {
         &self.stats_path
     }

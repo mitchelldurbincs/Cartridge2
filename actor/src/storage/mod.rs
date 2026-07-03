@@ -68,24 +68,16 @@ pub trait ReplayStore: Send + Sync {
     async fn clear(&self) -> Result<()>;
 }
 
-/// Configuration for creating a replay store
+/// Configuration for creating a replay store.
+///
+/// Built from [`crate::config::Config`], which resolves the connection URL
+/// and pool settings from CLI/env/config.toml.
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
     /// PostgreSQL connection string
     pub postgres_url: String,
     /// Connection pool configuration
     pub pool_config: PoolConfig,
-}
-
-impl Default for StorageConfig {
-    fn default() -> Self {
-        Self {
-            postgres_url: std::env::var("CARTRIDGE_STORAGE_POSTGRES_URL").unwrap_or_else(|_| {
-                "postgresql://cartridge:cartridge@localhost:5432/cartridge".to_string()
-            }),
-            pool_config: PoolConfig::default(),
-        }
-    }
 }
 
 /// Create a replay store based on configuration

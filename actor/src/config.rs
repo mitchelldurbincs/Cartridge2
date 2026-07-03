@@ -16,6 +16,11 @@ use engine_config::{load_config, CentralConfig};
 // Load central config once at startup
 static CENTRAL_CONFIG: Lazy<CentralConfig> = Lazy::new(load_config);
 
+/// Central config.toml settings, loaded once per process.
+pub fn central_config() -> &'static CentralConfig {
+    &CENTRAL_CONFIG
+}
+
 // Default value functions - env var -> central config fallback
 fn default_actor_id() -> String {
     std::env::var("ACTOR_ACTOR_ID").unwrap_or_else(|_| CENTRAL_CONFIG.actor.actor_id.clone())
@@ -160,6 +165,8 @@ pub struct Config {
     pub no_watch: bool,
 
     /// Port for health check HTTP server (Kubernetes liveness/readiness probes).
+    /// If the port is already in use (e.g. several actors on one host), the
+    /// server scans forward from this port and binds the next free one.
     #[arg(long, default_value_t = default_health_port())]
     pub health_port: u16,
 }
@@ -311,6 +318,17 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("flush_interval_secs"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_postgres_url() {
+        let mut cfg = base_config();
+        cfg.postgres_url.clear();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("postgres_url"));
     }
 
     #[test]

@@ -87,20 +87,9 @@ impl MctsPolicy {
     /// Create with a specific seed for determinism (used in tests)
     #[allow(dead_code)]
     pub fn with_seed(env_id: String, num_actions: usize, obs_size: usize, seed: u64) -> Self {
-        let sim_ctx = EngineContext::new(&env_id);
-        let config = MctsConfig::for_training();
-        let base_temp = config.temperature;
         Self {
-            env_id,
-            base_temperature: base_temp,
-            late_temperature: 0.1,
-            temp_threshold: 0,
-            config,
-            num_actions,
-            obs_size,
-            evaluator: Arc::new(RwLock::new(None)),
             rng: ChaCha20Rng::seed_from_u64(seed),
-            sim_ctx,
+            ..Self::new(env_id, num_actions, obs_size)
         }
     }
 
