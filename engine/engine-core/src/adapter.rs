@@ -18,8 +18,8 @@ use crate::typed::{Capabilities, EngineId, Game};
 /// random number generator state.
 ///
 /// The adapter maintains its own RNG instance that gets re-seeded on each reset,
-/// ensuring deterministic behavior while providing the stateless interface
-/// expected by the gRPC layer.
+/// ensuring deterministic behavior while providing the stateless, bytes-only
+/// interface expected by the registry and `EngineContext`.
 ///
 /// # Example
 ///

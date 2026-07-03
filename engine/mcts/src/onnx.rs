@@ -134,43 +134,6 @@ impl OnnxEvaluator {
         })
     }
 
-    /// Load an ONNX model from memory.
-    ///
-    /// # Arguments
-    /// * `model_data` - Raw ONNX model bytes
-    /// * `obs_size` - Size of the observation vector
-    /// * `intra_threads` - Number of intra-op threads (0 = auto-detect, uses all CPU cores)
-    pub fn load_from_memory(
-        model_data: &[u8],
-        obs_size: usize,
-        intra_threads: usize,
-    ) -> Result<Self, EvaluatorError> {
-        let threads = Self::resolve_intra_threads(intra_threads);
-        let builder = Session::builder()
-            .map_err(|e| {
-                EvaluatorError::ModelError(format!("Failed to create session builder: {}", e))
-            })?
-            .with_intra_threads(threads)
-            .map_err(|e| {
-                EvaluatorError::ModelError(format!("Failed to set intra threads: {}", e))
-            })?;
-
-        let mut builder = Self::register_coreml_ep(builder)?;
-
-        let session = builder.commit_from_memory(model_data).map_err(|e| {
-            EvaluatorError::ModelError(format!("Failed to load model from memory: {}", e))
-        })?;
-
-        Ok(Self {
-            session: Mutex::new(session),
-            obs_size,
-            inference_count: AtomicU64::new(0),
-            total_inference_time_us: AtomicU64::new(0),
-            total_prep_time_us: AtomicU64::new(0),
-            total_post_time_us: AtomicU64::new(0),
-        })
-    }
-
     /// Get diagnostic stats from this evaluator.
     pub fn get_stats(&self) -> OnnxStats {
         OnnxStats {

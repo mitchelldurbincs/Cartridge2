@@ -6,12 +6,13 @@ Rust workspace containing the core game engine, game implementations, and MCTS s
 
 | Crate | Description |
 |-------|-------------|
-| `engine-core` | Game trait, type erasure, registry, EngineContext API, GameMetadata (70 tests) |
+| `engine-core` | Game trait, type erasure, registry, EngineContext API, GameMetadata (77 tests) |
 | `engine-config` | Centralized configuration loading from config.toml (19 tests) |
+| `engine-games` | Registers all games via `register_all_games()` (2 tests) |
 | `games-tictactoe` | TicTacToe reference implementation (26 tests) |
-| `games-connect4` | Connect 4 implementation (20 tests) |
-| `games-othello` | Othello (Reversi) implementation (25 tests) |
-| `mcts` | Monte Carlo Tree Search for AlphaZero-style play (22 tests) |
+| `games-connect4` | Connect 4 implementation (21 tests) |
+| `games-othello` | Othello (Reversi) implementation (27 tests) |
+| `mcts` | Monte Carlo Tree Search for AlphaZero-style play (22 tests, +3 with `onnx`) |
 | `model-watcher` | Shared model hot-reload utilities (5 tests) |
 
 ## Quick Start
@@ -47,12 +48,14 @@ cargo build --release --features mcts/onnx
 +------------------+
 
 +------------------+
-|  model-watcher   |  (standalone utility crate)
+|  model-watcher   |  (model hot-reload; uses mcts with the onnx feature)
 +------------------+
 ```
 
 All game implementations depend on `engine-core` for the Game trait.
 MCTS uses `engine-core` for game simulation via EngineContext.
+`engine-games` bundles the three game crates behind a single
+`register_all_games()` entry point.
 
 ## Workspace Dependencies
 
@@ -78,16 +81,19 @@ See `games-tictactoe` or `games-connect4` for reference implementations.
 ## Testing
 
 ```bash
-# All tests (159 total)
+# All tests (202 unit tests + doc-tests; the workspace build enables the
+# mcts `onnx` feature via model-watcher, adding 3 tests over `-p mcts`)
 cargo test
 
 # Specific crate
-cargo test -p engine-core      # 70 tests
+cargo test -p engine-core      # 77 tests
 cargo test -p engine-config    # 19 tests
+cargo test -p engine-games     # 2 tests
 cargo test -p games-tictactoe  # 26 tests
-cargo test -p games-connect4   # 20 tests
+cargo test -p games-connect4   # 21 tests
+cargo test -p games-othello    # 27 tests
 cargo test -p mcts             # 22 tests
-cargo test -p model-watcher    # 2 tests
+cargo test -p model-watcher    # 5 tests
 
 # With output
 cargo test -- --nocapture

@@ -17,7 +17,10 @@
 //! let reset = ctx.reset(42, &[]).unwrap();
 //! ```
 
-use engine_core::game_utils::{calculate_reward, info_bits};
+use engine_core::game_utils::{
+    calculate_reward, decode_action_u32, info_bits, opponent, validate_board_cells,
+    validate_player_and_winner,
+};
 use engine_core::typed::{
     ActionSpace, Capabilities, DecodeError, EncodeError, Encoding, EngineId, Game,
 };
@@ -109,7 +112,7 @@ impl State {
 
         // Switch player if game not over
         if new_state.winner == 0 {
-            new_state.current_player = if self.current_player == 1 { 2 } else { 1 };
+            new_state.current_player = opponent(self.current_player);
         }
 
         new_state
@@ -182,7 +185,7 @@ impl TicTacToe {
     /// * Bits 0-8  : Legal move mask
     /// * Bits 16-19: Current player (1 = X, 2 = O)
     /// * Bits 20-23: Winner (0 = none, 1 = X, 2 = O, 3 = draw)
-    /// * Bits 24-27: Moves played so far
+    /// * Bits 24-31: Moves played so far (0-9)
     fn compute_info_bits(state: &State) -> u64 {
         let moves_played = state.board.iter().filter(|&&cell| cell != 0).count() as u64;
         info_bits::compute_info_bits(
@@ -282,28 +285,8 @@ impl Game for TicTacToe {
         let winner = buf[10];
 
         // Validate the state
-        if current_player != 1 && current_player != 2 {
-            return Err(DecodeError::CorruptedData(format!(
-                "Invalid current_player: {}",
-                current_player
-            )));
-        }
-
-        if winner > 3 {
-            return Err(DecodeError::CorruptedData(format!(
-                "Invalid winner: {}",
-                winner
-            )));
-        }
-
-        for &cell in &board {
-            if cell > 2 {
-                return Err(DecodeError::CorruptedData(format!(
-                    "Invalid board cell: {}",
-                    cell
-                )));
-            }
-        }
+        validate_player_and_winner(current_player, winner)?;
+        validate_board_cells(&board)?;
 
         Ok(State {
             board,
@@ -325,14 +308,7 @@ impl Game for TicTacToe {
     }
 
     fn decode_action(buf: &[u8]) -> Result<Self::Action, DecodeError> {
-        if buf.len() != 4 {
-            return Err(DecodeError::InvalidLength {
-                expected: 4,
-                actual: buf.len(),
-            });
-        }
-
-        let position = u32::from_le_bytes(buf.try_into().unwrap());
+        let position = decode_action_u32(buf)?;
         if position >= 9 {
             return Err(DecodeError::CorruptedData(format!(
                 "Invalid action position: {}",

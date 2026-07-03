@@ -34,7 +34,10 @@
 //! let reset = ctx.reset(42, &[]).unwrap();
 //! ```
 
-use engine_core::game_utils::{calculate_reward, info_bits};
+use engine_core::game_utils::{
+    calculate_reward, decode_action_u32, info_bits, opponent, validate_board_cells,
+    validate_player_and_winner,
+};
 use engine_core::typed::{
     ActionSpace, Capabilities, DecodeError, EncodeError, Encoding, EngineId, Game,
 };
@@ -51,6 +54,18 @@ pub const NUM_ACTIONS: usize = 65;
 
 /// Pass action index
 pub const PASS_ACTION: u32 = 64;
+
+/// The 8 direction vectors (dc, dr) used for move validation and flipping.
+const DIRECTIONS: [(isize, isize); 8] = [
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+    (-1, 0),
+    (1, 0),
+    (-1, 1),
+    (0, 1),
+    (1, 1),
+];
 
 /// Register Othello with the global game registry
 ///
@@ -120,16 +135,6 @@ impl State {
         (idx % COLS, idx / COLS)
     }
 
-    /// Get the opponent of a player
-    #[inline]
-    fn opponent(player: u8) -> u8 {
-        if player == 1 {
-            2
-        } else {
-            1
-        }
-    }
-
     /// Check if a move is valid (must flip at least one opponent piece)
     fn is_valid_move(&self, pos: usize) -> bool {
         if self.board[pos] != 0 {
@@ -138,21 +143,10 @@ impl State {
 
         let (col, row) = Self::idx_to_pos(pos);
         let player = self.current_player;
-        let opponent = Self::opponent(player);
+        let opponent = opponent(player);
 
         // Check all 8 directions
-        let directions: [(isize, isize); 8] = [
-            (-1, -1),
-            (0, -1),
-            (1, -1),
-            (-1, 0),
-            (1, 0),
-            (-1, 1),
-            (0, 1),
-            (1, 1),
-        ];
-
-        for (dc, dr) in directions {
+        for (dc, dr) in DIRECTIONS {
             let mut c = col as isize + dc;
             let mut r = row as isize + dr;
             let mut found_opponent = false;
@@ -238,7 +232,7 @@ impl State {
         if action == PASS_ACTION {
             let mut new_state = self.clone();
             new_state.pass_count += 1;
-            new_state.current_player = Self::opponent(self.current_player);
+            new_state.current_player = opponent(self.current_player);
 
             // Check if game should end (two consecutive passes)
             if new_state.pass_count >= 2 {
@@ -257,25 +251,14 @@ impl State {
 
         let (col, row) = Self::idx_to_pos(pos);
         let player = self.current_player;
-        let opponent = Self::opponent(player);
+        let opponent = opponent(player);
 
         let mut new_state = self.clone();
         new_state.board[pos] = player;
         new_state.pass_count = 0; // Reset pass count on any board move
 
         // Flip pieces in all 8 directions
-        let directions: [(isize, isize); 8] = [
-            (-1, -1),
-            (0, -1),
-            (1, -1),
-            (-1, 0),
-            (1, 0),
-            (-1, 1),
-            (0, 1),
-            (1, 1),
-        ];
-
-        for (dc, dr) in directions {
+        for (dc, dr) in DIRECTIONS {
             let mut to_flip: Vec<usize> = Vec::new();
             let mut c = col as isize + dc;
             let mut r = row as isize + dr;
@@ -303,7 +286,6 @@ impl State {
 
         // Switch player
         new_state.current_player = opponent;
-        new_state.pass_count = 0; // Reset pass count on any board move
 
         // Check if the new current player has any legal moves
         if !new_state.has_any_legal_moves() {
@@ -312,7 +294,7 @@ impl State {
             let opponent_has_moves = {
                 let temp_state = State {
                     board: new_state.board,
-                    current_player: Self::opponent(new_state.current_player),
+                    current_player: player,
                     winner: 0,
                     pass_count: 0,
                 };
@@ -346,8 +328,7 @@ impl State {
 
     /// Determine winner by disc count and set winner field
     fn determine_winner(&mut self) {
-        let black_count = self.board.iter().filter(|&&c| c == 1).count();
-        let white_count = self.board.iter().filter(|&&c| c == 2).count();
+        let (black_count, white_count) = self.piece_counts();
 
         self.winner = if black_count > white_count {
             1 // Black wins
@@ -477,11 +458,15 @@ impl Othello {
 
     /// Pack auxiliary information about the state into a u64 bit-field.
     ///
-    /// Uses the standard layout from `engine_core::game_utils::info_bits`:
-    /// * Bits 0-63 : Legal move mask (64 board positions)
-    /// * Bits 16-19: Current player (1 = Black, 2 = White)
-    /// * Bits 20-23: Winner (0 = none, 1 = Black, 2 = White, 3 = draw)
-    /// * Bits 24-31: Consecutive passes (0-2)
+    /// Uses `engine_core::game_utils::info_bits`, which ORs the legal move mask
+    /// with the current player (bits 16-19), winner (bits 20-23), and pass count
+    /// (bits 24-31) fields.
+    ///
+    /// CAVEAT: Othello's legal move mask spans all 64 board positions, so mask
+    /// bits 16 and above collide with the player/winner/pass fields. The packed
+    /// info value is therefore ambiguous and cannot be reliably decoded with
+    /// `info_bits::extract_*`. Consumers should read legal moves and the current
+    /// player from the observation instead (see `GameMetadata::extract_legal_moves`).
     fn compute_info_bits(state: &State) -> u64 {
         let legal_mask = state.legal_moves_mask();
         let player = state.current_player;
@@ -591,19 +576,7 @@ impl Game for Othello {
         let pass_count = buf[BOARD_SIZE + 2];
 
         // Validate the state
-        if current_player != 1 && current_player != 2 {
-            return Err(DecodeError::CorruptedData(format!(
-                "Invalid current_player: {}",
-                current_player
-            )));
-        }
-
-        if winner > 3 {
-            return Err(DecodeError::CorruptedData(format!(
-                "Invalid winner: {}",
-                winner
-            )));
-        }
+        validate_player_and_winner(current_player, winner)?;
 
         if pass_count > 2 {
             return Err(DecodeError::CorruptedData(format!(
@@ -612,14 +585,7 @@ impl Game for Othello {
             )));
         }
 
-        for &cell in &board {
-            if cell > 2 {
-                return Err(DecodeError::CorruptedData(format!(
-                    "Invalid board cell: {}",
-                    cell
-                )));
-            }
-        }
+        validate_board_cells(&board)?;
 
         Ok(State {
             board,
@@ -643,14 +609,7 @@ impl Game for Othello {
     }
 
     fn decode_action(buf: &[u8]) -> Result<Self::Action, DecodeError> {
-        if buf.len() != 4 {
-            return Err(DecodeError::InvalidLength {
-                expected: 4,
-                actual: buf.len(),
-            });
-        }
-
-        let action = u32::from_le_bytes(buf.try_into().unwrap());
+        let action = decode_action_u32(buf)?;
         if action >= NUM_ACTIONS as u32 {
             return Err(DecodeError::CorruptedData(format!(
                 "Invalid action: {}. Must be 0-{}",

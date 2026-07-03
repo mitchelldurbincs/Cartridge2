@@ -3,6 +3,84 @@
 //! This module provides common functionality used across multiple game implementations
 //! to reduce code duplication and ensure consistent behavior.
 
+use crate::typed::DecodeError;
+
+/// Get the opponent of a player in a two-player game (1 <-> 2).
+///
+/// # Example
+/// ```
+/// use engine_core::game_utils::opponent;
+///
+/// assert_eq!(opponent(1), 2);
+/// assert_eq!(opponent(2), 1);
+/// ```
+#[inline]
+pub fn opponent(player: u8) -> u8 {
+    if player == 1 {
+        2
+    } else {
+        1
+    }
+}
+
+/// Validate the `current_player` and `winner` fields of a decoded two-player game state.
+///
+/// Shared by game `decode_state` implementations. Accepts `current_player` of 1 or 2
+/// and `winner` of 0 (ongoing), 1, 2, or 3 (draw).
+///
+/// # Errors
+/// Returns `DecodeError::CorruptedData` if either field is out of range.
+pub fn validate_player_and_winner(current_player: u8, winner: u8) -> Result<(), DecodeError> {
+    if current_player != 1 && current_player != 2 {
+        return Err(DecodeError::CorruptedData(format!(
+            "Invalid current_player: {}",
+            current_player
+        )));
+    }
+
+    if winner > 3 {
+        return Err(DecodeError::CorruptedData(format!(
+            "Invalid winner: {}",
+            winner
+        )));
+    }
+
+    Ok(())
+}
+
+/// Validate that every cell of a decoded board is 0 (empty), 1 (player 1), or 2 (player 2).
+///
+/// # Errors
+/// Returns `DecodeError::CorruptedData` on the first out-of-range cell.
+pub fn validate_board_cells(board: &[u8]) -> Result<(), DecodeError> {
+    for &cell in board {
+        if cell > 2 {
+            return Err(DecodeError::CorruptedData(format!(
+                "Invalid board cell: {}",
+                cell
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Decode a discrete action encoded as a little-endian u32 (4 bytes).
+///
+/// Shared by game `decode_action` implementations; callers apply their own
+/// game-specific range check on the returned value.
+///
+/// # Errors
+/// Returns `DecodeError::InvalidLength` if `buf` is not exactly 4 bytes.
+pub fn decode_action_u32(buf: &[u8]) -> Result<u32, DecodeError> {
+    if buf.len() != 4 {
+        return Err(DecodeError::InvalidLength {
+            expected: 4,
+            actual: buf.len(),
+        });
+    }
+    Ok(u32::from_le_bytes(buf.try_into().unwrap()))
+}
+
 /// Calculate reward for a two-player zero-sum game.
 ///
 /// Returns the reward from the perspective of the player who just moved.
@@ -239,5 +317,64 @@ mod tests {
         let mut buf = Vec::new();
         encode_f32_slices(&mut buf, std::iter::empty::<&[f32]>());
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_opponent() {
+        assert_eq!(opponent(1), 2);
+        assert_eq!(opponent(2), 1);
+    }
+
+    #[test]
+    fn test_validate_player_and_winner_accepts_valid_combinations() {
+        for player in [1u8, 2] {
+            for winner in [0u8, 1, 2, 3] {
+                assert!(validate_player_and_winner(player, winner).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_player_and_winner_rejects_invalid_player() {
+        for player in [0u8, 3, 255] {
+            let err = validate_player_and_winner(player, 0).unwrap_err();
+            assert!(matches!(err, DecodeError::CorruptedData(_)));
+        }
+    }
+
+    #[test]
+    fn test_validate_player_and_winner_rejects_invalid_winner() {
+        for winner in [4u8, 255] {
+            let err = validate_player_and_winner(1, winner).unwrap_err();
+            assert!(matches!(err, DecodeError::CorruptedData(_)));
+        }
+    }
+
+    #[test]
+    fn test_validate_board_cells() {
+        assert!(validate_board_cells(&[0, 1, 2, 1, 0]).is_ok());
+        assert!(validate_board_cells(&[]).is_ok());
+
+        let err = validate_board_cells(&[0, 1, 3]).unwrap_err();
+        assert!(matches!(err, DecodeError::CorruptedData(_)));
+    }
+
+    #[test]
+    fn test_decode_action_u32_roundtrip() {
+        for value in [0u32, 4, 63, 64, u32::MAX] {
+            let buf = value.to_le_bytes();
+            assert_eq!(decode_action_u32(&buf).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn test_decode_action_u32_rejects_wrong_length() {
+        for bad in [&[][..], &[1][..], &[1, 2, 3][..], &[1, 2, 3, 4, 5][..]] {
+            let err = decode_action_u32(bad).unwrap_err();
+            assert!(matches!(
+                err,
+                DecodeError::InvalidLength { expected: 4, .. }
+            ));
+        }
     }
 }

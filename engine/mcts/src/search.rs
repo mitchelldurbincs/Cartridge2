@@ -13,7 +13,7 @@ use engine_core::{ActionSpace, EngineContext};
 use rand::Rng;
 use rand_chacha::ChaCha20Rng;
 use thiserror::Error;
-use tracing::{debug, trace};
+use tracing::debug;
 
 use crate::config::MctsConfig;
 use crate::evaluator::{Evaluator, EvaluatorError};
@@ -97,7 +97,8 @@ pub struct SearchStats {
     pub backprop_time_us: u64,
     /// Number of batched NN calls made
     pub num_batches: u32,
-    /// Total observations evaluated (should equal simulations)
+    /// Total observations evaluated (at most `simulations`; terminal hits
+    /// and already-expanded leaves complete without an NN call)
     pub total_evals: u32,
     /// Number of game step() calls during expansion
     pub game_steps: u32,
@@ -276,59 +277,6 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             simulations: root.visit_count,
             stats,
         })
-    }
-
-    /// Run a single simulation (select -> expand -> evaluate -> backpropagate).
-    /// NOTE: This method is kept for reference but replaced by batched evaluation in `run()`.
-    #[allow(dead_code)]
-    fn simulate(&mut self, _rng: &mut ChaCha20Rng) -> Result<(), SearchError> {
-        // Selection: traverse to a leaf
-        let (leaf_id, path) = self.select();
-
-        let (is_terminal, terminal_value, is_expanded, legal_mask) = {
-            let leaf = self.tree.get(leaf_id);
-            (
-                leaf.is_terminal,
-                leaf.terminal_value,
-                leaf.is_expanded(),
-                leaf.legal_moves_mask,
-            )
-        };
-
-        // If terminal, backpropagate the terminal value
-        if is_terminal {
-            self.tree.backpropagate(leaf_id, terminal_value);
-            return Ok(());
-        }
-
-        let (state, obs) = self.reconstruct_position(&path)?;
-
-        // Expansion + Evaluation: expand the node and get value estimate
-        // We call the evaluator ONCE and use its policy for priors and its value for backprop
-        let value = if !is_expanded {
-            // Expand and get the value from the same evaluation
-            self.expand_node(leaf_id, &state, &obs, legal_mask)?
-        } else {
-            // Already expanded (shouldn't happen in standard MCTS, but handle gracefully)
-            // This can occur if we select an expanded node that has no children
-            // (e.g., all children were pruned due to zero priors)
-            let eval = self
-                .evaluator
-                .evaluate(&obs, legal_mask, self.num_actions)?;
-            eval.value
-        };
-
-        // Backpropagation
-        self.tree.backpropagate(leaf_id, value);
-
-        trace!(
-            leaf = leaf_id.0,
-            path_len = path.len(),
-            value = value,
-            "MCTS simulation complete"
-        );
-
-        Ok(())
     }
 
     /// Select a leaf node by traversing the tree using UCB.
@@ -641,6 +589,7 @@ mod tests {
     use super::*;
     use crate::evaluator::UniformEvaluator;
     use rand::SeedableRng;
+    use tracing::trace;
 
     fn setup_tictactoe() -> EngineContext {
         engine_games::register_all_games();
