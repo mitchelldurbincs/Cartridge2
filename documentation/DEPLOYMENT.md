@@ -6,7 +6,7 @@ Cartridge2 supports three deployment modes, from simplest to most scalable.
 
 Best for experimentation and fast iteration. All processes run on your machine.
 
-**Requirements:** PostgreSQL, Rust toolchain, Python 3.11+, Node.js 20+
+**Requirements:** PostgreSQL, Rust toolchain, Python 3.10+, Node.js 20+
 
 ```bash
 # Terminal 0: Start PostgreSQL
@@ -21,6 +21,9 @@ cd web/frontend && npm install && npm run dev
 
 # Terminal 3: Train a model
 cd trainer && pip install -e .
+# Required: the trainer reads the replay-buffer connection string only from
+# this env var (config.toml's storage.postgres_url is not used by the trainer)
+export CARTRIDGE_STORAGE_POSTGRES_URL=postgresql://cartridge:cartridge@localhost:5432/cartridge
 python -m trainer loop --iterations 50 --episodes 200 --steps 500
 ```
 
@@ -118,8 +121,8 @@ Test distributed deployments locally using Docker Compose with the K8s overlay. 
 # Start with K8s-style backends
 docker compose -f docker-compose.yml -f docker-compose.k8s.yml up alphazero
 
-# Scale actors horizontally (4 parallel self-play workers)
-docker compose -f docker-compose.yml -f docker-compose.k8s.yml up --scale actor=4
+# Parallel self-play workers run inside the alphazero service — tune
+# [training].num_actors in config.toml (or CARTRIDGE_TRAINING_NUM_ACTORS)
 
 # Play against trained model
 docker compose -f docker-compose.yml -f docker-compose.k8s.yml up web frontend

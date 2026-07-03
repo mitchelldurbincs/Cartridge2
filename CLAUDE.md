@@ -80,14 +80,15 @@ Pure game logic library. No network I/O. Library-only design (no gRPC).
 
 - `engine-core/` - Game trait, erased adapter, registry, EngineContext API, GameMetadata (70 tests)
 - `engine-config/` - Centralized configuration loading from config.toml (19 tests)
+- `engine-games/` - One-call registration of all bundled games (2 tests)
 - `games-tictactoe/` - TicTacToe implementation (26 tests)
 - `games-connect4/` - Connect 4 implementation (20 tests)
 - `games-othello/` - Othello implementation (25 tests)
-- `mcts/` - Monte Carlo Tree Search implementation (22 tests)
+- `mcts/` - Monte Carlo Tree Search implementation (25 tests)
 - `model-watcher/` - Shared model hot-reload utilities (5 tests)
 
 ### Actor (Rust Binary) - `actor/`
-**Status: COMPLETE (69 tests)**
+**Status: COMPLETE (86 tests)**
 
 Self-play episode runner using engine-core directly:
 - Uses `EngineContext` for game simulation (no gRPC)
@@ -99,7 +100,7 @@ Self-play episode runner using engine-core directly:
 - Auto-derives game configuration from GameMetadata
 
 ### Web Server (Rust Binary) - `web/`
-**Status: COMPLETE (27 tests)**
+**Status: COMPLETE**
 
 Axum HTTP server for frontend interaction:
 - `/health` - Health check
@@ -124,20 +125,27 @@ Response: {"status": "ok"}
 **List Games**
 ```
 GET /games
-Response: {"games": ["tictactoe", "connect4", "othello"]}
+Response: {"games": ["connect4"]}
 ```
+Only the currently configured game (`common.env_id`) is returned, so the UI
+matches the game the loaded model was trained for.
 
 **Get Game Info**
 ```
 GET /game-info/:id
 Response: {
-  "id": "tictactoe",
+  "env_id": "tictactoe",
+  "display_name": "Tic-Tac-Toe",
   "board_width": 3,
   "board_height": 3,
   "num_actions": 9,
-  "obs_size": 27
+  "obs_size": 29,
+  "legal_mask_offset": 18,
+  "board_type": "grid",
+  ...
 }
 ```
+Requesting a game other than the current one returns `403 Forbidden`.
 
 **Start New Game**
 ```
@@ -152,21 +160,24 @@ GET /game/state
 Response: {
   "board": [0,0,0,0,0,0,0,0,0],
   "current_player": 1,
+  "human_player": 1,
   "winner": 0,
   "game_over": false,
-  "legal_moves": [0,1,2,3,4,5,6,7,8]
+  "legal_moves": [0,1,2,3,4,5,6,7,8],
+  "message": "Your turn (X)"
 }
 ```
 
 **Make Move**
 ```
 POST /move
-Body: {"action": 4}
-Response: {
-  "player_action": 4,
-  "bot_action": 0,
-  "state": GameStateResponse,
-  "game_over": false
+Body: {"position": 4}
+Response: all GameStateResponse fields plus the bot's reply:
+{
+  "board": [0,0,2,0,1,0,0,0,0],
+  "current_player": 1,
+  ...,
+  "bot_move": 2
 }
 ```
 
@@ -174,11 +185,17 @@ Response: {
 ```
 GET /stats
 Response: {
-  "iterations_completed": 10,
-  "episodes_generated": 5000,
-  "policy_loss": 1.2,
-  "value_loss": 0.5,
-  "current_learning_rate": 0.001
+  "step": 1500,
+  "total_steps": 5000,
+  "total_loss": 0.23,
+  "policy_loss": 0.12,
+  "value_loss": 0.11,
+  "learning_rate": 0.001,
+  "replay_buffer_size": 12500,
+  "env_id": "connect4",
+  "last_eval": {...},
+  "eval_history": [...],
+  "history": [...]
 }
 ```
 
@@ -192,13 +209,13 @@ Response: Prometheus-format metrics
 **Status: COMPLETE**
 
 Svelte 5 frontend with Vite:
-- TicTacToe board display
-- Play against bot (random moves for now)
+- Generic board display (TicTacToe, Connect 4, Othello)
+- Play against the trained model (MCTS + ONNX; random moves until a model is loaded)
 - Live training stats polling
 - Responsive dark-mode UI
 
 ### Trainer (Python) - `trainer/`
-**Status: COMPLETE (145 tests)**
+**Status: COMPLETE (245 tests)**
 
 PyTorch training with AlphaZero-style learning and orchestration:
 
@@ -245,8 +262,10 @@ cartridge2/
 │   ├── engine-core/       # Core Game trait + EngineContext API
 │   │   └── src/
 │   │       ├── adapter.rs  # GameAdapter (typed -> erased)
+│   │       ├── board_game.rs # TwoPlayerObs shared observation type
 │   │       ├── context.rs  # EngineContext high-level API
 │   │       ├── erased.rs   # ErasedGame trait
+│   │       ├── game_utils.rs # Shared helpers for game implementations
 │   │       ├── metadata.rs # GameMetadata for game configuration
 │   │       ├── registry.rs # Static game registration
 │   │       └── typed.rs    # Game trait definition
@@ -258,6 +277,7 @@ cartridge2/
 │   │   │   ├── loader.rs   # Loading logic + env overrides
 │   │   │   └── tests.rs    # Unit tests
 │   │   └── SCHEMA.md       # Configuration schema documentation
+│   ├── engine-games/      # One-call registration of all bundled games
 │   ├── games-tictactoe/   # TicTacToe implementation
 │   ├── games-connect4/    # Connect 4 implementation
 │   ├── games-othello/    # Othello implementation
@@ -296,13 +316,12 @@ cartridge2/
 │   └── README.md          # Run commands
 ├── trainer/               # Python training package
 │   ├── pyproject.toml     # Package configuration
-│   ├── Dockerfile         # Trainer-only Docker image
+│   ├── tests/             # Pytest suite
 │   └── src/trainer/
-│       ├── __main__.py    # CLI entrypoint (train, evaluate, loop)
+│       ├── __main__.py    # CLI entrypoint (train, evaluate, loop, solver-eval)
 │       ├── trainer.py     # Training loop
 │       ├── network.py     # Neural network (MLP, used for TicTacToe)
 │       ├── resnet.py      # ResNet architecture (used for Connect4, Othello)
-│       ├── replay.py      # Replay buffer interface
 │       ├── evaluator.py   # Model evaluation
 │       ├── solver_eval.py # Perfect-solver move-quality evaluation (Connect4)
 │       ├── wandb_logger.py # W&B wrapper (null-logger fallback, used by loop)
@@ -331,7 +350,11 @@ cartridge2/
 │       │   └── connect4.py
 │       └── storage/       # Storage backends (PostgreSQL, S3, filesystem)
 ├── Dockerfile.alphazero   # Combined actor+trainer image for Docker
+├── docker-compose.yml     # Local services (postgres, minio, training, web)
+├── docker-compose.k8s.yml # Overlay for K8s-style backends (S3 models)
+├── Makefile               # Convenience targets (setup, test, lint, train)
 ├── config.toml            # Central configuration file
+├── config.defaults.toml   # Default values (single source of truth)
 ├── .github/workflows/
 │   └── ci.yml             # CI pipeline (Rust fmt/clippy/test, Python lint/test, frontend build)
 ├── documentation/
@@ -339,9 +362,8 @@ cartridge2/
 │   ├── ARCHITECTURE.md    # Comprehensive architecture reference
 │   └── API.md             # REST API documentation with examples
 ├── data/                  # Runtime data (gitignored)
-│   ├── replay.db          # (Legacy) SQLite replay buffer - now using PostgreSQL
 │   ├── models/            # ONNX model files
-│   └── stats.json         # Training telemetry
+│   └── stats.json         # Training telemetry (replay buffer lives in PostgreSQL)
 └── CLAUDE.md              # This file
 ```
 
@@ -509,7 +531,7 @@ docker compose up alphazero -d
 docker compose logs -f alphazero  # Watch progress
 
 # Run standalone evaluation
-docker compose run --rm evaluator
+docker compose run --rm alphazero python -m trainer evaluate --model /app/data/models/latest.onnx
 
 # Play against trained model (in another terminal)
 docker compose up web frontend
@@ -531,10 +553,10 @@ cd actor && cargo build --release
 cd web && cargo build --release
 
 # Run all tests
-cd engine && cargo test   # 187 tests (70 + 19 + 26 + 20 + 25 + 22 + 5)
-cd actor && cargo test    # 69 tests
-cd web && cargo test      # 27 tests
-cd trainer && python -m pytest tests/ -v --tb=short  # 145 tests
+cd engine && cargo test   # 192 tests (70 core + 19 config + 2 games + 26 tictactoe + 20 connect4 + 25 othello + 25 mcts + 5 model-watcher)
+cd actor && cargo test    # 86 tests
+cd web && cargo test
+cd trainer && python -m pytest tests/ -v --tb=short  # 245 tests
 
 # Format and lint
 cd engine && cargo fmt && cargo clippy
@@ -555,6 +577,11 @@ cd web/frontend && npm run dev
 # Install trainer package (required for local training)
 cd trainer && pip install -e .
 
+# PostgreSQL must be running, and the Python trainer reads the replay-buffer
+# connection string ONLY from this env var — config.toml's storage.postgres_url
+# is used by the Rust actor/web but NOT by the trainer:
+export CARTRIDGE_STORAGE_POSTGRES_URL=postgresql://cartridge:cartridge@localhost:5432/cartridge
+
 # Basic synchronized training (TicTacToe) with evaluation
 python -m trainer loop --iterations 50 --episodes 200 --steps 500
 
@@ -572,7 +599,8 @@ python -m trainer loop --iterations 100 --start-iteration 25
 
 # ======= Standalone Commands =======
 
-# Train on existing replay buffer data (requires PostgreSQL)
+# Train on existing replay buffer data
+# (requires PostgreSQL + CARTRIDGE_STORAGE_POSTGRES_URL, see above)
 python -m trainer train --steps 1000
 
 # Evaluate model against random play
@@ -607,14 +635,14 @@ python -m trainer train --steps 1000
 - [x] Connect 4 game implementation - 20 tests
 - [x] Othello game implementation - 25 tests
 - [x] Removed gRPC/proto dependencies (library-only)
-- [x] Actor core (episode runner, pluggable storage backends) - 69 tests
+- [x] Actor core (episode runner, pluggable storage backends) - 86 tests
 - [x] MCTS integration in actor with ONNX evaluation
 - [x] Model hot-reload via file watching (model-watcher crate) - 5 tests
 - [x] Auto-derived game configuration from GameMetadata
-- [x] Web server (Axum, game API) - 27 tests
+- [x] Web server (Axum, game API)
 - [x] Web frontend (Svelte, play UI, stats, loss visualization)
-- [x] MCTS implementation - 22 tests
-- [x] Python trainer (PyTorch, ONNX export, evaluator) - 145 tests
+- [x] MCTS implementation - 25 tests
+- [x] Python trainer (PyTorch, ONNX export, evaluator) - 245 tests
 - [x] ResNet architecture for spatial games (Connect4, Othello)
 - [x] MCTS policy targets + game outcome propagation
 - [x] Storage backends (PostgreSQL, S3, filesystem)

@@ -40,7 +40,6 @@ x-storage-env: &storage-env
   CARTRIDGE_STORAGE_MODEL_BACKEND: s3
   CARTRIDGE_STORAGE_S3_BUCKET: cartridge-models
   CARTRIDGE_STORAGE_S3_ENDPOINT: http://minio:9000
-  CARTRIDGE_STORAGE_REPLAY_BACKEND: postgres
   CARTRIDGE_STORAGE_POSTGRES_URL: postgresql://cartridge:cartridge@postgres:5432/cartridge
 
 services:

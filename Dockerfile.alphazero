@@ -12,7 +12,7 @@
 #
 # Or via docker-compose:
 #   docker compose up alphazero
-#   docker compose --profile k8s up alphazero-k8s  # K8s backends
+#   docker compose -f docker-compose.yml -f docker-compose.k8s.yml up alphazero  # S3 model storage
 
 # ============================================
 # Stage 1: Build Rust Actor

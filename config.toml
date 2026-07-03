@@ -23,7 +23,8 @@
 # Common Settings
 # =============================================================================
 [common]
-# Base data directory for all runtime files (replay.db, models/, stats.json)
+# Base data directory for all runtime files (models/, stats.json;
+# the replay buffer itself lives in PostgreSQL)
 data_dir = "./data"
 
 # Game environment: tictactoe, connect4, othello
@@ -147,7 +148,7 @@ port = 8080
 start_sims = 50       # Simulations for first iteration
 max_sims = 250        # Maximum simulations (reached after ramping)
 sim_ramp_rate = 10    # Simulations to add per iteration
-# With these settings: iter 1=50, iter 10=230, iter 18+=400
+# With these settings: iter 1=50, iter 10=140, iter 21+=250
 
 # Legacy setting (used if ramping not configured)
 num_simulations = 200
@@ -203,12 +204,15 @@ include_target = true
 # =============================================================================
 [storage]
 # Model storage backend: filesystem (local), s3 (K8s)
-# For S3, set CARTRIDGE_S3_BUCKET and optionally CARTRIDGE_S3_ENDPOINT
+# For S3, set CARTRIDGE_STORAGE_S3_BUCKET and optionally CARTRIDGE_STORAGE_S3_ENDPOINT
 model_backend = "filesystem"
 
 # PostgreSQL connection string (required for replay buffer)
-# Can also be set via CARTRIDGE_STORAGE_POSTGRES_URL environment variable
 # For local dev: docker compose up postgres
+# NOTE: this key is read by the Rust actor and web server only. The Python
+# trainer (`python -m trainer loop/train/evaluate`) reads the connection
+# string exclusively from the CARTRIDGE_STORAGE_POSTGRES_URL environment
+# variable and fails at startup if it is not set.
 postgres_url = "postgresql://cartridge:cartridge@localhost:5432/cartridge"
 
 # Connection pool settings
@@ -217,11 +221,11 @@ pool_connect_timeout = 30   # Seconds to wait for a connection
 pool_idle_timeout = 300     # Seconds before idle connection is closed
 
 # S3 bucket for model storage (only used when model_backend = "s3")
-# Can also be set via CARTRIDGE_S3_BUCKET environment variable
+# Can also be set via CARTRIDGE_STORAGE_S3_BUCKET environment variable
 # s3_bucket = "cartridge-models"
 
 # S3-compatible endpoint URL (for MinIO, etc.)
-# Can also be set via CARTRIDGE_S3_ENDPOINT environment variable
+# Can also be set via CARTRIDGE_STORAGE_S3_ENDPOINT environment variable
 # s3_endpoint = "http://minio:9000"
 
 # =============================================================================

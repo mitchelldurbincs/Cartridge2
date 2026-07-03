@@ -65,6 +65,9 @@ cd web/frontend && npm install && npm run dev
 **Terminal 3** - Train a model:
 ```bash
 cd trainer && pip install -e .
+# Required: the Python trainer reads the replay-buffer connection string only
+# from this env var (config.toml's storage.postgres_url is not used by it)
+export CARTRIDGE_STORAGE_POSTGRES_URL=postgresql://cartridge:cartridge@localhost:5432/cartridge
 python -m trainer loop --iterations 50 --episodes 200 --steps 500
 ```
 
@@ -117,6 +120,7 @@ cartridge2/
 |   |-- engine-games/          # Game registration utilities
 |   |-- games-tictactoe/       # TicTacToe implementation
 |   |-- games-connect4/        # Connect 4 implementation
+|   |-- games-othello/         # Othello implementation
 |   |-- mcts/                  # Monte Carlo Tree Search
 |   +-- model-watcher/         # Shared model hot-reload library
 |
@@ -144,6 +148,8 @@ cartridge2/
 |       |-- network.py         # Neural network (MLP)
 |       |-- resnet.py          # ResNet architecture
 |       |-- evaluator.py       # Model evaluation
+|       |-- solver_eval.py     # Perfect-solver move scoring (Connect4)
+|       |-- wandb_logger.py    # Weights & Biases logging wrapper
 |       |-- game_config.py     # Game-specific configurations
 |       |-- stats.py           # Training statistics
 |       |-- config.py          # TrainerConfig dataclass
@@ -220,6 +226,7 @@ Axum HTTP server with endpoints:
 | `/game/state` | GET | Get current board state |
 | `/move` | POST | Make player move + get bot response |
 | `/stats` | GET | Read training telemetry |
+| `/actor-stats` | GET | Read actor self-play stats |
 | `/model` | GET | Get info about loaded model |
 
 ### Python Trainer (`trainer/`)
@@ -296,8 +303,9 @@ Uses PostgreSQL for replay buffer and S3/MinIO for model storage. Enables distri
 # Start with MinIO for model storage
 docker compose -f docker-compose.yml -f docker-compose.k8s.yml up
 
-# Scale actors horizontally (4 parallel self-play workers)
-docker compose -f docker-compose.yml -f docker-compose.k8s.yml up --scale actor=4
+# Parallel self-play: the alphazero service runs multiple actor processes
+# internally — tune [training].num_actors in config.toml (or
+# CARTRIDGE_TRAINING_NUM_ACTORS) instead of scaling containers
 
 # Access MinIO web console at http://localhost:9001
 ```
@@ -311,16 +319,21 @@ docker compose -f docker-compose.yml -f docker-compose.k8s.yml up --scale actor=
 | `CARTRIDGE_STORAGE_S3_BUCKET` | S3 bucket for models | - |
 | `CARTRIDGE_STORAGE_S3_ENDPOINT` | S3-compatible endpoint (MinIO) | - |
 
+Note: the default `postgres_url` applies to the Rust actor and web server (via
+config.toml). The Python trainer has no fallback — it requires
+`CARTRIDGE_STORAGE_POSTGRES_URL` to be set in its environment.
+
 ## Security Configuration
 
 ### CORS (Cross-Origin Resource Sharing)
 
 The web server implements **deny-by-default** CORS behavior for security:
 
-- **Development mode**: When `CARTRIDGE_WEB_ALLOWED_ORIGINS` is empty, only localhost origins are allowed (`http://localhost:*`, `http://127.0.0.1:*`)
-- **Production mode**: Set explicit allowed origins via environment variable:
-  ```bash
-  CARTRIDGE_WEB_ALLOWED_ORIGINS=https://yourdomain.com,https://www.yourdomain.com
+- **Development mode**: When `web.allowed_origins` is empty, only localhost origins are allowed
+- **Production mode**: Set explicit allowed origins in `config.toml`:
+  ```toml
+  [web]
+  allowed_origins = ["https://yourdomain.com", "https://www.yourdomain.com"]
   ```
 
 ### Credential Management
@@ -338,7 +351,7 @@ The web server implements **deny-by-default** CORS behavior for security:
 
 ### Container Security
 
-All Docker containers run as non-root user `cartridge` (UID 1000) for improved security. Container images include:
+All Docker containers run as a non-root `cartridge` user for improved security. Container images include:
 - Minimal attack surface (Ubuntu 24.04 base)
 - No unnecessary packages
 - Health checks configured
@@ -400,10 +413,10 @@ cd trainer && pip install -e .
 ### Test
 
 ```bash
-cd engine && cargo test    # ~172 tests
-cd actor && cargo test     # 69 tests
-cd web && cargo test       # 27 tests
-cd trainer && pytest       # Python tests
+cd engine && cargo test    # 192 tests
+cd actor && cargo test     # 86 tests
+cd web && cargo test
+cd trainer && pytest       # 245 tests
 ```
 
 ### Format & Lint
@@ -421,6 +434,7 @@ cd web && cargo fmt && cargo clippy
 - [x] EngineContext high-level API
 - [x] TicTacToe game implementation
 - [x] Connect 4 game implementation
+- [x] Othello game implementation
 - [x] MCTS implementation with ONNX evaluation
 
 **Training:**
@@ -442,9 +456,7 @@ cd web && cargo fmt && cargo clippy
 
 **Deployment:**
 - [x] Docker Compose (PostgreSQL, optional MinIO for S3)
-- [x] Horizontal actor scaling via `--scale`
-
-- [x] Othello game implementation
+- [x] Parallel self-play actors (`[training].num_actors`)
 
 **Planned:**
 - [ ] Kubernetes manifests (Helm/Kustomize)
