@@ -14,7 +14,6 @@ use tracing::{error, info};
 
 mod actor;
 mod config;
-mod game_config;
 mod health;
 mod mcts_policy;
 mod metrics;

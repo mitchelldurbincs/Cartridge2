@@ -217,12 +217,6 @@ pub fn apply_env_overrides(mut config: CentralConfig) -> CentralConfig {
     env_override!(config, web.port, "CARTRIDGE_WEB_PORT", parse);
 
     // MCTS
-    env_override!(
-        config,
-        mcts.num_simulations,
-        "CARTRIDGE_MCTS_NUM_SIMULATIONS",
-        parse
-    );
     env_override!(config, mcts.c_puct, "CARTRIDGE_MCTS_C_PUCT", parse);
     env_override!(
         config,
@@ -252,6 +246,14 @@ pub fn apply_env_overrides(mut config: CentralConfig) -> CentralConfig {
         config,
         mcts.onnx_intra_threads,
         "CARTRIDGE_MCTS_ONNX_INTRA_THREADS",
+        parse
+    );
+    env_override!(config, mcts.start_sims, "CARTRIDGE_MCTS_START_SIMS", parse);
+    env_override!(config, mcts.max_sims, "CARTRIDGE_MCTS_MAX_SIMS", parse);
+    env_override!(
+        config,
+        mcts.sim_ramp_rate,
+        "CARTRIDGE_MCTS_SIM_RAMP_RATE",
         parse
     );
 

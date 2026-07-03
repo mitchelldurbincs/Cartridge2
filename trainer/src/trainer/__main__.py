@@ -6,11 +6,8 @@ Provides subcommands for different operations:
     python -m trainer loop         - Run synchronized AlphaZero training
     python -m trainer solver-eval  - Score Connect4 moves vs perfect solver
 
-For backwards compatibility, running without a subcommand defaults to 'train':
-    python -m trainer --steps 1000
-
 Entry points after pip install:
-    trainer              - Same as 'python -m trainer train'
+    trainer              - Same CLI as 'python -m trainer'
     trainer-loop         - Same as 'python -m trainer loop'
     trainer-evaluate     - Same as 'python -m trainer evaluate'
     trainer-solver-eval  - Same as 'python -m trainer solver-eval'
@@ -84,14 +81,16 @@ def cmd_loop(args: argparse.Namespace) -> int:
     return orchestrator_main()
 
 
-def _add_train_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add train command arguments to a parser.
-
-    This is shared between the 'train' subcommand and backwards-compatible
-    direct invocation mode.
-    """
+def setup_train_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Set up the train subcommand parser."""
     from .central_config import get_config as get_central_config
     from .trainer import TrainerConfig
+
+    parser = subparsers.add_parser(
+        "train",
+        help="Train on replay buffer data",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
 
     # Load central config for defaults
     cfg = get_central_config()
@@ -125,16 +124,6 @@ def _add_train_arguments(parser: argparse.ArgumentParser) -> None:
         default=9090,
         help="Port for Prometheus metrics server",
     )
-
-
-def setup_train_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Set up the train subcommand parser."""
-    parser = subparsers.add_parser(
-        "train",
-        help="Train on replay buffer data",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    _add_train_arguments(parser)
     parser.set_defaults(func=cmd_train)
 
 
@@ -187,62 +176,40 @@ comes only from the current model version.
 
 def main() -> int:
     """Main entry point with subcommand support."""
-    # Check if we're being called with a subcommand
-    # For backwards compatibility, default to 'train' if no subcommand given
-    if len(sys.argv) >= 2 and sys.argv[1] in (
-        "train",
-        "evaluate",
-        "loop",
-        "solver-eval",
-        "-h",
-        "--help",
-    ):
-        # Subcommand mode
-        parser = argparse.ArgumentParser(
-            description="Cartridge2 AlphaZero Trainer",
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-        )
-        subparsers = parser.add_subparsers(
-            title="commands",
-            description="Available commands",
-            dest="command",
-        )
+    parser = argparse.ArgumentParser(
+        description="Cartridge2 AlphaZero Trainer",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(
+        title="commands",
+        description="Available commands",
+        dest="command",
+    )
 
-        setup_train_parser(subparsers)
-        setup_evaluate_parser(subparsers)
-        setup_loop_parser(subparsers)
-        setup_solver_eval_parser(subparsers)
+    setup_train_parser(subparsers)
+    setup_evaluate_parser(subparsers)
+    setup_loop_parser(subparsers)
+    setup_solver_eval_parser(subparsers)
 
-        args, remaining = parser.parse_known_args()
+    args, remaining = parser.parse_known_args()
 
-        if args.command is None:
-            parser.print_help()
-            return 0
-
-        # For non-loop commands, unknown args are an error
-        if args.command != "loop" and remaining:
+    if args.command is None:
+        if remaining:
             parser.error(f"unrecognized arguments: {' '.join(remaining)}")
+        parser.print_help()
+        return 0
 
-        # Configure structured logging (supports JSON for cloud deployments)
-        log_level = getattr(args, "log_level", "INFO")
-        component = "trainer" if args.command == "train" else args.command
-        setup_logging(level=log_level, component=component)
+    # For non-loop commands, unknown args are an error
+    # (loop re-parses sys.argv itself via orchestrator.main)
+    if args.command != "loop" and remaining:
+        parser.error(f"unrecognized arguments: {' '.join(remaining)}")
 
-        return args.func(args)
+    # Configure structured logging (supports JSON for cloud deployments)
+    log_level = getattr(args, "log_level", "INFO")
+    component = "trainer" if args.command == "train" else args.command
+    setup_logging(level=log_level, component=component)
 
-    else:
-        # Backwards compatibility: treat as 'train' command
-        parser = argparse.ArgumentParser(
-            description="Cartridge2 AlphaZero-style Trainer",
-            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        )
-        _add_train_arguments(parser)
-        args = parser.parse_args()
-
-        # Configure structured logging (supports JSON for cloud deployments)
-        setup_logging(level=args.log_level, component="trainer")
-
-        return cmd_train(args)
+    return args.func(args)
 
 
 if __name__ == "__main__":

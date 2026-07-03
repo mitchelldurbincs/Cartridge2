@@ -12,7 +12,7 @@ fn test_default_config() {
     assert_eq!(config.actor.max_episodes, -1);
     assert_eq!(config.web.host, "0.0.0.0");
     assert_eq!(config.web.port, 8080);
-    assert_eq!(config.mcts.num_simulations, 800);
+    assert_eq!(config.mcts.max_sims, 400);
 }
 
 #[test]
@@ -41,13 +41,15 @@ fn test_evaluation_defaults() {
 #[test]
 fn test_mcts_defaults() {
     let config = CentralConfig::default();
-    assert_eq!(config.mcts.num_simulations, 800);
     assert!((config.mcts.c_puct - 1.4).abs() < f64::EPSILON);
     assert!((config.mcts.temperature - 1.0).abs() < f64::EPSILON);
     assert!((config.mcts.dirichlet_alpha - 0.3).abs() < f64::EPSILON);
     assert!((config.mcts.dirichlet_weight - 0.25).abs() < f64::EPSILON);
     assert_eq!(config.mcts.eval_batch_size, 32);
     assert_eq!(config.mcts.onnx_intra_threads, 1);
+    assert_eq!(config.mcts.start_sims, 50);
+    assert_eq!(config.mcts.max_sims, 400);
+    assert_eq!(config.mcts.sim_ramp_rate, 20);
 }
 
 #[test]
@@ -177,7 +179,9 @@ port = 3000
 fn test_mcts_config_from_toml() {
     let toml_content = r#"
 [mcts]
-num_simulations = 1600
+start_sims = 100
+max_sims = 1600
+sim_ramp_rate = 50
 c_puct = 2.0
 temperature = 0.5
 dirichlet_alpha = 0.5
@@ -186,7 +190,9 @@ eval_batch_size = 64
 onnx_intra_threads = 4
 "#;
     let config: CentralConfig = toml::from_str(toml_content).unwrap();
-    assert_eq!(config.mcts.num_simulations, 1600);
+    assert_eq!(config.mcts.start_sims, 100);
+    assert_eq!(config.mcts.max_sims, 1600);
+    assert_eq!(config.mcts.sim_ramp_rate, 50);
     assert!((config.mcts.c_puct - 2.0).abs() < f64::EPSILON);
     assert!((config.mcts.temperature - 0.5).abs() < f64::EPSILON);
     assert!((config.mcts.dirichlet_alpha - 0.5).abs() < f64::EPSILON);

@@ -127,7 +127,6 @@ class WebConfig:
 class MctsConfig:
     """MCTS (Monte Carlo Tree Search) settings."""
 
-    num_simulations: int = 800
     c_puct: float = 1.4
     temperature: float = 1.0
     temp_threshold: int = (
@@ -261,36 +260,7 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
 
     Environment variables follow the pattern: CARTRIDGE_<SECTION>_<KEY>
     For example: CARTRIDGE_TRAINING_ITERATIONS=50
-
-    Also supports legacy ALPHAZERO_* variables for backward compatibility.
     """
-    # Legacy mapping: ALPHAZERO_* -> new config paths
-    legacy_mapping = {
-        "ALPHAZERO_ENV_ID": ("common", "env_id"),
-        "ALPHAZERO_ITERATIONS": ("training", "iterations"),
-        "ALPHAZERO_START_ITERATION": ("training", "start_iteration"),
-        "ALPHAZERO_EPISODES": ("training", "episodes_per_iteration"),
-        "ALPHAZERO_STEPS": ("training", "steps_per_iteration"),
-        "ALPHAZERO_BATCH_SIZE": ("training", "batch_size"),
-        "ALPHAZERO_LR": ("training", "learning_rate"),
-        "ALPHAZERO_DEVICE": ("training", "device"),
-        "ALPHAZERO_CHECKPOINT_INTERVAL": ("training", "checkpoint_interval"),
-        "ALPHAZERO_EVAL_INTERVAL": ("evaluation", "interval"),
-        "ALPHAZERO_EVAL_GAMES": ("evaluation", "games"),
-        "DATA_DIR": ("common", "data_dir"),
-    }
-
-    # Apply legacy overrides
-    for env_var, (section, key) in legacy_mapping.items():
-        value = os.environ.get(env_var)
-        if value is not None and value != "":
-            if section not in data:
-                data[section] = {}
-            # Convert to appropriate type
-            data[section][key] = _convert_value(value, section, key, data)
-            logger.debug(f"Applied legacy override {env_var}={value}")
-
-    # Apply CARTRIDGE_* overrides (higher priority)
     prefix = "CARTRIDGE_"
     for env_var, value in os.environ.items():
         if not env_var.startswith(prefix):

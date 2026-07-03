@@ -1,7 +1,7 @@
 //! Actor implementation using engine-core library directly
 
 use anyhow::{anyhow, Result};
-use engine_core::EngineContext;
+use engine_core::{EngineContext, GameMetadata};
 use indicatif::{ProgressBar, ProgressStyle};
 use mcts::{MctsConfig, SearchStats};
 use std::sync::{
@@ -12,7 +12,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
-use crate::game_config::{get_config, GameConfig};
 use crate::health::HealthState;
 use crate::mcts_policy::MctsPolicy;
 use crate::metrics;
@@ -132,7 +131,7 @@ impl EpisodeContext {
 
 pub struct Actor {
     config: Config,
-    game_config: GameConfig,
+    game_config: GameMetadata,
     engine: Mutex<EngineContext>,
     mcts_policy: Mutex<MctsPolicy>,
     replay: Arc<dyn ReplayStore>,
@@ -147,16 +146,16 @@ impl Actor {
         // Register all games
         engine_games::register_all_games();
 
-        // Get game configuration from registry
-        let game_config = get_config(&config.env_id)?;
+        // Create engine context for the specified game
+        let engine = EngineContext::new(&config.env_id)
+            .ok_or_else(|| anyhow!("Game '{}' not registered", config.env_id))?;
+
+        // Game metadata drives network sizing and observation parsing
+        let game_config = engine.metadata();
         info!(
             "Loaded game config for {}: {} actions, {} obs size",
             config.env_id, game_config.num_actions, game_config.obs_size
         );
-
-        // Create engine context for the specified game
-        let engine = EngineContext::new(&config.env_id)
-            .ok_or_else(|| anyhow!("Game '{}' not registered", config.env_id))?;
 
         let caps = engine.capabilities();
         info!(
@@ -704,7 +703,7 @@ mod tests {
         let result = Actor::new(config).await;
         assert!(result.is_err());
         let err = result.err().unwrap();
-        // Could fail at game_config lookup or engine context creation
+        // Fails at engine context creation
         let err_msg = err.to_string();
         assert!(
             err_msg.contains("Unknown game") || err_msg.contains("not registered"),

@@ -382,7 +382,6 @@ actor/
     ├── actor.rs           # Episode runner, main loop
     ├── mcts_policy.rs     # MCTS action selection
     ├── model_watcher.rs   # ONNX hot-reload (wraps engine model-watcher)
-    ├── game_config.rs     # Auto-derived game config
     ├── config.rs          # CLI configuration (defaults from engine-config)
     ├── health.rs          # Health check endpoint
     ├── metrics.rs         # Prometheus metrics
@@ -397,7 +396,7 @@ actor/
 ```rust
 pub struct Actor {
     config: Config,
-    game_config: GameConfig,
+    game_config: GameMetadata,
     engine: Mutex<EngineContext>,
     mcts_policy: Mutex<MctsPolicy>,
     replay: Arc<dyn ReplayStore>,
@@ -850,7 +849,9 @@ max_episodes = -1
 log_interval = 50
 
 [mcts]
-num_simulations = 800
+start_sims = 50
+max_sims = 400
+sim_ramp_rate = 20
 c_puct = 1.4
 temperature = 1.0
 temp_threshold = 15
@@ -868,17 +869,10 @@ postgres_url = "postgresql://..."
 
 ### Environment Variable Format
 
-New format (preferred):
 ```bash
 CARTRIDGE_COMMON_ENV_ID=connect4
 CARTRIDGE_TRAINING_ITERATIONS=50
-CARTRIDGE_MCTS_NUM_SIMULATIONS=800
-```
-
-Legacy format (supported):
-```bash
-ALPHAZERO_ENV_ID=connect4
-ALPHAZERO_ITERATIONS=50
+CARTRIDGE_MCTS_MAX_SIMS=400
 ```
 
 ### Search Paths
@@ -1164,6 +1158,6 @@ docker compose down -v
 |----------|-------------|
 | `CARTRIDGE_COMMON_ENV_ID` | Game to train |
 | `CARTRIDGE_TRAINING_DEVICE` | cpu, cuda, mps |
-| `CARTRIDGE_MCTS_NUM_SIMULATIONS` | MCTS simulations |
+| `CARTRIDGE_MCTS_MAX_SIMS` | MCTS simulations after ramping |
 | `CARTRIDGE_STORAGE_MODEL_BACKEND` | filesystem, s3 |
 | `CARTRIDGE_STORAGE_POSTGRES_URL` | PostgreSQL connection |

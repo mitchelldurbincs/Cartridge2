@@ -293,9 +293,10 @@ class TestBestModelInfo:
         assert reloaded.best_solver_rate == 0.611
         assert reloaded.best_model_iteration == 7
 
-    def test_legacy_info_loads_with_none_rate(self, tmp_path, monkeypatch):
+    def test_info_without_solver_rate_loads_with_none_rate(self, tmp_path, monkeypatch):
         runner = make_runner(tmp_path, monkeypatch)
-        # Legacy schema, as written before this feature (live file matches this).
+        # best_model.json without a solver rate (e.g. promoted while solver
+        # eval was disabled or unavailable).
         runner.config.best_model_info_path.write_text(
             json.dumps(
                 {"iteration": 5, "win_rate_when_promoted": 1.0, "timestamp": "t"}
@@ -350,7 +351,7 @@ class TestSolverOptimalPromotion:
 
         assert history[0]["became_new_best"] is False
 
-    def test_backfills_legacy_best_rate_once(self, tmp_path, monkeypatch):
+    def test_backfills_missing_best_rate_once(self, tmp_path, monkeypatch):
         runner = make_runner(
             tmp_path,
             monkeypatch,

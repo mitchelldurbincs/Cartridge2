@@ -88,7 +88,7 @@ Pure game logic library. No network I/O. Library-only design (no gRPC).
 - `model-watcher/` - Shared model hot-reload utilities (5 tests)
 
 ### Actor (Rust Binary) - `actor/`
-**Status: COMPLETE (86 tests)**
+**Status: COMPLETE (89 tests)**
 
 Self-play episode runner using engine-core directly:
 - Uses `EngineContext` for game simulation (no gRPC)
@@ -215,7 +215,7 @@ Svelte 5 frontend with Vite:
 - Responsive dark-mode UI
 
 ### Trainer (Python) - `trainer/`
-**Status: COMPLETE (245 tests)**
+**Status: COMPLETE (347 tests)**
 
 PyTorch training with AlphaZero-style learning and orchestration:
 
@@ -250,7 +250,6 @@ cartridge2/
 │       ├── main.rs         # Entry point
 │       ├── actor.rs        # Episode runner using EngineContext
 │       ├── config.rs       # CLI configuration (uses engine-config)
-│       ├── game_config.rs  # Game-specific config derived from metadata
 │       ├── mcts_policy.rs  # MCTS policy implementation
 │       ├── model_watcher.rs # ONNX model hot-reload via file watching
 │       ├── health.rs       # Health check endpoint
@@ -375,7 +374,7 @@ All settings are centralized in `config.toml` at the project root. This single f
 
 Settings are loaded with the following priority (highest to lowest):
 1. **CLI arguments** - Direct command-line flags
-2. **Environment variables** - `CARTRIDGE_*` or legacy `ALPHAZERO_*`
+2. **Environment variables** - `CARTRIDGE_*`
 3. **config.toml** - Central configuration file
 4. **Built-in defaults** - Hardcoded fallbacks
 
@@ -425,10 +424,10 @@ port = 8080
 
 [mcts]
 # Simulation ramping: starts low, increases over iterations
+# Standalone actors (run outside the orchestrator) search at max_sims
 start_sims = 50          # Simulations for first iteration
 max_sims = 250           # Maximum simulations after ramping
 sim_ramp_rate = 10       # Simulations added per iteration
-num_simulations = 200    # Legacy setting (used if ramping not configured)
 c_puct = 1.0
 temperature = 1.0
 temp_threshold = 15      # Move number to reduce temperature (0 = disabled)
@@ -487,13 +486,6 @@ CARTRIDGE_MCTS_START_SIMS=100       # MCTS simulation ramping
 CARTRIDGE_MCTS_MAX_SIMS=400
 ```
 
-Legacy format (Python trainer only):
-```bash
-ALPHAZERO_ENV_ID=connect4
-ALPHAZERO_ITERATIONS=50
-ALPHAZERO_EVAL_GAMES=100
-```
-
 ## Quick Start
 
 ### Play TicTacToe in Browser
@@ -523,8 +515,6 @@ docker compose up alphazero
 
 # Override game via environment variable
 CARTRIDGE_COMMON_ENV_ID=connect4 docker compose up alphazero
-# Or using legacy format:
-ALPHAZERO_ENV_ID=connect4 docker compose up alphazero
 
 # Run in background
 docker compose up alphazero -d
@@ -554,9 +544,9 @@ cd web && cargo build --release
 
 # Run all tests
 cd engine && cargo test   # 192 tests (70 core + 19 config + 2 games + 26 tictactoe + 20 connect4 + 25 othello + 25 mcts + 5 model-watcher)
-cd actor && cargo test    # 86 tests
+cd actor && cargo test    # 89 tests
 cd web && cargo test
-cd trainer && python -m pytest tests/ -v --tb=short  # 245 tests
+cd trainer && python -m pytest tests/ -v --tb=short  # 347 tests
 
 # Format and lint
 cd engine && cargo fmt && cargo clippy
@@ -635,14 +625,14 @@ python -m trainer train --steps 1000
 - [x] Connect 4 game implementation - 20 tests
 - [x] Othello game implementation - 25 tests
 - [x] Removed gRPC/proto dependencies (library-only)
-- [x] Actor core (episode runner, pluggable storage backends) - 86 tests
+- [x] Actor core (episode runner, pluggable storage backends) - 89 tests
 - [x] MCTS integration in actor with ONNX evaluation
 - [x] Model hot-reload via file watching (model-watcher crate) - 5 tests
 - [x] Auto-derived game configuration from GameMetadata
 - [x] Web server (Axum, game API)
 - [x] Web frontend (Svelte, play UI, stats, loss visualization)
 - [x] MCTS implementation - 25 tests
-- [x] Python trainer (PyTorch, ONNX export, evaluator) - 245 tests
+- [x] Python trainer (PyTorch, ONNX export, evaluator) - 347 tests
 - [x] ResNet architecture for spatial games (Connect4, Othello)
 - [x] MCTS policy targets + game outcome propagation
 - [x] Storage backends (PostgreSQL, S3, filesystem)

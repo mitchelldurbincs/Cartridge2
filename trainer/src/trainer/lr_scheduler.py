@@ -218,16 +218,10 @@ class WarmupCosineScheduler:
         - base_lrs is reset to target_lr (may have been saved during warmup)
 
         Args:
-            state: State dictionary from a previous state_dict() call,
-                  or a raw CosineAnnealingLR state dict for backwards compatibility.
+            state: State dictionary from a previous state_dict() call.
         """
-        # Handle legacy format (just the cosine scheduler state)
-        if "cosine_scheduler" not in state and "last_epoch" in state:
-            cosine_state = state
-            self._current_step = state.get("last_epoch", 0)
-        else:
-            cosine_state = state.get("cosine_scheduler")
-            self._current_step = state.get("current_step", 0)
+        cosine_state = state.get("cosine_scheduler")
+        self._current_step = state.get("current_step", 0)
 
         # Always disable warmup when loading from checkpoint
         if self._warmup_steps > 0:

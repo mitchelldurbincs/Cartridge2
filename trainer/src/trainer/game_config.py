@@ -3,9 +3,13 @@
 This module provides game-specific configuration that the trainer needs
 for neural network architecture and observation parsing.
 
-IMPORTANT: The preferred way to get configuration is from the replay database
-via ReplayBuffer.get_metadata(). The hardcoded values here are fallbacks
-for backward compatibility with databases that don't have metadata.
+This registry is the only source for network-architecture settings
+(network_type, hidden_size, ResNet dimensions) and is what evaluation uses,
+since it plays games in pure Python without a replay database. For the
+board/observation dimensions, the trainer prefers the metadata the actor
+wrote to the replay database (ReplayBuffer.get_metadata()) because it is
+guaranteed to match the data being trained on; the values here MUST match
+the Rust engine implementations exactly.
 """
 
 from __future__ import annotations
@@ -91,7 +95,7 @@ class GameConfig:
         return obs[:, offset : offset + 2]  # type: ignore[index]
 
 
-# Game configuration registry (fallback values - prefer reading from DB)
+# Game configuration registry.
 # These values MUST match the Rust engine implementations exactly.
 GAME_CONFIGS: dict[str, GameConfig] = {
     "tictactoe": GameConfig(

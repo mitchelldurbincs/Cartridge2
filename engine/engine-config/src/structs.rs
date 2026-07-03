@@ -94,9 +94,6 @@ fn d_port() -> u16 {
 fn d_allowed_origins() -> Vec<String> {
     defaults::allowed_origins().to_vec()
 }
-fn d_num_sims() -> u32 {
-    defaults::num_simulations()
-}
 fn d_c_puct() -> f64 {
     defaults::c_puct()
 }
@@ -332,8 +329,6 @@ impl Default for WebConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct MctsConfig {
-    #[serde(default = "d_num_sims")]
-    pub num_simulations: u32,
     #[serde(default = "d_c_puct")]
     pub c_puct: f64,
     #[serde(default = "d_temperature")]
@@ -359,7 +354,6 @@ pub struct MctsConfig {
 impl Default for MctsConfig {
     fn default() -> Self {
         Self {
-            num_simulations: defaults::num_simulations(),
             c_puct: defaults::c_puct(),
             temperature: defaults::temperature(),
             temp_threshold: defaults::temp_threshold(),

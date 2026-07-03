@@ -65,7 +65,6 @@ COPY --from=builder /app/web/target/release/web /app/web
 RUN mkdir -p /app/data/models && chown -R cartridge:cartridge /app
 
 # Environment variables with defaults
-ENV DATA_DIR="/app/data"
 ENV DEFAULT_GAME="tictactoe"
 ENV RUST_LOG="info"
 

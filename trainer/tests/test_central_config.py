@@ -108,17 +108,6 @@ class TestEnvironmentVariableOverrides:
 
         assert config.evaluation.eval_vs_random is False
 
-    def test_legacy_env_override(self, monkeypatch):
-        """Test legacy ALPHAZERO_* environment variables."""
-        reset_config()
-        monkeypatch.setenv("ALPHAZERO_ENV_ID", "connect4")
-        monkeypatch.setenv("ALPHAZERO_ITERATIONS", "75")
-
-        config = get_config(reload=True)
-
-        assert config.common.env_id == "connect4"
-        assert config.training.iterations == 75
-
     def test_empty_env_var_ignored(self, monkeypatch, tmp_path):
         """Test that empty environment variables are ignored."""
         # Isolate from repo's config.toml by changing to temp directory

@@ -149,9 +149,7 @@ start_sims = 50       # Simulations for first iteration
 max_sims = 250        # Maximum simulations (reached after ramping)
 sim_ramp_rate = 10    # Simulations to add per iteration
 # With these settings: iter 1=50, iter 10=140, iter 21+=250
-
-# Legacy setting (used if ramping not configured)
-num_simulations = 200
+# Standalone actors (run outside the orchestrator) search at max_sims.
 
 # Exploration constant (c_puct)
 # Lower values = more exploitation of current best moves

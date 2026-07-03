@@ -82,9 +82,8 @@ Monte Carlo Tree Search configuration.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `start_sims` | u32 | `50` | Simulations for first iteration (ramping start) |
-| `max_sims` | u32 | `250` | Maximum simulations after ramping completes |
-| `sim_ramp_rate` | u32 | `10` | Simulations added per iteration |
-| `num_simulations` | u32 | `800` | Legacy: MCTS simulations per move (used if ramping not configured) |
+| `max_sims` | u32 | `400` | Maximum simulations after ramping completes (also used by standalone actors) |
+| `sim_ramp_rate` | u32 | `20` | Simulations added per iteration |
 | `c_puct` | f64 | `1.4` | Exploration constant |
 | `temperature` | f64 | `1.0` | Action selection temperature |
 | `temp_threshold` | u32 | `15` | Move number after which to reduce temperature (0 = disabled) |
@@ -152,7 +151,7 @@ CARTRIDGE_WEB_HOST=127.0.0.1
 CARTRIDGE_WEB_PORT=3000
 
 # MCTS
-CARTRIDGE_MCTS_NUM_SIMULATIONS=1600
+CARTRIDGE_MCTS_MAX_SIMS=1600
 CARTRIDGE_MCTS_C_PUCT=2.0
 
 # Storage

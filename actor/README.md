@@ -53,7 +53,7 @@ Configuration is loaded from `config.toml` at the project root, with environment
 │    ├─ Parse CLI args (clap)                             │
 │    ├─ Load config from config.toml                       │
 │    ├─ Validate config                                   │
-│    ├─ Load GameConfig from metadata                     │
+│    ├─ Load GameMetadata via EngineContext               │
 │    ├─ Init model watcher                                │
 │    ├─ Init tracing                                      │
 │    └─ Run actor.run() async loop                        │
@@ -117,11 +117,11 @@ Hot-reload for ONNX models:
 - Automatically reloads the model when updated
 - Thread-safe access via Arc<RwLock>
 
-### Game Config (`src/game_config.rs`)
+### Game Configuration
 
-Game-specific configuration derived from GameMetadata:
+Game-specific configuration comes from `GameMetadata` (via
+`EngineContext::metadata()` in engine-core):
 - Auto-derives observation size, action space, legal mask offset
-- Supports TicTacToe and Connect 4
 - No hardcoded game parameters
 
 ### Replay Buffer (`src/storage/postgres.rs`)

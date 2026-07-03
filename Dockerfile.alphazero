@@ -103,26 +103,10 @@ RUN mkdir -p /app/data/models && chown -R cartridge:cartridge /app/data
 # Actor binary location (used by orchestrator)
 ENV ACTOR_BINARY="/app/actor"
 
-# Data paths
-ENV DATA_DIR="/app/data"
-
-# AlphaZero training defaults
-# Note: ENV_ID is intentionally NOT set here - it should come from
-# CARTRIDGE_COMMON_ENV_ID in docker-compose or config.toml to ensure
-# consistency across all services (actor, trainer, web).
-ENV ALPHAZERO_ITERATIONS="100"
-ENV ALPHAZERO_EPISODES="500"
-ENV ALPHAZERO_STEPS="1000"
-ENV ALPHAZERO_BATCH_SIZE="64"
-ENV ALPHAZERO_LR="0.001"
-ENV ALPHAZERO_DEVICE="cpu"
-
-# Evaluation enabled by default (every iteration)
-ENV ALPHAZERO_EVAL_INTERVAL="1"
-ENV ALPHAZERO_EVAL_GAMES="50"
-
-ENV ALPHAZERO_CHECKPOINT_INTERVAL="100"
-ENV ALPHAZERO_START_ITERATION="1"
+# Training settings come from config.defaults.toml (baked into the image),
+# config.toml (mount to /app/config.toml), and CARTRIDGE_* environment
+# variable overrides - no defaults are baked in here so the mounted
+# config.toml actually takes effect.
 
 # Run as non-root user
 USER cartridge

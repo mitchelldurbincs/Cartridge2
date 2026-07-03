@@ -80,7 +80,6 @@ struct WebDefaults {
 
 #[derive(Debug, Deserialize)]
 struct MctsDefaults {
-    num_simulations: u32,
     c_puct: f64,
     temperature: f64,
     temp_threshold: u32,
@@ -208,9 +207,6 @@ pub fn allowed_origins() -> &'static [String] {
 }
 
 // MCTS
-pub fn num_simulations() -> u32 {
-    DEFAULTS.mcts.num_simulations
-}
 pub fn c_puct() -> f64 {
     DEFAULTS.mcts.c_puct
 }
@@ -292,7 +288,6 @@ mod tests {
 
     #[test]
     fn test_mcts_defaults() {
-        assert_eq!(num_simulations(), 800);
         assert!((c_puct() - 1.4).abs() < f64::EPSILON);
         assert_eq!(temp_threshold(), 0);
         assert_eq!(start_sims(), 50);

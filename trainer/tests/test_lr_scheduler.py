@@ -302,23 +302,6 @@ class TestStateManagement:
         # LR should be restored (within reasonable tolerance)
         assert abs(scheduler2.get_lr() - lr_before) < 1e-4
 
-    def test_load_legacy_state_dict(self):
-        """Test loading legacy state dict format (backwards compatibility)."""
-        # These are created to establish the test setup pattern,
-        # though we only use the config below
-        _ = Adam([torch.randn(10, requires_grad=True)], lr=0.001)  # optimizer (unused)
-        config = LRConfig(target_lr=0.001, warmup_steps=0, total_steps=100)
-
-        # Create legacy state (just cosine scheduler state)
-        legacy_state = {"last_epoch": 15, "T_max": 100}
-
-        # Load into new scheduler
-        optimizer2 = Adam([torch.randn(10, requires_grad=True)], lr=0.001)
-        scheduler2 = WarmupCosineScheduler(optimizer2, config, from_checkpoint=True)
-        scheduler2.load_state_dict(legacy_state)
-
-        assert scheduler2._current_step == 15
-
 
 class TestEdgeCases:
     """Tests for edge cases and error conditions."""

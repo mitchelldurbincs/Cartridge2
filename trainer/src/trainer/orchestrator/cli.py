@@ -23,7 +23,7 @@ def parse_args() -> LoopConfig:
 
     Priority (highest to lowest):
     1. CLI arguments
-    2. Environment variables (CARTRIDGE_* and legacy ALPHAZERO_*)
+    2. Environment variables (CARTRIDGE_*)
     3. config.toml values
     4. Built-in defaults
     """
@@ -37,7 +37,7 @@ def parse_args() -> LoopConfig:
 Configuration:
     Settings are loaded from config.toml with the following override priority:
     1. CLI arguments (highest)
-    2. Environment variables (CARTRIDGE_* or legacy ALPHAZERO_*)
+    2. Environment variables (CARTRIDGE_*)
     3. config.toml values
     4. Built-in defaults (lowest)
 

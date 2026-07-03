@@ -80,11 +80,13 @@ fn default_data_dir() -> String {
     std::env::var("ACTOR_DATA_DIR").unwrap_or_else(|_| CENTRAL_CONFIG.common.data_dir.clone())
 }
 
+// Standalone actors (run outside the orchestrator, which passes
+// --num-simulations per iteration) search at the fully-ramped count.
 fn default_num_simulations() -> u32 {
     std::env::var("ACTOR_NUM_SIMULATIONS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(CENTRAL_CONFIG.mcts.num_simulations)
+        .unwrap_or(CENTRAL_CONFIG.mcts.max_sims)
 }
 
 fn default_temp_threshold() -> u32 {

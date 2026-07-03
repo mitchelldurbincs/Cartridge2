@@ -149,8 +149,11 @@ class EvalRunner:
     def _load_best_model_info(self) -> None:
         """Load best model info from disk if it exists.
 
-        Legacy files (pre solver-eval) lack the solver rate — read with
-        .get() so they load fine and the rate backfills lazily.
+        best_model.json may lack the solver rate — either written before
+        solver eval existed, or promoted while solver eval was disabled or
+        unavailable. This is a permanent tolerance, not a transition shim:
+        read with .get() so such files load fine and the rate backfills
+        lazily via _ensure_best_solver_rate.
         """
         if not self.config.best_model_info_path.exists():
             return
@@ -235,7 +238,7 @@ class EvalRunner:
         return metric
 
     def _ensure_best_solver_rate(self, game_config) -> float | None:
-        """Backfill the best model's solver rate for legacy best_model.json.
+        """Backfill the best model's solver rate when best_model.json lacks it.
 
         Evaluates best.onnx once with the same scorer, seed, and game count
         as the candidate, so the comparison is same-conditions.

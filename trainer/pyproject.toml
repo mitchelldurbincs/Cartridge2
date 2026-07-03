@@ -31,8 +31,6 @@ trainer = "trainer.__main__:main"
 trainer-loop = "trainer.orchestrator:main"
 trainer-evaluate = "trainer.evaluator:main"
 trainer-solver-eval = "trainer.solver_eval:main"
-# Legacy alias
-evaluator = "trainer.evaluator:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]

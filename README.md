@@ -98,7 +98,6 @@ cartridge2/
 |   |   |-- main.rs            # Entry point
 |   |   |-- actor.rs           # Episode loop
 |   |   |-- config.rs          # CLI configuration
-|   |   |-- game_config.rs     # Game-specific config from metadata
 |   |   |-- health.rs          # Health check endpoint
 |   |   |-- mcts_policy.rs     # MCTS policy implementation
 |   |   |-- metrics.rs         # Prometheus metrics
@@ -257,17 +256,16 @@ Run locally (with defaults targeting TicTacToe):
 # Using the subcommand interface
 trainer loop --iterations 5 --episodes 200 --steps 500
 # Or: python -m trainer loop --iterations 5 --episodes 200 --steps 500
-
-# Legacy entry point also works
+# Or the installed console script:
 trainer-loop --iterations 5 --episodes 200 --steps 500
 ```
 
-Configuration can be supplied via flags or environment variables (prefixed with
-`ALPHAZERO_` or `CARTRIDGE_`). For example, to train Connect4 with GPU acceleration
-and disable evaluation for speed:
+Configuration can be supplied via flags or `CARTRIDGE_*` environment variables.
+For example, to train Connect4 with GPU acceleration and disable evaluation
+for speed:
 
 ```bash
-ALPHAZERO_ENV_ID=connect4 ALPHAZERO_DEVICE=cuda ALPHAZERO_EVAL_INTERVAL=0 \
+CARTRIDGE_COMMON_ENV_ID=connect4 CARTRIDGE_TRAINING_DEVICE=cuda CARTRIDGE_EVALUATION_INTERVAL=0 \
     trainer loop --iterations 20 --episodes 300 --steps 1000
 ```
 
@@ -414,9 +412,9 @@ cd trainer && pip install -e .
 
 ```bash
 cd engine && cargo test    # 192 tests
-cd actor && cargo test     # 86 tests
+cd actor && cargo test     # 89 tests
 cd web && cargo test
-cd trainer && pytest       # 245 tests
+cd trainer && pytest       # 347 tests
 ```
 
 ### Format & Lint

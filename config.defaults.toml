@@ -52,7 +52,6 @@ port = 8080
 allowed_origins = []
 
 [mcts]
-num_simulations = 800
 c_puct = 1.4
 temperature = 1.0
 temp_threshold = 0        # Move number after which to reduce temperature (0 = disabled)
