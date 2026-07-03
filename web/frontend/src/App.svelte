@@ -85,27 +85,36 @@
     loading = false;
   }
 
+  // Games with a pass action have one more action than board cells (e.g. Othello:
+  // 65 = 8*8 + 1), with pass as the last index. Games whose actions all map to
+  // board positions (TicTacToe) or columns (Connect 4) have no pass action.
+  function passAction(): number | null {
+    if (!gameInfo) return null;
+    const { board_width, board_height, num_actions } = gameInfo;
+    if (num_actions !== board_width * board_height + 1) return null;
+    return num_actions - 1;
+  }
+
   // Check if pass action is available (for games like Othello)
   function canPass(): boolean {
     if (!gameState || gameState.game_over) return false;
     if (gameState.current_player !== gameState.human_player) return false;
-    // Pass action is typically the last action index (e.g., 64 for Othello's 65 actions)
-    const passAction = (gameInfo?.num_actions ?? 0) - 1;
-    return gameState.legal_moves.includes(passAction);
+    const pass = passAction();
+    return pass !== null && gameState.legal_moves.includes(pass);
   }
 
   // Handle pass action
   async function handlePass() {
     if (loading || !gameState || gameState.game_over) return;
     if (gameState.current_player !== gameState.human_player) return;
-    
-    const passAction = (gameInfo?.num_actions ?? 0) - 1;
-    if (!gameState.legal_moves.includes(passAction)) return;
+
+    const pass = passAction();
+    if (pass === null || !gameState.legal_moves.includes(pass)) return;
 
     loading = true;
     error = null;
     try {
-      const response: MoveResponse = await makeMove(passAction);
+      const response: MoveResponse = await makeMove(pass);
       gameState = response;
       lastBotMove = response.bot_move;
     } catch (e) {
