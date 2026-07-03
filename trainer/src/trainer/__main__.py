@@ -1,17 +1,19 @@
 """CLI entrypoint for the Cartridge2 trainer.
 
 Provides subcommands for different operations:
-    python -m trainer train     - Run training loop on replay buffer
-    python -m trainer evaluate  - Evaluate model against random baseline
-    python -m trainer loop      - Run synchronized AlphaZero training
+    python -m trainer train        - Run training loop on replay buffer
+    python -m trainer evaluate     - Evaluate model against random baseline
+    python -m trainer loop         - Run synchronized AlphaZero training
+    python -m trainer solver-eval  - Score Connect4 moves vs perfect solver
 
 For backwards compatibility, running without a subcommand defaults to 'train':
     python -m trainer --steps 1000
 
 Entry points after pip install:
-    trainer           - Same as 'python -m trainer train'
-    trainer-loop      - Same as 'python -m trainer loop'
-    trainer-evaluate  - Same as 'python -m trainer evaluate'
+    trainer              - Same as 'python -m trainer train'
+    trainer-loop         - Same as 'python -m trainer loop'
+    trainer-evaluate     - Same as 'python -m trainer evaluate'
+    trainer-solver-eval  - Same as 'python -m trainer solver-eval'
 
 Note: Replay buffer connection is configured via CARTRIDGE_STORAGE_POSTGRES_URL
 environment variable.
@@ -62,6 +64,13 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     from .evaluator import run_evaluation
 
     return run_evaluation(args)
+
+
+def cmd_solver_eval(args: argparse.Namespace) -> int:
+    """Run solver-based move-quality evaluation."""
+    from .solver_eval import run_solver_evaluation
+
+    return run_solver_evaluation(args)
 
 
 def cmd_loop(args: argparse.Namespace) -> int:
@@ -142,6 +151,19 @@ def setup_evaluate_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.set_defaults(func=cmd_evaluate)
 
 
+def setup_solver_eval_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Set up the solver-eval subcommand parser."""
+    from .solver_eval import add_solver_eval_arguments
+
+    parser = subparsers.add_parser(
+        "solver-eval",
+        help="Score Connect4 model moves against a perfect solver (bitbully)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    add_solver_eval_arguments(parser)
+    parser.set_defaults(func=cmd_solver_eval)
+
+
 def setup_loop_parser(subparsers: argparse._SubParsersAction) -> None:
     """Set up the loop subcommand parser."""
     parser = subparsers.add_parser(
@@ -171,6 +193,7 @@ def main() -> int:
         "train",
         "evaluate",
         "loop",
+        "solver-eval",
         "-h",
         "--help",
     ):
@@ -188,6 +211,7 @@ def main() -> int:
         setup_train_parser(subparsers)
         setup_evaluate_parser(subparsers)
         setup_loop_parser(subparsers)
+        setup_solver_eval_parser(subparsers)
 
         args, remaining = parser.parse_known_args()
 
@@ -198,7 +222,6 @@ def main() -> int:
         # For non-loop commands, unknown args are an error
         if args.command != "loop" and remaining:
             parser.error(f"unrecognized arguments: {' '.join(remaining)}")
-
 
         # Configure structured logging (supports JSON for cloud deployments)
         log_level = getattr(args, "log_level", "INFO")
