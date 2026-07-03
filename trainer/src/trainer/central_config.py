@@ -97,6 +97,11 @@ class EvaluationConfig:
     games: int = 50
     win_threshold: float = 0.55  # Win rate needed to become new best model
     eval_vs_random: bool = True  # Also evaluate against random baseline
+    # Perfect-solver move scoring during loop evaluation (connect4 only)
+    solver_games: int = 100  # Games per solver eval (0 = disable)
+    solver_seed: int = 42  # Fixed seed so rates are comparable across iterations
+    promotion_metric: str = "win_rate"  # "win_rate" or "solver_optimal"
+    promotion_margin: float = 0.01  # solver_optimal: candidate must exceed best by this
 
 
 @dataclass
@@ -162,6 +167,19 @@ class LoggingConfig:
 
 
 @dataclass
+class WandbConfig:
+    """Weights & Biases logging settings (used by the trainer loop)."""
+
+    enabled: bool = False
+    required: bool = False  # True: fail loudly instead of null-logger fallback
+    project: str = "cartridge2"
+    entity: str = ""  # Empty = the logged-in default entity
+    group: str = ""  # Groups related runs in the W&B UI
+    tags: list[str] = field(default_factory=list)
+    init_timeout_seconds: float = 30.0
+
+
+@dataclass
 class Config:
     """Root configuration container."""
 
@@ -173,6 +191,7 @@ class Config:
     mcts: MctsConfig = field(default_factory=MctsConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
 
     # Convenience properties for commonly accessed paths
     @property
@@ -347,6 +366,7 @@ def _dict_to_config(data: dict[str, Any]) -> Config:
         web=build_section(WebConfig, "web"),
         mcts=build_section(MctsConfig, "mcts"),
         storage=build_section(StorageConfig, "storage"),
+        wandb=build_section(WandbConfig, "wandb"),
     )
 
 

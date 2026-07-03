@@ -94,6 +94,20 @@ win_threshold = 0.55
 # Also evaluate against random baseline (useful for absolute performance)
 eval_vs_random = true
 
+# Perfect-solver move scoring during evaluation (connect4 only).
+# Every model decision is scored against the bitbully solver; results go to
+# eval_stats.json, solver_stats.json, and W&B (solver/* metrics).
+solver_games = 100        # Games per solver eval (0 = disable)
+solver_seed = 42          # Fixed seed so rates are comparable across iterations
+
+# Best-model promotion criterion:
+#   "win_rate"       - promote when candidate beats best.onnx > win_threshold (default)
+#   "solver_optimal" - promote when candidate's value-optimal rate exceeds the
+#                      best model's stored rate by promotion_margin (connect4 only;
+#                      falls back to win_rate when solver eval is unavailable)
+promotion_metric = "win_rate"
+promotion_margin = 0.01
+
 # =============================================================================
 # Actor Settings (Self-play episode runner)
 # =============================================================================
@@ -209,3 +223,21 @@ pool_idle_timeout = 300     # Seconds before idle connection is closed
 # S3-compatible endpoint URL (for MinIO, etc.)
 # Can also be set via CARTRIDGE_S3_ENDPOINT environment variable
 # s3_endpoint = "http://minio:9000"
+
+# =============================================================================
+# Weights & Biases Logging
+# =============================================================================
+# One W&B run per `python -m trainer loop` invocation: training losses per
+# step, eval + solver metrics per iteration, all on the global-step x-axis.
+# Requires `wandb login` (or WANDB_API_KEY) when enabled; WANDB_MODE=offline
+# logs locally without a network. WANDB_PROJECT / WANDB_ENTITY env vars
+# override the values below. WANDB_MODE=disabled force-disables.
+
+[wandb]
+enabled = false
+required = false          # true: fail loudly instead of no-op fallback
+project = "cartridge2"
+entity = ""               # Empty = logged-in default entity
+group = ""                # Groups related runs in the W&B UI
+tags = []
+init_timeout_seconds = 30.0
