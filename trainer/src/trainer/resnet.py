@@ -137,7 +137,7 @@ class ConvPolicyValueNetwork(BasePolicyValueNetwork):
         board_size = self.board_height * self.board_width
 
         # Extract board planes from the flat observation
-        # Assumption: first input_channels * board_size elements are board planes
+        # Assumption: first board_planes * board_size elements are board planes
         planes = []
         for i in range(self.board_planes):
             start = i * board_size
@@ -192,15 +192,3 @@ class ConvPolicyValueNetwork(BasePolicyValueNetwork):
         value = torch.tanh(self.value_fc2(v))
 
         return policy_logits, value
-
-
-def create_resnet(config: GameConfig) -> ConvPolicyValueNetwork:
-    """Factory function to create a ResNet for the specified game configuration.
-
-    Args:
-        config: Game configuration with CNN settings.
-
-    Returns:
-        ConvPolicyValueNetwork configured for the specified game.
-    """
-    return ConvPolicyValueNetwork(config)

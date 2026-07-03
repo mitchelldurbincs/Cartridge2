@@ -256,7 +256,8 @@ class S3ModelStore(ModelStore):
             return hash(etag)
         except self._s3.exceptions.NoSuchKey:
             return None
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Could not get latest model version: {e}")
             return None
 
     def load_latest_onnx(self) -> bytes | None:
@@ -351,7 +352,8 @@ class S3ModelStore(ModelStore):
             )
         except self._s3.exceptions.NoSuchKey:
             return None
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Could not get best model info: {e}")
             return None
 
     def download_to_local(self, s3_path: str, local_path: Path) -> Path:

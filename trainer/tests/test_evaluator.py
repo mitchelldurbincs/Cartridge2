@@ -7,11 +7,6 @@ This module tests:
 - Evaluation with mock ONNX models
 """
 
-from dataclasses import dataclass
-from unittest.mock import MagicMock, patch
-
-import pytest
-
 from trainer.evaluator import EvalResults, MatchResult, evaluate, play_game
 from trainer.game_config import GameConfig
 from trainer.games import Player, create_game_state
@@ -223,6 +218,25 @@ class TestPlayGame:
 
         # Game should complete with valid moves
         assert result.moves >= 5  # At least 5 moves played
+
+    def test_play_game_connect4_scripted_win(self):
+        """A scripted vertical four-in-a-row on Connect4 is detected."""
+        player1 = MockPolicy("stacker", [0, 0, 0, 0])
+        player2 = MockPolicy("spreader", [1, 2, 3])
+
+        config = create_test_config("connect4")
+
+        result = play_game(
+            player1=player1,
+            player2=player2,
+            player1_as=Player.FIRST,
+            env_id="connect4",
+            config=config,
+            verbose=False,
+        )
+
+        assert result.winner == 1
+        assert result.moves == 7
 
 
 class TestEvaluate:

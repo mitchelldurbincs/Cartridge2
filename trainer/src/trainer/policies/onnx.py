@@ -88,24 +88,3 @@ class OnnxPolicy:
             probs = np.exp(logits)
             probs = probs / np.sum(probs)
             return int(np.random.choice(config.num_actions, p=probs))
-
-    def get_value(
-        self, state: "GameState", config: "GameConfig | GameMetadata"
-    ) -> float:
-        """Get the value estimate for a state.
-
-        Args:
-            state: Current game state.
-            config: Game configuration for observation encoding.
-
-        Returns:
-            Value estimate from the network.
-        """
-        obs = state.to_observation(config)
-        obs_batch = obs.reshape(1, -1)
-
-        outputs = self.session.run(
-            [self.value_output],
-            {self.input_name: obs_batch},
-        )
-        return float(outputs[0][0][0])

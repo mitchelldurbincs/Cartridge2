@@ -26,7 +26,7 @@ postgres_available = bool(os.environ.get("CARTRIDGE_STORAGE_POSTGRES_URL"))
 # Skip decorator for PostgreSQL tests only
 requires_postgres = pytest.mark.skipif(
     not postgres_available,
-    reason="PostgreSQL not configured (set CARTRIDGE_STORAGE_POSTGRES_URL)"
+    reason="PostgreSQL not configured (set CARTRIDGE_STORAGE_POSTGRES_URL)",
 )
 
 
@@ -145,10 +145,16 @@ class TestMetadataOperations:
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                        ON CONFLICT (env_id) DO UPDATE SET
                        display_name = EXCLUDED.display_name""",
-                    (sample_metadata.env_id, sample_metadata.display_name,
-                     sample_metadata.board_width, sample_metadata.board_height,
-                     sample_metadata.num_actions, sample_metadata.obs_size,
-                     sample_metadata.legal_mask_offset, sample_metadata.player_count)
+                    (
+                        sample_metadata.env_id,
+                        sample_metadata.display_name,
+                        sample_metadata.board_width,
+                        sample_metadata.board_height,
+                        sample_metadata.num_actions,
+                        sample_metadata.obs_size,
+                        sample_metadata.legal_mask_offset,
+                        sample_metadata.player_count,
+                    ),
                 )
                 conn.commit()
 
@@ -177,7 +183,7 @@ class TestMetadataOperations:
                             num_actions, obs_size, legal_mask_offset, player_count)
                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                            ON CONFLICT (env_id) DO NOTHING""",
-                        (game_id, f"Game {i}", 3, 3, 9, 29, 18, 2)
+                        (game_id, f"Game {i}", 3, 3, 9, 29, 18, 2),
                     )
                 conn.commit()
 
@@ -202,7 +208,7 @@ class TestTransitionOperations:
         # PostgresReplayBuffer doesn't have add_transition,
         # it likely receives from actor
         # Skip this test if method doesn't exist
-        if not hasattr(replay_buffer, 'add_transition'):
+        if not hasattr(replay_buffer, "add_transition"):
             pytest.skip("add_transition not implemented in PostgresReplayBuffer")
 
     def test_count_increases_with_data(self, replay_buffer):
@@ -218,9 +224,23 @@ class TestTransitionOperations:
                         next_state, observation, next_observation, reward, done,
                         timestamp, policy_probs, mcts_value, game_outcome)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                    ("test-id", "testgame", "ep-001", 0, b"state", b"\x00",
-                     b"next", b"obs", b"next_obs", 0.0, False, 1234567890,
-                     None, 0.5, None)
+                    (
+                        "test-id",
+                        "testgame",
+                        "ep-001",
+                        0,
+                        b"state",
+                        b"\x00",
+                        b"next",
+                        b"obs",
+                        b"next_obs",
+                        0.0,
+                        False,
+                        1234567890,
+                        None,
+                        0.5,
+                        None,
+                    ),
                 )
                 conn.commit()
 
@@ -239,9 +259,23 @@ class TestTransitionOperations:
                             next_state, observation, next_observation, reward, done,
                             timestamp, policy_probs, mcts_value, game_outcome)
                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (f"test-{i}", "testgame", "ep-001", i, b"state", b"\x00",
-                         b"next", b"obs", b"next_obs", 0.0, i == 9, 1234567890,
-                         None, 0.5, 1.0)
+                        (
+                            f"test-{i}",
+                            "testgame",
+                            "ep-001",
+                            i,
+                            b"state",
+                            b"\x00",
+                            b"next",
+                            b"obs",
+                            b"next_obs",
+                            0.0,
+                            i == 9,
+                            1234567890,
+                            None,
+                            0.5,
+                            1.0,
+                        ),
                     )
                 conn.commit()
 
@@ -268,9 +302,23 @@ class TestTransitionOperations:
                             next_state, observation, next_observation, reward, done,
                             timestamp, policy_probs, mcts_value, game_outcome)
                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (f"test-{i}", "testgame", "ep-001", i, b"state", b"\x00",
-                         b"next", b"obs", b"next_obs", 0.0, False, 1234567890,
-                         None, 0.5, None)
+                        (
+                            f"test-{i}",
+                            "testgame",
+                            "ep-001",
+                            i,
+                            b"state",
+                            b"\x00",
+                            b"next",
+                            b"obs",
+                            b"next_obs",
+                            0.0,
+                            False,
+                            1234567890,
+                            None,
+                            0.5,
+                            None,
+                        ),
                     )
                 conn.commit()
 
@@ -293,9 +341,23 @@ class TestTransitionOperations:
                             next_state, observation, next_observation, reward, done,
                             timestamp, policy_probs, mcts_value, game_outcome)
                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (f"game1-{i}", "game1", "ep-001", i, b"state", b"\x00",
-                         b"next", b"obs", b"next_obs", 0.0, False, 1234567890,
-                         None, 0.5, None)
+                        (
+                            f"game1-{i}",
+                            "game1",
+                            "ep-001",
+                            i,
+                            b"state",
+                            b"\x00",
+                            b"next",
+                            b"obs",
+                            b"next_obs",
+                            0.0,
+                            False,
+                            1234567890,
+                            None,
+                            0.5,
+                            None,
+                        ),
                     )
                     cur.execute(
                         """INSERT INTO transitions
@@ -303,9 +365,23 @@ class TestTransitionOperations:
                             next_state, observation, next_observation, reward, done,
                             timestamp, policy_probs, mcts_value, game_outcome)
                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (f"game2-{i}", "game2", "ep-001", i, b"state", b"\x00",
-                         b"next", b"obs", b"next_obs", 0.0, False, 1234567890,
-                         None, 0.5, None)
+                        (
+                            f"game2-{i}",
+                            "game2",
+                            "ep-001",
+                            i,
+                            b"state",
+                            b"\x00",
+                            b"next",
+                            b"obs",
+                            b"next_obs",
+                            0.0,
+                            False,
+                            1234567890,
+                            None,
+                            0.5,
+                            None,
+                        ),
                     )
                 conn.commit()
 
@@ -328,9 +404,23 @@ class TestTransitionOperations:
                             next_state, observation, next_observation, reward, done,
                             timestamp, policy_probs, mcts_value, game_outcome)
                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (f"game1-{i}", "game1", "ep-001", i, b"state", b"\x00",
-                         b"next", b"obs", b"next_obs", 0.0, False, 1234567890,
-                         None, 0.5, None)
+                        (
+                            f"game1-{i}",
+                            "game1",
+                            "ep-001",
+                            i,
+                            b"state",
+                            b"\x00",
+                            b"next",
+                            b"obs",
+                            b"next_obs",
+                            0.0,
+                            False,
+                            1234567890,
+                            None,
+                            0.5,
+                            None,
+                        ),
                     )
                     cur.execute(
                         """INSERT INTO transitions
@@ -338,9 +428,23 @@ class TestTransitionOperations:
                             next_state, observation, next_observation, reward, done,
                             timestamp, policy_probs, mcts_value, game_outcome)
                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (f"game2-{i}", "game2", "ep-001", i, b"state", b"\x00",
-                         b"next", b"obs", b"next_obs", 0.0, False, 1234567890,
-                         None, 0.5, None)
+                        (
+                            f"game2-{i}",
+                            "game2",
+                            "ep-001",
+                            i,
+                            b"state",
+                            b"\x00",
+                            b"next",
+                            b"obs",
+                            b"next_obs",
+                            0.0,
+                            False,
+                            1234567890,
+                            None,
+                            0.5,
+                            None,
+                        ),
                     )
                 conn.commit()
 
@@ -351,6 +455,7 @@ class TestTransitionOperations:
         assert game1_count == 5
         assert game2_count == 5
         assert total_count >= 10
+
 
 @requires_postgres
 class TestBufferManagement:
@@ -368,9 +473,23 @@ class TestBufferManagement:
                             next_state, observation, next_observation, reward, done,
                             timestamp, policy_probs, mcts_value, game_outcome)
                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (f"test-{i}", "testgame", "ep-001", i, b"state", b"\x00",
-                         b"next", b"obs", b"next_obs", 0.0, False, 1234567890,
-                         None, 0.5, None)
+                        (
+                            f"test-{i}",
+                            "testgame",
+                            "ep-001",
+                            i,
+                            b"state",
+                            b"\x00",
+                            b"next",
+                            b"obs",
+                            b"next_obs",
+                            0.0,
+                            False,
+                            1234567890,
+                            None,
+                            0.5,
+                            None,
+                        ),
                     )
                 conn.commit()
 
@@ -393,10 +512,16 @@ class TestBufferManagement:
                        (env_id, display_name, board_width, board_height,
                         num_actions, obs_size, legal_mask_offset, player_count)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                    (sample_metadata.env_id, sample_metadata.display_name,
-                     sample_metadata.board_width, sample_metadata.board_height,
-                     sample_metadata.num_actions, sample_metadata.obs_size,
-                     sample_metadata.legal_mask_offset, sample_metadata.player_count)
+                    (
+                        sample_metadata.env_id,
+                        sample_metadata.display_name,
+                        sample_metadata.board_width,
+                        sample_metadata.board_height,
+                        sample_metadata.num_actions,
+                        sample_metadata.obs_size,
+                        sample_metadata.legal_mask_offset,
+                        sample_metadata.player_count,
+                    ),
                 )
                 conn.commit()
 
@@ -407,6 +532,14 @@ class TestBufferManagement:
         metadata = replay_buffer.get_metadata("testgame")
         assert metadata is not None
         assert metadata.env_id == "testgame"
+
+    def test_vacuum_runs_without_error(self, replay_buffer):
+        """VACUUM must run outside a transaction; exercise the autocommit toggle."""
+        replay_buffer.vacuum()
+
+        # Buffer is still usable afterwards
+        assert replay_buffer.count() == 0
+
 
 @requires_postgres
 class TestSampleBatchTensors:
@@ -427,9 +560,23 @@ class TestSampleBatchTensors:
                             next_state, observation, next_observation, reward, done,
                             timestamp, policy_probs, mcts_value, game_outcome)
                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (f"test-{i}", "testgame", "ep-001", i, b"state", b"\x00",
-                         b"next", obs1 if i % 2 == 0 else obs2, b"next_obs", 0.0, False, 1234567890,
-                         None, 0.5, 1.0)
+                        (
+                            f"test-{i}",
+                            "testgame",
+                            "ep-001",
+                            i,
+                            b"state",
+                            b"\x00",
+                            b"next",
+                            obs1 if i % 2 == 0 else obs2,
+                            b"next_obs",
+                            0.0,
+                            False,
+                            1234567890,
+                            None,
+                            0.5,
+                            1.0,
+                        ),
                     )
                 conn.commit()
 
@@ -469,7 +616,7 @@ class TestFilesystemStorage:
             assert store is not None
 
             # Cleanup
-            if hasattr(store, 'close'):
+            if hasattr(store, "close"):
                 store.close()
 
     def test_filesystem_save_and_load_latest(self):
