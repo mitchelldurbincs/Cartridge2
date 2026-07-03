@@ -149,52 +149,32 @@ static INIT: Once = Once::new();
 /// Safe to call multiple times - only initializes once.
 pub fn init_metrics() {
     INIT.call_once(|| {
-        // Register all metrics with the custom registry
-        REGISTRY.register(Box::new(EPISODES_TOTAL.clone())).unwrap();
-        REGISTRY.register(Box::new(PLAYER1_WINS.clone())).unwrap();
-        REGISTRY.register(Box::new(PLAYER2_WINS.clone())).unwrap();
-        REGISTRY.register(Box::new(DRAWS.clone())).unwrap();
-        REGISTRY
-            .register(Box::new(EPISODES_PER_SECOND.clone()))
-            .unwrap();
-        REGISTRY
-            .register(Box::new(EPISODE_DURATION.clone()))
-            .unwrap();
-        REGISTRY.register(Box::new(EPISODE_STEPS.clone())).unwrap();
-        REGISTRY
-            .register(Box::new(MCTS_SEARCHES_TOTAL.clone()))
-            .unwrap();
-        REGISTRY
-            .register(Box::new(MCTS_INFERENCE_SECONDS.clone()))
-            .unwrap();
-        REGISTRY
-            .register(Box::new(MCTS_SEARCH_SECONDS.clone()))
-            .unwrap();
-        REGISTRY
-            .register(Box::new(MCTS_SIMULATIONS_PER_SEARCH.clone()))
-            .unwrap();
-        REGISTRY
-            .register(Box::new(TRANSITIONS_STORED.clone()))
-            .unwrap();
-        REGISTRY
-            .register(Box::new(DB_WRITE_SECONDS.clone()))
-            .unwrap();
-        REGISTRY.register(Box::new(DB_POOL_SIZE.clone())).unwrap();
-        REGISTRY
-            .register(Box::new(DB_POOL_AVAILABLE.clone()))
-            .unwrap();
-        REGISTRY
-            .register(Box::new(DB_POOL_WAITING.clone()))
-            .unwrap();
-        REGISTRY.register(Box::new(MODEL_RELOADS.clone())).unwrap();
-        REGISTRY
-            .register(Box::new(MODEL_LOAD_SECONDS.clone()))
-            .unwrap();
-        REGISTRY.register(Box::new(MODEL_LOADED.clone())).unwrap();
-        REGISTRY
-            .register(Box::new(MEMORY_RSS_BYTES.clone()))
-            .unwrap();
-        REGISTRY.register(Box::new(ACTOR_INFO.clone())).unwrap();
+        let collectors: Vec<Box<dyn prometheus::core::Collector>> = vec![
+            Box::new(EPISODES_TOTAL.clone()),
+            Box::new(PLAYER1_WINS.clone()),
+            Box::new(PLAYER2_WINS.clone()),
+            Box::new(DRAWS.clone()),
+            Box::new(EPISODES_PER_SECOND.clone()),
+            Box::new(EPISODE_DURATION.clone()),
+            Box::new(EPISODE_STEPS.clone()),
+            Box::new(MCTS_SEARCHES_TOTAL.clone()),
+            Box::new(MCTS_INFERENCE_SECONDS.clone()),
+            Box::new(MCTS_SEARCH_SECONDS.clone()),
+            Box::new(MCTS_SIMULATIONS_PER_SEARCH.clone()),
+            Box::new(TRANSITIONS_STORED.clone()),
+            Box::new(DB_WRITE_SECONDS.clone()),
+            Box::new(DB_POOL_SIZE.clone()),
+            Box::new(DB_POOL_AVAILABLE.clone()),
+            Box::new(DB_POOL_WAITING.clone()),
+            Box::new(MODEL_RELOADS.clone()),
+            Box::new(MODEL_LOAD_SECONDS.clone()),
+            Box::new(MODEL_LOADED.clone()),
+            Box::new(MEMORY_RSS_BYTES.clone()),
+            Box::new(ACTOR_INFO.clone()),
+        ];
+        for collector in collectors {
+            REGISTRY.register(collector).unwrap();
+        }
     });
 }
 
@@ -212,22 +192,24 @@ pub fn encode_metrics() -> String {
     String::from_utf8(buffer).unwrap()
 }
 
-/// Update memory RSS gauge from /proc/self/status (Linux only)
+/// Read the current resident set size in kB from /proc/self/status.
+/// Returns None where /proc is unavailable (e.g. macOS) or on parse failure.
+fn read_rss_kb() -> Option<u64> {
+    let contents = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = contents.lines().find(|l| l.starts_with("VmRSS:"))?;
+    // Format: "VmRSS:    12345 kB"
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Current resident set size in MB, if available on this platform.
+pub fn rss_mb() -> Option<f64> {
+    read_rss_kb().map(|kb| kb as f64 / 1024.0)
+}
+
+/// Update memory RSS gauge from /proc/self/status (no-op where unavailable)
 pub fn update_memory_metrics() {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(contents) = std::fs::read_to_string("/proc/self/status") {
-            for line in contents.lines() {
-                if line.starts_with("VmRSS:") {
-                    if let Some(kb_str) = line.split_whitespace().nth(1) {
-                        if let Ok(kb) = kb_str.parse::<i64>() {
-                            MEMORY_RSS_BYTES.set(kb * 1024);
-                        }
-                    }
-                    break;
-                }
-            }
-        }
+    if let Some(kb) = read_rss_kb() {
+        MEMORY_RSS_BYTES.set(kb as i64 * 1024);
     }
 }
 

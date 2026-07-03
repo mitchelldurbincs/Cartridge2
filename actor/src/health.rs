@@ -44,11 +44,7 @@ impl HealthState {
 
     /// Update the last episode completion time.
     pub fn record_episode_complete(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        self.last_episode_time.store(now, Ordering::SeqCst);
+        self.last_episode_time.store(unix_now(), Ordering::SeqCst);
     }
 
     /// Check if the actor is ready.
@@ -68,12 +64,16 @@ impl HealthState {
             // No episodes completed yet, but that's ok during startup
             return true;
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        (now - last) < timeout_secs
+        unix_now().saturating_sub(last) < timeout_secs
     }
+}
+
+/// Current Unix time in seconds (0 if the system clock is before the epoch).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl Default for HealthState {
@@ -82,7 +82,53 @@ impl Default for HealthState {
     }
 }
 
+/// Maximum number of consecutive ports to try when binding the health server.
+const MAX_PORT_ATTEMPTS: u16 = 16;
+
+/// Bind the health listener, scanning forward from `preferred_port` if it is
+/// already in use.
+///
+/// Multiple actors on one host all default to the same health port; without
+/// this fallback every actor after the first fails with "Address already in
+/// use". Only `AddrInUse` triggers the scan — any other bind error (e.g.
+/// permission denied) is returned immediately.
+async fn bind_health_listener(preferred_port: u16) -> std::io::Result<TcpListener> {
+    let mut last_err = None;
+
+    for offset in 0..MAX_PORT_ATTEMPTS {
+        let Some(port) = preferred_port.checked_add(offset) else {
+            break;
+        };
+        match TcpListener::bind(("0.0.0.0", port)).await {
+            Ok(listener) => {
+                if port != preferred_port {
+                    info!(
+                        preferred_port,
+                        actual_port = port,
+                        "Preferred health port in use (another actor?), bound fallback port"
+                    );
+                }
+                return Ok(listener);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!("no free health port at or above {}", preferred_port),
+        )
+    }))
+}
+
 /// Start the health check HTTP server on the given port.
+///
+/// If the port is already taken (e.g. by another actor on the same host), the
+/// server falls back to the next free port; see [`bind_health_listener`].
 pub async fn start_health_server(
     port: u16,
     state: HealthState,
@@ -104,9 +150,8 @@ pub async fn start_health_server(
         )
         .route("/metrics", get(metrics_handler));
 
-    let addr = format!("0.0.0.0:{}", port);
-    let listener = TcpListener::bind(&addr).await?;
-    info!("Health server listening on {}", addr);
+    let listener = bind_health_listener(port).await?;
+    info!("Health server listening on {}", listener.local_addr()?);
 
     axum::serve(listener, app).await?;
     Ok(())
@@ -190,19 +235,74 @@ mod tests {
     fn test_progress_timeout() {
         let state = HealthState::new();
         // Manually set an old timestamp (1 second in the past)
-        state.last_episode_time.store(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                - 1,
-            Ordering::SeqCst,
-        );
+        state
+            .last_episode_time
+            .store(unix_now() - 1, Ordering::SeqCst);
 
         // With a 2 second timeout, should still be making progress
         assert!(state.is_making_progress(2));
 
         // With a 0 second timeout, should NOT be making progress
         assert!(!state.is_making_progress(0));
+    }
+
+    #[test]
+    fn test_progress_tolerates_future_timestamp() {
+        let state = HealthState::new();
+        // A timestamp ahead of the clock (skew) must not underflow/panic
+        state
+            .last_episode_time
+            .store(unix_now() + 100, Ordering::SeqCst);
+        assert!(state.is_making_progress(1));
+    }
+
+    /// Bind an OS-assigned port, keeping the listener alive so the port stays taken.
+    /// Retries until the port is low enough that the fallback scan cannot overflow u16.
+    async fn occupy_free_port() -> (TcpListener, u16) {
+        loop {
+            let listener = TcpListener::bind(("0.0.0.0", 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            if port < u16::MAX - MAX_PORT_ATTEMPTS {
+                return (listener, port);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_health_listener_uses_preferred_port() {
+        // Find a free port, release it, then ask for it explicitly
+        let (listener, port) = occupy_free_port().await;
+        drop(listener);
+
+        let bound = bind_health_listener(port).await.unwrap();
+        assert_eq!(bound.local_addr().unwrap().port(), port);
+    }
+
+    #[tokio::test]
+    async fn test_bind_health_listener_falls_back_when_port_taken() {
+        // Hold the preferred port so the fallback scan must kick in
+        let (_held, port) = occupy_free_port().await;
+
+        let bound = bind_health_listener(port).await.unwrap();
+        let actual = bound.local_addr().unwrap().port();
+        assert_ne!(actual, port, "should not bind the occupied port");
+        assert!(
+            actual > port && actual < port + MAX_PORT_ATTEMPTS,
+            "fallback port {} should be in ({}, {})",
+            actual,
+            port,
+            port + MAX_PORT_ATTEMPTS
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bind_health_listener_two_actors_get_distinct_ports() {
+        // Simulates two actors launched with the same --health-port
+        let (first, port) = occupy_free_port().await;
+        let second = bind_health_listener(port).await.unwrap();
+        assert_ne!(
+            first.local_addr().unwrap().port(),
+            second.local_addr().unwrap().port()
+        );
     }
 }

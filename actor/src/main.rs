@@ -3,7 +3,7 @@
 //! A long-running process that:
 //! 1. Watches `./data/models/latest.onnx` for updates
 //! 2. Runs MCTS self-play loops using the Engine library
-//! 3. Saves completed games to `./data/replay.db` (SQLite)
+//! 3. Saves completed games to the PostgreSQL replay buffer
 //! 4. Exposes a health check HTTP server for Kubernetes probes
 
 use anyhow::Result;
@@ -92,11 +92,9 @@ async fn main() -> Result<()> {
     // Validate configuration
     config.validate()?;
 
-    // Load central config for logging settings
-    let central_config = engine_config::load_config();
-
     // Initialize tracing with JSON support for cloud deployments
-    init_tracing(&config.log_level, &central_config.logging)?;
+    // (logging settings come from the central config loaded by config::Config)
+    init_tracing(&config.log_level, &config::central_config().logging)?;
 
     // Get trace context from environment (set by orchestrator)
     let (trace_id, parent_span) = get_trace_context();
