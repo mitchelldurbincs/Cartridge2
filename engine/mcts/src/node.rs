@@ -51,9 +51,6 @@ pub struct MctsNode {
     /// Children: Vec of (action, NodeId) pairs.
     /// Empty until node is expanded.
     pub children: Vec<(u8, NodeId)>,
-
-    /// Virtual loss for parallel MCTS (subtracted during selection, added back after eval)
-    pub virtual_loss: f32,
 }
 
 impl MctsNode {
@@ -69,12 +66,10 @@ impl MctsNode {
             terminal_value: 0.0,
             legal_moves_mask,
             children: Vec::new(),
-            virtual_loss: 0.0,
         }
     }
 
     /// Create a new child node.
-    #[allow(clippy::too_many_arguments)]
     pub fn new_child(
         parent: NodeId,
         action: u8,
@@ -93,7 +88,6 @@ impl MctsNode {
             terminal_value,
             legal_moves_mask,
             children: Vec::new(),
-            virtual_loss: 0.0,
         }
     }
 
@@ -124,7 +118,7 @@ impl MctsNode {
     #[inline]
     pub fn ucb_score(&self, parent_visits_sqrt: f32, c_puct: f32) -> f32 {
         // Negate Q because the child stores value from opponent's perspective
-        let q = -self.mean_value() - self.virtual_loss;
+        let q = -self.mean_value();
         let u = c_puct * self.prior * parent_visits_sqrt / (1.0 + self.visit_count as f32);
         q + u
     }

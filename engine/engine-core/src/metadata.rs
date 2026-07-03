@@ -120,7 +120,13 @@ impl GameMetadata {
     }
 
     /// Create a bitmask for extracting legal moves from info bits
-    /// based on num_actions
+    /// based on num_actions.
+    ///
+    /// Note: only valid for games with fewer than 64 actions; the shift
+    /// overflows for games like Othello (65 actions). Such games cannot
+    /// represent their legal moves as a u64 bitmask — use
+    /// [`extract_legal_moves`](Self::extract_legal_moves) instead, which reads
+    /// the observation directly.
     pub fn legal_mask_bits(&self) -> u64 {
         (1u64 << self.num_actions) - 1
     }

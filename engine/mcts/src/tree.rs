@@ -90,7 +90,6 @@ impl MctsTree {
 
     /// Add a child to a parent node.
     /// Returns the new child's NodeId.
-    #[allow(clippy::too_many_arguments)]
     pub fn add_child(
         &mut self,
         parent_id: NodeId,
@@ -127,29 +126,10 @@ impl MctsTree {
             node.visit_count += 1;
             node.value_sum += current_value;
 
-            // Remove virtual loss if any
-            if node.virtual_loss > 0.0 {
-                node.virtual_loss = 0.0;
-            }
-
             // Negate for opponent's perspective
             current_value = -current_value;
 
             current_id = node.parent;
-        }
-    }
-
-    /// Apply virtual loss to nodes along a path (for parallel MCTS).
-    pub fn apply_virtual_loss(&mut self, path: &[NodeId], loss: f32) {
-        for &node_id in path {
-            self.get_mut(node_id).virtual_loss += loss;
-        }
-    }
-
-    /// Remove virtual loss from nodes along a path.
-    pub fn remove_virtual_loss(&mut self, path: &[NodeId]) {
-        for &node_id in path {
-            self.get_mut(node_id).virtual_loss = 0.0;
         }
     }
 
@@ -164,7 +144,8 @@ impl MctsTree {
     }
 
     /// Get the policy (visit distribution) from the root.
-    /// Returns a vector of (action, probability) pairs.
+    /// Returns a dense vector of length `num_actions` where index `i` is the
+    /// probability of action `i` (zero for unvisited/illegal actions).
     pub fn root_policy(&self, num_actions: usize, temperature: f32) -> Vec<f32> {
         let root = self.get(self.root);
         let mut policy = vec![0.0; num_actions];

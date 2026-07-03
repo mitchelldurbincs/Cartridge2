@@ -26,8 +26,11 @@ pub struct MctsConfig {
     /// AlphaZero uses 1.0 for first 30 moves, then 0.0
     pub temperature: f32,
 
-    /// Whether to add virtual loss during parallel search.
-    /// Virtual loss discourages multiple threads from exploring the same path.
+    /// Magnitude of the virtual loss applied to a leaf while it waits in a
+    /// pending evaluation batch. The leaf's value sum is reduced by this amount
+    /// (and its visit count incremented) when selected, then restored before
+    /// backpropagation, discouraging the same leaf from being selected twice
+    /// within one batch.
     pub virtual_loss: f32,
 
     /// Batch size for neural network evaluation.

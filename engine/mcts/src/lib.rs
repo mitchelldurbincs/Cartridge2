@@ -35,7 +35,7 @@
 //! // Set up MCTS
 //! let evaluator = UniformEvaluator::new();
 //! let config = MctsConfig::for_testing();
-//! let legal_mask = reset.info & 0x1FF;
+//! let legal_mask = 0b111111111u64; // All 9 positions legal at the start
 //!
 //! // Run search
 //! let mut rng = ChaCha20Rng::seed_from_u64(42);
@@ -44,6 +44,7 @@
 //!     &evaluator,
 //!     config,
 //!     reset.state,
+//!     reset.obs,
 //!     legal_mask,
 //!     &mut rng,
 //! ).unwrap();

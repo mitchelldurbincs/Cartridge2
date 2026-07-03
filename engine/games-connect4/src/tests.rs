@@ -422,3 +422,37 @@ fn test_random_games_invariants() {
         );
     }
 }
+
+/// State encoding must roundtrip at every point of a game. This also
+/// exercises the column-height reconstruction in `decode_state`, which
+/// rebuilds `column_heights` from the raw board bytes.
+#[test]
+fn test_state_encoding_roundtrip_random_games() {
+    use rand::Rng;
+
+    for seed in 0..10u64 {
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
+        let mut state = State::new();
+
+        while !state.is_done() {
+            let mut buf = Vec::new();
+            Connect4::encode_state(&state, &mut buf).unwrap();
+            let decoded = Connect4::decode_state(&buf).unwrap();
+            assert_eq!(state, decoded, "State should roundtrip (seed={})", seed);
+
+            let legal = state.legal_moves();
+            let action = legal[rng.gen_range(0..legal.len())];
+            state = state.drop_piece(action);
+        }
+
+        // Terminal state must roundtrip too
+        let mut buf = Vec::new();
+        Connect4::encode_state(&state, &mut buf).unwrap();
+        let decoded = Connect4::decode_state(&buf).unwrap();
+        assert_eq!(
+            state, decoded,
+            "Terminal state should roundtrip (seed={})",
+            seed
+        );
+    }
+}

@@ -362,15 +362,24 @@ fn test_decode_invalid_state_data() {
     let result = Othello::decode_state(&buf);
     assert!(result.is_err());
 
-    // Invalid winner
+    // Invalid winner (current_player must be valid so the winner check is reached)
     let mut buf = vec![0u8; 67];
+    buf[64] = 1; // Valid player
     buf[65] = 5; // Invalid winner
     let result = Othello::decode_state(&buf);
     assert!(result.is_err());
 
-    // Invalid cell value
+    // Invalid pass count (player and winner valid so the pass check is reached)
+    let mut buf = vec![0u8; 67];
+    buf[64] = 1; // Valid player
+    buf[66] = 3; // Invalid pass count
+    let result = Othello::decode_state(&buf);
+    assert!(result.is_err());
+
+    // Invalid cell value (other fields valid so the cell check is reached)
     let mut buf = vec![0u8; 67];
     buf[0] = 5; // Invalid cell
+    buf[64] = 1; // Valid player
     let result = Othello::decode_state(&buf);
     assert!(result.is_err());
 }
@@ -567,4 +576,53 @@ fn test_info_bits_computation() {
     // Check that legal moves are encoded
     let legal_mask = state.legal_moves_mask();
     assert_eq!(info & legal_mask, legal_mask); // Legal moves should be set
+}
+
+/// State encoding must roundtrip at every point of a game, not just the
+/// initial position (mid-game boards, flipped pieces, terminal states).
+#[test]
+fn test_state_encoding_roundtrip_random_games() {
+    use rand::Rng;
+
+    for seed in 0..10u64 {
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
+        let mut state = State::new();
+
+        for _ in 0..200 {
+            let mut buf = Vec::new();
+            Othello::encode_state(&state, &mut buf).unwrap();
+            let decoded = Othello::decode_state(&buf).unwrap();
+            assert_eq!(state, decoded, "State should roundtrip (seed={})", seed);
+
+            if state.is_done() {
+                break;
+            }
+
+            let legal = state.legal_moves();
+            let action = legal[rng.gen_range(0..legal.len())];
+            state = state.make_move(action);
+        }
+    }
+}
+
+/// A state with a pending pass (pass_count = 1) must roundtrip, since
+/// pass_count is part of the encoded state.
+#[test]
+fn test_state_encoding_roundtrip_pass_state() {
+    let state = State::new().make_move(PASS_ACTION);
+    assert_eq!(state.pass_count, 1);
+
+    let mut buf = Vec::new();
+    Othello::encode_state(&state, &mut buf).unwrap();
+    let decoded = Othello::decode_state(&buf).unwrap();
+    assert_eq!(state, decoded);
+
+    // Second pass ends the game; the terminal state must roundtrip too.
+    let terminal = state.make_move(PASS_ACTION);
+    assert!(terminal.is_done());
+
+    let mut buf = Vec::new();
+    Othello::encode_state(&terminal, &mut buf).unwrap();
+    let decoded = Othello::decode_state(&buf).unwrap();
+    assert_eq!(terminal, decoded);
 }

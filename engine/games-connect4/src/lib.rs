@@ -31,7 +31,10 @@
 //! let reset = ctx.reset(42, &[]).unwrap();
 //! ```
 
-use engine_core::game_utils::{calculate_reward, info_bits};
+use engine_core::game_utils::{
+    calculate_reward, decode_action_u32, info_bits, opponent, validate_board_cells,
+    validate_player_and_winner,
+};
 use engine_core::typed::{
     ActionSpace, Capabilities, DecodeError, EncodeError, Encoding, EngineId, Game,
 };
@@ -146,7 +149,7 @@ impl State {
 
         // Switch player if game not over
         if new_state.winner == 0 {
-            new_state.current_player = if self.current_player == 1 { 2 } else { 1 };
+            new_state.current_player = opponent(self.current_player);
         }
 
         new_state
@@ -359,28 +362,8 @@ impl Game for Connect4 {
         let winner = buf[BOARD_SIZE + 1];
 
         // Validate the state
-        if current_player != 1 && current_player != 2 {
-            return Err(DecodeError::CorruptedData(format!(
-                "Invalid current_player: {}",
-                current_player
-            )));
-        }
-
-        if winner > 3 {
-            return Err(DecodeError::CorruptedData(format!(
-                "Invalid winner: {}",
-                winner
-            )));
-        }
-
-        for &cell in &board {
-            if cell > 2 {
-                return Err(DecodeError::CorruptedData(format!(
-                    "Invalid board cell: {}",
-                    cell
-                )));
-            }
-        }
+        validate_player_and_winner(current_player, winner)?;
+        validate_board_cells(&board)?;
 
         // Reconstruct column heights from board
         let mut column_heights = [0u8; COLS];
@@ -413,14 +396,7 @@ impl Game for Connect4 {
     }
 
     fn decode_action(buf: &[u8]) -> Result<Self::Action, DecodeError> {
-        if buf.len() != 4 {
-            return Err(DecodeError::InvalidLength {
-                expected: 4,
-                actual: buf.len(),
-            });
-        }
-
-        let column = u32::from_le_bytes(buf.try_into().unwrap());
+        let column = decode_action_u32(buf)?;
         if column as usize >= COLS {
             return Err(DecodeError::CorruptedData(format!(
                 "Invalid action column: {}",

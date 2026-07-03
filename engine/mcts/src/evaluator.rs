@@ -34,10 +34,9 @@ pub struct EvalResult {
 
 /// Trait for position evaluators.
 ///
-/// Implementations could be:
+/// Implementations:
 /// - UniformEvaluator: Returns uniform policy (for testing)
-/// - OnnxEvaluator: Neural network inference (for training/play)
-/// - RolloutEvaluator: Random rollouts to terminal state
+/// - OnnxEvaluator: Neural network inference (for training/play, `onnx` feature)
 pub trait Evaluator: Send + Sync {
     /// Evaluate a single game observation.
     ///
@@ -110,31 +109,6 @@ impl Evaluator for UniformEvaluator {
         Ok(EvalResult { policy, value: 0.0 })
     }
 }
-
-/// Random rollout evaluator that plays random moves to terminal state.
-/// Returns the game outcome as the value estimate.
-#[derive(Debug, Clone)]
-pub struct RolloutEvaluator {
-    /// Maximum rollout depth to prevent infinite games
-    pub max_depth: u32,
-}
-
-impl Default for RolloutEvaluator {
-    fn default() -> Self {
-        Self { max_depth: 100 }
-    }
-}
-
-impl RolloutEvaluator {
-    pub fn new(max_depth: u32) -> Self {
-        Self { max_depth }
-    }
-}
-
-// Note: RolloutEvaluator::evaluate requires EngineContext to simulate,
-// which would create a circular dependency. Instead, rollouts should be
-// performed at a higher level (in search.rs) where EngineContext is available.
-// This struct is kept as a marker/config for rollout-based evaluation.
 
 #[cfg(test)]
 mod tests {

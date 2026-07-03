@@ -22,11 +22,11 @@ use crate::typed::{ActionSpace, Capabilities, EngineId};
 /// let mut ctx = EngineContext::new("tictactoe").expect("game not found");
 ///
 /// // Reset and get initial state
-/// let (state, obs) = ctx.reset(42, &[]).unwrap();
+/// let reset = ctx.reset(42, &[]).unwrap();
 ///
 /// // Take a step with an action
 /// let action = 4u32.to_le_bytes().to_vec(); // Center position
-/// let result = ctx.step(&state, &action).unwrap();
+/// let result = ctx.step(&reset.state, &action).unwrap();
 /// println!("Reward: {}, Done: {}", result.reward, result.done);
 /// ```
 #[derive(Debug)]
