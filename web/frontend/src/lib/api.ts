@@ -96,12 +96,6 @@ export async function getHealth(): Promise<HealthResponse> {
   return res.json();
 }
 
-export async function getGameState(): Promise<GameState> {
-  const res = await fetch(`${API_BASE}/game/state`);
-  if (!res.ok) throw new Error('Failed to get game state');
-  return res.json();
-}
-
 export async function newGame(first: 'player' | 'bot' = 'player', game?: string): Promise<GameState> {
   const body: { first: string; game?: string } = { first };
   if (game) {
