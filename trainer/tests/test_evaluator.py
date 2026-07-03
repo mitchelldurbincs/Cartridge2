@@ -246,8 +246,14 @@ class TestEvaluate:
 
         assert results.games_played == 20
         # Half as first, half as second
-        assert results.player1_wins_as_first + results.player1_wins_as_second == results.player1_wins
-        assert results.player2_wins_as_first + results.player2_wins_as_second == results.player2_wins
+        assert (
+            results.player1_wins_as_first + results.player1_wins_as_second
+            == results.player1_wins
+        )
+        assert (
+            results.player2_wins_as_first + results.player2_wins_as_second
+            == results.player2_wins
+        )
 
     def test_evaluate_tracks_wins_correctly(self):
         """Test that wins are tracked correctly."""
