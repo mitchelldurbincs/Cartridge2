@@ -59,6 +59,31 @@ class StatsManager:
         with open(self.config.eval_stats_path, "w") as f:
             json.dump({"evaluations": eval_history}, f, indent=2)
 
+    def _format_eval_for_frontend(self, record: dict) -> dict:
+        """Convert one eval-history record to the shape the frontend expects."""
+        return {
+            "step": record.get(
+                "step",
+                record.get("iteration", 0) * self.config.steps_per_iteration,
+            ),
+            "current_iteration": record.get("iteration", 0),
+            # Model vs Best results
+            "opponent": "best",
+            "opponent_iteration": record.get("vs_best_opponent_iteration"),
+            "win_rate": record.get("vs_best_win_rate", 0.0),
+            "draw_rate": record.get("vs_best_draw_rate", 0.0),
+            "loss_rate": 1.0
+            - record.get("vs_best_win_rate", 0.0)
+            - record.get("vs_best_draw_rate", 0.0),
+            "became_new_best": record.get("became_new_best", False),
+            # Model vs Random results
+            "vs_random_win_rate": record.get("vs_random_win_rate"),
+            "vs_random_draw_rate": record.get("vs_random_draw_rate"),
+            # Metadata
+            "games_played": record.get("games", 0),
+            "timestamp": time.time(),
+        }
+
     def update_stats_with_eval(
         self, eval_history: list[dict], best_iteration: int | None
     ) -> None:
@@ -78,38 +103,11 @@ class StatsManager:
                     stats_data = json.load(f)
 
             # Convert eval_history to the format expected by frontend
-            formatted_history = []
-            for record in eval_history:
-                formatted_history.append(
-                    {
-                        "step": record.get(
-                            "step",
-                            record.get("iteration", 0)
-                            * self.config.steps_per_iteration,
-                        ),
-                        "current_iteration": record.get("iteration", 0),
-                        # Model vs Best results
-                        "opponent": "best",
-                        "opponent_iteration": record.get("vs_best_opponent_iteration"),
-                        "win_rate": record.get("vs_best_win_rate", 0.0),
-                        "draw_rate": record.get("vs_best_draw_rate", 0.0),
-                        "loss_rate": 1.0
-                        - record.get("vs_best_win_rate", 0.0)
-                        - record.get("vs_best_draw_rate", 0.0),
-                        "became_new_best": record.get("became_new_best", False),
-                        # Model vs Random results
-                        "vs_random_win_rate": record.get("vs_random_win_rate"),
-                        "vs_random_draw_rate": record.get("vs_random_draw_rate"),
-                        # Metadata
-                        "games_played": record.get("games", 0),
-                        "timestamp": time.time(),
-                    }
-                )
-
-            # Update stats with eval data
-            if formatted_history:
-                stats_data["last_eval"] = formatted_history[-1]
-                stats_data["eval_history"] = formatted_history
+            formatted_history = [
+                self._format_eval_for_frontend(record) for record in eval_history
+            ]
+            stats_data["last_eval"] = formatted_history[-1]
+            stats_data["eval_history"] = formatted_history
 
             # Add best model info
             if best_iteration is not None:

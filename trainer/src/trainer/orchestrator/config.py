@@ -105,6 +105,10 @@ class LoopConfig:
         return self.data_dir / "solver_stats.json"
 
     @property
+    def latest_model_path(self) -> Path:
+        return self.models_dir / "latest.onnx"
+
+    @property
     def best_model_path(self) -> Path:
         return self.models_dir / "best.onnx"
 

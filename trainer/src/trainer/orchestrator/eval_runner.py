@@ -22,6 +22,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Head-to-head evaluation uses a small sampling temperature: with temperature
+# 0, two deterministic policies would replay the exact same game every time.
+EVAL_TEMPERATURE = 0.2
+
 
 def should_promote(
     *,
@@ -197,7 +201,7 @@ class EvalRunner:
                 later switch to solver_optimal needs no backfill).
             metric: The promotion metric that made this decision.
         """
-        current_path = self.config.models_dir / "latest.onnx"
+        current_path = self.config.latest_model_path
         if not current_path.exists():
             logger.warning("Cannot promote: latest.onnx not found")
             return
@@ -263,6 +267,216 @@ class EvalRunner:
         )
         return self.best_solver_rate
 
+    def _evaluate_vs_best(
+        self,
+        iteration: int,
+        current_policy,
+        game_config,
+        candidate_solver_rate: float | None,
+        promotion_metric: str,
+    ) -> tuple[float, float, bool]:
+        """Run the gatekeeper evaluation and apply the promotion decision.
+
+        The very first evaluation has no best model to play against: the
+        candidate is promoted unconditionally and credited with a 100% win
+        rate. Otherwise the candidate plays against best.onnx and
+        ``should_promote`` decides using the effective promotion metric.
+
+        Returns:
+            Tuple of (win_rate_vs_best, draw_rate_vs_best, became_new_best).
+        """
+        if not self.config.best_model_path.exists():
+            # First iteration: current becomes best
+            logger.info("No best model yet - promoting current model to best")
+            self.promote_to_best(
+                iteration,
+                1.0,
+                solver_rate=candidate_solver_rate,
+                metric=promotion_metric,
+            )
+            return 1.0, 0.0, True
+
+        logger.info(
+            f"Evaluating vs best model (iter {self.best_model_iteration}) "
+            f"- {self.config.eval_games} games..."
+        )
+        best_policy = OnnxPolicy(
+            str(self.config.best_model_path), temperature=EVAL_TEMPERATURE
+        )
+
+        vs_best_results = run_eval(
+            player1=current_policy,
+            player2=best_policy,
+            env_id=self.config.env_id,
+            config=game_config,
+            num_games=self.config.eval_games,
+            verbose=False,
+        )
+
+        vs_best_win_rate = vs_best_results.player1_win_rate
+        vs_best_draw_rate = vs_best_results.draw_rate
+
+        logger.info(
+            f"vs Best (iter {self.best_model_iteration}): "
+            f"Win {vs_best_win_rate:.1%}, Draw {vs_best_draw_rate:.1%}, "
+            f"Loss {vs_best_results.player2_win_rate:.1%}"
+        )
+
+        # Promotion decision (win_rate or solver_optimal)
+        best_solver_rate = (
+            self._ensure_best_solver_rate(game_config)
+            if promotion_metric == "solver_optimal"
+            else self.best_solver_rate
+        )
+        promote, reason = should_promote(
+            promotion_metric=promotion_metric,
+            vs_best_win_rate=vs_best_win_rate,
+            win_threshold=self.config.eval_win_threshold,
+            candidate_solver_rate=candidate_solver_rate,
+            best_solver_rate=best_solver_rate,
+            margin=self.config.promotion_margin,
+        )
+        logger.info(f"Promotion decision: {reason}")
+        if promote:
+            self.promote_to_best(
+                iteration,
+                vs_best_win_rate,
+                solver_rate=candidate_solver_rate,
+                metric=promotion_metric,
+            )
+        return vs_best_win_rate, vs_best_draw_rate, promote
+
+    def _evaluate_vs_random(
+        self, current_policy, game_config
+    ) -> tuple[float | None, float | None]:
+        """Evaluate the candidate against the random baseline, if enabled.
+
+        Returns:
+            Tuple of (win_rate, draw_rate); both None when disabled.
+        """
+        if not self.config.eval_vs_random:
+            return None, None
+
+        logger.info(f"Evaluating vs random - {self.config.eval_games} games...")
+        vs_random_results = run_eval(
+            player1=current_policy,
+            player2=RandomPolicy(),
+            env_id=self.config.env_id,
+            config=game_config,
+            num_games=self.config.eval_games,
+            verbose=False,
+        )
+
+        logger.info(
+            f"vs Random: Win {vs_random_results.player1_win_rate:.1%}, "
+            f"Draw {vs_random_results.draw_rate:.1%}, "
+            f"Loss {vs_random_results.player2_win_rate:.1%}"
+        )
+        return vs_random_results.player1_win_rate, vs_random_results.draw_rate
+
+    def _build_eval_record(
+        self,
+        iteration: int,
+        *,
+        vs_best_win_rate: float,
+        vs_best_draw_rate: float,
+        became_new_best: bool,
+        vs_random_win_rate: float | None,
+        vs_random_draw_rate: float | None,
+        solver_results: "SolverEvalResults | None",
+        promotion_metric: str,
+    ) -> dict:
+        """Assemble one eval-history record.
+
+        The key set is a frozen schema: eval_stats.json is read by the web
+        frontend (via StatsManager) — do not rename or drop keys.
+        """
+        return {
+            "iteration": iteration,
+            "step": iteration * self.config.steps_per_iteration,
+            # Model vs Best results
+            "vs_best_win_rate": vs_best_win_rate,
+            "vs_best_draw_rate": vs_best_draw_rate,
+            "vs_best_opponent_iteration": self.best_model_iteration,
+            "became_new_best": became_new_best,
+            # Model vs Random results (if enabled)
+            "vs_random_win_rate": vs_random_win_rate,
+            "vs_random_draw_rate": vs_random_draw_rate,
+            # Perfect-solver move scoring (None when skipped/unavailable)
+            "solver_value_optimal_rate": (
+                solver_results.overall.value_optimal_rate if solver_results else None
+            ),
+            "solver_exact_best_rate": (
+                solver_results.overall.exact_best_rate if solver_results else None
+            ),
+            "solver_blunder_rate": (
+                solver_results.overall.blunder_rate if solver_results else None
+            ),
+            "solver_positions": (
+                solver_results.overall.positions if solver_results else None
+            ),
+            "promotion_metric": promotion_metric,
+            # Metadata
+            "games": self.config.eval_games,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    def _append_solver_history(
+        self, solver_results: "SolverEvalResults | None", iteration: int
+    ) -> None:
+        """Append this iteration's solver results to solver_stats.json."""
+        if solver_results is None:
+            return
+
+        solver_entry = solver_results.to_dict()
+        solver_entry.update(
+            {
+                "iteration": iteration,
+                "global_step": iteration * self.config.steps_per_iteration,
+                "context": "loop",
+            }
+        )
+        append_solver_stats(solver_entry, self.config.solver_stats_path)
+
+    def _log_eval_to_wandb(
+        self, eval_record: dict, solver_results: "SolverEvalResults | None"
+    ) -> None:
+        """Mirror the eval record (plus solver detail) to W&B, dropping Nones."""
+        if self.wandb_logger is None:
+            return
+
+        wandb_metrics = {
+            "eval/vs_best_win_rate": eval_record["vs_best_win_rate"],
+            "eval/vs_best_draw_rate": eval_record["vs_best_draw_rate"],
+            "eval/became_new_best": int(eval_record["became_new_best"]),
+            "eval/best_model_iteration": self.best_model_iteration,
+            "eval/vs_random_win_rate": eval_record["vs_random_win_rate"],
+            "eval/vs_random_draw_rate": eval_record["vs_random_draw_rate"],
+        }
+        if solver_results is not None:
+            overall = solver_results.overall
+            wandb_metrics.update(
+                {
+                    "solver/value_optimal_rate": overall.value_optimal_rate,
+                    "solver/exact_best_rate": overall.exact_best_rate,
+                    "solver/blunder_rate": overall.blunder_rate,
+                    "solver/blunders_win_to_draw": overall.blunders_win_to_draw,
+                    "solver/blunders_win_to_loss": overall.blunders_win_to_loss,
+                    "solver/blunders_draw_to_loss": overall.blunders_draw_to_loss,
+                    "solver/positions_scored": overall.positions,
+                    "solver/model_win_rate_vs_random": (
+                        solver_results.model_wins / solver_results.games
+                        if solver_results.games
+                        else 0.0
+                    ),
+                    "solver/eval_seconds": solver_results.wall_time_seconds,
+                }
+            )
+        self.wandb_logger.log(
+            {k: v for k, v in wandb_metrics.items() if v is not None},
+            step=eval_record["step"],
+        )
+
     def run(
         self, iteration: int, eval_history: list[dict]
     ) -> tuple[float | None, float | None, float]:
@@ -275,211 +489,60 @@ class EvalRunner:
         Returns:
             Tuple of (win_rate_vs_best, draw_rate_vs_best, elapsed_seconds).
         """
-        model_path = self.config.models_dir / "latest.onnx"
+        model_path = self.config.latest_model_path
 
         if not model_path.exists():
             logger.warning(f"Model not found for evaluation: {model_path}")
             return None, None, 0.0
 
         start_time = time.time()
-        config = get_game_config(self.config.env_id)
+        game_config = get_game_config(self.config.env_id)
 
         try:
-            # Use small temperature for evaluation to avoid deterministic games
-            # With temp=0, identical models play the exact same game 50 times
-            eval_temperature = 0.2
-            current_policy = OnnxPolicy(str(model_path), temperature=eval_temperature)
+            current_policy = OnnxPolicy(str(model_path), temperature=EVAL_TEMPERATURE)
 
-            # --- Perfect-solver move scoring (connect4 only) ---
-            # Runs before promotion so the candidate's rate is available to
-            # the promotion decision and gets recorded even on the very
-            # first promotion.
-            solver_results = self._run_solver_eval(model_path, config)
+            # Solver scoring (connect4 only) runs before the promotion
+            # decision so the candidate's rate can drive it and gets
+            # recorded even on the very first promotion.
+            solver_results = self._run_solver_eval(model_path, game_config)
             candidate_solver_rate = (
                 solver_results.overall.value_optimal_rate if solver_results else None
             )
-
-            # --- Model vs Best (Gatekeeper) Evaluation ---
-            vs_best_win_rate = None
-            vs_best_draw_rate = None
-            became_new_best = False
             promotion_metric = self._effective_promotion_metric()
 
-            if not self.config.best_model_path.exists():
-                # First iteration: current becomes best
-                logger.info("No best model yet - promoting current model to best")
-                self.promote_to_best(
+            vs_best_win_rate, vs_best_draw_rate, became_new_best = (
+                self._evaluate_vs_best(
                     iteration,
-                    1.0,
-                    solver_rate=candidate_solver_rate,
-                    metric=promotion_metric,
-                )
-                vs_best_win_rate = 1.0
-                vs_best_draw_rate = 0.0
-                became_new_best = True
-            else:
-                # Evaluate against best
-                logger.info(
-                    f"Evaluating vs best model (iter {self.best_model_iteration}) "
-                    f"- {self.config.eval_games} games..."
-                )
-                best_policy = OnnxPolicy(
-                    str(self.config.best_model_path), temperature=eval_temperature
-                )
-
-                vs_best_results = run_eval(
-                    player1=current_policy,
-                    player2=best_policy,
-                    env_id=self.config.env_id,
-                    config=config,
-                    num_games=self.config.eval_games,
-                    verbose=False,
-                )
-
-                vs_best_win_rate = vs_best_results.player1_win_rate
-                vs_best_draw_rate = vs_best_results.draw_rate
-
-                logger.info(
-                    f"vs Best (iter {self.best_model_iteration}): "
-                    f"Win {vs_best_win_rate:.1%}, Draw {vs_best_draw_rate:.1%}, "
-                    f"Loss {vs_best_results.player2_win_rate:.1%}"
-                )
-
-                # Promotion decision (win_rate or solver_optimal)
-                best_solver_rate = (
-                    self._ensure_best_solver_rate(config)
-                    if promotion_metric == "solver_optimal"
-                    else self.best_solver_rate
-                )
-                promote, reason = should_promote(
-                    promotion_metric=promotion_metric,
-                    vs_best_win_rate=vs_best_win_rate,
-                    win_threshold=self.config.eval_win_threshold,
+                    current_policy,
+                    game_config,
                     candidate_solver_rate=candidate_solver_rate,
-                    best_solver_rate=best_solver_rate,
-                    margin=self.config.promotion_margin,
+                    promotion_metric=promotion_metric,
                 )
-                logger.info(f"Promotion decision: {reason}")
-                if promote:
-                    self.promote_to_best(
-                        iteration,
-                        vs_best_win_rate,
-                        solver_rate=candidate_solver_rate,
-                        metric=promotion_metric,
-                    )
-                    became_new_best = True
+            )
 
-            # --- Model vs Random Evaluation (optional) ---
-            vs_random_win_rate = None
-            vs_random_draw_rate = None
-
-            if self.config.eval_vs_random:
-                logger.info(f"Evaluating vs random - {self.config.eval_games} games...")
-                random_policy = RandomPolicy()
-
-                vs_random_results = run_eval(
-                    player1=current_policy,
-                    player2=random_policy,
-                    env_id=self.config.env_id,
-                    config=config,
-                    num_games=self.config.eval_games,
-                    verbose=False,
-                )
-
-                vs_random_win_rate = vs_random_results.player1_win_rate
-                vs_random_draw_rate = vs_random_results.draw_rate
-
-                logger.info(
-                    f"vs Random: Win {vs_random_win_rate:.1%}, "
-                    f"Draw {vs_random_draw_rate:.1%}, "
-                    f"Loss {vs_random_results.player2_win_rate:.1%}"
-                )
+            vs_random_win_rate, vs_random_draw_rate = self._evaluate_vs_random(
+                current_policy, game_config
+            )
 
             elapsed = time.time() - start_time
 
-            # Save to eval history (includes both evaluations)
-            eval_record = {
-                "iteration": iteration,
-                "step": iteration * self.config.steps_per_iteration,
-                # Model vs Best results
-                "vs_best_win_rate": vs_best_win_rate,
-                "vs_best_draw_rate": vs_best_draw_rate,
-                "vs_best_opponent_iteration": self.best_model_iteration,
-                "became_new_best": became_new_best,
-                # Model vs Random results (if enabled)
-                "vs_random_win_rate": vs_random_win_rate,
-                "vs_random_draw_rate": vs_random_draw_rate,
-                # Perfect-solver move scoring (None when skipped/unavailable)
-                "solver_value_optimal_rate": (
-                    solver_results.overall.value_optimal_rate
-                    if solver_results
-                    else None
-                ),
-                "solver_exact_best_rate": (
-                    solver_results.overall.exact_best_rate if solver_results else None
-                ),
-                "solver_blunder_rate": (
-                    solver_results.overall.blunder_rate if solver_results else None
-                ),
-                "solver_positions": (
-                    solver_results.overall.positions if solver_results else None
-                ),
-                "promotion_metric": promotion_metric,
-                # Metadata
-                "games": self.config.eval_games,
-                "timestamp": datetime.now().isoformat(),
-            }
+            eval_record = self._build_eval_record(
+                iteration,
+                vs_best_win_rate=vs_best_win_rate,
+                vs_best_draw_rate=vs_best_draw_rate,
+                became_new_best=became_new_best,
+                vs_random_win_rate=vs_random_win_rate,
+                vs_random_draw_rate=vs_random_draw_rate,
+                solver_results=solver_results,
+                promotion_metric=promotion_metric,
+            )
             eval_history.append(eval_record)
 
-            if solver_results is not None:
-                solver_entry = solver_results.to_dict()
-                solver_entry.update(
-                    {
-                        "iteration": iteration,
-                        "global_step": iteration * self.config.steps_per_iteration,
-                        "context": "loop",
-                    }
-                )
-                append_solver_stats(solver_entry, self.config.solver_stats_path)
-
-            if self.wandb_logger is not None:
-                wandb_metrics = {
-                    "eval/vs_best_win_rate": vs_best_win_rate,
-                    "eval/vs_best_draw_rate": vs_best_draw_rate,
-                    "eval/became_new_best": int(became_new_best),
-                    "eval/best_model_iteration": self.best_model_iteration,
-                    "eval/vs_random_win_rate": vs_random_win_rate,
-                    "eval/vs_random_draw_rate": vs_random_draw_rate,
-                }
-                if solver_results is not None:
-                    overall = solver_results.overall
-                    wandb_metrics.update(
-                        {
-                            "solver/value_optimal_rate": overall.value_optimal_rate,
-                            "solver/exact_best_rate": overall.exact_best_rate,
-                            "solver/blunder_rate": overall.blunder_rate,
-                            "solver/blunders_win_to_draw": overall.blunders_win_to_draw,
-                            "solver/blunders_win_to_loss": overall.blunders_win_to_loss,
-                            "solver/blunders_draw_to_loss": overall.blunders_draw_to_loss,
-                            "solver/positions_scored": overall.positions,
-                            "solver/model_win_rate_vs_random": (
-                                solver_results.model_wins / solver_results.games
-                                if solver_results.games
-                                else 0.0
-                            ),
-                            "solver/eval_seconds": solver_results.wall_time_seconds,
-                        }
-                    )
-                self.wandb_logger.log(
-                    {k: v for k, v in wandb_metrics.items() if v is not None},
-                    step=iteration * self.config.steps_per_iteration,
-                )
+            self._append_solver_history(solver_results, iteration)
+            self._log_eval_to_wandb(eval_record, solver_results)
 
             return vs_best_win_rate, vs_best_draw_rate, elapsed
 
         except Exception as e:
-            logger.error(f"Evaluation failed: {e}")
-            import traceback
-
-            traceback.print_exc()
+            logger.exception(f"Evaluation failed: {e}")
             return None, None, time.time() - start_time

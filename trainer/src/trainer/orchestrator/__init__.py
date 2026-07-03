@@ -4,7 +4,7 @@ This package implements the classic AlphaZero iteration pattern:
 1. Clear replay buffer (start fresh with current model)
 2. Run actor for N episodes (self-play data generation)
 3. Train for M steps on the generated data
-4. Run evaluation against random baseline
+4. Evaluate the new model (gatekeeper vs best, optional random baseline)
 5. Export new model, repeat
 
 Usage:
