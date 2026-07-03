@@ -199,3 +199,192 @@ class TestSolverMetricsInEval:
         assert history[0]["became_new_best"] is True
         assert history[0]["solver_value_optimal_rate"] == 0.6
         assert runner.config.best_model_path.exists()
+
+
+class TestShouldPromote:
+    """Pure decision-function matrix."""
+
+    def _call(self, **overrides):
+        from trainer.orchestrator.eval_runner import should_promote
+
+        defaults = dict(
+            promotion_metric="win_rate",
+            vs_best_win_rate=0.6,
+            win_threshold=0.55,
+            candidate_solver_rate=None,
+            best_solver_rate=None,
+            margin=0.01,
+        )
+        defaults.update(overrides)
+        return should_promote(**defaults)
+
+    def test_win_rate_above_threshold_promotes(self):
+        promote, reason = self._call(vs_best_win_rate=0.6)
+        assert promote
+        assert "win_rate" in reason
+
+    def test_win_rate_at_threshold_rejects(self):
+        promote, _ = self._call(vs_best_win_rate=0.55)
+        assert not promote
+
+    def test_win_rate_none_rejects(self):
+        promote, reason = self._call(vs_best_win_rate=None)
+        assert not promote
+        assert "no vs-best result" in reason
+
+    def test_solver_optimal_promotes_above_margin(self):
+        promote, reason = self._call(
+            promotion_metric="solver_optimal",
+            candidate_solver_rate=0.611,
+            best_solver_rate=0.58,
+        )
+        assert promote
+        assert "solver_optimal" in reason
+
+    def test_solver_optimal_rejects_within_margin(self):
+        promote, _ = self._call(
+            promotion_metric="solver_optimal",
+            candidate_solver_rate=0.585,
+            best_solver_rate=0.58,
+        )
+        assert not promote
+
+    def test_solver_optimal_missing_candidate_falls_back(self):
+        promote, reason = self._call(
+            promotion_metric="solver_optimal",
+            candidate_solver_rate=None,
+            best_solver_rate=0.58,
+            vs_best_win_rate=0.7,
+        )
+        assert promote
+        assert "falling back" in reason
+
+    def test_solver_optimal_missing_best_falls_back(self):
+        promote, reason = self._call(
+            promotion_metric="solver_optimal",
+            candidate_solver_rate=0.6,
+            best_solver_rate=None,
+            vs_best_win_rate=0.4,
+        )
+        assert not promote
+        assert "falling back" in reason
+
+    def test_unknown_metric_falls_back(self):
+        promote, reason = self._call(promotion_metric="elo", vs_best_win_rate=0.7)
+        assert promote
+        assert "unknown metric" in reason
+
+
+class TestBestModelInfo:
+    def test_promote_writes_new_schema_and_reload(self, tmp_path, monkeypatch):
+        runner = make_runner(tmp_path, monkeypatch)
+
+        runner.promote_to_best(7, 0.62, solver_rate=0.611, metric="solver_optimal")
+
+        with open(runner.config.best_model_info_path) as f:
+            data = json.load(f)
+        assert data["iteration"] == 7
+        assert data["win_rate_when_promoted"] == 0.62
+        assert data["solver_value_optimal_rate"] == 0.611
+        assert data["promotion_metric"] == "solver_optimal"
+
+        # A fresh runner loads the stored rate.
+        reloaded = EvalRunner(runner.config)
+        assert reloaded.best_solver_rate == 0.611
+        assert reloaded.best_model_iteration == 7
+
+    def test_legacy_info_loads_with_none_rate(self, tmp_path, monkeypatch):
+        runner = make_runner(tmp_path, monkeypatch)
+        # Legacy schema, as written before this feature (live file matches this).
+        runner.config.best_model_info_path.write_text(
+            json.dumps(
+                {"iteration": 5, "win_rate_when_promoted": 1.0, "timestamp": "t"}
+            )
+        )
+
+        reloaded = EvalRunner(runner.config)
+
+        assert reloaded.best_model_iteration == 5
+        assert reloaded.best_solver_rate is None
+
+
+class TestSolverOptimalPromotion:
+    def _path_aware_solver(self, monkeypatch, rates: dict):
+        """solver_evaluate stub returning a rate keyed by model filename."""
+        from pathlib import Path
+
+        def stub(**kwargs):
+            name = Path(kwargs["model"].model_path).name
+            return make_solver_results(rates[name])
+
+        monkeypatch.setattr(eval_runner_module, "solver_evaluate", stub)
+
+    def test_promotes_when_candidate_beats_best_by_margin(self, tmp_path, monkeypatch):
+        runner = make_runner(
+            tmp_path,
+            monkeypatch,
+            promotion_metric="solver_optimal",
+            vs_best_win_rate=0.4,
+        )
+        self._path_aware_solver(monkeypatch, {"latest.onnx": 0.7, "best.onnx": 0.6})
+        history = []
+
+        runner.run(iteration=2, eval_history=history)
+
+        # Win rate 0.4 would NOT promote; solver_optimal does.
+        assert history[0]["became_new_best"] is True
+        assert history[0]["promotion_metric"] == "solver_optimal"
+        assert runner.best_solver_rate == 0.7
+
+    def test_rejects_within_margin(self, tmp_path, monkeypatch):
+        runner = make_runner(
+            tmp_path,
+            monkeypatch,
+            promotion_metric="solver_optimal",
+            vs_best_win_rate=0.9,  # would promote under win_rate
+        )
+        self._path_aware_solver(monkeypatch, {"latest.onnx": 0.605, "best.onnx": 0.6})
+        history = []
+
+        runner.run(iteration=2, eval_history=history)
+
+        assert history[0]["became_new_best"] is False
+
+    def test_backfills_legacy_best_rate_once(self, tmp_path, monkeypatch):
+        runner = make_runner(
+            tmp_path,
+            monkeypatch,
+            promotion_metric="solver_optimal",
+            vs_best_win_rate=0.4,
+        )
+        runner.config.best_model_info_path.write_text(
+            json.dumps({"iteration": 5, "win_rate_when_promoted": 1.0})
+        )
+        runner.best_solver_rate = None
+        self._path_aware_solver(monkeypatch, {"latest.onnx": 0.7, "best.onnx": 0.6})
+
+        runner.run(iteration=2, eval_history=[])
+
+        # Backfill wrote the best rate before promotion replaced it.
+        assert runner.best_solver_rate == 0.7  # promoted candidate is the new best
+        with open(runner.config.best_model_info_path) as f:
+            data = json.load(f)
+        assert data["solver_value_optimal_rate"] == 0.7
+
+    def test_tictactoe_falls_back_to_win_rate(self, tmp_path, monkeypatch):
+        runner = make_runner(
+            tmp_path,
+            monkeypatch,
+            env_id="tictactoe",
+            solver_rate=None,
+            promotion_metric="solver_optimal",
+            vs_best_win_rate=0.7,
+        )
+        history = []
+
+        runner.run(iteration=2, eval_history=history)
+
+        # Solver unavailable for tictactoe -> effective metric is win_rate,
+        # and 0.7 > 0.55 promotes.
+        assert history[0]["promotion_metric"] == "win_rate"
+        assert history[0]["became_new_best"] is True
