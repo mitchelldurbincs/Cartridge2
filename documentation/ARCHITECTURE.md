@@ -33,7 +33,7 @@ Cartridge2 is a simplified AlphaZero training and visualization platform that en
 |------|--------|-------|---------|---------|
 | TicTacToe | Complete | 3x3 | 9 | MLP |
 | Connect 4 | Complete | 7x6 | 7 | ResNet |
-| Othello | Planned | 8x8 | 64 | ResNet |
+| Othello | Complete | 8x8 | 65 (64 cells + pass) | ResNet |
 
 ### Technology Stack
 
@@ -161,6 +161,7 @@ Actor and trainer run concurrently:
 ```
 engine/
 ├── Cargo.toml                 # Workspace root
+├── engine-config/             # Centralized config.toml loading (shared by actor/web)
 ├── engine-core/               # Core abstractions (Game trait, registry, context)
 │   └── src/
 │       ├── lib.rs             # Public API exports
@@ -170,9 +171,12 @@ engine/
 │       ├── context.rs         # EngineContext high-level API
 │       ├── registry.rs        # Static game registration
 │       ├── metadata.rs        # GameMetadata for UI/config
+│       ├── game_utils.rs      # Shared helpers for game implementations
 │       └── board_game.rs      # TwoPlayerObs generic type
+├── engine-games/              # One-call registration of all bundled games
 ├── games-tictactoe/           # TicTacToe implementation
 ├── games-connect4/            # Connect 4 implementation
+├── games-othello/             # Othello implementation
 ├── mcts/                      # Monte Carlo Tree Search
 │   └── src/
 │       ├── config.rs          # MctsConfig parameters
@@ -332,6 +336,16 @@ Implementations:
 | Network | ResNet (4 blocks, 128 filters) |
 | Board Type | "drop_column" |
 
+#### Othello
+
+| Property | Value |
+|----------|-------|
+| Board | 8x8 grid |
+| Actions | 65 (64 cells + 1 pass) |
+| Observation | 195 f32s (128 board + 65 legal + 2 player) |
+| Network | ResNet |
+| Board Type | "grid" |
+
 ### Model Watcher
 
 Hot-reload system for ONNX models:
@@ -367,9 +381,12 @@ actor/
     ├── main.rs            # Entry point, CLI parsing
     ├── actor.rs           # Episode runner, main loop
     ├── mcts_policy.rs     # MCTS action selection
-    ├── model_watcher.rs   # Re-export from engine
+    ├── model_watcher.rs   # ONNX hot-reload (wraps engine model-watcher)
     ├── game_config.rs     # Auto-derived game config
-    ├── central_config.rs  # config.toml loading
+    ├── config.rs          # CLI configuration (defaults from engine-config)
+    ├── health.rs          # Health check endpoint
+    ├── metrics.rs         # Prometheus metrics
+    ├── stats.rs           # Self-play statistics (actor_stats.json)
     └── storage/
         ├── mod.rs         # ReplayStore trait
         └── postgres.rs    # PostgreSQL backend
@@ -474,13 +491,15 @@ let config = GameConfig::from_context(&ctx);
 ```
 trainer/
 ├── pyproject.toml
+├── tests/                 # Pytest suite
 └── src/trainer/
-    ├── __main__.py        # CLI (train, evaluate, loop)
+    ├── __main__.py        # CLI (train, evaluate, loop, solver-eval)
     ├── trainer.py         # Training loop
-    ├── orchestrator.py    # Synchronized AlphaZero
     ├── network.py         # MLP architecture
     ├── resnet.py          # ResNet architecture
     ├── evaluator.py       # Model evaluation
+    ├── solver_eval.py     # Perfect-solver move scoring (Connect4)
+    ├── wandb_logger.py    # Weights & Biases logging wrapper
     ├── config.py          # TrainerConfig
     ├── game_config.py     # Game configurations
     ├── checkpoint.py      # ONNX + PyTorch save/load
@@ -488,6 +507,16 @@ trainer/
     ├── lr_scheduler.py    # Warmup + cosine annealing
     ├── backoff.py         # Wait utilities
     ├── central_config.py  # config.toml loading
+    ├── metrics.py         # Prometheus metrics export
+    ├── orchestrator/      # Synchronized AlphaZero loop
+    │   ├── orchestrator.py # Main loop coordinator
+    │   ├── cli.py         # `trainer loop` argument parsing
+    │   ├── config.py      # LoopConfig
+    │   ├── actor_runner.py # Actor process management
+    │   ├── eval_runner.py # Evaluation runner
+    │   └── stats_manager.py # Stats aggregation
+    ├── policies/          # Random + ONNX policies (for evaluation)
+    ├── games/             # Pure Python game logic (for evaluation)
     └── storage/
         ├── base.py        # Abstract interfaces
         ├── factory.py     # Backend factory
@@ -505,9 +534,16 @@ python -m trainer train --steps 1000
 # Model evaluation
 python -m trainer evaluate --model ./data/models/latest.onnx --games 100
 
+# Perfect-solver move scoring (Connect4 only)
+python -m trainer solver-eval --model ./data/models/latest.onnx --games 100
+
 # Synchronized AlphaZero (recommended)
 python -m trainer loop --iterations 50 --episodes 500 --steps 1000
 ```
+
+> The trainer reads the replay-buffer connection string only from the
+> `CARTRIDGE_STORAGE_POSTGRES_URL` environment variable (config.toml's
+> `storage.postgres_url` is used by the Rust actor/web, not the trainer).
 
 ### Network Architectures
 
@@ -578,9 +614,9 @@ class LoopConfig:
     steps_per_iteration: int = 1000
 
     # MCTS simulation ramping
-    mcts_start_sims: int = 200
-    mcts_max_sims: int = 800
-    mcts_sim_ramp_rate: int = 30
+    mcts_start_sims: int = 50
+    mcts_max_sims: int = 400
+    mcts_sim_ramp_rate: int = 20
 
     # Evaluation gatekeeper
     eval_interval: int = 1
@@ -632,14 +668,14 @@ History downsampling:
 web/
 ├── Cargo.toml
 ├── src/
-│   ├── main.rs            # Server setup, routing
+│   ├── main.rs            # Server setup, routing (uses engine-config)
 │   ├── game.rs            # GameSession management
-│   ├── central_config.rs  # Config loading
-│   ├── model_watcher.rs   # Re-export
+│   ├── metrics.rs         # Prometheus metrics
+│   ├── model_watcher.rs   # ONNX hot-reload
 │   ├── handlers/
 │   │   ├── game.rs        # Game endpoints
 │   │   ├── health.rs      # Health check
-│   │   └── stats.rs       # Training stats
+│   │   └── stats.rs       # Training + actor stats
 │   └── types/
 │       ├── requests.rs    # Request DTOs
 │       └── responses.rs   # Response DTOs
@@ -651,8 +687,11 @@ web/
         ├── GenericBoard.svelte    # Board rendering
         ├── Stats.svelte           # Training stats
         ├── LossChart.svelte       # Loss visualization
+        ├── LossOverTimePage.svelte # Full-screen charts
         └── lib/
-            └── api.ts     # API client
+            ├── api.ts     # API client
+            ├── chart.ts   # Chart formatting utilities
+            └── constants.ts # Polling intervals, etc.
 ```
 
 ### API Endpoints
@@ -660,12 +699,14 @@ web/
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check |
-| `/games` | GET | List available games |
-| `/game-info/:id` | GET | Game metadata |
+| `/metrics` | GET | Prometheus metrics |
+| `/games` | GET | List available games (only the configured game) |
+| `/game-info/:id` | GET | Game metadata (403 for non-current games) |
 | `/game/new` | POST | Start new game |
 | `/game/state` | GET | Get current board |
 | `/move` | POST | Make player move + bot response |
 | `/stats` | GET | Training statistics |
+| `/actor-stats` | GET | Actor self-play statistics |
 | `/model` | GET | Model info |
 
 ### GameSession
@@ -714,8 +755,10 @@ Features:
 ### Replay Buffer (PostgreSQL)
 
 ```python
+# Connection string from the CARTRIDGE_STORAGE_POSTGRES_URL env var...
+replay = create_replay_buffer()
+# ...or passed explicitly
 replay = create_replay_buffer(
-    backend="postgres",
     connection_string="postgresql://user:pass@host:5432/db"
 )
 ```
@@ -817,7 +860,6 @@ host = "0.0.0.0"
 port = 8080
 
 [storage]
-replay_backend = "postgres"
 model_backend = "filesystem"
 postgres_url = "postgresql://..."
 # s3_bucket = "cartridge-models"
@@ -929,32 +971,31 @@ docker compose up web frontend
 #### Kubernetes Simulation
 
 ```bash
-# Full K8s stack (PostgreSQL + MinIO)
-docker compose -f docker-compose.yml -f docker-compose.k8s.yml --profile k8s up
+# Full K8s-style stack (PostgreSQL + MinIO model storage)
+docker compose -f docker-compose.yml -f docker-compose.k8s.yml up
 
-# Scale actors
-docker compose --profile k8s up --scale actor-k8s=4
+# Parallel self-play is configured via [training].num_actors in config.toml
+# (or CARTRIDGE_TRAINING_NUM_ACTORS), not by scaling containers
 ```
 
 ### Dockerfiles
 
-| Image | Base | Purpose | Size |
-|-------|------|---------|------|
-| `alphazero` | Python 3.11 | Actor + Trainer | ~1.3GB |
-| `actor` | Debian slim | Self-play only | ~150MB |
-| `trainer` | Python 3.11 | Training only | ~1.2GB |
-| `web` | Debian slim | API server | ~200MB |
-| `frontend` | nginx unprivileged | Svelte UI | ~50MB |
+| Image | Dockerfile | Base | Purpose |
+|-------|------------|------|---------|
+| `alphazero` | `Dockerfile.alphazero` | Ubuntu 24.04 | Actor + Trainer (synchronized loop) |
+| `web` | `web/Dockerfile` | Ubuntu 24.04 | API server |
+| `frontend` | `web/frontend/Dockerfile` | nginx alpine | Svelte UI |
 
 ### Feature Flags
 
-Actor and web support optional features:
-- `postgres`: PostgreSQL replay backend
-- `s3`: S3 model storage
+PostgreSQL support is built in. Optional cargo features:
+- `s3` (actor, web): S3/MinIO model storage
+- `coreml` (actor): CoreML execution provider for ONNX on Apple Silicon
+- `onnx` (web, default): MCTS bot with ONNX inference
 
 Build with features:
 ```bash
-docker build --build-arg CARGO_FEATURES="postgres,s3" -t cartridge-actor-k8s ./actor
+docker build -f Dockerfile.alphazero --build-arg CARGO_FEATURES="s3" .
 ```
 
 ### Health Checks
@@ -972,26 +1013,33 @@ docker build --build-arg CARGO_FEATURES="postgres,s3" -t cartridge-actor-k8s ./a
 
 ### Test Distribution
 
+Counts as of 2026-07 (unit tests per crate/package — they drift as code evolves,
+so treat `cargo test` / `pytest` output as the source of truth):
+
 | Component | Tests | Coverage |
 |-----------|-------|----------|
-| engine-core | 64 | Game trait, adapter, registry, context |
-| games-tictactoe | 27 | Game logic, encoding |
-| games-connect4 | 21 | Game logic, encoding |
-| mcts | 22 | Config, evaluator, tree, search |
-| actor | 36 | Initialization, episodes, storage |
-| web | 22 | Handlers, game session |
-| trainer | ~20 | CLI, stats, smoke tests |
+| engine-core | 70 | Game trait, adapter, registry, context |
+| engine-config | 19 | Config loading, env overrides |
+| engine-games | 2 | Registration of all bundled games |
+| games-tictactoe | 26 | Game logic, encoding |
+| games-connect4 | 20 | Game logic, encoding |
+| games-othello | 25 | Game logic, encoding |
+| mcts | 25 | Config, evaluator, tree, search |
+| model-watcher | 5 | Hot-reload behavior |
+| actor | 86 | Initialization, episodes, storage |
+| web | ~100 | Handlers, game session |
+| trainer | 245 | Trainer, orchestrator, storage, eval |
 
 ### Running Tests
 
 ```bash
 # Rust tests
-cd engine && cargo test     # 134 tests
-cd actor && cargo test      # 36 tests
-cd web && cargo test        # 22 tests
+cd engine && cargo test     # 192 tests
+cd actor && cargo test      # 86 tests
+cd web && cargo test
 
 # Python tests
-cd trainer && pytest
+cd trainer && pytest        # 245 tests
 
 # All Rust formatting and linting
 cargo fmt --check
@@ -1001,13 +1049,17 @@ cargo clippy -- -D warnings
 ### CI Pipeline
 
 GitHub Actions workflow:
-1. **rust-fmt**: Format check
+1. **rust-fmt**: Format (auto-fix committed on PRs)
 2. **rust-clippy**: Lint with warnings as errors
 3. **rust-test**: Full test suite
-4. **python-lint**: Ruff + Black
-5. **python-test**: Pytest
-6. **frontend**: Svelte check + build
-7. **docker**: Dockerfile validation
+4. **rust-build**: Release build
+5. **rust-security-audit**: cargo audit (non-blocking)
+6. **python-lint**: Ruff + Black (auto-fix committed on PRs)
+7. **python-test**: Pytest
+8. **python-security-audit**: pip-audit (non-blocking)
+9. **frontend**: Svelte check + build
+10. **docker-build**: Docker image build validation
+11. **secrets-scan**: GitLeaks (non-blocking)
 
 ---
 

@@ -12,7 +12,8 @@
    - [Game Session](#53-game-session)
    - [Training Statistics](#54-training-statistics)
    - [Model Information](#55-model-information)
-   - [Self-Play Control](#56-self-play-control)
+   - [Actor Statistics](#56-actor-statistics)
+   - [Prometheus Metrics](#57-prometheus-metrics)
 6. [Type Definitions](#6-type-definitions)
 7. [Error Handling](#7-error-handling)
 8. [Game-Specific Behavior](#8-game-specific-behavior)
@@ -61,15 +62,20 @@ http://localhost:8080   # From host machine
 
 ### CORS Configuration
 
-The API allows all origins, methods, and headers for development:
+CORS is deny-by-default:
 
-```
-Access-Control-Allow-Origin: *
-Access-Control-Allow-Methods: *
-Access-Control-Allow-Headers: *
+- When `web.allowed_origins` (config.toml) is empty, only localhost origins
+  (e.g. `http://localhost:5173`, `http://localhost:8080`) are allowed —
+  suitable for local development.
+- For production, list explicit origins:
+
+```toml
+[web]
+allowed_origins = ["https://yourdomain.com"]
 ```
 
-> **Note**: In production, you should configure specific allowed origins.
+Allowed methods are `GET`, `POST`, `OPTIONS` with the `Content-Type` and
+`Accept` headers.
 
 ---
 
@@ -164,7 +170,9 @@ curl http://localhost:8080/health
 
 #### GET /games
 
-List all registered game environments.
+List the playable game environment. Only the currently configured game
+(`common.env_id`) is returned — other registered games are hidden so the UI
+always matches the game the loaded model was trained for.
 
 **Request**
 
@@ -177,7 +185,7 @@ Host: localhost:8080
 
 ```json
 {
-  "games": ["tictactoe", "connect4"]
+  "games": ["connect4"]
 }
 ```
 
@@ -185,7 +193,7 @@ Host: localhost:8080
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `games` | string[] | Array of registered game IDs |
+| `games` | string[] | Single-element array with the current game ID |
 
 **Example**
 
@@ -260,12 +268,13 @@ Host: localhost:8080
 | Code | Description |
 |------|-------------|
 | 200 | Success |
+| 403 | Game exists but is not the currently configured game |
 | 404 | Game not found |
 
-**Error Response (404)**
+**Error Response (403)**
 
 ```
-Game not found: nonexistent. Use /games to list available games.
+Cannot access game 'tictactoe': only the current game 'connect4' is available
 ```
 
 **Example**
@@ -417,6 +426,7 @@ When `first: "bot"`:
 | Code | Description |
 |------|-------------|
 | 200 | Game created successfully |
+| 403 | Requested game is not the currently configured game |
 | 500 | Failed to create game (invalid game ID) |
 
 **Example**
@@ -698,32 +708,35 @@ curl http://localhost:8080/model
 
 ---
 
-### 5.6 Self-Play Control
+### 5.6 Actor Statistics
 
-#### POST /selfplay
+#### GET /actor-stats
 
-Control self-play actor (placeholder - not yet implemented).
+Get self-play statistics written by the actor to `{data_dir}/actor_stats.json`.
+Returns zeroed defaults if the file doesn't exist yet.
 
-**Request Body**
+**Request**
 
-```json
-{
-  "action": "start"
-}
+```http
+GET /actor-stats HTTP/1.1
+Host: localhost:8080
 ```
-
-**Request Fields**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `action` | string | Yes | Action to perform: `"start"` or `"stop"` |
 
 **Response**
 
 ```json
 {
-  "status": "placeholder",
-  "message": "Self-play start requested (not implemented yet)"
+  "env_id": "connect4",
+  "episodes_completed": 1250,
+  "total_steps": 31875,
+  "player1_wins": 640,
+  "player2_wins": 545,
+  "draws": 65,
+  "avg_episode_length": 25.5,
+  "episodes_per_second": 3.2,
+  "runtime_seconds": 390.6,
+  "mcts_avg_inference_us": 850.0,
+  "timestamp": 1704067200
 }
 ```
 
@@ -731,19 +744,37 @@ Control self-play actor (placeholder - not yet implemented).
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `status` | string | Always `"placeholder"` currently |
-| `message` | string | Description of action taken |
-
-**Note**: This endpoint is a placeholder. Self-play is controlled via:
-- Docker: `docker compose up actor`
-- CLI: `cargo run --release -p actor`
+| `env_id` | string | Game being self-played |
+| `episodes_completed` | number | Episodes finished |
+| `total_steps` | number | Total game steps across all episodes |
+| `player1_wins` | number | Episodes won by player 1 |
+| `player2_wins` | number | Episodes won by player 2 |
+| `draws` | number | Episodes ending in a draw |
+| `avg_episode_length` | number | Average moves per episode |
+| `episodes_per_second` | number | Self-play throughput |
+| `runtime_seconds` | number | Total actor runtime |
+| `mcts_avg_inference_us` | number | Average MCTS inference time (µs) |
+| `timestamp` | number | Unix timestamp of last update |
 
 **Example**
 
 ```bash
-curl -X POST http://localhost:8080/selfplay \
-  -H "Content-Type: application/json" \
-  -d '{"action": "start"}'
+curl http://localhost:8080/actor-stats
+```
+
+---
+
+### 5.7 Prometheus Metrics
+
+#### GET /metrics
+
+Prometheus-format metrics for scraping (request counts, latencies, game
+sessions). Returns `text/plain` in the Prometheus exposition format, not JSON.
+
+**Example**
+
+```bash
+curl http://localhost:8080/metrics
 ```
 
 ---
@@ -847,14 +878,19 @@ interface ModelInfo {
   status: string;
 }
 
-// Self-play control
-interface SelfPlayRequest {
-  action: 'start' | 'stop';
-}
-
-interface SelfPlayResponse {
-  status: string;
-  message: string;
+// Actor self-play statistics
+interface ActorStats {
+  env_id: string;
+  episodes_completed: number;
+  total_steps: number;
+  player1_wins: number;
+  player2_wins: number;
+  draws: number;
+  avg_episode_length: number;
+  episodes_per_second: number;
+  runtime_seconds: number;
+  mcts_avg_inference_us: number;
+  timestamp: number;
 }
 ```
 
@@ -874,6 +910,7 @@ See source files:
 |------|---------|---------------|
 | 200 | OK | Successful request |
 | 400 | Bad Request | Invalid move, game over, not your turn |
+| 403 | Forbidden | Game other than the currently configured one |
 | 404 | Not Found | Unknown game ID |
 | 500 | Internal Server Error | Server-side failure |
 
@@ -895,7 +932,9 @@ Illegal move: position/column 9 is not valid
 | POST /move | `Game is already over` | Move attempted after game ended |
 | POST /move | `Not your turn` | Move when it's bot's turn |
 | POST /move | `Illegal move: position/column X is not valid` | Invalid or occupied position |
+| POST /game/new | `Cannot switch to game 'X': only the current game 'Y' is available` | Non-current game |
 | POST /game/new | `Failed to create game 'X': ...` | Unknown game ID |
+| GET /game-info/:id | `Cannot access game 'X': only the current game 'Y' is available` | Non-current game |
 | GET /game-info/:id | `Game not found: X` | Unknown game ID |
 
 ### Client Error Handling
@@ -960,6 +999,22 @@ Piece drops to lowest empty cell in column
 ```
 Index = row * 7 + col
 Row 0 = bottom, Row 5 = top
+```
+
+### Othello
+
+| Property | Value |
+|----------|-------|
+| Board Size | 8x8 (64 cells) |
+| Position Range | 0-63 (cells), 64 = pass |
+| Board Type | `grid` |
+| Win Condition | Most discs when neither player can move |
+
+**Board Mapping**
+
+```
+Position = row * 8 + col
+Action 64 is the pass move (only legal when no placement is possible)
 ```
 
 ### Winner Values
@@ -1224,14 +1279,15 @@ curl -s http://localhost:8080/game/state | jq '.board | . as $b | [range(0;9)] |
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/health` | Health check |
-| GET | `/games` | List available games |
+| GET | `/metrics` | Prometheus metrics |
+| GET | `/games` | List available games (current game only) |
 | GET | `/game-info/:id` | Get game metadata |
 | GET | `/game/state` | Get current game state |
 | POST | `/game/new` | Start new game |
 | POST | `/move` | Make a move |
 | GET | `/stats` | Get training statistics |
+| GET | `/actor-stats` | Get actor self-play statistics |
 | GET | `/model` | Get model info |
-| POST | `/selfplay` | Control self-play (placeholder) |
 
 ### Status Code Quick Reference
 

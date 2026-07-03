@@ -17,9 +17,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Use defaults for CI to avoid needing .env file
-  MINIO_ROOT_USER: minioadmin
-  MINIO_ROOT_PASSWORD: testpassword123
 
 jobs:
   # ============================================
@@ -42,7 +39,7 @@ jobs:
             engine
             actor
             web
-      # On PRs: auto-fix and commit. On push to main: just check.
+      # Formats the code; on PRs the resulting fixes are committed back.
       - name: Format code (engine)
         run: cargo fmt --all --manifest-path engine/Cargo.toml
       - name: Format code (actor)
