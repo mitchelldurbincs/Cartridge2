@@ -75,7 +75,7 @@ max_checkpoints = 10
 # Number of parallel actor processes for self-play
 # More actors = faster episode generation (scales well with CPU cores)
 # Recommended: 6 for 8-core, 8-10 for 10+ core machines
-num_actors = 6
+num_actors = 10
 
 # =============================================================================
 # Evaluation Settings
