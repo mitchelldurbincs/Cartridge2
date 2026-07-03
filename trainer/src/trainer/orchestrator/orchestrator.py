@@ -4,7 +4,7 @@ This module implements the classic AlphaZero iteration pattern:
 1. Clear replay buffer (start fresh with current model)
 2. Run actor for N episodes (self-play data generation)
 3. Train for M steps on the generated data
-4. Run evaluation against random baseline
+4. Evaluate the new model (gatekeeper vs best, optional random baseline)
 5. Export new model, repeat
 
 This ensures each training iteration only uses data from the current model,
@@ -284,7 +284,7 @@ class Orchestrator:
                     f"Step 4: Skipping evaluation (next at iteration {next_eval})"
                 )
             else:
-                logger.info("Step 4: Evaluation disabled (ALPHAZERO_EVAL_INTERVAL=0)")
+                logger.info("Step 4: Evaluation disabled (eval_interval=0)")
 
         total_time = time.time() - iter_start
 
@@ -326,11 +326,8 @@ class Orchestrator:
 
         return stats
 
-    def run(self) -> None:
-        """Run the full training loop."""
-        self._ensure_directories()
-
-        # Log configuration with evaluation status prominently
+    def _log_startup_summary(self) -> None:
+        """Log the loop configuration with evaluation status prominently."""
         logger.info("=" * 60)
         logger.info("Synchronized AlphaZero Training")
         logger.info("=" * 60)
@@ -388,32 +385,12 @@ class Orchestrator:
                     f"  Current best model: iteration {self.eval_runner.best_iteration}"
                 )
         else:
-            logger.info(
-                "Evaluation: DISABLED (set ALPHAZERO_EVAL_INTERVAL > 0 to enable)"
-            )
+            logger.info("Evaluation: DISABLED (set eval_interval > 0 to enable)")
 
         logger.info("=" * 60)
 
-        loop_start = time.time()
-
-        try:
-            for iteration in range(
-                self.config.start_iteration,
-                self.config.start_iteration + self.config.iterations,
-            ):
-                if self._shutdown_requested:
-                    logger.warning("Shutdown requested, stopping loop")
-                    break
-
-                stats = self.run_iteration(iteration)
-                if stats:
-                    self.iteration_history.append(stats)
-                    self.stats_manager.save_loop_stats(self.iteration_history)
-        finally:
-            # Always close out the W&B run, including on shutdown or crash.
-            self.wandb_logger.finish()
-
-        total_time = time.time() - loop_start
+    def _log_completion_summary(self, total_time: float) -> None:
+        """Log totals for the finished (or interrupted) training session."""
         total_in_history = len(self.iteration_history)
         # Count only iterations completed in this session
         new_completed = total_in_history - (self.config.start_iteration - 1)
@@ -421,7 +398,7 @@ class Orchestrator:
         logger.info("")
         logger.info("=" * 60)
         logger.info("TRAINING COMPLETE")
-        logger.info(f"{'='*60}")
+        logger.info("=" * 60)
         if self.config.start_iteration > 1:
             logger.info(
                 f"Completed iterations this session: {new_completed} "
@@ -450,6 +427,32 @@ class Orchestrator:
                 logger.info(
                     f"Final evaluation: {final.eval_win_rate:.1%} win rate vs random"
                 )
+
+    def run(self) -> None:
+        """Run the full training loop."""
+        self._ensure_directories()
+        self._log_startup_summary()
+
+        loop_start = time.time()
+
+        try:
+            for iteration in range(
+                self.config.start_iteration,
+                self.config.start_iteration + self.config.iterations,
+            ):
+                if self._shutdown_requested:
+                    logger.warning("Shutdown requested, stopping loop")
+                    break
+
+                stats = self.run_iteration(iteration)
+                if stats:
+                    self.iteration_history.append(stats)
+                    self.stats_manager.save_loop_stats(self.iteration_history)
+        finally:
+            # Always close out the W&B run, including on shutdown or crash.
+            self.wandb_logger.finish()
+
+        self._log_completion_summary(time.time() - loop_start)
 
         # Clean up shared resources
         self._replay_buffer.close()

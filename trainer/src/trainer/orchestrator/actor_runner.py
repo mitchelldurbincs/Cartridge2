@@ -10,11 +10,19 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
 
 from .config import LoopConfig
 
 logger = logging.getLogger(__name__)
+
+
+class _ActorProcess(NamedTuple):
+    """A spawned actor subprocess plus its episode quota and log label."""
+
+    process: subprocess.Popen
+    episodes: int
+    actor_id: str
 
 
 class ActorRunner:
@@ -34,6 +42,23 @@ class ActorRunner:
         self.config = config
         self._shutdown_check = shutdown_check or (lambda: False)
         self._actor_binary: Path | None = None
+
+    def _auto_detect_candidates(self) -> list[Path]:
+        """Standard locations to search for the actor binary."""
+        # Use the module's location to find the project root:
+        # trainer/src/trainer/orchestrator/actor_runner.py -> project root
+        project_root = Path(__file__).parents[4]
+
+        return [
+            # Docker location
+            Path("/app/actor"),
+            # Workspace-level target
+            project_root / "target" / "release" / "actor",
+            project_root / "target" / "debug" / "actor",
+            # Actor-specific target
+            project_root / "actor" / "target" / "release" / "actor",
+            project_root / "actor" / "target" / "debug" / "actor",
+        ]
 
     def find_binary(self) -> Path:
         """Find the actor binary, preferring release build.
@@ -73,22 +98,7 @@ class ActorRunner:
             raise FileNotFoundError(f"ACTOR_BINARY not found: {env_path}")
 
         # Auto-detect from standard locations
-        # Use the module's location to find the project root
-        module_dir = Path(__file__).parent
-        # trainer/src/trainer/orchestrator -> project root
-        project_root = module_dir.parent.parent.parent.parent
-
-        candidates = [
-            # Docker location
-            Path("/app/actor"),
-            # Workspace-level target
-            project_root / "target" / "release" / "actor",
-            project_root / "target" / "debug" / "actor",
-            # Actor-specific target
-            project_root / "actor" / "target" / "release" / "actor",
-            project_root / "actor" / "target" / "debug" / "actor",
-        ]
-
+        candidates = self._auto_detect_candidates()
         for candidate in candidates:
             if candidate.exists():
                 logger.info(f"Found actor binary: {candidate}")
@@ -99,6 +109,45 @@ class ActorRunner:
             f"Actor binary not found. Searched: {[str(c) for c in candidates]}. "
             "Set ACTOR_BINARY environment variable or run 'cd actor && cargo build --release'."
         )
+
+    def _build_command(
+        self,
+        actor_binary: Path,
+        actor_id: str,
+        num_episodes: int,
+        num_simulations: int,
+    ) -> list[str]:
+        """Build the CLI invocation for one actor process."""
+        return [
+            str(actor_binary),
+            "--env-id",
+            self.config.env_id,
+            "--max-episodes",
+            str(num_episodes),
+            "--data-dir",
+            str(self.config.data_dir),
+            "--log-interval",
+            str(self.config.actor_log_interval),
+            "--log-level",
+            "info",
+            "--num-simulations",
+            str(num_simulations),
+            "--temp-threshold",
+            str(self.config.temp_threshold),
+            "--actor-id",
+            actor_id,
+            "--no-watch",  # Orchestrator pre-loads model; no hot-reload needed
+        ]
+
+    @staticmethod
+    def _stream_output(proc: subprocess.Popen, actor_id: str) -> None:
+        """Relay one actor's combined stdout/stderr to our stdout, line-prefixed."""
+        while True:
+            line = proc.stdout.readline()
+            if not line and proc.poll() is not None:
+                break
+            if line:
+                print(f"[{actor_id}] {line.rstrip()}", flush=True)
 
     def run(
         self, num_episodes: int, iteration: int, trace_id: str | None = None
@@ -129,9 +178,7 @@ class ActorRunner:
         )
 
         start_time = time.time()
-        processes: list[tuple[subprocess.Popen, int, str]] = (
-            []
-        )  # (process, episodes, actor_id)
+        processes: list[_ActorProcess] = []
 
         try:
             # Spawn all actors
@@ -143,26 +190,9 @@ class ActorRunner:
                 if episodes_for_actor == 0:
                     continue
 
-                cmd = [
-                    str(actor_binary),
-                    "--env-id",
-                    self.config.env_id,
-                    "--max-episodes",
-                    str(episodes_for_actor),
-                    "--data-dir",
-                    str(self.config.data_dir),
-                    "--log-interval",
-                    str(self.config.actor_log_interval),
-                    "--log-level",
-                    "info",
-                    "--num-simulations",
-                    str(num_simulations),
-                    "--temp-threshold",
-                    str(self.config.temp_threshold),
-                    "--actor-id",
-                    actor_id,
-                    "--no-watch",  # Orchestrator pre-loads model; no hot-reload needed
-                ]
+                cmd = self._build_command(
+                    actor_binary, actor_id, episodes_for_actor, num_simulations
+                )
 
                 if num_actors == 1:
                     logger.info(f"Command: {' '.join(cmd)}")
@@ -181,22 +211,16 @@ class ActorRunner:
                     bufsize=1,
                     env=env,
                 )
-                processes.append((process, episodes_for_actor, actor_id))
+                processes.append(_ActorProcess(process, episodes_for_actor, actor_id))
                 logger.info(f"Started {actor_id} for {episodes_for_actor} episodes")
 
             # Stream output from all actors using threads
-            def stream_output(proc: subprocess.Popen, actor_id: str) -> None:
-                while True:
-                    line = proc.stdout.readline()
-                    if not line and proc.poll() is not None:
-                        break
-                    if line:
-                        print(f"[{actor_id}] {line.rstrip()}", flush=True)
-
             threads = []
-            for proc, _, actor_id in processes:
+            for actor in processes:
                 t = threading.Thread(
-                    target=stream_output, args=(proc, actor_id), daemon=True
+                    target=self._stream_output,
+                    args=(actor.process, actor.actor_id),
+                    daemon=True,
                 )
                 t.start()
                 threads.append(t)
@@ -206,24 +230,25 @@ class ActorRunner:
             while processes:
                 if self._shutdown_check():
                     logger.warning("Shutdown requested, terminating actors...")
-                    for proc, _, actor_id in processes:
-                        proc.terminate()
-                    for proc, _, _ in processes:
-                        proc.wait(timeout=5)
+                    for actor in processes:
+                        actor.process.terminate()
+                    for actor in processes:
+                        actor.process.wait(timeout=5)
                     return False, time.time() - start_time
 
                 # Check which processes are done
                 still_running = []
-                for proc, episodes, actor_id in processes:
-                    ret = proc.poll()
+                for actor in processes:
+                    ret = actor.process.poll()
                     if ret is None:
-                        still_running.append((proc, episodes, actor_id))
+                        still_running.append(actor)
+                    elif ret != 0:
+                        logger.error(f"{actor.actor_id} exited with code {ret}")
+                        all_success = False
                     else:
-                        if ret != 0:
-                            logger.error(f"{actor_id} exited with code {ret}")
-                            all_success = False
-                        else:
-                            logger.info(f"{actor_id} completed ({episodes} episodes)")
+                        logger.info(
+                            f"{actor.actor_id} completed ({actor.episodes} episodes)"
+                        )
                 processes = still_running
 
                 if processes:
@@ -242,10 +267,10 @@ class ActorRunner:
         except Exception as e:
             logger.error(f"Actor(s) failed: {e}")
             # Clean up any running processes
-            for proc, _, _ in processes:
+            for actor in processes:
                 try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
+                    actor.process.terminate()
+                    actor.process.wait(timeout=2)
                 except Exception:
                     pass
             return False, time.time() - start_time

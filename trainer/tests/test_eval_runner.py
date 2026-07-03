@@ -388,3 +388,97 @@ class TestSolverOptimalPromotion:
         # and 0.7 > 0.55 promotes.
         assert history[0]["promotion_metric"] == "win_rate"
         assert history[0]["became_new_best"] is True
+
+
+class TestEvalRecordSchema:
+    def test_eval_record_key_set_is_frozen(self, tmp_path, monkeypatch):
+        """The record schema is consumed by the frontend — guard the key set."""
+        runner = make_runner(tmp_path, monkeypatch)
+        history = []
+
+        runner.run(iteration=2, eval_history=history)
+
+        assert set(history[0]) == {
+            "iteration",
+            "step",
+            "vs_best_win_rate",
+            "vs_best_draw_rate",
+            "vs_best_opponent_iteration",
+            "became_new_best",
+            "vs_random_win_rate",
+            "vs_random_draw_rate",
+            "solver_value_optimal_rate",
+            "solver_exact_best_rate",
+            "solver_blunder_rate",
+            "solver_positions",
+            "promotion_metric",
+            "games",
+            "timestamp",
+        }
+
+    def test_vs_random_disabled_leaves_fields_none(self, tmp_path, monkeypatch):
+        runner = make_runner(tmp_path, monkeypatch, eval_vs_random=False)
+        history = []
+
+        runner.run(iteration=1, eval_history=history)
+
+        assert history[0]["vs_random_win_rate"] is None
+        assert history[0]["vs_random_draw_rate"] is None
+
+    def test_wandb_drops_none_valued_metrics(self, tmp_path, monkeypatch):
+        logger = RecordingLogger()
+        runner = make_runner(
+            tmp_path,
+            monkeypatch,
+            env_id="tictactoe",
+            solver_rate=None,
+            logger=logger,
+            eval_vs_random=False,
+        )
+
+        runner.run(iteration=1, eval_history=[])
+
+        metrics, _ = logger.logged[0]
+        assert "eval/vs_random_win_rate" not in metrics
+        assert not any(key.startswith("solver/") for key in metrics)
+        assert metrics["eval/vs_best_win_rate"] == 0.4
+
+
+class TestEvalFailurePaths:
+    def test_missing_model_skips_eval(self, tmp_path, monkeypatch):
+        runner = make_runner(tmp_path, monkeypatch)
+        runner.config.latest_model_path.unlink()
+        history = []
+
+        result = runner.run(iteration=1, eval_history=history)
+
+        assert result == (None, None, 0.0)
+        assert history == []
+
+    def test_eval_exception_yields_none_rates_and_no_record(
+        self, tmp_path, monkeypatch
+    ):
+        runner = make_runner(tmp_path, monkeypatch)
+
+        def boom(**kwargs):
+            raise RuntimeError("eval exploded")
+
+        monkeypatch.setattr(eval_runner_module, "run_eval", boom)
+        history = []
+
+        win_rate, draw_rate, elapsed = runner.run(iteration=1, eval_history=history)
+
+        assert win_rate is None
+        assert draw_rate is None
+        assert elapsed >= 0.0
+        assert history == []
+
+    def test_promote_without_latest_model_keeps_state(self, tmp_path, monkeypatch):
+        runner = make_runner(tmp_path, monkeypatch)
+        runner.best_model_iteration = 3
+        runner.config.latest_model_path.unlink()
+
+        runner.promote_to_best(9, 0.9)
+
+        assert runner.best_model_iteration == 3
+        assert not runner.config.best_model_info_path.exists()
