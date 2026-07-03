@@ -244,11 +244,10 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             total_evals = stats.total_evals,
             game_steps = stats.game_steps,
             terminal_hits = stats.terminal_hits,
-            avg_batch_size = if stats.num_batches > 0 {
-                stats.total_evals / stats.num_batches
-            } else {
-                0
-            },
+            avg_batch_size = stats
+                .total_evals
+                .checked_div(stats.num_batches)
+                .unwrap_or(0),
             "MCTS search stats"
         );
 
