@@ -14,6 +14,9 @@ avoiding the noise that comes from mixing data from many model generations.
 import logging
 import signal
 import time
+from dataclasses import asdict
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from ..storage import create_replay_buffer
@@ -22,6 +25,7 @@ from ..structured_logging import (
     generate_trace_id,
     set_trace_context,
 )
+from ..wandb_logger import make_logger
 from .actor_runner import ActorRunner
 from .config import IterationStats, LoopConfig
 from .eval_runner import EvalRunner
@@ -53,7 +57,6 @@ class Orchestrator:
 
         # Initialize components
         self.stats_manager = StatsManager(config)
-        self.eval_runner = EvalRunner(config)
         self.actor_runner = ActorRunner(
             config, shutdown_check=lambda: self._shutdown_requested
         )
@@ -69,10 +72,39 @@ class Orchestrator:
         # Auto-resume from previous state if start_iteration is default (1)
         self._auto_resume_if_needed()
 
+        # W&B logger and eval runner are created after auto-resume so the
+        # run name reflects the actual starting iteration.
+        start = self.config.start_iteration
+        self.wandb_logger = make_logger(
+            wandb_config=config.wandb,
+            run_name=f"{config.env_id}_loop_it{start:03d}_{datetime.now():%Y%m%d-%H%M%S}",
+            run_config=self._run_config_dict(),
+            tags=(config.env_id, "alphazero", "loop"),
+        )
+        self.eval_runner = EvalRunner(config, wandb_logger=self.wandb_logger)
+
     def _signal_handler(self, signum: int, frame: Any) -> None:
         """Handle shutdown signals gracefully."""
         logger.warning(f"Received signal {signum}, requesting shutdown...")
         self._shutdown_requested = True
+
+    def _run_config_dict(self) -> dict:
+        """LoopConfig as a JSON-friendly dict for the W&B run config."""
+        raw = asdict(self.config)
+        return {k: str(v) if isinstance(v, Path) else v for k, v in raw.items()}
+
+    def _train_metrics_hook(self, payload: dict, step: int) -> None:
+        """Forward trainer per-step metrics to W&B under the train/ prefix."""
+        metrics = {
+            "train/total_loss": payload["total_loss"],
+            "train/value_loss": payload["value_loss"],
+            "train/policy_loss": payload["policy_loss"],
+            "train/lr": payload["learning_rate"],
+            "train/samples_seen": payload["samples_seen"],
+        }
+        if "grad_norm" in payload:
+            metrics["train/grad_norm"] = payload["grad_norm"]
+        self.wandb_logger.log(metrics, step=step)
 
     def _auto_resume_if_needed(self) -> None:
         """Auto-resume from previous state if start_iteration is default (1)."""
@@ -137,6 +169,7 @@ class Orchestrator:
             eval_interval=0,  # Disable trainer's built-in eval, we do it ourselves
             lr_total_steps=lr_total_steps,  # Continuous LR decay across iterations
             shutdown_check=lambda: self._shutdown_requested,  # Pass shutdown check
+            metrics_hook=self._train_metrics_hook,  # Forward step metrics to W&B
         )
 
         logger.info(f"Starting trainer for {num_steps} steps (start_step={start_step})")
@@ -268,6 +301,20 @@ class Orchestrator:
             eval_draw_rate=draw_rate,
         )
 
+        self.wandb_logger.log(
+            {
+                "loop/iteration": iteration,
+                "loop/actor_seconds": actor_time,
+                "loop/trainer_seconds": trainer_time,
+                "loop/eval_seconds": eval_time,
+                "loop/total_seconds": total_time,
+                "loop/episodes": stats.episodes_generated,
+                "loop/transitions": transitions_count,
+                "loop/mcts_simulations": num_simulations,
+            },
+            step=iteration * self.config.steps_per_iteration,
+        )
+
         logger.info(f"\nIteration {iteration} complete:")
         logger.info(f"  Episodes: {stats.episodes_generated}")
         logger.info(f"  Transitions: {stats.transitions_generated}")
@@ -349,18 +396,22 @@ class Orchestrator:
 
         loop_start = time.time()
 
-        for iteration in range(
-            self.config.start_iteration,
-            self.config.start_iteration + self.config.iterations,
-        ):
-            if self._shutdown_requested:
-                logger.warning("Shutdown requested, stopping loop")
-                break
+        try:
+            for iteration in range(
+                self.config.start_iteration,
+                self.config.start_iteration + self.config.iterations,
+            ):
+                if self._shutdown_requested:
+                    logger.warning("Shutdown requested, stopping loop")
+                    break
 
-            stats = self.run_iteration(iteration)
-            if stats:
-                self.iteration_history.append(stats)
-                self.stats_manager.save_loop_stats(self.iteration_history)
+                stats = self.run_iteration(iteration)
+                if stats:
+                    self.iteration_history.append(stats)
+                    self.stats_manager.save_loop_stats(self.iteration_history)
+        finally:
+            # Always close out the W&B run, including on shutdown or crash.
+            self.wandb_logger.finish()
 
         total_time = time.time() - loop_start
         total_in_history = len(self.iteration_history)

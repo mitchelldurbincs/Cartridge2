@@ -31,6 +31,10 @@ interval = 1
 games = 50
 win_threshold = 0.55      # Win rate needed to become new best model
 eval_vs_random = true     # Also evaluate against random baseline
+solver_games = 100        # Perfect-solver eval games per evaluation, 0 = disable (connect4 only)
+solver_seed = 42          # Fixed seed so solver rates are comparable across iterations
+promotion_metric = "win_rate"   # "win_rate" or "solver_optimal"
+promotion_margin = 0.01   # solver_optimal: candidate must exceed best's rate by this
 
 [actor]
 actor_id = "actor-1"
@@ -72,3 +76,12 @@ postgres_url = "postgresql://cartridge:cartridge@localhost:5432/cartridge"
 pool_max_size = 16
 pool_connect_timeout = 30
 pool_idle_timeout = 300
+
+[wandb]
+enabled = false           # Log trainer loop runs to Weights & Biases
+required = false          # true: fail loudly instead of falling back to no-op logging
+project = "cartridge2"
+entity = ""               # Empty = logged-in default entity
+group = ""                # Groups related runs in the W&B UI
+tags = []
+init_timeout_seconds = 30.0

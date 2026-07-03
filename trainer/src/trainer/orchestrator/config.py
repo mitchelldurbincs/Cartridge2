@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from ..central_config import WandbConfig
+
 
 @dataclass
 class IterationStats:
@@ -70,6 +72,15 @@ class LoopConfig:
     eval_win_threshold: float = 0.55  # Win rate needed to become new best
     eval_vs_random: bool = True  # Also evaluate against random baseline
 
+    # Perfect-solver move scoring during evaluation (connect4 only)
+    solver_games: int = 100  # Games per solver eval (0 = disable)
+    solver_seed: int = 42  # Fixed seed so rates are comparable across iterations
+    promotion_metric: str = "win_rate"  # "win_rate" or "solver_optimal"
+    promotion_margin: float = 0.01  # solver_optimal: candidate must exceed best by this
+
+    # W&B logging (one run per loop invocation)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
+
     # Logging
     log_level: str = "INFO"
 
@@ -88,6 +99,10 @@ class LoopConfig:
     @property
     def eval_stats_path(self) -> Path:
         return self.data_dir / "eval_stats.json"
+
+    @property
+    def solver_stats_path(self) -> Path:
+        return self.data_dir / "solver_stats.json"
 
     @property
     def best_model_path(self) -> Path:

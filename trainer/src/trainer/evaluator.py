@@ -13,14 +13,19 @@ Usage (defaults assume running from trainer/ directory):
 import argparse
 import logging
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .game_config import GameConfig, get_config
 from .games import Player, create_game_state
 from .logging_utils import silence_noisy_loggers
 from .policies import OnnxPolicy, Policy, RandomPolicy
 from .storage import GameMetadata, create_replay_buffer
+
+if TYPE_CHECKING:
+    from .games import GameState
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +135,7 @@ def play_game(
     env_id: str,
     config: GameConfig | GameMetadata,
     verbose: bool = False,
+    on_move: "Callable[[GameState, int, Policy], None] | None" = None,
 ) -> MatchResult:
     """Play a single game between two policies.
 
@@ -140,6 +146,10 @@ def play_game(
         env_id: Environment ID for creating game state.
         config: Game configuration (from database or fallback).
         verbose: Print game moves.
+        on_move: Optional callback invoked before each move is applied,
+            with (state, action, acting_policy). The state is the live,
+            mutable pre-move state — callbacks must copy() it if they
+            retain a reference.
 
     Returns:
         MatchResult with winner and game length.
@@ -164,6 +174,8 @@ def play_game(
 
         # Get action (pass config for observation encoding)
         action = policy.select_action(state, config)
+        if on_move is not None:
+            on_move(state, action, policy)
         state.make_move(action)
         moves += 1
 

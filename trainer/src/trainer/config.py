@@ -188,6 +188,11 @@ class TrainerConfig:
     # Returns True if shutdown was requested
     shutdown_check: Callable[[], bool] | None = field(default=None, repr=False)
 
+    # Per-step metrics callback (not exposed to CLI, set programmatically).
+    # Called as metrics_hook(payload, global_step) at stats_interval cadence;
+    # the orchestrator uses it to forward training metrics to W&B.
+    metrics_hook: Callable[[dict, int], None] | None = field(default=None, repr=False)
+
     def resolve_device(self) -> str:
         """Resolve 'auto' device to the best available: cuda > mps > cpu."""
         if self.device != "auto":

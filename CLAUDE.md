@@ -206,6 +206,7 @@ PyTorch training with AlphaZero-style learning and orchestration:
 - `python -m trainer train` - Train on replay buffer data
 - `python -m trainer evaluate` - Evaluate model against random baseline
 - `python -m trainer loop` - Synchronized AlphaZero training (actor + trainer + eval)
+- `python -m trainer solver-eval` - Score Connect4 model moves against the bitbully perfect solver
 
 **Features:**
 - Reads transitions from PostgreSQL replay buffer
@@ -303,6 +304,8 @@ cartridge2/
 │       ├── resnet.py      # ResNet architecture (used for Connect4, Othello)
 │       ├── replay.py      # Replay buffer interface
 │       ├── evaluator.py   # Model evaluation
+│       ├── solver_eval.py # Perfect-solver move-quality evaluation (Connect4)
+│       ├── wandb_logger.py # W&B wrapper (null-logger fallback, used by loop)
 │       ├── game_config.py # Game-specific configs (auto-selects network type)
 │       ├── stats.py       # Training statistics
 │       ├── config.py      # TrainerConfig dataclass
@@ -381,6 +384,10 @@ interval = 1             # Evaluate every N iterations (0=disable)
 games = 50               # Games per evaluation
 win_threshold = 0.55     # Win rate to become new best model
 eval_vs_random = true    # Also evaluate against random baseline
+solver_games = 100       # Perfect-solver eval games per evaluation, 0=disable (connect4 only)
+solver_seed = 42         # Fixed seed so solver rates are comparable across iterations
+promotion_metric = "win_rate"   # "win_rate" or "solver_optimal"
+promotion_margin = 0.01  # solver_optimal: candidate must exceed best's rate by this
 
 [actor]
 actor_id = "actor-1"
@@ -421,7 +428,21 @@ pool_connect_timeout = 30
 pool_idle_timeout = 300
 # s3_bucket = "cartridge-models"      # For S3 backend
 # s3_endpoint = "http://minio:9000"   # For MinIO
+
+[wandb]
+enabled = false           # One W&B run per `trainer loop`: train/, eval/, solver/, loop/ metrics
+required = false          # true: fail loudly instead of no-op fallback
+project = "cartridge2"
+entity = ""               # Empty = logged-in default entity
+group = ""
+tags = []
+init_timeout_seconds = 30.0
 ```
+
+W&B notes: requires `wandb login` (or `WANDB_API_KEY`) when enabled; `WANDB_MODE=offline`
+logs locally with no network; `WANDB_MODE=disabled` force-disables; `WANDB_PROJECT` /
+`WANDB_ENTITY` env vars override the config. All metrics share the global-training-step
+x-axis. Enable per run with `--wandb-enabled true`.
 
 ### Environment Variable Overrides
 
@@ -556,6 +577,16 @@ python -m trainer train --steps 1000
 
 # Evaluate model against random play
 python -m trainer evaluate --model ./data/models/latest.onnx --games 100
+
+# Score Connect4 model decisions against a perfect solver (bitbully)
+# Metrics: value-optimal-move rate, blunder rate, exact-best rate
+# (overall / by ply bucket / by seat); appends to data/solver_stats.json
+python -m trainer solver-eval --model ./data/models/latest.onnx --games 100
+python -m trainer solver-eval --all-checkpoints --games 100   # progression across checkpoints
+
+# The loop runs solver eval automatically each evaluation (connect4) and can
+# log everything to W&B; opt into solver-based gatekeeping with:
+python -m trainer loop --env-id connect4 --wandb-enabled true --promotion-metric solver_optimal
 
 # ======= Alternative: Continuous (non-synchronized) training =======
 # Actor and trainer run concurrently - mixes data from multiple model versions

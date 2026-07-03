@@ -5,6 +5,7 @@ synchronized AlphaZero training loop.
 """
 
 import argparse
+import dataclasses
 import logging
 import os
 import sys
@@ -199,6 +200,41 @@ Examples:
         help="Also evaluate against random baseline (true/false)",
     )
 
+    # Solver eval / promotion settings
+    parser.add_argument(
+        "--solver-games",
+        type=int,
+        default=cfg.evaluation.solver_games,
+        help="Games per perfect-solver eval during evaluation, 0 to disable (connect4 only)",
+    )
+    parser.add_argument(
+        "--solver-seed",
+        type=int,
+        default=cfg.evaluation.solver_seed,
+        help="Fixed seed for solver eval games (comparable across iterations)",
+    )
+    parser.add_argument(
+        "--promotion-metric",
+        type=str,
+        default=cfg.evaluation.promotion_metric,
+        choices=["win_rate", "solver_optimal"],
+        help="Best-model promotion criterion",
+    )
+    parser.add_argument(
+        "--promotion-margin",
+        type=float,
+        default=cfg.evaluation.promotion_margin,
+        help="solver_optimal: candidate value-optimal rate must exceed best's by this",
+    )
+
+    # W&B logging (project/entity/group/tags come from config.toml or WANDB_* env vars)
+    parser.add_argument(
+        "--wandb-enabled",
+        type=lambda x: x.lower() in ("true", "1", "yes"),
+        default=cfg.wandb.enabled,
+        help="Log this loop run to Weights & Biases (true/false)",
+    )
+
     # Logging
     parser.add_argument(
         "--log-level",
@@ -231,6 +267,11 @@ Examples:
         eval_games=args.eval_games,
         eval_win_threshold=args.eval_win_threshold,
         eval_vs_random=args.eval_vs_random,
+        solver_games=args.solver_games,
+        solver_seed=args.solver_seed,
+        promotion_metric=args.promotion_metric,
+        promotion_margin=args.promotion_margin,
+        wandb=dataclasses.replace(cfg.wandb, enabled=args.wandb_enabled),
         device=args.device,
         log_level=args.log_level,
     )

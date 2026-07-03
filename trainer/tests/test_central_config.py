@@ -353,3 +353,78 @@ class TestConfigEdgeCases:
         assert len(DEFAULTS_SEARCH_PATHS) > 0
         assert all(isinstance(p, Path) for p in CONFIG_SEARCH_PATHS)
         assert all(isinstance(p, Path) for p in DEFAULTS_SEARCH_PATHS)
+
+
+class TestWandbAndSolverConfig:
+    """Test the [wandb] section and the new [evaluation] solver/promotion keys."""
+
+    def test_wandb_defaults(self, monkeypatch, tmp_path):
+        from trainer.central_config import WandbConfig
+
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+        config = get_config(reload=True)
+
+        assert isinstance(config.wandb, WandbConfig)
+        assert config.wandb.enabled is False
+        assert config.wandb.required is False
+        assert config.wandb.project == "cartridge2"
+        assert config.wandb.entity == ""
+        assert config.wandb.tags == []
+        assert config.wandb.init_timeout_seconds == 30.0
+
+    def test_evaluation_solver_defaults(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+        config = get_config(reload=True)
+
+        assert config.evaluation.solver_games == 100
+        assert config.evaluation.solver_seed == 42
+        assert config.evaluation.promotion_metric == "win_rate"
+        assert config.evaluation.promotion_margin == 0.01
+
+    def test_toml_parses_wandb_and_solver_keys(self, monkeypatch, tmp_path):
+        (tmp_path / "config.toml").write_text(
+            """
+[evaluation]
+solver_games = 25
+solver_seed = 7
+promotion_metric = "solver_optimal"
+promotion_margin = 0.02
+
+[wandb]
+enabled = true
+project = "my-project"
+entity = "my-entity"
+group = "exp-group"
+tags = ["a", "b"]
+"""
+        )
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+        config = get_config(reload=True)
+
+        assert config.evaluation.solver_games == 25
+        assert config.evaluation.solver_seed == 7
+        assert config.evaluation.promotion_metric == "solver_optimal"
+        assert config.evaluation.promotion_margin == 0.02
+        assert config.wandb.enabled is True
+        assert config.wandb.project == "my-project"
+        assert config.wandb.entity == "my-entity"
+        assert config.wandb.group == "exp-group"
+        assert config.wandb.tags == ["a", "b"]
+
+    def test_env_overrides_wandb_and_promotion(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+        monkeypatch.setenv("CARTRIDGE_WANDB_ENABLED", "true")
+        monkeypatch.setenv("CARTRIDGE_WANDB_INIT_TIMEOUT_SECONDS", "60")
+        monkeypatch.setenv("CARTRIDGE_EVALUATION_PROMOTION_METRIC", "solver_optimal")
+        monkeypatch.setenv("CARTRIDGE_EVALUATION_SOLVER_GAMES", "12")
+
+        config = get_config(reload=True)
+
+        assert config.wandb.enabled is True
+        assert config.wandb.init_timeout_seconds == 60.0
+        assert config.evaluation.promotion_metric == "solver_optimal"
+        assert config.evaluation.solver_games == 12
