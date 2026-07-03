@@ -3,22 +3,24 @@
 This module handles running evaluations and managing the "gatekeeper" best model.
 """
 
-import json
 import logging
-import shutil
 import time
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 from ..evaluator import OnnxPolicy, RandomPolicy
 from ..evaluator import evaluate as run_eval
 from ..game_config import get_config as get_game_config
-from ..solver_eval import SolverScorer, append_solver_stats, solver_evaluate
+from ..solver_eval import SolverScorer, solver_evaluate
 from .config import LoopConfig
+from .eval_reporting import EvalReportingMixin
+from .promotion import PromotionMixin, should_promote
 
 if TYPE_CHECKING:
     from ..solver_eval import SolverEvalResults
     from ..wandb_logger import WandbLogger
+
+# Re-exported so existing imports (and tests) keep working.
+__all__ = ["EvalRunner", "should_promote"]
 
 logger = logging.getLogger(__name__)
 
@@ -27,57 +29,7 @@ logger = logging.getLogger(__name__)
 EVAL_TEMPERATURE = 0.2
 
 
-def should_promote(
-    *,
-    promotion_metric: str,
-    vs_best_win_rate: float | None,
-    win_threshold: float,
-    candidate_solver_rate: float | None,
-    best_solver_rate: float | None,
-    margin: float,
-) -> tuple[bool, str]:
-    """Decide whether the candidate model becomes the new best.
-
-    Pure function: returns (promote, human-readable reason). The
-    "solver_optimal" metric falls back to the win_rate rule when either
-    solver rate is unavailable.
-    """
-
-    def win_rate_rule(prefix: str = "") -> tuple[bool, str]:
-        if vs_best_win_rate is None:
-            return False, prefix + "win_rate: no vs-best result, not promoting"
-        if vs_best_win_rate > win_threshold:
-            return True, (
-                prefix
-                + f"win_rate: {vs_best_win_rate:.1%} > threshold {win_threshold:.1%}"
-            )
-        return False, (
-            prefix
-            + f"win_rate: {vs_best_win_rate:.1%} <= threshold {win_threshold:.1%}"
-        )
-
-    if promotion_metric == "solver_optimal":
-        if candidate_solver_rate is None or best_solver_rate is None:
-            missing = "candidate" if candidate_solver_rate is None else "best"
-            return win_rate_rule(
-                f"solver_optimal unavailable ({missing} rate missing), falling back to "
-            )
-        if candidate_solver_rate > best_solver_rate + margin:
-            return True, (
-                f"solver_optimal: candidate {candidate_solver_rate:.1%} > "
-                f"best {best_solver_rate:.1%} + margin {margin:.1%}"
-            )
-        return False, (
-            f"solver_optimal: candidate {candidate_solver_rate:.1%} <= "
-            f"best {best_solver_rate:.1%} + margin {margin:.1%}"
-        )
-
-    if promotion_metric != "win_rate":
-        return win_rate_rule(f"unknown metric {promotion_metric!r}, falling back to ")
-    return win_rate_rule()
-
-
-class EvalRunner:
+class EvalRunner(PromotionMixin, EvalReportingMixin):
     """Manages model evaluation and best model (gatekeeper) tracking."""
 
     def __init__(self, config: LoopConfig, wandb_logger: "WandbLogger | None" = None):
@@ -145,127 +97,6 @@ class EvalRunner:
     def best_iteration(self) -> int | None:
         """Get the iteration number of the current best model."""
         return self.best_model_iteration
-
-    def _load_best_model_info(self) -> None:
-        """Load best model info from disk if it exists.
-
-        Legacy files (pre solver-eval) lack the solver rate — read with
-        .get() so they load fine and the rate backfills lazily.
-        """
-        if not self.config.best_model_info_path.exists():
-            return
-
-        try:
-            with open(self.config.best_model_info_path) as f:
-                data = json.load(f)
-            self.best_model_iteration = data.get("iteration")
-            self.best_solver_rate = data.get("solver_value_optimal_rate")
-            logger.info(
-                f"Loaded best model info: iteration {self.best_model_iteration}"
-            )
-        except Exception as e:
-            logger.warning(f"Failed to load best model info: {e}")
-
-    def _save_best_model_info(
-        self,
-        iteration: int,
-        win_rate: float,
-        solver_rate: float | None = None,
-        metric: str = "win_rate",
-    ) -> None:
-        """Save best model info to disk."""
-        data = {
-            "iteration": iteration,
-            "win_rate_when_promoted": win_rate,
-            "solver_value_optimal_rate": solver_rate,
-            "promotion_metric": metric,
-            "timestamp": datetime.now().isoformat(),
-        }
-        with open(self.config.best_model_info_path, "w") as f:
-            json.dump(data, f, indent=2)
-
-    def promote_to_best(
-        self,
-        iteration: int,
-        win_rate: float,
-        solver_rate: float | None = None,
-        metric: str = "win_rate",
-    ) -> None:
-        """Copy current model to best.onnx and update tracking.
-
-        Args:
-            iteration: The iteration number being promoted.
-            win_rate: The win rate that qualified this model for promotion.
-            solver_rate: The candidate's solver value-optimal rate, when
-                available (recorded regardless of the metric used, so a
-                later switch to solver_optimal needs no backfill).
-            metric: The promotion metric that made this decision.
-        """
-        current_path = self.config.latest_model_path
-        if not current_path.exists():
-            logger.warning("Cannot promote: latest.onnx not found")
-            return
-
-        shutil.copy(current_path, self.config.best_model_path)
-        self.best_model_iteration = iteration
-        self.best_solver_rate = solver_rate
-        self._save_best_model_info(iteration, win_rate, solver_rate, metric)
-        logger.info(
-            f"New best model! Iteration {iteration} with {win_rate:.1%} win rate"
-            + (
-                f", solver value-optimal {solver_rate:.1%}"
-                if solver_rate is not None
-                else ""
-            )
-        )
-
-    def _effective_promotion_metric(self) -> str:
-        """Resolve the promotion metric, falling back when solver eval is off."""
-        metric = self.config.promotion_metric
-        if metric == "solver_optimal" and not self._solver_enabled():
-            if not self._promotion_fallback_warned:
-                logger.warning(
-                    "promotion_metric=solver_optimal but solver eval is "
-                    f"unavailable (env={self.config.env_id}, "
-                    f"solver_games={self.config.solver_games}, "
-                    f"disabled={self._solver_disabled}); using win_rate"
-                )
-                self._promotion_fallback_warned = True
-            return "win_rate"
-        return metric
-
-    def _ensure_best_solver_rate(self, game_config) -> float | None:
-        """Backfill the best model's solver rate for legacy best_model.json.
-
-        Evaluates best.onnx once with the same scorer, seed, and game count
-        as the candidate, so the comparison is same-conditions.
-        """
-        if self.best_solver_rate is not None:
-            return self.best_solver_rate
-        if not self.config.best_model_path.exists() or not self._solver_enabled():
-            return None
-
-        logger.info("Backfilling solver rate for existing best model...")
-        best_results = self._run_solver_eval(self.config.best_model_path, game_config)
-        if best_results is None:
-            return None
-
-        self.best_solver_rate = best_results.overall.value_optimal_rate
-        # Preserve existing metadata fields while adding the rate.
-        data = {}
-        if self.config.best_model_info_path.exists():
-            try:
-                with open(self.config.best_model_info_path) as f:
-                    data = json.load(f)
-            except Exception:
-                data = {}
-        data["solver_value_optimal_rate"] = self.best_solver_rate
-        with open(self.config.best_model_info_path, "w") as f:
-            json.dump(data, f, indent=2)
-        logger.info(
-            f"Best model solver value-optimal rate: {self.best_solver_rate:.1%}"
-        )
-        return self.best_solver_rate
 
     def _evaluate_vs_best(
         self,
@@ -373,109 +204,6 @@ class EvalRunner:
             f"Loss {vs_random_results.player2_win_rate:.1%}"
         )
         return vs_random_results.player1_win_rate, vs_random_results.draw_rate
-
-    def _build_eval_record(
-        self,
-        iteration: int,
-        *,
-        vs_best_win_rate: float,
-        vs_best_draw_rate: float,
-        became_new_best: bool,
-        vs_random_win_rate: float | None,
-        vs_random_draw_rate: float | None,
-        solver_results: "SolverEvalResults | None",
-        promotion_metric: str,
-    ) -> dict:
-        """Assemble one eval-history record.
-
-        The key set is a frozen schema: eval_stats.json is read by the web
-        frontend (via StatsManager) — do not rename or drop keys.
-        """
-        return {
-            "iteration": iteration,
-            "step": iteration * self.config.steps_per_iteration,
-            # Model vs Best results
-            "vs_best_win_rate": vs_best_win_rate,
-            "vs_best_draw_rate": vs_best_draw_rate,
-            "vs_best_opponent_iteration": self.best_model_iteration,
-            "became_new_best": became_new_best,
-            # Model vs Random results (if enabled)
-            "vs_random_win_rate": vs_random_win_rate,
-            "vs_random_draw_rate": vs_random_draw_rate,
-            # Perfect-solver move scoring (None when skipped/unavailable)
-            "solver_value_optimal_rate": (
-                solver_results.overall.value_optimal_rate if solver_results else None
-            ),
-            "solver_exact_best_rate": (
-                solver_results.overall.exact_best_rate if solver_results else None
-            ),
-            "solver_blunder_rate": (
-                solver_results.overall.blunder_rate if solver_results else None
-            ),
-            "solver_positions": (
-                solver_results.overall.positions if solver_results else None
-            ),
-            "promotion_metric": promotion_metric,
-            # Metadata
-            "games": self.config.eval_games,
-            "timestamp": datetime.now().isoformat(),
-        }
-
-    def _append_solver_history(
-        self, solver_results: "SolverEvalResults | None", iteration: int
-    ) -> None:
-        """Append this iteration's solver results to solver_stats.json."""
-        if solver_results is None:
-            return
-
-        solver_entry = solver_results.to_dict()
-        solver_entry.update(
-            {
-                "iteration": iteration,
-                "global_step": iteration * self.config.steps_per_iteration,
-                "context": "loop",
-            }
-        )
-        append_solver_stats(solver_entry, self.config.solver_stats_path)
-
-    def _log_eval_to_wandb(
-        self, eval_record: dict, solver_results: "SolverEvalResults | None"
-    ) -> None:
-        """Mirror the eval record (plus solver detail) to W&B, dropping Nones."""
-        if self.wandb_logger is None:
-            return
-
-        wandb_metrics = {
-            "eval/vs_best_win_rate": eval_record["vs_best_win_rate"],
-            "eval/vs_best_draw_rate": eval_record["vs_best_draw_rate"],
-            "eval/became_new_best": int(eval_record["became_new_best"]),
-            "eval/best_model_iteration": self.best_model_iteration,
-            "eval/vs_random_win_rate": eval_record["vs_random_win_rate"],
-            "eval/vs_random_draw_rate": eval_record["vs_random_draw_rate"],
-        }
-        if solver_results is not None:
-            overall = solver_results.overall
-            wandb_metrics.update(
-                {
-                    "solver/value_optimal_rate": overall.value_optimal_rate,
-                    "solver/exact_best_rate": overall.exact_best_rate,
-                    "solver/blunder_rate": overall.blunder_rate,
-                    "solver/blunders_win_to_draw": overall.blunders_win_to_draw,
-                    "solver/blunders_win_to_loss": overall.blunders_win_to_loss,
-                    "solver/blunders_draw_to_loss": overall.blunders_draw_to_loss,
-                    "solver/positions_scored": overall.positions,
-                    "solver/model_win_rate_vs_random": (
-                        solver_results.model_wins / solver_results.games
-                        if solver_results.games
-                        else 0.0
-                    ),
-                    "solver/eval_seconds": solver_results.wall_time_seconds,
-                }
-            )
-        self.wandb_logger.log(
-            {k: v for k, v in wandb_metrics.items() if v is not None},
-            step=eval_record["step"],
-        )
 
     def run(
         self, iteration: int, eval_history: list[dict]
