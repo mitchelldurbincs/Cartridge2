@@ -298,6 +298,8 @@ mod tests {
     use rand_chacha::ChaCha20Rng;
 
     #[derive(Debug, Default)]
+    // Similar dummy-game fixtures exist in typed.rs and registry.rs tests;
+    // each module keeps its own variant (different state/action shapes).
     struct SimpleGame;
 
     impl Game for SimpleGame {

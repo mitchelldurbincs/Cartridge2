@@ -239,6 +239,8 @@ impl Game for TicTacToe {
             .with_description("Get three in a row to win!")
     }
 
+    // reset/step mirror games-connect4 and games-othello; the shared pieces
+    // (reward, info bits, validation) live in engine_core::game_utils.
     fn reset(&mut self, _rng: &mut ChaCha20Rng, _hint: &[u8]) -> (Self::State, Self::Obs) {
         let state = State::new();
         let obs = observation_from_state(&state);

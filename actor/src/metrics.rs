@@ -2,12 +2,13 @@
 //!
 //! This module provides comprehensive metrics for monitoring actor performance,
 //! episode generation throughput, MCTS search efficiency, and storage operations.
+//!
+//! The metric definitions below are actor-specific (its sibling is
+//! `web/src/metrics.rs`); the shared registration/encoding plumbing lives in
+//! the `metrics-common` crate.
 
 use lazy_static::lazy_static;
-use prometheus::{
-    Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, IntGaugeVec, Opts, Registry,
-    TextEncoder,
-};
+use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, IntGaugeVec, Opts, Registry};
 use std::sync::Once;
 
 lazy_static! {
@@ -149,32 +150,32 @@ static INIT: Once = Once::new();
 /// Safe to call multiple times - only initializes once.
 pub fn init_metrics() {
     INIT.call_once(|| {
-        let collectors: Vec<Box<dyn prometheus::core::Collector>> = vec![
-            Box::new(EPISODES_TOTAL.clone()),
-            Box::new(PLAYER1_WINS.clone()),
-            Box::new(PLAYER2_WINS.clone()),
-            Box::new(DRAWS.clone()),
-            Box::new(EPISODES_PER_SECOND.clone()),
-            Box::new(EPISODE_DURATION.clone()),
-            Box::new(EPISODE_STEPS.clone()),
-            Box::new(MCTS_SEARCHES_TOTAL.clone()),
-            Box::new(MCTS_INFERENCE_SECONDS.clone()),
-            Box::new(MCTS_SEARCH_SECONDS.clone()),
-            Box::new(MCTS_SIMULATIONS_PER_SEARCH.clone()),
-            Box::new(TRANSITIONS_STORED.clone()),
-            Box::new(DB_WRITE_SECONDS.clone()),
-            Box::new(DB_POOL_SIZE.clone()),
-            Box::new(DB_POOL_AVAILABLE.clone()),
-            Box::new(DB_POOL_WAITING.clone()),
-            Box::new(MODEL_RELOADS.clone()),
-            Box::new(MODEL_LOAD_SECONDS.clone()),
-            Box::new(MODEL_LOADED.clone()),
-            Box::new(MEMORY_RSS_BYTES.clone()),
-            Box::new(ACTOR_INFO.clone()),
-        ];
-        for collector in collectors {
-            REGISTRY.register(collector).unwrap();
-        }
+        metrics_common::register_all(
+            &REGISTRY,
+            vec![
+                Box::new(EPISODES_TOTAL.clone()),
+                Box::new(PLAYER1_WINS.clone()),
+                Box::new(PLAYER2_WINS.clone()),
+                Box::new(DRAWS.clone()),
+                Box::new(EPISODES_PER_SECOND.clone()),
+                Box::new(EPISODE_DURATION.clone()),
+                Box::new(EPISODE_STEPS.clone()),
+                Box::new(MCTS_SEARCHES_TOTAL.clone()),
+                Box::new(MCTS_INFERENCE_SECONDS.clone()),
+                Box::new(MCTS_SEARCH_SECONDS.clone()),
+                Box::new(MCTS_SIMULATIONS_PER_SEARCH.clone()),
+                Box::new(TRANSITIONS_STORED.clone()),
+                Box::new(DB_WRITE_SECONDS.clone()),
+                Box::new(DB_POOL_SIZE.clone()),
+                Box::new(DB_POOL_AVAILABLE.clone()),
+                Box::new(DB_POOL_WAITING.clone()),
+                Box::new(MODEL_RELOADS.clone()),
+                Box::new(MODEL_LOAD_SECONDS.clone()),
+                Box::new(MODEL_LOADED.clone()),
+                Box::new(MEMORY_RSS_BYTES.clone()),
+                Box::new(ACTOR_INFO.clone()),
+            ],
+        );
     });
 }
 
@@ -185,11 +186,7 @@ pub fn set_actor_info(game: &str, actor_id: &str) {
 
 /// Encode all metrics to Prometheus text format
 pub fn encode_metrics() -> String {
-    let encoder = TextEncoder::new();
-    let metric_families = REGISTRY.gather();
-    let mut buffer = Vec::new();
-    encoder.encode(&metric_families, &mut buffer).unwrap();
-    String::from_utf8(buffer).unwrap()
+    metrics_common::encode_metrics(&REGISTRY)
 }
 
 /// Read the current resident set size in kB from /proc/self/status.

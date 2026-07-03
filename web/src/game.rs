@@ -82,8 +82,8 @@ impl GameSession {
         Self::with_evaluator(env_id, Arc::new(RwLock::new(None)))
     }
 
-    /// Create a new game session with a shared evaluator (for hot-reloading)
-    #[cfg(feature = "onnx")]
+    /// Create a new game session with a shared evaluator (for hot-reloading).
+    /// Without the `onnx` feature the evaluator is a stub and MCTS is skipped.
     pub fn with_evaluator(
         env_id: &str,
         evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,
@@ -106,11 +106,13 @@ impl GameSession {
         let (board, current_player, winner) = Self::parse_state(&reset.state, board_size)?;
 
         // Configure MCTS for playing (less exploration than training)
+        #[cfg(feature = "onnx")]
         let mcts_config = MctsConfig::for_evaluation()
             .with_simulations(MCTS_SIMULATIONS)
             .with_temperature(MCTS_TEMPERATURE);
 
         // Pre-create simulation context for MCTS (avoids repeated registry lookups)
+        #[cfg(feature = "onnx")]
         let mcts_sim_ctx = EngineContext::new(env_id);
 
         Ok(Self {
@@ -124,45 +126,10 @@ impl GameSession {
             human_player: DEFAULT_HUMAN_PLAYER,
             rng: ChaCha20Rng::seed_from_u64(seed),
             evaluator,
+            #[cfg(feature = "onnx")]
             mcts_config,
+            #[cfg(feature = "onnx")]
             mcts_sim_ctx,
-        })
-    }
-
-    /// Create a new game session with a shared evaluator (stub when ONNX disabled)
-    #[cfg(not(feature = "onnx"))]
-    pub fn with_evaluator(
-        env_id: &str,
-        evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,
-    ) -> Result<Self> {
-        let mut ctx = EngineContext::new(env_id)
-            .ok_or_else(|| anyhow!("Game '{}' not registered", env_id))?;
-
-        // Get game metadata
-        let metadata = ctx.metadata();
-        let board_size = metadata.board_size();
-
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-
-        let reset = ctx.reset(seed, &[])?;
-
-        // Parse the state (board_size + current_player + winner bytes)
-        let (board, current_player, winner) = Self::parse_state(&reset.state, board_size)?;
-
-        Ok(Self {
-            ctx,
-            metadata,
-            state: reset.state,
-            obs: reset.obs,
-            board,
-            current_player,
-            winner,
-            human_player: DEFAULT_HUMAN_PLAYER,
-            rng: ChaCha20Rng::seed_from_u64(seed),
-            evaluator,
         })
     }
 

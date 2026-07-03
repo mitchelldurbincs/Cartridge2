@@ -32,8 +32,6 @@ use tracing::{info, warn};
 mod game;
 mod handlers;
 mod metrics;
-#[cfg(feature = "onnx")]
-mod model_watcher;
 mod types;
 
 use engine_config::load_config;
@@ -172,48 +170,6 @@ pub fn create_test_state() -> Arc<AppState> {
     })
 }
 
-/// Initialize tracing with optional JSON format for cloud deployments.
-///
-/// Supports CARTRIDGE_LOGGING_FORMAT environment variable override:
-/// - "text" (default): Human-readable format for local development
-/// - "json": Structured JSON format for Google Cloud Logging
-fn init_tracing(logging_config: &engine_config::LoggingConfig) {
-    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"))
-        .add_directive("web=info".parse().unwrap())
-        .add_directive("ort=warn".parse().unwrap())
-        .add_directive("h2=warn".parse().unwrap())
-        .add_directive("hyper=warn".parse().unwrap());
-
-    // Check for environment variable override
-    let json_format = std::env::var("CARTRIDGE_LOGGING_FORMAT")
-        .map(|v| v.eq_ignore_ascii_case("json"))
-        .unwrap_or_else(|_| logging_config.is_json());
-
-    let registry = tracing_subscriber::registry().with(filter);
-
-    if json_format {
-        // JSON format for Google Cloud Logging
-        registry
-            .with(
-                fmt::layer()
-                    .json()
-                    .with_current_span(true)
-                    .with_span_list(false)
-                    .with_file(false)
-                    .with_line_number(false)
-                    .flatten_event(true)
-                    .with_target(logging_config.include_target),
-            )
-            .init();
-    } else {
-        // Human-readable format for local development
-        registry.with(fmt::layer()).init();
-    }
-}
-
 /// Creates a future that completes when a shutdown signal is received.
 /// Handles Ctrl+C on all platforms.
 async fn shutdown_signal() {
@@ -233,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
     let config = load_config();
 
     // Initialize tracing with JSON support for cloud deployments
-    init_tracing(&config.logging);
+    engine_config::init_tracing("info", &["web=info"], &config.logging);
 
     // Initialize Prometheus metrics
     metrics::init_metrics();

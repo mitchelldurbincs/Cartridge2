@@ -1,0 +1,8 @@
+[package]
+name = "metrics-common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared Prometheus metrics plumbing for Cartridge2 binaries"
+
+[dependencies]
+prometheus = { workspace = true }

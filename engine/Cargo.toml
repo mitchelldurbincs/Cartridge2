@@ -7,6 +7,7 @@ members = [
     "games-connect4",
     "games-othello",
     "mcts",
+    "metrics-common",
     "model-watcher"
 ]
 resolver = "2"
@@ -25,6 +26,10 @@ once_cell = "1.19"
 
 # Observability (minimal - no metrics export)
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Prometheus metrics plumbing shared by the actor and web binaries
+prometheus = "0.13"
 
 # Testing and benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }

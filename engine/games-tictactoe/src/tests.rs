@@ -493,6 +493,8 @@ fn test_observation_encoding_roundtrip() {
 // =========================================================================
 
 /// Play many random games and verify invariants hold
+/// (mirrors games-connect4's test of the same name; the game-specific
+/// constants — legal-mask width, max moves — differ)
 #[test]
 fn test_random_games_invariants() {
     use rand::Rng;

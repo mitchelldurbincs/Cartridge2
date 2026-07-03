@@ -2,21 +2,30 @@
 
 This is the default backend for local development, storing ONNX models
 and PyTorch checkpoints in the local filesystem.
+
+Sibling: S3ModelStore in s3.py. Naming, best-model serialization, and
+checkpoint rotation shared by both live in base.py; atomic-write helpers
+are shared with trainer/checkpoint.py via trainer.atomic_io.
 """
 
 import glob
-import json
 import logging
 import os
-import re
-import shutil
-import tempfile
 import time
 from pathlib import Path
 
 import torch
 
-from trainer.storage.base import ModelInfo, ModelStore
+from trainer.atomic_io import atomic_copy, atomic_write
+from trainer.checkpoint import cleanup_temp_onnx_data as _cleanup_temp_onnx_data
+from trainer.storage.base import (
+    ModelInfo,
+    ModelStore,
+    checkpoint_filename,
+    decode_best_model_metadata,
+    encode_best_model_metadata,
+    parse_checkpoint_step,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,25 +67,15 @@ class FilesystemModelStore(ModelStore):
         meta_path = self.model_dir / "best_model.json"
         if meta_path.exists():
             try:
-                with open(meta_path) as f:
-                    data = json.load(f)
-                    self._best_step = data.get("step")
-            except (json.JSONDecodeError, IOError):
+                self._best_step = decode_best_model_metadata(meta_path.read_text())
+            except OSError:
                 pass
 
     def _save_best_metadata(self, step: int) -> None:
         """Save best model metadata to file."""
         meta_path = self.model_dir / "best_model.json"
-        temp_fd, temp_path = tempfile.mkstemp(suffix=".json", dir=self.model_dir)
-        os.close(temp_fd)
-        try:
-            with open(temp_path, "w") as f:
-                json.dump({"step": step, "timestamp": time.time()}, f)
-            os.replace(temp_path, meta_path)
-        except Exception:
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-            raise
+        payload = encode_best_model_metadata(step)
+        atomic_write(meta_path, lambda temp_path: Path(temp_path).write_text(payload))
 
     def save_onnx(
         self,
@@ -85,44 +84,21 @@ class FilesystemModelStore(ModelStore):
         is_latest: bool = True,
     ) -> ModelInfo:
         """Save an ONNX model checkpoint with atomic write."""
-        # Write to temp file first, then rename (atomic)
-        temp_fd, temp_path = tempfile.mkstemp(suffix=".onnx", dir=self.model_dir)
-        os.close(temp_fd)
+        checkpoint_path = self.model_dir / checkpoint_filename(step)
+        atomic_write(
+            checkpoint_path, lambda temp_path: Path(temp_path).write_bytes(model_bytes)
+        )
 
-        try:
-            with open(temp_path, "wb") as f:
-                f.write(model_bytes)
+        if is_latest:
+            # Copy to latest.onnx atomically
+            atomic_copy(checkpoint_path, self.model_dir / "latest.onnx")
 
-            # Atomic rename to final path
-            checkpoint_path = self.model_dir / f"model_step_{step:06d}.onnx"
-            os.replace(temp_path, checkpoint_path)
-
-            if is_latest:
-                # Copy to latest.onnx atomically
-                latest_path = self.model_dir / "latest.onnx"
-                temp_fd2, temp_path2 = tempfile.mkstemp(
-                    suffix=".onnx", dir=self.model_dir
-                )
-                os.close(temp_fd2)
-                try:
-                    shutil.copy2(checkpoint_path, temp_path2)
-                    os.replace(temp_path2, latest_path)
-                except Exception:
-                    if os.path.exists(temp_path2):
-                        os.unlink(temp_path2)
-                    raise
-
-            return ModelInfo(
-                path=str(checkpoint_path),
-                step=step,
-                timestamp=time.time(),
-                is_latest=is_latest,
-            )
-
-        except Exception:
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-            raise
+        return ModelInfo(
+            path=str(checkpoint_path),
+            step=step,
+            timestamp=time.time(),
+            is_latest=is_latest,
+        )
 
     def save_pytorch(
         self,
@@ -132,21 +108,13 @@ class FilesystemModelStore(ModelStore):
         """Save PyTorch training state with atomic write."""
         checkpoint_path = self.model_dir / PYTORCH_CHECKPOINT_NAME
 
-        temp_fd, temp_path = tempfile.mkstemp(suffix=".pt", dir=self.model_dir)
-        os.close(temp_fd)
-
-        try:
-            # Add step to state dict
-            state_dict["step"] = step
-            torch.save(state_dict, temp_path)
-            os.replace(temp_path, checkpoint_path)
-            logger.debug(f"Saved PyTorch checkpoint: {checkpoint_path}")
-            return str(checkpoint_path)
-
-        except Exception:
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-            raise
+        # Add step to state dict
+        state_dict["step"] = step
+        atomic_write(
+            checkpoint_path, lambda temp_path: torch.save(state_dict, temp_path)
+        )
+        logger.debug(f"Saved PyTorch checkpoint: {checkpoint_path}")
+        return str(checkpoint_path)
 
     def load_pytorch(self) -> tuple[dict, int] | None:
         """Load the latest PyTorch training state."""
@@ -220,10 +188,8 @@ class FilesystemModelStore(ModelStore):
 
         checkpoints = []
         for filepath in sorted(files):
-            # Extract step from filename
-            match = re.search(r"model_step_(\d+)\.onnx$", filepath)
-            if match:
-                step = int(match.group(1))
+            step = parse_checkpoint_step(filepath)
+            if step is not None:
                 path = Path(filepath)
                 checkpoints.append(
                     ModelInfo(
@@ -236,45 +202,21 @@ class FilesystemModelStore(ModelStore):
 
         return sorted(checkpoints, key=lambda x: x.step)
 
-    def cleanup_old_checkpoints(self, max_keep: int) -> int:
-        """Remove old checkpoints to save storage."""
-        checkpoints = self.list_checkpoints()
-        deleted = 0
-
-        while len(checkpoints) > max_keep:
-            old_checkpoint = checkpoints.pop(0)
-            # Don't delete the best model
-            if old_checkpoint.step == self._best_step:
-                continue
-            try:
-                os.unlink(old_checkpoint.path)
-                logger.debug(f"Removed old checkpoint: {old_checkpoint.path}")
-                deleted += 1
-            except OSError as e:
-                logger.warning(f"Failed to remove {old_checkpoint.path}: {e}")
-
-        return deleted
+    def _delete_checkpoint(self, checkpoint: ModelInfo) -> None:
+        """Delete a checkpoint file (rotation lives in ModelStore)."""
+        os.unlink(checkpoint.path)
 
     def mark_as_best(self, step: int) -> None:
         """Mark a specific checkpoint as the 'best' model."""
         # Find the checkpoint
-        checkpoint_path = self.model_dir / f"model_step_{step:06d}.onnx"
+        checkpoint_path = self.model_dir / checkpoint_filename(step)
         best_path = self.model_dir / "best.onnx"
 
         if checkpoint_path.exists():
-            # Atomic copy
-            temp_fd, temp_path = tempfile.mkstemp(suffix=".onnx", dir=self.model_dir)
-            os.close(temp_fd)
-            try:
-                shutil.copy2(checkpoint_path, temp_path)
-                os.replace(temp_path, best_path)
-                self._best_step = step
-                self._save_best_metadata(step)
-                logger.info(f"Marked step {step} as best model")
-            except Exception:
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
-                raise
+            atomic_copy(checkpoint_path, best_path)
+            self._best_step = step
+            self._save_best_metadata(step)
+            logger.info(f"Marked step {step} as best model")
         else:
             logger.warning(f"Checkpoint not found for step {step}")
 
@@ -293,10 +235,4 @@ class FilesystemModelStore(ModelStore):
 
     def cleanup_temp_onnx_data(self) -> None:
         """Remove orphaned tmp*.onnx.data files from PyTorch ONNX exporter."""
-        pattern = str(self.model_dir / "tmp*.onnx.data")
-        for data_file in glob.glob(pattern):
-            try:
-                os.unlink(data_file)
-                logger.debug(f"Removed orphaned ONNX data file: {data_file}")
-            except OSError as e:
-                logger.warning(f"Failed to remove {data_file}: {e}")
+        _cleanup_temp_onnx_data(self.model_dir)

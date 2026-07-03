@@ -1,22 +1,26 @@
 """Model checkpointing with atomic writes and cleanup.
 
 This module handles ONNX model export and checkpoint management:
-- Atomic write-then-rename for safe checkpointing
+- Atomic write-then-rename for safe checkpointing (via trainer.atomic_io)
 - PyTorch state dict saving/loading for training continuity
 - Checkpoint rotation to limit disk usage
 - Cleanup of orphaned temporary files from PyTorch ONNX exporter
+
+Sibling: FilesystemModelStore in storage/filesystem.py implements the same
+conventions behind the ModelStore interface (taking model bytes rather than
+exporting a live network).
 """
 
 import glob
 import logging
 import os
-import shutil
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import onnx
 import torch
+
+from trainer.atomic_io import atomic_copy, atomic_write
 
 if TYPE_CHECKING:
     from torch import nn
@@ -57,11 +61,7 @@ def save_onnx_checkpoint(
     # Create deterministic dummy input for ONNX export
     dummy_input = torch.zeros(1, obs_size, device=device)
 
-    # Write to temp file first, then rename (atomic on most filesystems)
-    temp_fd, temp_path = tempfile.mkstemp(suffix=".onnx", dir=model_dir)
-    os.close(temp_fd)
-
-    try:
+    def _export(temp_path: str) -> None:
         torch.onnx.export(
             network,
             dummy_input,
@@ -87,30 +87,14 @@ def save_onnx_checkpoint(
             onnx.save_model(model, temp_path, save_as_external_data=False)
             os.unlink(data_sidecar)
 
-        # Atomic rename to final path
-        checkpoint_path = model_dir / f"model_step_{step:06d}.onnx"
-        os.replace(temp_path, checkpoint_path)
+    # Same filename convention as trainer.storage.base.checkpoint_filename
+    checkpoint_path = model_dir / f"model_step_{step:06d}.onnx"
+    atomic_write(checkpoint_path, _export)
 
-        # Copy to latest.onnx (instead of exporting twice)
-        # Use atomic copy: copy to temp, then rename
-        latest_path = model_dir / "latest.onnx"
-        temp_fd2, temp_path2 = tempfile.mkstemp(suffix=".onnx", dir=model_dir)
-        os.close(temp_fd2)
-        try:
-            shutil.copy2(checkpoint_path, temp_path2)
-            os.replace(temp_path2, latest_path)
-        except Exception:
-            if os.path.exists(temp_path2):
-                os.unlink(temp_path2)
-            raise
+    # Copy to latest.onnx (instead of exporting twice)
+    atomic_copy(checkpoint_path, model_dir / "latest.onnx")
 
-        return checkpoint_path
-
-    except Exception:
-        # Clean up temp file on error
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
-        raise
+    return checkpoint_path
 
 
 def save_pytorch_checkpoint(
@@ -136,29 +120,20 @@ def save_pytorch_checkpoint(
     """
     checkpoint_path = model_dir / PYTORCH_CHECKPOINT_NAME
 
-    # Write to temp file first, then rename (atomic)
-    temp_fd, temp_path = tempfile.mkstemp(suffix=".pt", dir=model_dir)
-    os.close(temp_fd)
+    checkpoint_data = {
+        "step": step,
+        "model_state_dict": network.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+    # Save scheduler state to prevent LR jumps on resume
+    if scheduler is not None:
+        checkpoint_data["scheduler_state_dict"] = scheduler.state_dict()
 
-    try:
-        checkpoint_data = {
-            "step": step,
-            "model_state_dict": network.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-        }
-        # Save scheduler state to prevent LR jumps on resume
-        if scheduler is not None:
-            checkpoint_data["scheduler_state_dict"] = scheduler.state_dict()
-
-        torch.save(checkpoint_data, temp_path)
-        os.replace(temp_path, checkpoint_path)
-        logger.debug(f"Saved PyTorch checkpoint: {checkpoint_path}")
-        return checkpoint_path
-
-    except Exception:
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
-        raise
+    atomic_write(
+        checkpoint_path, lambda temp_path: torch.save(checkpoint_data, temp_path)
+    )
+    logger.debug(f"Saved PyTorch checkpoint: {checkpoint_path}")
+    return checkpoint_path
 
 
 def load_pytorch_checkpoint(

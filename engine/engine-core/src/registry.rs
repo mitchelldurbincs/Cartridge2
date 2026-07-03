@@ -220,6 +220,8 @@ mod tests {
 
     // Test game implementation
     #[derive(Debug, Default)]
+    // Similar dummy-game fixtures exist in typed.rs and context.rs tests;
+    // each module keeps its own variant (different state/action shapes).
     struct TestGame {
         name: String,
     }

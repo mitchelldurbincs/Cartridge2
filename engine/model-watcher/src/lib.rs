@@ -572,4 +572,58 @@ mod tests {
             ModelWatcher::new("/tmp/models", "latest.onnx", 29, 1, evaluator2).with_metadata();
         assert!(watcher2.model_info.is_some());
     }
+
+    #[test]
+    fn test_with_poll_interval() {
+        let evaluator = Arc::new(RwLock::new(None));
+        let watcher = ModelWatcher::new("/tmp/models", "latest.onnx", 29, 1, evaluator)
+            .with_poll_interval(Duration::from_secs(10));
+
+        assert_eq!(watcher.poll_interval, Duration::from_secs(10));
+        assert_eq!(
+            watcher.model_path(),
+            PathBuf::from("/tmp/models/latest.onnx")
+        );
+    }
+
+    /// Multiple watchers with different configurations (e.g. per-game obs sizes)
+    #[test]
+    fn test_multiple_watchers_different_configs() {
+        let evaluator1 = Arc::new(RwLock::new(None));
+        let evaluator2 = Arc::new(RwLock::new(None));
+
+        let watcher1 = ModelWatcher::new("/tmp/models1", "tictactoe.onnx", 29, 1, evaluator1);
+        let watcher2 = ModelWatcher::new("/tmp/models2", "connect4.onnx", 116, 4, evaluator2);
+
+        assert_eq!(
+            watcher1.model_path(),
+            PathBuf::from("/tmp/models1/tictactoe.onnx")
+        );
+        assert_eq!(
+            watcher2.model_path(),
+            PathBuf::from("/tmp/models2/connect4.onnx")
+        );
+    }
+
+    /// ModelInfo fields can be updated through the shared lock (web server use case)
+    #[test]
+    fn test_model_info_manual_update() {
+        let info = Arc::new(RwLock::new(ModelInfo::default()));
+
+        {
+            let mut guard = info.write().unwrap();
+            guard.loaded = true;
+            guard.path = Some("/models/test.onnx".to_string());
+            guard.file_modified = Some(1234567890);
+            guard.loaded_at = Some(1234567891);
+            guard.training_step = Some(500);
+        }
+
+        let guard = info.read().unwrap();
+        assert!(guard.loaded);
+        assert_eq!(guard.path, Some("/models/test.onnx".to_string()));
+        assert_eq!(guard.file_modified, Some(1234567890));
+        assert_eq!(guard.loaded_at, Some(1234567891));
+        assert_eq!(guard.training_step, Some(500));
+    }
 }

@@ -214,6 +214,8 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     struct TestObs(Vec<f32>);
 
+    // Similar dummy-game fixtures exist in registry.rs and context.rs tests;
+    // each module keeps its own variant (different state/action shapes).
     #[derive(Debug)]
     struct TestGame;
 

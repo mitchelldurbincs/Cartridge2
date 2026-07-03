@@ -314,6 +314,8 @@ impl Game for Connect4 {
             .with_board_type("drop_column")
     }
 
+    // reset/step mirror games-tictactoe and games-othello; the shared pieces
+    // (reward, info bits, validation) live in engine_core::game_utils.
     fn reset(&mut self, _rng: &mut ChaCha20Rng, _hint: &[u8]) -> (Self::State, Self::Obs) {
         let state = State::new();
         let obs = observation_from_state(&state);

@@ -20,6 +20,7 @@ engine-core = { path = "../engine/engine-core" }
 engine-config = { path = "../engine/engine-config" }
 engine-games = { path = "../engine/engine-games" }
 mcts = { path = "../engine/mcts", features = ["onnx"] }
+metrics-common = { path = "../engine/metrics-common" }
 model-watcher = { path = "../engine/model-watcher" }
 
 # Core dependencies
@@ -42,9 +43,8 @@ rand_chacha = "0.3"
 # Async and concurrency
 async-trait = "0.1"
 
-# Observability
+# Observability (tracing setup itself lives in engine-config::init_tracing)
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Prometheus metrics
 prometheus = "0.13"

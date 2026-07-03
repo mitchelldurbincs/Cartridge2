@@ -2,12 +2,13 @@
 //!
 //! This module provides metrics for monitoring web server performance,
 //! game session tracking, and bot move latency.
+//!
+//! The metric definitions below are web-specific (its sibling is
+//! `actor/src/metrics.rs`); the shared registration/encoding plumbing lives in
+//! the `metrics-common` crate.
 
 use lazy_static::lazy_static;
-use prometheus::{
-    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntGauge, Opts, Registry,
-    TextEncoder,
-};
+use prometheus::{Histogram, HistogramOpts, HistogramVec, IntCounter, IntGauge, Opts, Registry};
 use std::sync::Once;
 
 lazy_static! {
@@ -71,30 +72,25 @@ static INIT: Once = Once::new();
 /// Safe to call multiple times - only initializes once.
 pub fn init_metrics() {
     INIT.call_once(|| {
-        REGISTRY.register(Box::new(GAMES_CREATED.clone())).unwrap();
-        REGISTRY.register(Box::new(GAMES_ACTIVE.clone())).unwrap();
-        REGISTRY.register(Box::new(MOVES_PLAYED.clone())).unwrap();
-        REGISTRY
-            .register(Box::new(GAMES_COMPLETED.clone()))
-            .unwrap();
-        REGISTRY
-            .register(Box::new(REQUEST_LATENCY.clone()))
-            .unwrap();
-        REGISTRY
-            .register(Box::new(BOT_MOVE_SECONDS.clone()))
-            .unwrap();
-        REGISTRY.register(Box::new(MODEL_LOADED.clone())).unwrap();
-        REGISTRY.register(Box::new(MODEL_RELOADS.clone())).unwrap();
+        metrics_common::register_all(
+            &REGISTRY,
+            vec![
+                Box::new(GAMES_CREATED.clone()),
+                Box::new(GAMES_ACTIVE.clone()),
+                Box::new(MOVES_PLAYED.clone()),
+                Box::new(GAMES_COMPLETED.clone()),
+                Box::new(REQUEST_LATENCY.clone()),
+                Box::new(BOT_MOVE_SECONDS.clone()),
+                Box::new(MODEL_LOADED.clone()),
+                Box::new(MODEL_RELOADS.clone()),
+            ],
+        );
     });
 }
 
 /// Encode all metrics to Prometheus text format
 pub fn encode_metrics() -> String {
-    let encoder = TextEncoder::new();
-    let metric_families = REGISTRY.gather();
-    let mut buffer = Vec::new();
-    encoder.encode(&metric_families, &mut buffer).unwrap();
-    String::from_utf8(buffer).unwrap()
+    metrics_common::encode_metrics(&REGISTRY)
 }
 
 #[cfg(test)]

@@ -17,6 +17,24 @@ use crate::types::{
 };
 use crate::AppState;
 
+/// Map an internal failure to a 500 response tuple.
+fn internal_error(context: &str, e: impl std::fmt::Display) -> (StatusCode, String) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("{}: {}", context, e),
+    )
+}
+
+/// Run the bot's move, recording its latency and converting errors to a 500.
+fn timed_bot_move(session: &mut GameSession) -> Result<u8, (StatusCode, String)> {
+    let bot_start = Instant::now();
+    let pos = session
+        .bot_move()
+        .map_err(|e| internal_error("Bot move failed", e))?;
+    metrics::BOT_MOVE_SECONDS.observe(bot_start.elapsed().as_secs_f64());
+    Ok(pos)
+}
+
 /// List available games.
 /// Only returns the currently configured game to prevent users from
 /// selecting games that don't match the loaded model.
@@ -97,28 +115,14 @@ pub async fn new_game(
     let game_id = current_game;
 
     // Reset the game with shared evaluator (for hot-reloading)
-    *session =
-        GameSession::with_evaluator(&game_id, Arc::clone(&state.evaluator)).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to create game '{}': {}", game_id, e),
-            )
-        })?;
+    *session = GameSession::with_evaluator(&game_id, Arc::clone(&state.evaluator))
+        .map_err(|e| internal_error(&format!("Failed to create game '{}'", game_id), e))?;
 
     // If bot goes first, bot is player 1, human is player 2
     // If player goes first, human is player 1, bot is player 2
     if req.first == "bot" {
         session.set_human_player(2); // Human plays as O (player 2)
-
-        // Time bot move
-        let bot_start = Instant::now();
-        session.bot_move().map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Bot move failed: {}", e),
-            )
-        })?;
-        metrics::BOT_MOVE_SECONDS.observe(bot_start.elapsed().as_secs_f64());
+        timed_bot_move(&mut session)?;
     } else {
         session.set_human_player(1); // Human plays as X (player 1) - default
     }
@@ -155,24 +159,14 @@ pub async fn make_move(
     }
 
     // Make player's move
-    session.player_move(req.position).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Move failed: {}", e),
-        )
-    })?;
+    session
+        .player_move(req.position)
+        .map_err(|e| internal_error("Move failed", e))?;
     metrics::MOVES_PLAYED.inc();
 
     // If game is not over, bot makes a move
     let bot_move = if !session.is_game_over() {
-        let bot_start = Instant::now();
-        let pos = session.bot_move().map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Bot move failed: {}", e),
-            )
-        })?;
-        metrics::BOT_MOVE_SECONDS.observe(bot_start.elapsed().as_secs_f64());
+        let pos = timed_bot_move(&mut session)?;
         metrics::MOVES_PLAYED.inc(); // Count bot move too
         Some(pos)
     } else {
@@ -198,6 +192,9 @@ pub async fn make_move(
 // Unit Tests
 // ============================================================================
 
+// These construction/serialization tests overlap with the suites in
+// types/requests.rs and types/responses.rs; they exercise the shapes the
+// handlers above actually return.
 #[cfg(test)]
 mod tests {
     use crate::types::{
