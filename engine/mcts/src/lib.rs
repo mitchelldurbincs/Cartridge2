@@ -95,6 +95,9 @@ pub mod node;
 pub mod search;
 pub mod tree;
 
+mod sampling;
+mod types;
+
 #[cfg(feature = "onnx")]
 pub mod onnx;
 
