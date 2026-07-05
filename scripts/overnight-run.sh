@@ -25,7 +25,7 @@ ENV_ID="${ENV_ID:-connect4}"
 ITERATIONS="${ITERATIONS:-400}"
 EPISODES="${EPISODES:-500}"
 STEPS="${STEPS:-400}"
-DEVICE="${DEVICE:-cuda}"          # auto | cpu | cuda | mps
+DEVICE="${DEVICE:-auto}"          # auto | cpu | cuda | mps (auto picks cuda/mps/cpu)
 NUM_ACTORS="${NUM_ACTORS:-10}"
 WANDB="${WANDB:-false}"           # true to log this run to Weights & Biases
 POSTGRES_URL="${CARTRIDGE_STORAGE_POSTGRES_URL:-postgresql://cartridge:cartridge@localhost:5432/cartridge}"
@@ -34,6 +34,27 @@ POSTGRES_URL="${CARTRIDGE_STORAGE_POSTGRES_URL:-postgresql://cartridge:cartridge
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
+
+# --- Resolve Python interpreter (must have torch + trainer installed) ---------
+# Prefer an explicit $PYTHON, then an active venv, then the repo's .venv(s),
+# then whatever `python`/`python3` is on PATH. This avoids the trap where bare
+# `python` isn't on PATH (macOS ships only `python3`) or resolves to a system
+# interpreter without torch.
+if [ -n "${PYTHON:-}" ]; then
+  PY="${PYTHON}"
+elif [ -n "${VIRTUAL_ENV:-}" ] && [ -x "${VIRTUAL_ENV}/bin/python" ]; then
+  PY="${VIRTUAL_ENV}/bin/python"
+elif [ -x "${REPO_ROOT}/.venv/bin/python" ]; then
+  PY="${REPO_ROOT}/.venv/bin/python"
+elif [ -x "${REPO_ROOT}/trainer/.venv/bin/python" ]; then
+  PY="${REPO_ROOT}/trainer/.venv/bin/python"
+elif command -v python >/dev/null 2>&1; then
+  PY="python"
+elif command -v python3 >/dev/null 2>&1; then
+  PY="python3"
+else
+  echo "[overnight] ERROR: no python interpreter found" >&2; exit 1
+fi
 
 export CARTRIDGE_STORAGE_POSTGRES_URL="${POSTGRES_URL}"
 
@@ -69,9 +90,10 @@ fi
 log "PostgreSQL reachable at ${pg_host}:${pg_port}."
 
 # 2. Trainer package importable.
-python -c "import trainer" 2>/dev/null || {
+log "Using Python interpreter: ${PY}"
+"${PY}" -c "import trainer" 2>/dev/null || {
   log "Installing trainer package (pip install -e trainer)..."
-  pip install -e ./trainer
+  "${PY}" -m pip install -e ./trainer
 }
 
 # 3. Actor binary built (release).
@@ -83,7 +105,7 @@ log "Actor binary: ${REPO_ROOT}/actor/target/release/actor"
 
 # 4. GPU sanity check when cuda requested.
 if [ "${DEVICE}" = "cuda" ]; then
-  if ! python -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+  if ! "${PY}" -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
     die "DEVICE=cuda but torch.cuda.is_available() is False. Fix CUDA/PyTorch, or re-run with DEVICE=auto (falls back to CPU)."
   fi
   log "CUDA available."
@@ -97,7 +119,7 @@ log "  log file: ${LOG_FILE}"
 log "  (auto-resumes from last completed iteration if re-run)"
 
 set -x
-python -m trainer loop \
+"${PY}" -m trainer loop \
   --env-id "${ENV_ID}" \
   --iterations "${ITERATIONS}" \
   --episodes "${EPISODES}" \
