@@ -10,8 +10,10 @@ with Cartridge2's concrete pieces:
   whose ``Orchestrator(config)`` signature keeps cli.py and the console
   entry points untouched.
 - config.py, actor_runner.py, eval_runner.py, and eval_reporting.py
-  restore this repo's defaults on top of the core classes; promotion.py
-  and stats_manager.py re-export unchanged.
+  restore this repo's defaults on top of the core classes;
+  stats_manager.py re-exports unchanged. (Promotion has no shim: its
+  logic lives in training_core.orchestrator.promotion and is consumed
+  there by the core eval_runner.)
 - cli.py stays host-side: its argument defaults come from this repo's
   central config, and it calls setup_logging() process-wide before
   constructing the Orchestrator.
