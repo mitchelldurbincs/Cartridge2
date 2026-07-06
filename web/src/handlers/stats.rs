@@ -1,28 +1,35 @@
 //! Stats and model info handlers.
 
 use axum::{extract::State, Json};
+use serde::de::DeserializeOwned;
 use std::sync::Arc;
 
 use crate::types::{ActorStats, ModelInfoResponse, TrainingStats};
 use crate::AppState;
 
-/// Get training stats from stats.json.
-pub async fn get_stats(State(state): State<Arc<AppState>>) -> Json<TrainingStats> {
-    let stats_path = format!("{}/stats.json", state.data_dir);
+/// Read a JSON stats file from the data directory, falling back to the
+/// default value when the file is missing or unparseable.
+async fn read_stats_file<T: DeserializeOwned + Default>(data_dir: &str, filename: &str) -> Json<T> {
+    let stats_path = format!("{}/{}", data_dir, filename);
 
     match tokio::fs::read_to_string(&stats_path).await {
-        Ok(content) => match serde_json::from_str::<TrainingStats>(&content) {
+        Ok(content) => match serde_json::from_str::<T>(&content) {
             Ok(stats) => Json(stats),
             Err(e) => {
-                tracing::warn!("Failed to parse stats.json: {}", e);
-                Json(TrainingStats::default())
+                tracing::warn!("Failed to parse {}: {}", filename, e);
+                Json(T::default())
             }
         },
         Err(_) => {
             // Return empty stats if file doesn't exist
-            Json(TrainingStats::default())
+            Json(T::default())
         }
     }
+}
+
+/// Get training stats from stats.json.
+pub async fn get_stats(State(state): State<Arc<AppState>>) -> Json<TrainingStats> {
+    read_stats_file(&state.data_dir, "stats.json").await
 }
 
 /// Get info about the currently loaded model.
@@ -56,21 +63,7 @@ pub async fn get_model_info(State(state): State<Arc<AppState>>) -> Json<ModelInf
 
 /// Get actor self-play stats from actor_stats.json.
 pub async fn get_actor_stats(State(state): State<Arc<AppState>>) -> Json<ActorStats> {
-    let stats_path = format!("{}/actor_stats.json", state.data_dir);
-
-    match tokio::fs::read_to_string(&stats_path).await {
-        Ok(content) => match serde_json::from_str::<ActorStats>(&content) {
-            Ok(stats) => Json(stats),
-            Err(e) => {
-                tracing::warn!("Failed to parse actor_stats.json: {}", e);
-                Json(ActorStats::default())
-            }
-        },
-        Err(_) => {
-            // Return empty stats if file doesn't exist
-            Json(ActorStats::default())
-        }
-    }
+    read_stats_file(&state.data_dir, "actor_stats.json").await
 }
 
 // ============================================================================

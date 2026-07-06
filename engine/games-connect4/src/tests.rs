@@ -342,6 +342,8 @@ fn test_metadata() {
     assert_eq!(meta.player_count, 2);
 }
 
+/// (mirrors games-tictactoe's test of the same name; the game-specific
+/// constants — legal-mask width, max moves — differ)
 #[test]
 fn test_random_games_invariants() {
     use rand::Rng;

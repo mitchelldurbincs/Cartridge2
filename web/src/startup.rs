@@ -1,5 +1,5 @@
 //! Server plumbing: shared application state, router/CORS construction,
-//! tracing initialization, and shutdown signal handling.
+//! and shutdown signal handling (tracing setup lives in engine_config::init_tracing).
 //!
 //! This keeps `main.rs` a thin entrypoint. The types and constructor
 //! functions here are re-exported from the crate root so that their public
@@ -28,7 +28,7 @@ use crate::handlers::{
     make_move, metrics_handler, new_game,
 };
 #[cfg(feature = "onnx")]
-pub use crate::model_watcher::ModelInfo;
+pub use model_watcher::ModelInfo;
 
 /// Stub evaluator type when ONNX is disabled (for testing)
 #[cfg(not(feature = "onnx"))]
@@ -155,48 +155,6 @@ pub fn create_test_state() -> Arc<AppState> {
         evaluator,
         model_info,
     })
-}
-
-/// Initialize tracing with optional JSON format for cloud deployments.
-///
-/// Supports CARTRIDGE_LOGGING_FORMAT environment variable override:
-/// - "text" (default): Human-readable format for local development
-/// - "json": Structured JSON format for Google Cloud Logging
-pub fn init_tracing(logging_config: &engine_config::LoggingConfig) {
-    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"))
-        .add_directive("web=info".parse().unwrap())
-        .add_directive("ort=warn".parse().unwrap())
-        .add_directive("h2=warn".parse().unwrap())
-        .add_directive("hyper=warn".parse().unwrap());
-
-    // Check for environment variable override
-    let json_format = std::env::var("CARTRIDGE_LOGGING_FORMAT")
-        .map(|v| v.eq_ignore_ascii_case("json"))
-        .unwrap_or_else(|_| logging_config.is_json());
-
-    let registry = tracing_subscriber::registry().with(filter);
-
-    if json_format {
-        // JSON format for Google Cloud Logging
-        registry
-            .with(
-                fmt::layer()
-                    .json()
-                    .with_current_span(true)
-                    .with_span_list(false)
-                    .with_file(false)
-                    .with_line_number(false)
-                    .flatten_event(true)
-                    .with_target(logging_config.include_target),
-            )
-            .init();
-    } else {
-        // Human-readable format for local development
-        registry.with(fmt::layer()).init();
-    }
 }
 
 /// Creates a future that completes when a shutdown signal is received.

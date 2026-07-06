@@ -4,6 +4,7 @@ use anyhow::{anyhow, Result};
 use engine_core::EngineContext;
 use indicatif::{ProgressBar, ProgressStyle};
 use mcts::{MctsConfig, SearchStats};
+use model_watcher::ModelWatcher;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Mutex, MutexGuard,
@@ -16,7 +17,6 @@ use crate::game_config::{get_config, GameConfig};
 use crate::health::HealthState;
 use crate::mcts_policy::MctsPolicy;
 use crate::metrics;
-use crate::model_watcher::ModelWatcher;
 use crate::stats::ActorStats;
 use crate::storage::{create_replay_store, ReplayStore, StorageConfig, Transition};
 

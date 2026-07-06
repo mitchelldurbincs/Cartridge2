@@ -303,6 +303,8 @@ impl Evaluator for OnnxEvaluator {
         Ok(EvalResult { policy, value })
     }
 
+    // The tensor-prep/session-lock/extract plumbing mirrors evaluate() above;
+    // kept separate because the outputs are batch- vs single-shaped.
     fn evaluate_batch(
         &self,
         observations: &[&[u8]],

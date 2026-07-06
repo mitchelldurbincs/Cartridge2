@@ -19,6 +19,7 @@ engine-core = { path = "../engine/engine-core" }
 engine-config = { path = "../engine/engine-config" }
 engine-games = { path = "../engine/engine-games" }
 mcts = { path = "../engine/mcts" }
+metrics-common = { path = "../engine/metrics-common" }
 model-watcher = { path = "../engine/model-watcher", features = ["metadata"] }
 
 # Web framework
@@ -35,9 +36,8 @@ serde_json = "1.0"
 thiserror = "1.0"
 anyhow = "1.0"
 
-# Logging
+# Logging (tracing setup itself lives in engine-config::init_tracing)
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Prometheus metrics
 prometheus = "0.13"

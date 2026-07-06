@@ -2,15 +2,49 @@
 
 These interfaces define the contract for storage backends, allowing
 the trainer to work with SQLite locally or PostgreSQL/S3 in K8s.
+
+Also home to the serialization/naming conventions shared by all ModelStore
+backends: the checkpoint filename format and the best-model marker payload.
 """
 
+import json
 import logging
+import re
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# Checkpoint naming convention shared by all ModelStore backends (the
+# direct-filesystem path in trainer/checkpoint.py writes the same format).
+CHECKPOINT_STEP_RE = re.compile(r"model_step_(\d+)\.onnx$")
+
+
+def checkpoint_filename(step: int) -> str:
+    """Canonical ONNX checkpoint filename for a training step."""
+    return f"model_step_{step:06d}.onnx"
+
+
+def parse_checkpoint_step(name: str) -> int | None:
+    """Extract the training step from a checkpoint filename/key, or None."""
+    match = CHECKPOINT_STEP_RE.search(name)
+    return int(match.group(1)) if match else None
+
+
+def encode_best_model_metadata(step: int) -> str:
+    """Serialize the best-model marker payload shared by ModelStore backends."""
+    return json.dumps({"step": step, "timestamp": time.time()})
+
+
+def decode_best_model_metadata(data: str | bytes) -> int | None:
+    """Parse a payload written by encode_best_model_metadata (None if malformed)."""
+    try:
+        return json.loads(data).get("step")
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
 @dataclass
@@ -334,9 +368,11 @@ class ModelStore(ABC):
         """
         pass
 
-    @abstractmethod
     def cleanup_old_checkpoints(self, max_keep: int) -> int:
         """Remove old checkpoints to save storage.
+
+        Deletes oldest-first via _delete_checkpoint, never deleting the
+        best model, until at most max_keep checkpoints remain.
 
         Args:
             max_keep: Maximum number of checkpoints to retain.
@@ -344,6 +380,26 @@ class ModelStore(ABC):
         Returns:
             Number of checkpoints deleted.
         """
+        checkpoints = self.list_checkpoints()
+        deleted = 0
+
+        while len(checkpoints) > max_keep:
+            old_checkpoint = checkpoints.pop(0)
+            # Don't delete the best model
+            if old_checkpoint.is_best:
+                continue
+            try:
+                self._delete_checkpoint(old_checkpoint)
+                logger.debug(f"Removed old checkpoint: {old_checkpoint.path}")
+                deleted += 1
+            except Exception as e:
+                logger.warning(f"Failed to remove {old_checkpoint.path}: {e}")
+
+        return deleted
+
+    @abstractmethod
+    def _delete_checkpoint(self, checkpoint: ModelInfo) -> None:
+        """Delete a single checkpoint artifact (backend-specific)."""
         pass
 
     @abstractmethod

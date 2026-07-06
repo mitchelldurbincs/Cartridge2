@@ -17,12 +17,14 @@ pub async fn health() -> Json<HealthResponse> {
 }
 
 /// Prometheus metrics handler.
+/// Sibling: actor/src/health.rs::metrics_handler (actor also refreshes its
+/// memory gauge before encoding).
 pub async fn metrics_handler() -> (StatusCode, [(header::HeaderName, &'static str); 1], String) {
     (
         StatusCode::OK,
         [(
             header::CONTENT_TYPE,
-            "text/plain; version=0.0.4; charset=utf-8",
+            metrics_common::PROMETHEUS_TEXT_CONTENT_TYPE,
         )],
         metrics::encode_metrics(),
     )

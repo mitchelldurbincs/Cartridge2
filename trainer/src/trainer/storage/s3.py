@@ -18,19 +18,27 @@ Environment variables:
     AWS_ACCESS_KEY_ID: AWS access key
     AWS_SECRET_ACCESS_KEY: AWS secret key
     AWS_REGION: AWS region (default: us-east-1)
+
+Sibling: FilesystemModelStore in filesystem.py. Naming, best-model
+serialization, and checkpoint rotation shared by both live in base.py.
 """
 
-import json
 import logging
 import os
-import re
 import tempfile
 import time
 from pathlib import Path
 
 import torch
 
-from trainer.storage.base import ModelInfo, ModelStore
+from trainer.storage.base import (
+    ModelInfo,
+    ModelStore,
+    checkpoint_filename,
+    decode_best_model_metadata,
+    encode_best_model_metadata,
+    parse_checkpoint_step,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -124,8 +132,9 @@ class S3ModelStore(ModelStore):
                 Bucket=self.bucket,
                 Key=self._key("metadata/best_model.json"),
             )
-            data = json.loads(response["Body"].read().decode("utf-8"))
-            self._best_step = data.get("step")
+            self._best_step = decode_best_model_metadata(
+                response["Body"].read().decode("utf-8")
+            )
         except self._s3.exceptions.NoSuchKey:
             pass
         except Exception as e:
@@ -133,7 +142,7 @@ class S3ModelStore(ModelStore):
 
     def _save_best_metadata(self, step: int) -> None:
         """Save best model metadata to S3."""
-        data = json.dumps({"step": step, "timestamp": time.time()})
+        data = encode_best_model_metadata(step)
         self._s3.put_object(
             Bucket=self.bucket,
             Key=self._key("metadata/best_model.json"),
@@ -149,7 +158,7 @@ class S3ModelStore(ModelStore):
     ) -> ModelInfo:
         """Save an ONNX model checkpoint to S3."""
         # Upload checkpoint
-        checkpoint_key = self._key(f"checkpoints/model_step_{step:06d}.onnx")
+        checkpoint_key = self._key(f"checkpoints/{checkpoint_filename(step)}")
         self._s3.put_object(
             Bucket=self.bucket,
             Key=checkpoint_key,
@@ -283,10 +292,8 @@ class S3ModelStore(ModelStore):
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
-                # Extract step from key
-                match = re.search(r"model_step_(\d+)\.onnx$", key)
-                if match:
-                    step = int(match.group(1))
+                step = parse_checkpoint_step(key)
+                if step is not None:
                     checkpoints.append(
                         ModelInfo(
                             path=f"s3://{self.bucket}/{key}",
@@ -298,31 +305,15 @@ class S3ModelStore(ModelStore):
 
         return sorted(checkpoints, key=lambda x: x.step)
 
-    def cleanup_old_checkpoints(self, max_keep: int) -> int:
-        """Remove old checkpoints to save storage."""
-        checkpoints = self.list_checkpoints()
-        deleted = 0
-
-        while len(checkpoints) > max_keep:
-            old_checkpoint = checkpoints.pop(0)
-            # Don't delete the best model
-            if old_checkpoint.step == self._best_step:
-                continue
-
-            try:
-                # Extract key from s3:// path
-                key = old_checkpoint.path.replace(f"s3://{self.bucket}/", "")
-                self._s3.delete_object(Bucket=self.bucket, Key=key)
-                logger.debug(f"Removed old checkpoint: {old_checkpoint.path}")
-                deleted += 1
-            except Exception as e:
-                logger.warning(f"Failed to remove {old_checkpoint.path}: {e}")
-
-        return deleted
+    def _delete_checkpoint(self, checkpoint: ModelInfo) -> None:
+        """Delete a checkpoint object (rotation lives in ModelStore)."""
+        # Extract key from s3:// path
+        key = checkpoint.path.replace(f"s3://{self.bucket}/", "")
+        self._s3.delete_object(Bucket=self.bucket, Key=key)
 
     def mark_as_best(self, step: int) -> None:
         """Mark a specific checkpoint as the 'best' model."""
-        src_key = self._key(f"checkpoints/model_step_{step:06d}.onnx")
+        src_key = self._key(f"checkpoints/{checkpoint_filename(step)}")
         dst_key = self._key("best.onnx")
 
         try:

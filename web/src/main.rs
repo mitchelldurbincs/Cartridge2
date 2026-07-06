@@ -20,8 +20,6 @@ use tracing::info;
 mod game;
 mod handlers;
 mod metrics;
-#[cfg(feature = "onnx")]
-mod model_watcher;
 mod startup;
 mod types;
 
@@ -30,7 +28,7 @@ use game::GameSession;
 #[cfg(feature = "onnx")]
 use model_watcher::ModelWatcher;
 
-use startup::{init_tracing, shutdown_signal};
+use startup::shutdown_signal;
 // Re-export server plumbing so the public paths (`crate::AppState`,
 // `crate::create_app`, `crate::ModelInfo`, ...) stay stable for handlers and tests.
 #[cfg(test)]
@@ -43,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
     let config = load_config();
 
     // Initialize tracing with JSON support for cloud deployments
-    init_tracing(&config.logging);
+    engine_config::init_tracing("info", &["web=info"], &config.logging);
 
     // Initialize Prometheus metrics
     metrics::init_metrics();

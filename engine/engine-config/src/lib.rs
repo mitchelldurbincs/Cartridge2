@@ -25,10 +25,12 @@
 
 mod defaults;
 mod loader;
+mod logging;
 mod structs;
 
 pub use defaults::*;
 pub use loader::{apply_env_overrides, load_config, load_from_path, CONFIG_SEARCH_PATHS};
+pub use logging::init_tracing;
 pub use structs::*;
 
 #[cfg(test)]

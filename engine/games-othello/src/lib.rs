@@ -527,6 +527,8 @@ impl Game for Othello {
             .with_board_type("grid")
     }
 
+    // reset/step mirror games-tictactoe and games-connect4; the shared pieces
+    // (reward, info bits, validation) live in engine_core::game_utils.
     fn reset(&mut self, _rng: &mut ChaCha20Rng, _hint: &[u8]) -> (Self::State, Self::Obs) {
         let state = State::new();
         let obs = observation_from_state(&state);

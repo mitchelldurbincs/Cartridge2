@@ -177,6 +177,8 @@ async fn ready_handler(state: HealthState) -> axum::http::StatusCode {
     }
 }
 
+// Sibling: web/src/handlers/health.rs::metrics_handler (web serves the same
+// format but has no memory gauge to refresh).
 async fn metrics_handler() -> (
     axum::http::StatusCode,
     [(axum::http::header::HeaderName, &'static str); 1],
@@ -189,7 +191,7 @@ async fn metrics_handler() -> (
         axum::http::StatusCode::OK,
         [(
             axum::http::header::CONTENT_TYPE,
-            "text/plain; version=0.0.4; charset=utf-8",
+            metrics_common::PROMETHEUS_TEXT_CONTENT_TYPE,
         )],
         crate::metrics::encode_metrics(),
     )
