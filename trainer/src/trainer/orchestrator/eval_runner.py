@@ -61,6 +61,26 @@ class EvalRunner(EvalReportingMixin, _CoreEvalRunner):
 
     The ``(config, wandb_logger)`` construction signature is unchanged for
     orchestrator.py and other callers.
+
+    Exact 6-class MRO (the shim mixin MUST precede the core runner so its
+    appender pin wins the class-attribute lookup)::
+
+        trainer.orchestrator.eval_runner.EvalRunner
+        trainer.orchestrator.eval_reporting.EvalReportingMixin
+        training_core.orchestrator.eval_runner.EvalRunner
+        training_core.orchestrator.promotion.PromotionMixin
+        training_core.orchestrator.eval_reporting.EvalReportingMixin
+        builtins.object
+
+    Invariant: ``_solver_stats_appender`` must remain a CLASS-level lookup.
+    The pin above lives on the shim mixin's class; if training-core's
+    EvalRunner ever assigned ``self._solver_stats_appender = ...`` in
+    ``__init__``, that instance attribute would silently shadow the pin and
+    solver_stats.json would quietly stop being written -- both suites would
+    stay green except for the tripwire test at
+    tests/test_orchestrator_composition.py::
+    TestEvalRunnerComposition::test_solver_stats_file_written, which writes
+    the real file through this class and exists to catch exactly that.
     """
 
     def __init__(self, config: LoopConfig, wandb_logger: "WandbLogger | None" = None):
