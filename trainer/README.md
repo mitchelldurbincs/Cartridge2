@@ -593,7 +593,7 @@ trainer loop --iterations 100 --start-iteration 25
 trainer loop --iterations 50 --steps 500 --lr-total-steps 25000
 ```
 
-For the full loop argument reference, run `python -m trainer.orchestrator --help`.
+For the full loop argument reference, run `trainer-loop --help`.
 
 ## AlphaZero Training Tips
 
