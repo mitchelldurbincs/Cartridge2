@@ -19,6 +19,10 @@ class LoopConfig(_CoreLoopConfig):
 
     training-core's LoopConfig defaults ``wandb`` to None; Cartridge2 callers
     keep getting a ready-to-use ``WandbConfig()`` exactly as before the move.
+    Dataclass-subclass gotcha: the generated ``__eq__`` compares
+    ``other.__class__ is self.__class__``, so an instance of this subclass
+    never compares equal to a core ``LoopConfig`` instance, even with
+    identical field values.
     """
 
     wandb: WandbConfig = field(default_factory=WandbConfig)
