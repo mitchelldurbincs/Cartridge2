@@ -57,6 +57,12 @@ def make_solver_results(
 
 
 class TestEvalRunnerComposition:
+    def test_eval_temperature_literal_value(self):
+        # Byte-equivalence insurance until Gate B: head-to-head eval games
+        # must keep sampling at exactly this temperature; a drift in
+        # training-core would silently change Cartridge2's eval behavior.
+        assert eval_runner_shim.EVAL_TEMPERATURE == 0.2
+
     def test_solver_stats_file_written(self, tmp_path, monkeypatch):
         """solver_stats.json is written end-to-end through the shim EvalRunner.
 
