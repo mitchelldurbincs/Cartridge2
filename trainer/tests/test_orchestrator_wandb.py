@@ -1,8 +1,8 @@
 """Orchestrator component tests (no Postgres, no wandb, no real actor binary).
 
-Covers the W&B logger lifecycle, auto-resume, LoopConfig helpers, ActorRunner
-subprocess handling (via a fake actor executable), and StatsManager
-persistence.
+Covers the W&B logger lifecycle, auto-resume, and ActorRunner subprocess
+handling (via a fake actor executable). LoopConfig and StatsManager tests
+moved to the training-core repo with their implementations.
 """
 
 import json
@@ -149,26 +149,6 @@ class TestAutoResume:
 
         assert orchestrator.config.start_iteration == 5
         assert orchestrator.iteration_history == []
-
-
-class TestLoopConfig:
-    def test_model_paths_derive_from_data_dir(self, tmp_path):
-        config = LoopConfig(data_dir=tmp_path)
-
-        assert config.latest_model_path == tmp_path / "models" / "latest.onnx"
-        assert config.best_model_path == tmp_path / "models" / "best.onnx"
-
-    def test_explicit_device_passes_through(self):
-        assert LoopConfig(device="cpu").resolve_device() == "cpu"
-
-    def test_num_simulations_ramp_and_cap(self):
-        config = LoopConfig(
-            mcts_start_sims=50, mcts_max_sims=400, mcts_sim_ramp_rate=20
-        )
-
-        assert config.get_num_simulations(1) == 50
-        assert config.get_num_simulations(3) == 90
-        assert config.get_num_simulations(1000) == 400
 
 
 # --- ActorRunner ---
@@ -359,114 +339,3 @@ class TestActorRunnerRun:
 
         assert success is False
         assert time.time() - start < 10  # terminated, not waited out
-
-
-# --- StatsManager ---
-
-
-class TestStatsManager:
-    def _manager(self, tmp_path, **overrides):
-        return StatsManager(LoopConfig(data_dir=tmp_path, **overrides))
-
-    def test_save_loop_stats_schema(self, tmp_path):
-        manager = self._manager(tmp_path, env_id="connect4")
-
-        manager.save_loop_stats([make_iteration_stats(1)])
-
-        data = json.loads(manager.config.loop_stats_path.read_text())
-        assert data["config"]["env_id"] == "connect4"
-        entry = data["iterations"][0]
-        assert entry["iteration"] == 1
-        assert entry["episodes"] == 10
-        assert entry["transitions"] == 100
-        assert entry["eval_win_rate"] == 0.6
-
-    def test_save_and_load_round_trip(self, tmp_path):
-        manager = self._manager(tmp_path)
-        history = [make_iteration_stats(1), make_iteration_stats(2)]
-        manager.save_loop_stats(history)
-        manager.save_eval_stats([{"iteration": 1, "vs_best_win_rate": 0.7}])
-
-        loaded_history, eval_history, start_iteration = manager.load_previous_state()
-
-        assert start_iteration == 3
-        assert loaded_history == history
-        assert eval_history == [{"iteration": 1, "vs_best_win_rate": 0.7}]
-
-    def test_load_previous_state_fresh_dir(self, tmp_path):
-        assert self._manager(tmp_path).load_previous_state() == ([], [], 1)
-
-    def test_load_previous_state_no_completed_iterations(self, tmp_path):
-        manager = self._manager(tmp_path)
-        manager.save_loop_stats([])
-
-        assert manager.load_previous_state() == ([], [], 1)
-
-    def test_corrupt_loop_stats_starts_fresh(self, tmp_path):
-        manager = self._manager(tmp_path)
-        manager.config.loop_stats_path.write_text("{not json")
-
-        assert manager.load_previous_state() == ([], [], 1)
-
-    def test_corrupt_eval_stats_keeps_iteration_history(self, tmp_path):
-        manager = self._manager(tmp_path)
-        manager.save_loop_stats([make_iteration_stats(4)])
-        manager.config.eval_stats_path.write_text("{not json")
-
-        history, eval_history, start_iteration = manager.load_previous_state()
-
-        assert start_iteration == 5
-        assert [s.iteration for s in history] == [4]
-        assert eval_history == []
-
-    def test_update_stats_with_eval_writes_frontend_fields(self, tmp_path):
-        manager = self._manager(tmp_path)
-        manager.config.stats_path.write_text(json.dumps({"policy_loss": 1.2}))
-        eval_history = [
-            {
-                "iteration": 2,
-                "step": 2000,
-                "vs_best_win_rate": 0.6,
-                "vs_best_draw_rate": 0.2,
-                "vs_best_opponent_iteration": 1,
-                "became_new_best": True,
-                "vs_random_win_rate": 0.9,
-                "vs_random_draw_rate": 0.05,
-                "games": 50,
-            }
-        ]
-
-        manager.update_stats_with_eval(eval_history, best_iteration=2)
-
-        data = json.loads(manager.config.stats_path.read_text())
-        assert data["policy_loss"] == 1.2  # pre-existing keys preserved
-        assert len(data["eval_history"]) == 1
-        last = data["last_eval"]
-        assert last["step"] == 2000
-        assert last["opponent"] == "best"
-        assert last["opponent_iteration"] == 1
-        assert last["win_rate"] == 0.6
-        assert last["loss_rate"] == pytest.approx(0.2)
-        assert last["became_new_best"] is True
-        assert last["games_played"] == 50
-        assert data["best_model"] == {
-            "iteration": 2,
-            "step": 2 * manager.config.steps_per_iteration,
-        }
-
-    def test_update_stats_with_eval_step_falls_back_to_iteration(self, tmp_path):
-        manager = self._manager(tmp_path)
-
-        manager.update_stats_with_eval([{"iteration": 3}], best_iteration=None)
-
-        data = json.loads(manager.config.stats_path.read_text())
-        assert data["last_eval"]["step"] == 3 * manager.config.steps_per_iteration
-        assert data["last_eval"]["win_rate"] == 0.0
-        assert "best_model" not in data
-
-    def test_update_stats_with_eval_empty_history_is_noop(self, tmp_path):
-        manager = self._manager(tmp_path)
-
-        manager.update_stats_with_eval([], best_iteration=1)
-
-        assert not manager.config.stats_path.exists()
