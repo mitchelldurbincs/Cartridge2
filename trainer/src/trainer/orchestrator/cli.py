@@ -43,13 +43,13 @@ Configuration:
 
 Examples:
     # Basic training with evaluation every iteration
-    python -m trainer.orchestrator --iterations 50 --episodes 200 --steps 500
+    python -m trainer loop --iterations 50 --episodes 200 --steps 500
 
     # Connect4 with GPU
-    python -m trainer.orchestrator --env-id connect4 --device cuda --iterations 100
+    python -m trainer loop --env-id connect4 --device cuda --iterations 100
 
     # Disable evaluation for faster training
-    python -m trainer.orchestrator --eval-interval 0
+    python -m trainer loop --eval-interval 0
 
     # Via Docker (uses config.toml mounted to /app/config.toml)
     docker compose up alphazero

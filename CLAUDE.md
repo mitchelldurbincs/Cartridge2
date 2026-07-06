@@ -240,6 +240,36 @@ PyTorch training with AlphaZero-style learning and orchestration:
 - Structured JSON logging for cloud deployments
 - Prometheus metrics export
 
+### training-core Dependency (Python) - sibling repo
+**Status: EXTRACTED (local sibling checkout; not yet on GitHub/PyPI)**
+
+The trainer's orchestration core lives in the sibling `training-core` repo
+(`training_core` package): the synchronized loop (`Orchestrator`), the
+`ActorRunner`/`EvalRunner` base classes, stats manager, promotion +
+eval-reporting logic, `LoopConfig`, plus `wandb_logger`, `atomic_io`, and
+`backoff`. Generation, training, and evaluation backends are injected
+through the `typing.Protocol` seams in `training_core/protocols.py`.
+
+**Dev setup** - install training-core editable before the trainer:
+```bash
+cd trainer
+pip install -e ../../training-core   # sibling checkout, relative to trainer/
+pip install -e ".[dev]"
+```
+
+**Composition root:** `trainer/src/trainer/orchestrator/orchestrator.py`
+binds this repo's concrete pieces (storage.create_replay_buffer,
+Trainer/TrainerConfig via TrainSpec, the shim ActorRunner/EvalRunner
+subclasses, structured_logging tracing) into the core Orchestrator, keeping
+the `Orchestrator(config)` signature unchanged for cli.py and callers.
+
+**Shims:** `trainer/src/trainer/{wandb_logger,atomic_io,backoff}.py` and
+`trainer/src/trainer/orchestrator/{config,stats_manager,eval_reporting,actor_runner,eval_runner}.py`
+re-export from `training_core` (some restore repo-specific defaults) so
+existing `trainer.*` imports keep working. Repo code imports through the
+shims; only the composition root and tests reference `training_core.*`
+directly.
+
 ## Directory Structure
 
 ```
