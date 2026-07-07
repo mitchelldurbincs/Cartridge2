@@ -1,10 +1,10 @@
-"""Composition tests: Cartridge2's orchestrator wiring into training-core.
+"""Composition tests: Cartridge2's orchestrator wiring into crucible.
 
 The orchestrator loop and its eval/config/actor modules live in
-training-core with injected seams; trainer.orchestrator is this repo's
+crucible with injected seams; trainer.orchestrator is this repo's
 composition root. Each test here constructs through THIS repo's production
-wiring and pins behavior that training-core deliberately does not provide.
-They would stay green against training-core alone only if the composition
+wiring and pins behavior that crucible deliberately does not provide.
+They would stay green against crucible alone only if the composition
 root silently lost its wiring -- which is exactly the regression they exist
 to catch.
 """
@@ -112,13 +112,13 @@ class TestEvalRunnerComposition:
     def test_eval_temperature_literal_value(self):
         # Byte-equivalence insurance until Gate B: head-to-head eval games
         # must keep sampling at exactly this temperature; a drift in
-        # training-core would silently change Cartridge2's eval behavior.
+        # crucible would silently change Cartridge2's eval behavior.
         assert eval_runner_shim.EVAL_TEMPERATURE == 0.2
 
     def test_solver_stats_file_written(self, tmp_path, monkeypatch):
         """solver_stats.json is written through the ORCHESTRATOR'S eval runner.
 
-        training-core's default solver-stats appender is a silent no-op, so
+        crucible's default solver-stats appender is a silent no-op, so
         both suites would stay green if the composition root ever stopped
         wiring the shim EvalRunner (which re-pins the real
         ``append_solver_stats``) into the loop. The runner under test is
@@ -289,7 +289,7 @@ class TestLoopConfigComposition:
     def test_wandb_default_is_real_wandb_config(self):
         """The config shim must keep restoring this repo's WandbConfig default.
 
-        training-core's LoopConfig defaults ``wandb`` to None; every
+        crucible's LoopConfig defaults ``wandb`` to None; every
         Cartridge2 caller relies on getting a ready-to-use WandbConfig.
         """
         assert isinstance(LoopConfig().wandb, WandbConfig)

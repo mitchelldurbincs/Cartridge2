@@ -1,12 +1,12 @@
-"""Shim: implementation moved to the training-core package."""
+"""Shim: implementation moved to the crucible package."""
 
 from dataclasses import dataclass, field
 
-from training_core.orchestrator.config import *  # noqa: F401,F403
-from training_core.orchestrator.config import (
+from crucible.orchestrator.config import *  # noqa: F401,F403
+from crucible.orchestrator.config import (
     IterationStats,
 )
-from training_core.orchestrator.config import (
+from crucible.orchestrator.config import (
     LoopConfig as _CoreLoopConfig,
 )
 
@@ -17,7 +17,7 @@ from ..central_config import WandbConfig
 class LoopConfig(_CoreLoopConfig):
     """Cartridge2 LoopConfig: restores this repo's WandbConfig default.
 
-    training-core's LoopConfig defaults ``wandb`` to None; Cartridge2 callers
+    crucible's LoopConfig defaults ``wandb`` to None; Cartridge2 callers
     keep getting a ready-to-use ``WandbConfig()`` exactly as before the move.
     Dataclass-subclass gotcha: the generated ``__eq__`` compares
     ``other.__class__ is self.__class__``, so an instance of this subclass

@@ -1,17 +1,17 @@
-"""Shim: implementation moved to the training-core package."""
+"""Shim: implementation moved to the crucible package."""
 
 from typing import TYPE_CHECKING
 
-from training_core.orchestrator.eval_runner import *  # noqa: F401,F403
-from training_core.orchestrator.eval_runner import (
+from crucible.orchestrator.eval_runner import *  # noqa: F401,F403
+from crucible.orchestrator.eval_runner import (
     # Redundant alias: EVAL_TEMPERATURE was a public module attribute here
     # before the move but (as before) is deliberately not in __all__.
     EVAL_TEMPERATURE as EVAL_TEMPERATURE,
 )
-from training_core.orchestrator.eval_runner import (
+from crucible.orchestrator.eval_runner import (
     EvalRunner as _CoreEvalRunner,
 )
-from training_core.orchestrator.eval_runner import (
+from crucible.orchestrator.eval_runner import (
     should_promote,
 )
 
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 
 class _Cartridge2SolverHooks:
-    """training-core ``SolverHooks`` backed by this repo's solver_eval.
+    """crucible ``SolverHooks`` backed by this repo's solver_eval.
 
     Both hooks resolve ``SolverScorer``/``solver_evaluate`` from this
     module's globals at call time, preserving the pre-move test seam
@@ -46,7 +46,7 @@ class _Cartridge2SolverHooks:
 class EvalRunner(EvalReportingMixin, _CoreEvalRunner):
     """Cartridge2 EvalRunner: this repo's eval stack wired into the core runner.
 
-    training-core's EvalRunner takes its evaluation backends by constructor
+    crucible's EvalRunner takes its evaluation backends by constructor
     injection and defaults its solver-stats appender to a no-op; this
     subclass restores pre-move behavior exactly:
 
@@ -67,13 +67,13 @@ class EvalRunner(EvalReportingMixin, _CoreEvalRunner):
 
         trainer.orchestrator.eval_runner.EvalRunner
         trainer.orchestrator.eval_reporting.EvalReportingMixin
-        training_core.orchestrator.eval_runner.EvalRunner
-        training_core.orchestrator.promotion.PromotionMixin
-        training_core.orchestrator.eval_reporting.EvalReportingMixin
+        crucible.orchestrator.eval_runner.EvalRunner
+        crucible.orchestrator.promotion.PromotionMixin
+        crucible.orchestrator.eval_reporting.EvalReportingMixin
         builtins.object
 
     Invariant: ``_solver_stats_appender`` must remain a CLASS-level lookup.
-    The pin above lives on the shim mixin's class; if training-core's
+    The pin above lives on the shim mixin's class; if crucible's
     EvalRunner ever assigned ``self._solver_stats_appender = ...`` in
     ``__init__``, that instance attribute would silently shadow the pin and
     solver_stats.json would quietly stop being written -- both suites would

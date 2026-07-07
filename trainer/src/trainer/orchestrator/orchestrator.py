@@ -1,7 +1,7 @@
-"""Shim: implementation moved to the training-core package.
+"""Shim: implementation moved to the crucible package.
 
 This module is also Cartridge2's COMPOSITION ROOT for the training loop.
-training-core's Orchestrator takes every backend as a required keyword-only
+crucible's Orchestrator takes every backend as a required keyword-only
 factory seam; the subclass below pre-binds this repo's concrete pieces so
 the ``Orchestrator(config)`` construction signature -- and therefore
 cli.py's ``Orchestrator(config).run()``, ``python -m trainer loop``, and
@@ -29,11 +29,11 @@ Factory bindings (pre-move behavior, verbatim):
   structured_logging.
 """
 
-from training_core.orchestrator.orchestrator import *  # noqa: F401,F403
-from training_core.orchestrator.orchestrator import (
+from crucible.orchestrator.orchestrator import *  # noqa: F401,F403
+from crucible.orchestrator.orchestrator import (
     Orchestrator as _CoreOrchestrator,
 )
-from training_core.orchestrator.orchestrator import (
+from crucible.orchestrator.orchestrator import (
     TrainSpec,
 )
 
