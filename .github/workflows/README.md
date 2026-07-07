@@ -1,6 +1,6 @@
 # CI/CD Pipeline
 
-GitHub Actions workflow for Cartridge2. Defined in `workflows/ci.yml`.
+GitHub Actions workflow for Cartridge2. Defined in `ci.yml`.
 
 ## Triggers
 
