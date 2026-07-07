@@ -1,6 +1,6 @@
-"""Shim: implementation moved to the training-core package."""
+"""Shim: implementation moved to the crucible package."""
 
-from training_core.orchestrator.stats_manager import *  # noqa: F401,F403
-from training_core.orchestrator.stats_manager import StatsManager
+from crucible.orchestrator.stats_manager import *  # noqa: F401,F403
+from crucible.orchestrator.stats_manager import StatsManager
 
 __all__ = ["StatsManager"]

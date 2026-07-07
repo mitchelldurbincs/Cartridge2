@@ -423,7 +423,7 @@ replay = create_replay_buffer(backend="postgres", connection_string="...")
 ## Development
 
 Some trainer modules (e.g. `trainer.wandb_logger`) are shims that re-export
-from the `training-core` package, which is not yet a declared dependency:
+from the `crucible` package, which is not yet a declared dependency:
 install it editable from the sibling checkout before running the trainer or
 its tests. Formal dependency declaration + CI wiring happens in Task B8.
 
@@ -431,8 +431,8 @@ its tests. Formal dependency declaration + CI wiring happens in Task B8.
 # Install with dev dependencies
 pip install -e ".[dev]"
 
-# Install training-core from the sibling checkout (required)
-pip install -e ../../training-core
+# Install crucible from the sibling checkout (required)
+pip install -e ../../crucible
 
 # Run tests
 pytest

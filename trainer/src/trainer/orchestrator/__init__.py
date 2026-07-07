@@ -1,6 +1,6 @@
 """Synchronized AlphaZero Training Loop Orchestrator (composition root).
 
-The loop coordinator and its components live in the training-core package
+The loop coordinator and its components live in the crucible package
 and take every backend through injected seams; this package composes them
 with Cartridge2's concrete pieces:
 
@@ -12,7 +12,7 @@ with Cartridge2's concrete pieces:
 - config.py, actor_runner.py, eval_runner.py, and eval_reporting.py
   restore this repo's defaults on top of the core classes;
   stats_manager.py re-exports unchanged. (Promotion has no shim: its
-  logic lives in training_core.orchestrator.promotion and is consumed
+  logic lives in crucible.orchestrator.promotion and is consumed
   there by the core eval_runner.)
 - cli.py stays host-side: its argument defaults come from this repo's
   central config, and it calls setup_logging() process-wide before

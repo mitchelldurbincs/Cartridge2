@@ -1,10 +1,10 @@
-"""Shim: implementation moved to the training-core package."""
+"""Shim: implementation moved to the crucible package."""
 
 from pathlib import Path
 from typing import Callable
 
-from training_core.orchestrator.actor_runner import *  # noqa: F401,F403
-from training_core.orchestrator.actor_runner import ActorRunner as _CoreActorRunner
+from crucible.orchestrator.actor_runner import *  # noqa: F401,F403
+from crucible.orchestrator.actor_runner import ActorRunner as _CoreActorRunner
 
 from .config import LoopConfig
 
@@ -26,7 +26,7 @@ _BINARY_CANDIDATES = [
 class ActorRunner(_CoreActorRunner):
     """Cartridge2 ActorRunner: auto-detects this repo's Rust actor binary.
 
-    training-core's ActorRunner searches nowhere by default; injecting the
+    crucible's ActorRunner searches nowhere by default; injecting the
     candidate list above keeps binary discovery (config.actor_binary, then
     ACTOR_BINARY, then these paths) byte-equivalent to before the move.
     """

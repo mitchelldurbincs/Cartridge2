@@ -1,7 +1,7 @@
-"""Shim: implementation moved to the training-core package."""
+"""Shim: implementation moved to the crucible package."""
 
-from training_core.orchestrator.eval_reporting import *  # noqa: F401,F403
-from training_core.orchestrator.eval_reporting import (
+from crucible.orchestrator.eval_reporting import *  # noqa: F401,F403
+from crucible.orchestrator.eval_reporting import (
     EvalReportingMixin as _CoreEvalReportingMixin,
 )
 
@@ -11,7 +11,7 @@ from ..solver_eval import append_solver_stats
 class EvalReportingMixin(_CoreEvalReportingMixin):
     """Cartridge2 mixin: solver history persists via this repo's solver_eval.
 
-    training-core's mixin defaults its solver-stats appender to a no-op;
+    crucible's mixin defaults its solver-stats appender to a no-op;
     pinning ``append_solver_stats`` here keeps ``EvalRunner`` behavior
     byte-equivalent to before the move.
     """
