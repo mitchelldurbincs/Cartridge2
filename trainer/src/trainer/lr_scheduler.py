@@ -37,6 +37,7 @@ Usage:
 """
 
 import logging
+import math
 from dataclasses import dataclass
 
 import torch
@@ -239,11 +240,19 @@ class WarmupCosineScheduler:
             self._restore_cosine_state(cosine_state)
 
     def _restore_cosine_state(self, cosine_state: dict) -> None:
-        """Restore the cosine scheduler from saved state."""
-        last_epoch = cosine_state.get("last_epoch", 0)
-        t_max = cosine_state.get("T_max", self.config.cosine_steps)
+        """Restore the cosine scheduler from saved state.
 
-        # Check if schedule already completed
+        The horizon (``T_max``) is re-anchored to the *current* config rather than
+        the value saved in the checkpoint. Honoring a stale/shorter saved horizon is
+        what let a completed old schedule pin the LR at ``eta_min`` forever across
+        resumes: once a short schedule finished, every later resume saw
+        ``last_epoch >= saved_T_max`` and clamped to the floor, even when the new run
+        intended a much longer schedule.
+        """
+        last_epoch = cosine_state.get("last_epoch", 0)
+        t_max = self.config.cosine_steps
+
+        # Check completion against the CURRENT horizon (not the saved one).
         if last_epoch >= t_max:
             self._set_lr(self.config.min_lr)
             logger.info(
@@ -252,13 +261,36 @@ class WarmupCosineScheduler:
             )
             return
 
-        # Restore the scheduler state
+        # Restore the scheduler counters, then re-anchor horizon + base LR.
         self._cosine_scheduler.load_state_dict(cosine_state)
-
-        # CRITICAL: Reset base_lrs to target_lr
-        # The saved base_lrs might be warmup_start_lr if the checkpoint was
-        # saved during warmup. We want cosine annealing from target_lr.
+        self._cosine_scheduler.T_max = t_max
+        # Reset base_lrs to target_lr: the saved base_lrs might be warmup_start_lr
+        # (checkpoint saved during warmup) and cosine should anneal from target_lr.
         self._cosine_scheduler.base_lrs = [self.config.target_lr]
+
+        # Re-seed the LR *only* when the checkpoint was pinned at eta_min. PyTorch's
+        # CosineAnnealingLR.step() is recurrent -- it scales the *previous* LR by
+        # (lr - eta_min). A checkpoint saved at eta_min (a short schedule that ran to
+        # completion) makes that factor zero, so the LR would stay pinned at the floor
+        # forever regardless of base_lrs, even though last_epoch now sits within a
+        # longer horizon. Seeding the optimizer LR (and cached _last_lr) from the
+        # cosine closed form restores headroom so the schedule resumes correctly.
+        # When not floored we leave the restored LR untouched: the live LR is carried
+        # by the optimizer checkpoint, and stepping continues the cosine normally.
+        saved_last_lr = cosine_state.get("_last_lr") or []
+        floored = abs(self.get_lr() - self.config.min_lr) < 1e-12 or (
+            len(saved_last_lr) > 0
+            and abs(saved_last_lr[0] - self.config.min_lr) < 1e-12
+        )
+        if floored:
+            closed_form_lr = (
+                self.config.min_lr
+                + (self.config.target_lr - self.config.min_lr)
+                * (1 + math.cos(math.pi * last_epoch / t_max))
+                / 2
+            )
+            self._set_lr(closed_form_lr)
+            self._cosine_scheduler._last_lr = [closed_form_lr]
 
         logger.info(
             f"Restored LR scheduler (epoch={last_epoch}, T_max={t_max}, "
