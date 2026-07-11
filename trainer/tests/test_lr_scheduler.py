@@ -9,6 +9,8 @@ Tests cover:
 - Edge cases (zero warmup, completed schedules)
 """
 
+import math
+
 import pytest
 import torch
 from torch.optim import SGD, Adam
@@ -431,6 +433,69 @@ class TestEdgeCases:
         assert "WarmupCosineScheduler" in repr_str
         assert "lr=" in repr_str
         assert "phase=" in repr_str
+
+
+class TestResumeReheatsFlooredLR:
+    """Regression tests for the eta_min-floor resume bug.
+
+    A cosine schedule that bottomed out at eta_min under one horizon used to pin the
+    LR at the floor forever on every subsequent resume, because PyTorch's
+    CosineAnnealingLR.step() is recurrent -- it scales the *previous* LR by
+    (lr - eta_min), which is zero once the LR reaches eta_min. Resetting base_lrs did
+    not help (the recurrent path ignores it). This starved long training runs of
+    learning rate. See lr_scheduler._restore_cosine_state.
+    """
+
+    def test_resume_under_longer_horizon_is_not_floored(self):
+        """A completed short schedule, resumed under a longer horizon, must give a
+        usable LR at the correct cosine position -- not stay pinned at eta_min."""
+        # 1) Short schedule, run to exactly T_max -> LR bottoms at eta_min.
+        #    (Stepping *past* T_max would curve back up via cosine periodicity, so
+        #    stop exactly at the end to reproduce the floored-checkpoint state.)
+        optimizer = Adam([torch.randn(10, requires_grad=True)], lr=0.001)
+        short = LRConfig(target_lr=0.001, warmup_steps=0, total_steps=10, min_ratio=0.1)
+        scheduler = WarmupCosineScheduler(optimizer, short)
+        for _ in range(10):  # T_max=10 -> ends exactly at eta_min
+            scheduler.step()
+        assert abs(scheduler.get_lr() - 0.0001) < 1e-9  # floored at eta_min
+        state = scheduler.state_dict()
+
+        # 2) Resume under a much longer horizon (e.g. iterations increased). Emulate
+        #    the optimizer-state restore that pins the group LR at eta_min, which is
+        #    what makes the new cosine's base_lrs start at the floor.
+        optimizer2 = Adam([torch.randn(10, requires_grad=True)], lr=0.001)
+        for g in optimizer2.param_groups:
+            g["lr"] = 0.0001
+        long_cfg = LRConfig(
+            target_lr=0.001, warmup_steps=0, total_steps=1000, min_ratio=0.1
+        )
+        scheduler2 = WarmupCosineScheduler(optimizer2, long_cfg, from_checkpoint=True)
+        scheduler2.load_state_dict(state)
+
+        # last_epoch (10) sits near the start of the 1000-step horizon, so the LR
+        # must be well above the floor -- matching the closed-form cosine value.
+        expected = 0.0001 + (0.001 - 0.0001) * (1 + math.cos(math.pi * 10 / 1000)) / 2
+        assert scheduler2.get_lr() > 5 * 0.0001, "LR is still floored at eta_min"
+        assert abs(scheduler2.get_lr() - expected) < 1e-4
+
+        # And it must keep producing usable, non-increasing LRs as we continue.
+        lrs = [scheduler2.step() for _ in range(50)]
+        assert all(lr > 0.00011 for lr in lrs), "LR collapsed back to eta_min"
+        assert lrs[0] >= lrs[-1]  # still annealing downward
+
+    def test_resume_genuinely_completed_schedule_stays_at_min(self):
+        """When the *current* horizon is also complete, the LR should stay at min."""
+        optimizer = Adam([torch.randn(10, requires_grad=True)], lr=0.001)
+        cfg = LRConfig(target_lr=0.001, warmup_steps=0, total_steps=10, min_ratio=0.1)
+        scheduler = WarmupCosineScheduler(optimizer, cfg)
+        for _ in range(15):
+            scheduler.step()
+        state = scheduler.state_dict()
+
+        optimizer2 = Adam([torch.randn(10, requires_grad=True)], lr=0.001)
+        scheduler2 = WarmupCosineScheduler(optimizer2, cfg, from_checkpoint=True)
+        scheduler2.load_state_dict(state)
+        assert abs(scheduler2.get_lr() - 0.0001) < 1e-6
 
 
 if __name__ == "__main__":
