@@ -3,6 +3,7 @@
 //! These are extracted from `search.rs` and re-exported there (and from the
 //! crate root) so the public API is unchanged.
 
+use engine_core::LegalMask;
 use thiserror::Error;
 
 use crate::evaluator::EvaluatorError;
@@ -13,7 +14,7 @@ pub(crate) struct PendingLeaf {
     pub(crate) node_id: NodeId,
     pub(crate) state: Vec<u8>,
     pub(crate) obs: Vec<u8>,
-    pub(crate) legal_mask: u64,
+    pub(crate) legal_mask: LegalMask,
 }
 
 /// Result of selecting a leaf node during MCTS simulation.
@@ -25,7 +26,7 @@ pub(crate) enum LeafResult {
         node_id: NodeId,
         state: Vec<u8>,
         obs: Vec<u8>,
-        legal_mask: u64,
+        legal_mask: LegalMask,
     },
     /// Already expanded (edge case - shouldn't normally happen).
     AlreadyExpanded,
@@ -54,7 +55,7 @@ pub enum SearchError {
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     /// Best action to take
-    pub action: u8,
+    pub action: u32,
 
     /// Policy distribution over actions (visit counts normalized)
     pub policy: Vec<f32>,

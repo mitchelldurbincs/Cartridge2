@@ -18,7 +18,7 @@ fn test_mcts_basic_search() {
 
     let reset = ctx.reset(42, &[]).unwrap();
     // All 9 positions are legal at the start of TicTacToe
-    let legal_mask = 0b111111111u64;
+    let legal_mask = LegalMask::from_u64(0b111111111, 9);
 
     let mut rng = ChaCha20Rng::seed_from_u64(42);
     let result = run_mcts(
@@ -75,7 +75,7 @@ fn test_mcts_finds_winning_move() {
     }
 
     // Now it's X's turn, position 2 wins
-    let legal_mask = 0b111100100u64; // positions 2, 5, 6, 7, 8 are legal
+    let legal_mask = LegalMask::from_u64(0b111100100, 9); // positions 2, 5, 6, 7, 8 are legal
 
     let mut rng = ChaCha20Rng::seed_from_u64(42);
     let result = run_mcts(
@@ -116,27 +116,21 @@ fn test_mcts_winning_move_has_positive_value() {
     let moves = [0u32, 3, 1, 4];
     let mut state = reset.state;
     let mut obs = reset.obs;
-    let mut info = 0u64;
 
     for m in moves {
         let action = m.to_le_bytes().to_vec();
         let step = ctx.step(&state, &action).unwrap();
         state = step.state;
         obs = step.obs;
-        info = step.info;
     }
 
-    // Extract legal mask from info
-    let num_actions = match ctx.action_space() {
-        ActionSpace::Discrete(n) => n,
-        _ => panic!("Expected discrete action space"),
-    };
-    let legal_mask = info_bits::extract_legal_mask(info, num_actions);
+    // Extract legal mask from the observation (the authoritative source)
+    let legal_mask = ctx.metadata().legal_mask_from_obs(&obs);
 
     // Verify position 2 is legal
     assert!(
-        (legal_mask >> 2) & 1 == 1,
-        "Position 2 should be legal, mask={:#b}",
+        legal_mask.is_legal(2),
+        "Position 2 should be legal, mask={:?}",
         legal_mask
     );
 
@@ -219,6 +213,88 @@ fn test_mcts_winning_move_has_positive_value() {
         result.policy[2] > 0.5,
         "Policy should favor winning move, got {}",
         result.policy[2]
+    );
+}
+
+#[test]
+fn test_mcts_generals_257_actions() {
+    // Regression test for the u64 mask ceiling: generals_8x8 has 257 actions
+    // (256 moves + wait), which cannot fit in a u64 mask or in info_bits.
+    engine_games::register_all_games();
+    let mut ctx = EngineContext::new("generals_8x8").unwrap();
+    let evaluator = UniformEvaluator::new();
+    let config = MctsConfig::for_testing().with_simulations(50);
+
+    let reset = ctx.reset(42, &[]).unwrap();
+    let meta = ctx.metadata();
+    assert_eq!(meta.num_actions, 257);
+    let legal_mask = meta.legal_mask_from_obs(&reset.obs);
+    // Wait (action 256, past the u64 boundary) must be legal at the root
+    assert!(legal_mask.is_legal(256));
+
+    let mut rng = ChaCha20Rng::seed_from_u64(42);
+    let result = run_mcts(
+        &mut ctx,
+        &evaluator,
+        config,
+        reset.state,
+        reset.obs.clone(),
+        legal_mask.clone(),
+        &mut rng,
+    )
+    .unwrap();
+
+    // The chosen action must be legal and the policy confined to legal moves
+    assert!(legal_mask.is_legal(result.action as usize));
+    assert_eq!(result.policy.len(), 257);
+    for (a, &p) in result.policy.iter().enumerate() {
+        if p > 0.0 {
+            assert!(
+                legal_mask.is_legal(a),
+                "policy mass on illegal action {}",
+                a
+            );
+        }
+    }
+    assert!(result.simulations > 0);
+}
+
+#[test]
+fn test_single_batch_search_spreads_visits() {
+    // Regression test for the virtual-loss sign bug: when all simulations
+    // fit in one evaluation batch (sims <= eval_batch_size), virtual loss
+    // with the wrong sign made every simulation pile onto one child (the
+    // last-index tie-winner), producing one-hot policy targets and
+    // collapsing self-play training.
+    engine_games::register_all_games();
+    let mut ctx = EngineContext::new("tictactoe").unwrap();
+    let evaluator = UniformEvaluator::new();
+    let config = MctsConfig::for_testing()
+        .with_simulations(9)
+        .with_eval_batch_size(64) // all sims in a single batch
+        .with_temperature(1.0); // visit-proportional policy, not greedy
+
+    let reset = ctx.reset(42, &[]).unwrap();
+    let legal_mask = LegalMask::from_u64(0b111111111, 9);
+
+    let mut rng = ChaCha20Rng::seed_from_u64(42);
+    let result = run_mcts(
+        &mut ctx,
+        &evaluator,
+        config,
+        reset.state,
+        reset.obs,
+        legal_mask,
+        &mut rng,
+    )
+    .unwrap();
+
+    let support = result.policy.iter().filter(|&&p| p > 0.0).count();
+    assert!(
+        support >= 5,
+        "single-batch search must spread visits over children, support={} policy={:?}",
+        support,
+        result.policy
     );
 }
 

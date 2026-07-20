@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::legal_mask::LegalMask;
+
 /// Metadata about a game for UI display and configuration
 ///
 /// This struct contains all the information needed to:
@@ -166,6 +168,15 @@ impl GameMetadata {
             }
         }
         mask
+    }
+
+    /// Extract the legal-move mask from observation bytes as a [`LegalMask`].
+    ///
+    /// Unlike [`extract_legal_mask`](Self::extract_legal_mask), this works for
+    /// any action-space size (Othello's 65, Generals' 257, ...). Prefer this
+    /// in new code.
+    pub fn legal_mask_from_obs(&self, obs: &[u8]) -> LegalMask {
+        LegalMask::from_obs(obs, self.legal_mask_offset, self.num_actions)
     }
 
     /// Extract legal moves as a vector of action indices.

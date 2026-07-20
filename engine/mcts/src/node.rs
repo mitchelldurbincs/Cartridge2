@@ -3,6 +3,8 @@
 //! Each node represents a game state reached by taking an action from the parent.
 //! Nodes store visit statistics used for UCB selection and policy improvement.
 
+use engine_core::LegalMask;
+
 /// Index into the node arena. Using a newtype for type safety.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(pub u32);
@@ -26,7 +28,7 @@ pub struct MctsNode {
     pub parent: NodeId,
 
     /// Action that led to this node from parent (0-indexed)
-    pub action: u8,
+    pub action: u32,
 
     /// Number of times this node has been visited
     pub visit_count: u32,
@@ -45,17 +47,17 @@ pub struct MctsNode {
     /// Terminal reward (only valid if is_terminal)
     pub terminal_value: f32,
 
-    /// Legal moves mask at this state (packed into bits)
-    pub legal_moves_mask: u64,
+    /// Legal moves mask at this state
+    pub legal_moves_mask: LegalMask,
 
     /// Children: Vec of (action, NodeId) pairs.
     /// Empty until node is expanded.
-    pub children: Vec<(u8, NodeId)>,
+    pub children: Vec<(u32, NodeId)>,
 }
 
 impl MctsNode {
     /// Create a new root node.
-    pub fn new_root(legal_moves_mask: u64) -> Self {
+    pub fn new_root(legal_moves_mask: LegalMask) -> Self {
         Self {
             parent: NodeId::NONE,
             action: 0,
@@ -72,9 +74,9 @@ impl MctsNode {
     /// Create a new child node.
     pub fn new_child(
         parent: NodeId,
-        action: u8,
+        action: u32,
         prior: f32,
-        legal_moves_mask: u64,
+        legal_moves_mask: LegalMask,
         is_terminal: bool,
         terminal_value: f32,
     ) -> Self {
@@ -144,7 +146,7 @@ impl MctsNode {
 
     /// Get the most visited child action.
     /// Returns None if no children or all unvisited.
-    pub fn best_child_by_visits<'a>(&self, arena: &'a [MctsNode]) -> Option<(u8, &'a MctsNode)> {
+    pub fn best_child_by_visits<'a>(&self, arena: &'a [MctsNode]) -> Option<(u32, &'a MctsNode)> {
         self.children
             .iter()
             .map(|(action, id)| (*action, &arena[id.0 as usize]))
@@ -153,7 +155,7 @@ impl MctsNode {
 
     /// Get visit count distribution over children (for training targets).
     /// Returns a vector of (action, visit_fraction) pairs.
-    pub fn visit_distribution(&self, arena: &[MctsNode]) -> Vec<(u8, f32)> {
+    pub fn visit_distribution(&self, arena: &[MctsNode]) -> Vec<(u32, f32)> {
         let total_visits: u32 = self
             .children
             .iter()
@@ -188,7 +190,7 @@ mod tests {
 
     #[test]
     fn test_new_root() {
-        let node = MctsNode::new_root(0b111);
+        let node = MctsNode::new_root(LegalMask::from_u64(0b111, 9));
 
         assert!(node.parent.is_none());
         assert_eq!(node.visit_count, 0);
@@ -199,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_mean_value() {
-        let mut node = MctsNode::new_root(0);
+        let mut node = MctsNode::new_root(LegalMask::new(9));
 
         // Unvisited
         assert!((node.mean_value()).abs() < 1e-6);
@@ -212,7 +214,7 @@ mod tests {
 
     #[test]
     fn test_ucb_score() {
-        let mut node = MctsNode::new_root(0);
+        let mut node = MctsNode::new_root(LegalMask::new(9));
         node.prior = 0.5;
         node.visit_count = 10;
         node.value_sum = 5.0; // Q from child's perspective = 0.5
@@ -234,7 +236,7 @@ mod tests {
 
     #[test]
     fn test_is_leaf() {
-        let mut node = MctsNode::new_root(0);
+        let mut node = MctsNode::new_root(LegalMask::new(9));
 
         // Initially a leaf (no children)
         assert!(node.is_leaf());
@@ -244,7 +246,7 @@ mod tests {
         assert!(!node.is_leaf());
 
         // Terminal nodes are always leaves
-        let mut terminal = MctsNode::new_root(0);
+        let mut terminal = MctsNode::new_root(LegalMask::new(9));
         terminal.is_terminal = true;
         terminal.children.push((0, NodeId(1)));
         assert!(terminal.is_leaf());

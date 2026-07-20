@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use engine_core::LegalMask;
 use ort::{session::Session, value::Value};
 use tracing::debug;
 
@@ -187,10 +188,10 @@ impl OnnxEvaluator {
     }
 
     /// Apply softmax with masking for illegal moves.
-    fn masked_softmax(logits: &[f32], legal_mask: u64, num_actions: usize) -> Vec<f32> {
+    fn masked_softmax(logits: &[f32], legal_mask: &LegalMask, num_actions: usize) -> Vec<f32> {
         let mut max_logit = f32::NEG_INFINITY;
         for (i, &logit) in logits.iter().enumerate().take(num_actions) {
-            if (legal_mask >> i) & 1 == 1 && logit > max_logit {
+            if legal_mask.is_legal(i) && logit > max_logit {
                 max_logit = logit;
             }
         }
@@ -204,7 +205,7 @@ impl OnnxEvaluator {
         let mut exp_values = vec![0.0; num_actions];
 
         for (i, &logit) in logits.iter().enumerate().take(num_actions) {
-            if (legal_mask >> i) & 1 == 1 {
+            if legal_mask.is_legal(i) {
                 let exp_val = (logit - max_logit).exp();
                 exp_values[i] = exp_val;
                 exp_sum += exp_val;
@@ -225,7 +226,7 @@ impl Evaluator for OnnxEvaluator {
     fn evaluate(
         &self,
         obs: &[u8],
-        legal_moves_mask: u64,
+        legal_moves_mask: &LegalMask,
         num_actions: usize,
     ) -> Result<EvalResult, EvaluatorError> {
         // Track prep time: converting bytes and creating tensor
@@ -308,7 +309,7 @@ impl Evaluator for OnnxEvaluator {
     fn evaluate_batch(
         &self,
         observations: &[&[u8]],
-        legal_moves_masks: &[u64],
+        legal_moves_masks: &[&LegalMask],
         num_actions: usize,
     ) -> Result<Vec<EvalResult>, EvaluatorError> {
         if observations.is_empty() {
@@ -388,7 +389,7 @@ impl Evaluator for OnnxEvaluator {
         // Build results for each batch item
         let mut results = Vec::with_capacity(batch_size);
 
-        for (i, &legal_mask) in legal_moves_masks.iter().enumerate().take(batch_size) {
+        for (i, legal_mask) in legal_moves_masks.iter().enumerate().take(batch_size) {
             let logits_start = i * action_size;
             let logits_end = logits_start + action_size;
             let logits = &policy_flat[logits_start..logits_end];
@@ -465,7 +466,7 @@ impl Evaluator for SharedOnnxEvaluator {
     fn evaluate(
         &self,
         obs: &[u8],
-        legal_moves_mask: u64,
+        legal_moves_mask: &LegalMask,
         num_actions: usize,
     ) -> Result<EvalResult, EvaluatorError> {
         self.inner.evaluate(obs, legal_moves_mask, num_actions)
@@ -474,7 +475,7 @@ impl Evaluator for SharedOnnxEvaluator {
     fn evaluate_batch(
         &self,
         observations: &[&[u8]],
-        legal_moves_masks: &[u64],
+        legal_moves_masks: &[&LegalMask],
         num_actions: usize,
     ) -> Result<Vec<EvalResult>, EvaluatorError> {
         self.inner

@@ -9,21 +9,21 @@ use rand_chacha::ChaCha20Rng;
 use crate::types::SearchError;
 
 /// Sample an action from a probability distribution.
-pub(crate) fn sample_action(policy: &[f32], rng: &mut ChaCha20Rng) -> Result<u8, SearchError> {
+pub(crate) fn sample_action(policy: &[f32], rng: &mut ChaCha20Rng) -> Result<u32, SearchError> {
     let r: f32 = rng.gen();
     let mut cumsum = 0.0;
 
     for (i, &p) in policy.iter().enumerate() {
         cumsum += p;
         if r < cumsum {
-            return Ok(i as u8);
+            return Ok(i as u32);
         }
     }
 
     // Fallback to last non-zero action (handles floating point issues)
     for (i, &p) in policy.iter().enumerate().rev() {
         if p > 0.0 {
-            return Ok(i as u8);
+            return Ok(i as u32);
         }
     }
 

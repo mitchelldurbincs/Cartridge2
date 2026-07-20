@@ -12,6 +12,7 @@ pub mod board_game;
 pub mod context;
 pub mod erased;
 pub mod game_utils;
+pub mod legal_mask;
 pub mod metadata;
 pub mod registry;
 pub mod typed;
@@ -21,6 +22,7 @@ pub use adapter::GameAdapter;
 pub use board_game::TwoPlayerObs;
 pub use context::{EngineContext, ResetResult, StepResult};
 pub use erased::ErasedGame;
+pub use legal_mask::LegalMask;
 pub use metadata::GameMetadata;
 pub use registry::{
     clear_registry, create_game, is_registered, list_registered_games, register_game, GameFactory,

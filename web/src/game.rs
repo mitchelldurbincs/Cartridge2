@@ -205,7 +205,10 @@ impl GameSession {
         }
 
         // Build legal moves mask
-        let legal_mask: u64 = legal.iter().fold(0u64, |acc, &pos| acc | (1u64 << pos));
+        let mut legal_mask = engine_core::LegalMask::new(self.metadata.num_actions);
+        for &pos in &legal {
+            legal_mask.set(pos as usize);
+        }
 
         // Check if we have a model
         let has_model = {
@@ -250,7 +253,8 @@ impl GameSession {
                     "MCTS selected move"
                 );
 
-                Ok(result.action as u8)
+                u8::try_from(result.action)
+                    .map_err(|_| anyhow!("Action {} does not fit in u8", result.action))
             })();
 
             match mcts_result {

@@ -64,6 +64,10 @@ def setup_replay(trainer: "Trainer", replay, env_id: str) -> None:
     db_metadata = replay.get_metadata(env_id)
     if db_metadata:
         logger.info(f"Using game metadata from database for {env_id}")
+        # DB metadata only describes the observation layout; keep the
+        # network-architecture settings (network type, channel count, etc.)
+        # from the registry config the trainer was initialized with.
+        fallback = trainer.game_config
         trainer.game_config = GameConfig(
             env_id=db_metadata.env_id,
             display_name=db_metadata.display_name,
@@ -72,6 +76,12 @@ def setup_replay(trainer: "Trainer", replay, env_id: str) -> None:
             num_actions=db_metadata.num_actions,
             obs_size=db_metadata.obs_size,
             legal_mask_offset=db_metadata.legal_mask_offset,
+            hidden_size=fallback.hidden_size,
+            network_type=fallback.network_type,
+            num_res_blocks=fallback.num_res_blocks,
+            num_filters=fallback.num_filters,
+            input_channels=fallback.input_channels,
+            player_relative_obs=fallback.player_relative_obs,
         )
     else:
         logger.warning(f"No metadata in database for {env_id}, using fallback config")

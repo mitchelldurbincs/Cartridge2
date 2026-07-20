@@ -8,8 +8,7 @@
 
 use std::time::Instant;
 
-use engine_core::game_utils::info_bits;
-use engine_core::{ActionSpace, EngineContext};
+use engine_core::{ActionSpace, EngineContext, LegalMask};
 use rand_chacha::ChaCha20Rng;
 use tracing::debug;
 
@@ -30,6 +29,9 @@ pub struct MctsSearch<'a, E: Evaluator> {
     evaluator: &'a E,
     config: MctsConfig,
     num_actions: usize,
+    /// Float offset of the legal-move plane in the observation; child masks
+    /// are read from the child obs rather than the (width-limited) info bits.
+    legal_mask_offset: usize,
     root_state: Vec<u8>,
     root_obs: Vec<u8>,
     step_state_buf: Vec<u8>,
@@ -44,12 +46,14 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
         config: MctsConfig,
         state: Vec<u8>,
         obs: Vec<u8>,
-        legal_moves_mask: u64,
+        legal_moves_mask: LegalMask,
     ) -> Result<Self, SearchError> {
         let num_actions = match ctx.action_space() {
             ActionSpace::Discrete(n) => n as usize,
             _ => return Err(SearchError::UnsupportedActionSpace),
         };
+        let legal_mask_offset = ctx.metadata().legal_mask_offset;
+        debug_assert_eq!(legal_moves_mask.num_actions(), num_actions);
 
         let tree = MctsTree::new(legal_moves_mask);
         let state_capacity = state.len().max(64);
@@ -61,6 +65,7 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             evaluator,
             config,
             num_actions,
+            legal_mask_offset,
             root_state: state,
             root_obs: obs,
             step_state_buf: Vec::with_capacity(state_capacity),
@@ -76,13 +81,18 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
         let search_start = Instant::now();
         let mut stats = SearchStats::default();
 
-        // First, expand the root if needed (single NN call, special case)
+        // First, expand the root if needed (single NN call, special case).
+        // Backpropagate the root evaluation so the root starts with one
+        // visit: with zero parent visits the UCB exploration term is
+        // c*prior*sqrt(0) = 0 for every child, making the first selection a
+        // pure tie broken by child order instead of by prior.
         if !self.tree.get(self.tree.root()).is_expanded() {
             let root_id = self.tree.root();
-            let legal_mask = self.tree.get(root_id).legal_moves_mask;
+            let legal_mask = self.tree.get(root_id).legal_moves_mask.clone();
             let root_state = self.root_state.clone();
             let root_obs = self.root_obs.clone();
-            self.expand_node(root_id, &root_state, &root_obs, legal_mask)?;
+            let root_value = self.expand_node(root_id, &root_state, &root_obs, &legal_mask)?;
+            self.tree.backpropagate(root_id, root_value);
         }
 
         // Add Dirichlet noise to root if configured
@@ -90,11 +100,19 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             self.add_dirichlet_noise(rng);
         }
 
-        // Batched simulation loop
-        let batch_size = self.config.eval_batch_size.max(1);
+        // Batched simulation loop. Cap the batch to a quarter of the
+        // simulation budget so evaluations interleave with selection: if
+        // every simulation were collected before the first evaluation
+        // returned, visit counts would be driven purely by priors and
+        // virtual loss, and the search would never use its value estimates.
+        let target_simulations = self.config.num_simulations;
+        let batch_size = self
+            .config
+            .eval_batch_size
+            .max(1)
+            .min(((target_simulations as usize) / 4).max(1));
         let mut pending: Vec<PendingLeaf> = Vec::with_capacity(batch_size);
         let mut completed_simulations: u32 = 0;
-        let target_simulations = self.config.num_simulations;
 
         while completed_simulations < target_simulations {
             // Selection phase: collect leaves until batch is full or we've queued enough
@@ -226,15 +244,10 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
     fn select_leaf(&mut self) -> Result<LeafResult, SearchError> {
         let (leaf_id, path) = self.select();
 
-        // Check terminal/expanded status first (no cloning needed for early returns)
-        let (is_terminal, terminal_value, is_expanded, legal_mask) = {
+        // Check terminal/expanded status first (no mask cloning for early returns)
+        let (is_terminal, terminal_value, is_expanded) = {
             let leaf = self.tree.get(leaf_id);
-            (
-                leaf.is_terminal,
-                leaf.terminal_value,
-                leaf.is_expanded(),
-                leaf.legal_moves_mask,
-            )
+            (leaf.is_terminal, leaf.terminal_value, leaf.is_expanded())
         };
 
         if is_terminal {
@@ -248,14 +261,19 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             return Ok(LeafResult::AlreadyExpanded);
         }
 
+        let legal_mask = self.tree.get(leaf_id).legal_moves_mask.clone();
+
         // Reconstruct state/obs for this path on demand.
         let (state, obs) = self.reconstruct_position(&path)?;
 
-        // Apply virtual loss to discourage selecting this node again
-        // before it's been evaluated (prevents duplicate selection in batch)
+        // Apply virtual loss to discourage selecting this node again before
+        // it's been evaluated (prevents duplicate selection in a batch).
+        // Nodes store values from their own (opponent-of-parent) perspective
+        // and UCB negates them, so making the node LESS attractive to its
+        // parent means RAISING its value sum.
         let leaf_mut = self.tree.get_mut(leaf_id);
         leaf_mut.visit_count += 1;
-        leaf_mut.value_sum -= self.config.virtual_loss;
+        leaf_mut.value_sum += self.config.virtual_loss;
 
         Ok(LeafResult::NeedsEvaluation {
             node_id: leaf_id,
@@ -271,7 +289,7 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
         let mut obs = self.root_obs.clone();
 
         for &node_id in path.iter().skip(1) {
-            let action_bytes = (self.tree.get(node_id).action as u32).to_le_bytes();
+            let action_bytes = self.tree.get(node_id).action.to_le_bytes();
             self.ctx
                 .step_into(
                     &state,
@@ -295,7 +313,7 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
         node_id: NodeId,
         parent_state: &[u8],
         parent_obs: &[u8],
-        legal_mask: u64,
+        legal_mask: &LegalMask,
     ) -> Result<f32, SearchError> {
         let node = self.tree.get(node_id);
 
@@ -328,7 +346,7 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
 
         // Prepare batch inputs
         let observations: Vec<&[u8]> = pending.iter().map(|p| p.obs.as_slice()).collect();
-        let legal_masks: Vec<u64> = pending.iter().map(|p| p.legal_mask).collect();
+        let legal_masks: Vec<&LegalMask> = pending.iter().map(|p| &p.legal_mask).collect();
 
         // Single batched NN call - track inference time
         let inference_start = Instant::now();
@@ -342,16 +360,23 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             // Remove virtual loss before applying real values
             let node = self.tree.get_mut(leaf.node_id);
             node.visit_count -= 1;
-            node.value_sum += self.config.virtual_loss;
+            node.value_sum -= self.config.virtual_loss;
 
-            // Expand the node with children - track expansion time and game steps
+            // Expand the node with children - track expansion time and game
+            // steps. A leaf can appear more than once in a batch (it stays
+            // unexpanded while pending); only the first occurrence expands,
+            // or children would be duplicated.
             let expansion_start = Instant::now();
-            let steps = self.expand_node_with_eval_counted(
-                leaf.node_id,
-                &leaf.state,
-                leaf.legal_mask,
-                eval,
-            )?;
+            let steps = if !self.tree.get(leaf.node_id).is_expanded() {
+                self.expand_node_with_eval_counted(
+                    leaf.node_id,
+                    &leaf.state,
+                    &leaf.legal_mask,
+                    eval,
+                )?
+            } else {
+                0
+            };
             stats.expansion_time_us += expansion_start.elapsed().as_micros() as u64;
             stats.game_steps += steps;
 
@@ -369,17 +394,13 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
         &mut self,
         node_id: NodeId,
         parent_state: &[u8],
-        legal_mask: u64,
+        legal_mask: &LegalMask,
         eval: &crate::evaluator::EvalResult,
     ) -> Result<u32, SearchError> {
         let mut step_count = 0;
 
         // Add children for each legal action
-        for action in 0..self.num_actions {
-            if (legal_mask >> action) & 1 == 0 {
-                continue; // Illegal action
-            }
-
+        for action in legal_mask.iter_ones() {
             let prior = eval.policy[action];
             if prior < 1e-8 {
                 continue; // Skip zero-prior actions
@@ -387,7 +408,7 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
 
             // Simulate the action using zero-copy buffers.
             let action_bytes = (action as u32).to_le_bytes();
-            let (reward, done, info) = self
+            let (reward, done, _info) = self
                 .ctx
                 .step_into(
                     parent_state,
@@ -398,15 +419,18 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
                 .map_err(|e| SearchError::EngineError(e.to_string()))?;
             step_count += 1;
 
-            // Extract legal moves from info bits
-            let child_legal_mask = info_bits::extract_legal_mask(info, self.num_actions as u32);
+            // Read the child's legal moves from its observation. The obs is
+            // the authoritative source: info bits collide with the player/
+            // winner fields past 16 actions and cannot hold >64 actions.
+            let child_legal_mask =
+                LegalMask::from_obs(&self.step_obs_buf, self.legal_mask_offset, self.num_actions);
 
             // Terminal value (negated for opponent's perspective)
             let terminal_value = if done { -reward } else { 0.0 };
 
             self.tree.add_child(
                 node_id,
-                action as u8,
+                action as u32,
                 prior,
                 child_legal_mask,
                 done,
@@ -453,7 +477,7 @@ pub fn run_mcts<E: Evaluator>(
     config: MctsConfig,
     state: Vec<u8>,
     obs: Vec<u8>,
-    legal_moves_mask: u64,
+    legal_moves_mask: LegalMask,
     rng: &mut ChaCha20Rng,
 ) -> Result<SearchResult, SearchError> {
     let mut search = MctsSearch::new(ctx, evaluator, config, state, obs, legal_moves_mask)?;

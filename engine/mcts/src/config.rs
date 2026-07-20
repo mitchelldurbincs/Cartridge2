@@ -27,10 +27,11 @@ pub struct MctsConfig {
     pub temperature: f32,
 
     /// Magnitude of the virtual loss applied to a leaf while it waits in a
-    /// pending evaluation batch. The leaf's value sum is reduced by this amount
-    /// (and its visit count incremented) when selected, then restored before
-    /// backpropagation, discouraging the same leaf from being selected twice
-    /// within one batch.
+    /// pending evaluation batch. The leaf's value sum is RAISED by this
+    /// amount (and its visit count incremented) when selected — nodes store
+    /// values from the opponent-of-parent perspective and UCB negates them,
+    /// so a higher stored value makes the node less attractive to its
+    /// parent. Restored before backpropagation.
     pub virtual_loss: f32,
 
     /// Batch size for neural network evaluation.

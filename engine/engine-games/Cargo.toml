@@ -8,6 +8,7 @@ description = "Game registration for Cartridge engine"
 games-tictactoe = { path = "../games-tictactoe" }
 games-connect4 = { path = "../games-connect4" }
 games-othello = { path = "../games-othello" }
+games-generals = { path = "../games-generals" }
 
 [dev-dependencies]
 engine-core = { path = "../engine-core" }

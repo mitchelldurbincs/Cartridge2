@@ -87,12 +87,15 @@ def create_game_state(env_id: str) -> GameState:
     """
     # Import here to avoid circular imports
     from .connect4 import Connect4State
+    from .generals import GeneralsState
     from .tictactoe import TicTacToeState
 
     if env_id == "tictactoe":
         return TicTacToeState.new()
     elif env_id == "connect4":
         return Connect4State.new()
+    elif env_id == "generals_8x8":
+        return GeneralsState.new()
     else:
         raise ValueError(f"Unsupported game: {env_id}")
 

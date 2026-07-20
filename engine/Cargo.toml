@@ -6,6 +6,7 @@ members = [
     "games-tictactoe",
     "games-connect4",
     "games-othello",
+    "games-generals",
     "mcts",
     "metrics-common",
     "model-watcher"

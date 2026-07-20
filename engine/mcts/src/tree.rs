@@ -5,6 +5,7 @@
 //! and referenced by NodeId indices.
 
 use crate::node::{MctsNode, NodeId};
+use engine_core::LegalMask;
 
 /// MCTS tree with arena-based node storage.
 #[derive(Debug)]
@@ -18,7 +19,7 @@ pub struct MctsTree {
 
 impl MctsTree {
     /// Create a new tree with the given root legal move mask.
-    pub fn new(legal_moves_mask: u64) -> Self {
+    pub fn new(legal_moves_mask: LegalMask) -> Self {
         let root_node = MctsNode::new_root(legal_moves_mask);
         Self {
             nodes: vec![root_node],
@@ -93,9 +94,9 @@ impl MctsTree {
     pub fn add_child(
         &mut self,
         parent_id: NodeId,
-        action: u8,
+        action: u32,
         prior: f32,
-        legal_moves_mask: u64,
+        legal_moves_mask: LegalMask,
         is_terminal: bool,
         terminal_value: f32,
     ) -> NodeId {
@@ -135,7 +136,7 @@ impl MctsTree {
 
     /// Get the best action from root based on visit counts.
     /// Returns (action, visit_count) or None if root has no children.
-    pub fn best_action(&self) -> Option<(u8, u32)> {
+    pub fn best_action(&self) -> Option<(u32, u32)> {
         let root = self.get(self.root);
         root.children
             .iter()
@@ -225,7 +226,7 @@ mod tests {
 
     #[test]
     fn test_new_tree() {
-        let tree = MctsTree::new(0b111);
+        let tree = MctsTree::new(LegalMask::from_u64(0b111, 9));
 
         assert_eq!(tree.len(), 1);
         assert_eq!(tree.root(), NodeId(0));
@@ -236,13 +237,13 @@ mod tests {
 
     #[test]
     fn test_add_child() {
-        let mut tree = MctsTree::new(0b111);
+        let mut tree = MctsTree::new(LegalMask::from_u64(0b111, 9));
 
         let child_id = tree.add_child(
             tree.root(),
             1,   // action
             0.5, // prior
-            0b110,
+            LegalMask::from_u64(0b110, 9),
             false,
             0.0,
         );
@@ -262,11 +263,19 @@ mod tests {
 
     #[test]
     fn test_backpropagate() {
-        let mut tree = MctsTree::new(0b111);
+        let mut tree = MctsTree::new(LegalMask::from_u64(0b111, 9));
 
         // Create a chain: root -> child -> grandchild
-        let child_id = tree.add_child(tree.root(), 0, 0.5, 0b11, false, 0.0);
-        let grandchild_id = tree.add_child(child_id, 1, 0.5, 0b1, false, 0.0);
+        let child_id = tree.add_child(
+            tree.root(),
+            0,
+            0.5,
+            LegalMask::from_u64(0b11, 9),
+            false,
+            0.0,
+        );
+        let grandchild_id =
+            tree.add_child(child_id, 1, 0.5, LegalMask::from_u64(0b1, 9), false, 0.0);
 
         // Backpropagate value 1.0 from grandchild
         tree.backpropagate(grandchild_id, 1.0);
@@ -284,11 +293,11 @@ mod tests {
 
     #[test]
     fn test_select_child() {
-        let mut tree = MctsTree::new(0b111);
+        let mut tree = MctsTree::new(LegalMask::from_u64(0b111, 9));
 
         // Add two children with different priors
-        tree.add_child(tree.root(), 0, 0.3, 0, false, 0.0);
-        tree.add_child(tree.root(), 1, 0.7, 0, false, 0.0);
+        tree.add_child(tree.root(), 0, 0.3, LegalMask::new(9), false, 0.0);
+        tree.add_child(tree.root(), 1, 0.7, LegalMask::new(9), false, 0.0);
 
         // Initially, higher prior should win (UCB dominated by prior when unvisited)
         let best = tree.select_child(tree.root(), 1.0).unwrap();
@@ -297,11 +306,11 @@ mod tests {
 
     #[test]
     fn test_root_policy() {
-        let mut tree = MctsTree::new(0b111);
+        let mut tree = MctsTree::new(LegalMask::from_u64(0b111, 9));
 
         // Add children and simulate visits
-        let c1 = tree.add_child(tree.root(), 0, 0.5, 0, false, 0.0);
-        let c2 = tree.add_child(tree.root(), 1, 0.5, 0, false, 0.0);
+        let c1 = tree.add_child(tree.root(), 0, 0.5, LegalMask::new(9), false, 0.0);
+        let c2 = tree.add_child(tree.root(), 1, 0.5, LegalMask::new(9), false, 0.0);
 
         tree.get_mut(c1).visit_count = 30;
         tree.get_mut(c2).visit_count = 70;
@@ -322,8 +331,15 @@ mod tests {
 
     #[test]
     fn test_tree_stats() {
-        let mut tree = MctsTree::new(0b111);
-        tree.add_child(tree.root(), 0, 0.5, 0b11, false, 0.0);
+        let mut tree = MctsTree::new(LegalMask::from_u64(0b111, 9));
+        tree.add_child(
+            tree.root(),
+            0,
+            0.5,
+            LegalMask::from_u64(0b11, 9),
+            false,
+            0.0,
+        );
 
         let stats = tree.stats();
         assert_eq!(stats.total_nodes, 2);
