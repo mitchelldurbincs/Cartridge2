@@ -4,7 +4,7 @@
 
 Cartridge2 is a simplified AlphaZero training and visualization platform. It enables training neural network game agents via self-play and lets users play against trained models through a web interface.
 
-**Target Games:** TicTacToe (complete), Connect 4 (complete), Othello (complete)
+**Target Games:** TicTacToe (complete), Connect 4 (complete), Othello (complete), Generals 8×8 (`generals_8x8` — engine/trainer complete, training does not yet beat random at local compute scale; no web renderer yet)
 
 **Key Difference from Cartridge1:** This is a monolithic/filesystem approach vs. Cartridge1's microservices architecture. No Kubernetes, no gRPC between services—just shared filesystem and local processes.
 
@@ -78,14 +78,21 @@ npm run build   # Build
 
 Pure game logic library. No network I/O. Library-only design (no gRPC).
 
-- `engine-core/` - Game trait, erased adapter, registry, EngineContext API, GameMetadata (70 tests)
+- `engine-core/` - Game trait, erased adapter, registry, EngineContext API, GameMetadata, LegalMask (88 tests)
 - `engine-config/` - Centralized configuration loading from config.toml (19 tests)
 - `engine-games/` - One-call registration of all bundled games (2 tests)
 - `games-tictactoe/` - TicTacToe implementation (26 tests)
-- `games-connect4/` - Connect 4 implementation (20 tests)
-- `games-othello/` - Othello implementation (25 tests)
-- `mcts/` - Monte Carlo Tree Search implementation (25 tests)
-- `model-watcher/` - Shared model hot-reload utilities (5 tests)
+- `games-connect4/` - Connect 4 implementation (21 tests)
+- `games-othello/` - Othello implementation (27 tests)
+- `games-generals/` - Generals 8×8 implementation (29 tests); see the crate's
+  lib.rs for the ruleset (full-info, alternating turns, territory
+  adjudication, parity-randomized ply cap) and `generals_obs:v1` layout
+- `mcts/` - Monte Carlo Tree Search implementation (27 tests); legal masks are
+  dynamic-width (`LegalMask`) and read from the observation, never `info_bits`.
+  Two diagnostic examples: `generals_policy_probe` (visit-distribution health)
+  and `generals_strength_probe` (MCTS+model vs random — the honest strength
+  measure; the trainer's built-in eval is argmax-only and understates models)
+- `model-watcher/` - Shared model hot-reload utilities (8 tests)
 
 ### Actor (Rust Binary) - `actor/`
 **Status: COMPLETE (86 tests)**
@@ -215,7 +222,7 @@ Svelte 5 frontend with Vite:
 - Responsive dark-mode UI
 
 ### Trainer (Python) - `trainer/`
-**Status: COMPLETE (245 tests)**
+**Status: COMPLETE (302 tests)**
 
 PyTorch training with AlphaZero-style learning and orchestration:
 
@@ -241,7 +248,7 @@ PyTorch training with AlphaZero-style learning and orchestration:
 - Prometheus metrics export
 
 ### crucible Dependency (Python) - sibling repo
-**Status: EXTRACTED (local sibling checkout; not yet on GitHub/PyPI)**
+**Status: EXTRACTED (github.com/mitchelldurbincs/crucible; not on PyPI — CI installs it from GitHub pinned to a commit, local dev uses the editable sibling checkout)**
 
 The trainer's orchestration core lives in the sibling `crucible` repo
 (`crucible` package): the synchronized loop (`Orchestrator`), the
@@ -311,6 +318,7 @@ cartridge2/
 │   ├── games-tictactoe/   # TicTacToe implementation
 │   ├── games-connect4/    # Connect 4 implementation
 │   ├── games-othello/    # Othello implementation
+│   ├── games-generals/   # Generals 8×8 implementation
 │   ├── mcts/              # Monte Carlo Tree Search
 │   │   └── src/
 │   │       ├── config.rs   # MctsConfig
@@ -377,7 +385,8 @@ cartridge2/
 │       │   └── onnx.py    # ONNX model policy
 │       ├── games/         # Pure Python game implementations (for evaluation)
 │       │   ├── tictactoe.py
-│       │   └── connect4.py
+│       │   ├── connect4.py
+│       │   └── generals.py # Mirrors engine/games-generals rules exactly
 │       └── storage/       # Storage backends (PostgreSQL, S3, filesystem)
 ├── Dockerfile.alphazero   # Combined actor+trainer image for Docker
 ├── docker-compose.yml     # Local services (postgres, minio, training, web)
@@ -414,7 +423,7 @@ Settings are loaded with the following priority (highest to lowest):
 ```toml
 [common]
 data_dir = "./data"      # Base data directory
-env_id = "tictactoe"     # Game: tictactoe, connect4, othello
+env_id = "tictactoe"     # Game: tictactoe, connect4, othello, generals_8x8
 log_level = "info"       # trace, debug, info, warn, error
 
 [training]
@@ -583,10 +592,10 @@ cd actor && cargo build --release
 cd web && cargo build --release
 
 # Run all tests
-cd engine && cargo test   # 192 tests (70 core + 19 config + 2 games + 26 tictactoe + 20 connect4 + 25 othello + 25 mcts + 5 model-watcher)
-cd actor && cargo test    # 86 tests
-cd web && cargo test
-cd trainer && python -m pytest tests/ -v --tb=short  # 245 tests
+cd engine && cargo test   # 260 tests (88 core + 19 config + 2 games + 26 tictactoe + 21 connect4 + 27 othello + 29 generals + 27 mcts + 3 metrics + 8 model-watcher)
+cd actor && cargo test    # 85 tests
+cd web && cargo test      # 98 tests
+cd trainer && python -m pytest tests/ -v --tb=short  # 302 tests (needs crucible: pip install -e ../../crucible)
 
 # Format and lint
 cd engine && cargo fmt && cargo clippy

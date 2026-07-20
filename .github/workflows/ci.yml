@@ -183,7 +183,8 @@ jobs:
           cache: pip
           cache-dependency-path: trainer/pyproject.toml
       - name: Install crucible (orchestration core, sibling repo)
-        run: pip install "crucible @ git+https://github.com/mitchelldurbincs/crucible.git"
+        # Pinned to a commit for reproducible CI; bump deliberately.
+        run: pip install "crucible @ git+https://github.com/mitchelldurbincs/crucible.git@d7eb32c2a2f1724d0a1206fd4137e3893e436e38"
       - name: Install package with dev dependencies
         run: pip install -e ".[dev]"
       - name: Run pytest
