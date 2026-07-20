@@ -43,9 +43,17 @@ class GameConfig:
     # CNN-specific settings (used when network_type="resnet")
     num_res_blocks: int = 4  # Number of residual blocks
     num_filters: int = 128  # Filters per conv layer
-    input_channels: int = (
-        2  # Channels for board encoding (e.g., 2 for each player's pieces)
-    )
+    # Number of spatial board planes in the observation (game-specific;
+    # e.g. 2 for one plane per player's pieces, or more for richer encodings)
+    input_channels: int = 2
+    # True when the obs board planes are already encoded from the
+    # current player's perspective (own/enemy), in which case the network
+    # must NOT receive the current-player indicator: with a seat-relative
+    # board it is a pure side channel, and a systematically advantaged seat
+    # lets the value head collapse into a seat detector instead of learning
+    # positions (observed with generals: P2 wins ~all alternating-turn
+    # self-play games at adjudication).
+    player_relative_obs: bool = False
 
     @property
     def board_size(self) -> int:
@@ -131,6 +139,23 @@ GAME_CONFIGS: dict[str, GameConfig] = {
         num_res_blocks=6,
         num_filters=256,
         input_channels=2,  # Black positions, White positions
+    ),
+    "generals_8x8": GameConfig(
+        env_id="generals_8x8",
+        display_name="Generals 8×8",
+        board_width=8,
+        board_height=8,
+        num_actions=257,  # 64 tiles * 4 directions + 1 wait
+        obs_size=835,  # 576 (9 channels * 64) + 257 (legal) + 2 (player)
+        legal_mask_offset=576,
+        hidden_size=512,
+        network_type="resnet",
+        num_res_blocks=6,
+        num_filters=128,
+        # generals_obs:v1 spatial planes: own/enemy/neutral territory,
+        # own/enemy log-armies, cities, mountains, generals, turn progress
+        input_channels=9,
+        player_relative_obs=True,
     ),
 }
 

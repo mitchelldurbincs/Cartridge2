@@ -308,7 +308,7 @@ def add_evaluate_arguments(
         "--env-id",
         type=str,
         default="tictactoe",
-        choices=["tictactoe", "connect4"],
+        choices=["tictactoe", "connect4", "generals_8x8"],
         help="Game environment to evaluate",
     )
     parser.add_argument(

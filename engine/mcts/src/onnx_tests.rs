@@ -5,8 +5,8 @@ use super::*;
 #[test]
 fn test_masked_softmax_all_legal() {
     let logits = vec![1.0, 2.0, 3.0];
-    let mask = 0b111;
-    let policy = OnnxEvaluator::masked_softmax(&logits, mask, 3);
+    let mask = LegalMask::from_u64(0b111, 3);
+    let policy = OnnxEvaluator::masked_softmax(&logits, &mask, 3);
 
     // Should sum to 1.0
     let sum: f32 = policy.iter().sum();
@@ -20,8 +20,8 @@ fn test_masked_softmax_all_legal() {
 #[test]
 fn test_masked_softmax_with_illegal() {
     let logits = vec![1.0, 2.0, 3.0, 4.0];
-    let mask = 0b0101; // Only actions 0 and 2 are legal
-    let policy = OnnxEvaluator::masked_softmax(&logits, mask, 4);
+    let mask = LegalMask::from_u64(0b0101, 4); // Only actions 0 and 2 are legal
+    let policy = OnnxEvaluator::masked_softmax(&logits, &mask, 4);
 
     // Sum should be 1.0
     let sum: f32 = policy.iter().sum();
@@ -38,8 +38,8 @@ fn test_masked_softmax_with_illegal() {
 #[test]
 fn test_masked_softmax_no_legal() {
     let logits = vec![1.0, 2.0, 3.0];
-    let mask = 0b0; // No legal moves
-    let policy = OnnxEvaluator::masked_softmax(&logits, mask, 3);
+    let mask = LegalMask::new(3); // No legal moves
+    let policy = OnnxEvaluator::masked_softmax(&logits, &mask, 3);
 
     // All should be 0
     for p in &policy {

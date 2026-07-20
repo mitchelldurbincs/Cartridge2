@@ -4,7 +4,7 @@
 //! an ONNX neural network evaluator to select actions.
 
 use anyhow::{anyhow, Result};
-use engine_core::EngineContext;
+use engine_core::{EngineContext, LegalMask};
 use mcts::{run_mcts, MctsConfig, OnnxEvaluator, SearchResult, SearchStats};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -131,7 +131,7 @@ impl MctsPolicy {
     /// # Arguments
     /// * `state` - Current game state bytes
     /// * `obs` - Current observation bytes
-    /// * `legal_moves_mask` - Bit mask of legal actions
+    /// * `legal_moves_mask` - Mask of legal actions (read from the observation)
     /// * `move_number` - Current move number in the game (0-indexed)
     ///
     /// # Returns
@@ -140,7 +140,7 @@ impl MctsPolicy {
         &mut self,
         state: &[u8],
         obs: &[u8],
-        legal_moves_mask: u64,
+        legal_moves_mask: &LegalMask,
         move_number: u32,
     ) -> Result<MctsPolicyResult> {
         // Acquire read lock once and hold it through the operation to avoid TOCTOU race.
@@ -182,7 +182,7 @@ impl MctsPolicy {
             config,
             state.to_vec(),
             obs.to_vec(),
-            legal_moves_mask,
+            legal_moves_mask.clone(),
             &mut self.rng,
         )
         .map_err(|e| anyhow!("MCTS search failed: {}", e))?;
@@ -222,7 +222,7 @@ impl MctsPolicy {
         }
 
         // Convert action index to bytes (u32 little-endian)
-        let action_bytes = (result.action as u32).to_le_bytes().to_vec();
+        let action_bytes = result.action.to_le_bytes().to_vec();
 
         Ok(MctsPolicyResult {
             action: action_bytes,
@@ -233,10 +233,10 @@ impl MctsPolicy {
     }
 
     /// Fall back to random action selection when no model is available
-    fn random_action(&mut self, legal_moves_mask: u64) -> Result<MctsPolicyResult> {
+    fn random_action(&mut self, legal_moves_mask: &LegalMask) -> Result<MctsPolicyResult> {
         use rand::Rng;
 
-        if legal_moves_mask == 0 {
+        if legal_moves_mask.is_empty() {
             return Err(anyhow!("No legal moves available"));
         }
 
@@ -245,11 +245,12 @@ impl MctsPolicy {
         let mut policy = vec![0.0; self.num_actions];
         let mut legal_actions = Vec::new();
 
-        for (i, p) in policy.iter_mut().enumerate().take(self.num_actions) {
-            if (legal_moves_mask >> i) & 1 == 1 {
-                *p = 1.0 / num_legal;
-                legal_actions.push(i);
-            }
+        for i in legal_moves_mask
+            .iter_ones()
+            .filter(|&i| i < self.num_actions)
+        {
+            policy[i] = 1.0 / num_legal;
+            legal_actions.push(i);
         }
 
         // Sample random legal action
@@ -290,10 +291,10 @@ mod tests {
         // Create a dummy state/obs - in practice these come from the game
         let state = vec![0u8; 10]; // TicTacToe state is about 10 bytes
         let obs = vec![0u8; 29 * 4]; // 29 floats = 116 bytes
-        let legal_mask = 0b111111111u64; // All 9 positions legal
+        let legal_mask = LegalMask::from_u64(0b111111111, 9); // All 9 positions legal
 
         // Without a model, should return random action
-        let result = policy.select_action(&state, &obs, legal_mask, 0);
+        let result = policy.select_action(&state, &obs, &legal_mask, 0);
         assert!(result.is_ok());
 
         let result = result.unwrap();
@@ -313,11 +314,11 @@ mod tests {
         let mut policy = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 42);
 
         // Only positions 0, 2, 4 are legal
-        let legal_mask = 0b000010101u64;
+        let legal_mask = LegalMask::from_u64(0b000010101, 9);
 
         // Run multiple times to verify only legal actions selected
         for _ in 0..20 {
-            let result = policy.random_action(legal_mask).unwrap();
+            let result = policy.random_action(&legal_mask).unwrap();
             let action = u32::from_le_bytes(result.action.try_into().unwrap());
             assert!(
                 action == 0 || action == 2 || action == 4,
@@ -334,7 +335,7 @@ mod tests {
     #[test]
     fn test_random_action_no_legal_moves_fails() {
         let mut policy = MctsPolicy::new("tictactoe".into(), 9, 29);
-        let result = policy.random_action(0);
+        let result = policy.random_action(&LegalMask::new(9));
         assert!(result.is_err());
     }
 
@@ -377,8 +378,8 @@ mod tests {
         let mut policy = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 12345);
 
         // Force only action 0 to be legal
-        let legal_mask = 0b000000001u64;
-        let result = policy.random_action(legal_mask).unwrap();
+        let legal_mask = LegalMask::from_u64(0b000000001, 9);
+        let result = policy.random_action(&legal_mask).unwrap();
 
         // Action 0 should encode to [0, 0, 0, 0] (little-endian u32)
         assert_eq!(result.action, vec![0, 0, 0, 0]);
@@ -389,8 +390,8 @@ mod tests {
         let mut policy = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 12345);
 
         // Force only action 4 (center) to be legal
-        let legal_mask = 0b000010000u64;
-        let result = policy.random_action(legal_mask).unwrap();
+        let legal_mask = LegalMask::from_u64(0b000010000, 9);
+        let result = policy.random_action(&legal_mask).unwrap();
 
         // Action 4 should encode to [4, 0, 0, 0] (little-endian u32)
         assert_eq!(result.action, vec![4, 0, 0, 0]);
@@ -401,8 +402,8 @@ mod tests {
         let mut policy = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 12345);
 
         // Force only action 8 to be legal
-        let legal_mask = 0b100000000u64;
-        let result = policy.random_action(legal_mask).unwrap();
+        let legal_mask = LegalMask::from_u64(0b100000000, 9);
+        let result = policy.random_action(&legal_mask).unwrap();
 
         // Action 8 should encode to [8, 0, 0, 0] (little-endian u32)
         assert_eq!(result.action, vec![8, 0, 0, 0]);
@@ -436,7 +437,7 @@ mod tests {
         ];
 
         for mask in masks {
-            let result = policy.random_action(mask).unwrap();
+            let result = policy.random_action(&LegalMask::from_u64(mask, 9)).unwrap();
             let sum: f32 = result.policy.iter().sum();
             assert!(
                 (sum - 1.0).abs() < 1e-5,
@@ -451,8 +452,8 @@ mod tests {
         let mut policy = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 42);
 
         // 3 legal moves
-        let legal_mask = 0b000010101u64; // positions 0, 2, 4
-        let result = policy.random_action(legal_mask).unwrap();
+        let legal_mask = LegalMask::from_u64(0b000010101, 9); // positions 0, 2, 4
+        let result = policy.random_action(&legal_mask).unwrap();
 
         // Each legal move should have 1/3 probability
         let expected = 1.0 / 3.0;
@@ -505,9 +506,9 @@ mod tests {
     #[test]
     fn test_random_action_returns_default_stats() {
         let mut policy = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 42);
-        let legal_mask = 0b111111111u64;
+        let legal_mask = LegalMask::from_u64(0b111111111, 9);
 
-        let result = policy.random_action(legal_mask).unwrap();
+        let result = policy.random_action(&legal_mask).unwrap();
 
         // Without MCTS (no model), stats should be default
         assert_eq!(result.stats.total_time_us, 0);
@@ -518,9 +519,9 @@ mod tests {
     #[test]
     fn test_random_action_returns_neutral_value() {
         let mut policy = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 42);
-        let legal_mask = 0b111111111u64;
+        let legal_mask = LegalMask::from_u64(0b111111111, 9);
 
-        let result = policy.random_action(legal_mask).unwrap();
+        let result = policy.random_action(&legal_mask).unwrap();
 
         // Without a model, value should be neutral (0.0)
         assert!((result.value - 0.0).abs() < 1e-6);
@@ -545,8 +546,8 @@ mod tests {
         let mut policy = MctsPolicy::with_seed("connect4".into(), 7, 127, 42);
 
         // All 7 columns legal in Connect4
-        let legal_mask = 0b1111111u64;
-        let result = policy.random_action(legal_mask).unwrap();
+        let legal_mask = LegalMask::from_u64(0b1111111, 7);
+        let result = policy.random_action(&legal_mask).unwrap();
 
         let action = u32::from_le_bytes(result.action.try_into().unwrap());
         assert!(action < 7, "Connect4 action should be 0-6, got {}", action);
@@ -566,12 +567,12 @@ mod tests {
         let mut policy1 = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 12345);
         let mut policy2 = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 12345);
 
-        let legal_mask = 0b111111111u64;
+        let legal_mask = LegalMask::from_u64(0b111111111, 9);
 
         // They should produce the same sequence of actions
         for _ in 0..10 {
-            let r1 = policy1.random_action(legal_mask).unwrap();
-            let r2 = policy2.random_action(legal_mask).unwrap();
+            let r1 = policy1.random_action(&legal_mask).unwrap();
+            let r2 = policy2.random_action(&legal_mask).unwrap();
             assert_eq!(r1.action, r2.action);
         }
     }
@@ -581,13 +582,13 @@ mod tests {
         let mut policy1 = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 11111);
         let mut policy2 = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 22222);
 
-        let legal_mask = 0b111111111u64;
+        let legal_mask = LegalMask::from_u64(0b111111111, 9);
 
         // Run enough iterations that it's extremely unlikely they match
         let mut matches = 0;
         for _ in 0..20 {
-            let r1 = policy1.random_action(legal_mask).unwrap();
-            let r2 = policy2.random_action(legal_mask).unwrap();
+            let r1 = policy1.random_action(&legal_mask).unwrap();
+            let r2 = policy2.random_action(&legal_mask).unwrap();
             if r1.action == r2.action {
                 matches += 1;
             }

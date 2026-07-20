@@ -552,7 +552,7 @@ impl Actor {
         // Episode state
         let mut current_state = reset_result.state;
         let mut current_obs = reset_result.obs;
-        let mut current_legal_mask = self.game_config.extract_legal_mask(&current_obs);
+        let mut current_legal_mask = self.game_config.legal_mask_from_obs(&current_obs);
         let mut step_number = 0u32;
         let mut steps_taken = 0u32;
         let mut total_reward = 0.0f32;
@@ -568,7 +568,7 @@ impl Actor {
                 policy.select_action(
                     &current_state,
                     &current_obs,
-                    current_legal_mask,
+                    &current_legal_mask,
                     step_number,
                 )?
             };
@@ -632,7 +632,9 @@ impl Actor {
             // Update state for next step
             current_state = step_result.state;
             current_obs = step_result.obs;
-            current_legal_mask = step_result.info & self.game_config.legal_mask_bits();
+            // Read the mask from the obs, not info bits: info collides with the
+            // player/winner fields past 16 actions and cannot hold >64 actions.
+            current_legal_mask = self.game_config.legal_mask_from_obs(&current_obs);
             step_number += 1;
         }
 

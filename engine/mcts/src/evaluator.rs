@@ -4,6 +4,7 @@
 //! for game states. In AlphaZero, this is a neural network. For testing,
 //! we provide a uniform evaluator that returns equal priors.
 
+use engine_core::LegalMask;
 use thiserror::Error;
 
 /// Errors that can occur during evaluation.
@@ -42,7 +43,7 @@ pub trait Evaluator: Send + Sync {
     ///
     /// # Arguments
     /// * `obs` - Encoded observation bytes (neural network input format)
-    /// * `legal_moves_mask` - Bit mask of legal actions (from info bits)
+    /// * `legal_moves_mask` - Mask of legal actions (from the observation)
     /// * `num_actions` - Total number of possible actions
     ///
     /// # Returns
@@ -50,7 +51,7 @@ pub trait Evaluator: Send + Sync {
     fn evaluate(
         &self,
         obs: &[u8],
-        legal_moves_mask: u64,
+        legal_moves_mask: &LegalMask,
         num_actions: usize,
     ) -> Result<EvalResult, EvaluatorError>;
 
@@ -59,13 +60,13 @@ pub trait Evaluator: Send + Sync {
     fn evaluate_batch(
         &self,
         observations: &[&[u8]],
-        legal_moves_masks: &[u64],
+        legal_moves_masks: &[&LegalMask],
         num_actions: usize,
     ) -> Result<Vec<EvalResult>, EvaluatorError> {
         observations
             .iter()
             .zip(legal_moves_masks.iter())
-            .map(|(obs, mask)| self.evaluate(obs, *mask, num_actions))
+            .map(|(obs, mask)| self.evaluate(obs, mask, num_actions))
             .collect()
     }
 }
@@ -85,7 +86,7 @@ impl Evaluator for UniformEvaluator {
     fn evaluate(
         &self,
         _obs: &[u8],
-        legal_moves_mask: u64,
+        legal_moves_mask: &LegalMask,
         num_actions: usize,
     ) -> Result<EvalResult, EvaluatorError> {
         let mut policy = vec![0.0; num_actions];
@@ -100,9 +101,9 @@ impl Evaluator for UniformEvaluator {
 
         // Uniform distribution over legal moves
         let prob = 1.0 / num_legal;
-        for (i, p) in policy.iter_mut().enumerate().take(num_actions) {
-            if (legal_moves_mask >> i) & 1 == 1 {
-                *p = prob;
+        for action in legal_moves_mask.iter_ones() {
+            if action < num_actions {
+                policy[action] = prob;
             }
         }
 
@@ -119,8 +120,8 @@ mod tests {
         let eval = UniformEvaluator::new();
 
         // 3 legal moves out of 9 (mask: 0b101010001 = positions 0, 4, 6, 8)
-        let mask = 0b101010001u64;
-        let result = eval.evaluate(&[], mask, 9).unwrap();
+        let mask = LegalMask::from_u64(0b101010001, 9);
+        let result = eval.evaluate(&[], &mask, 9).unwrap();
 
         // Should have 4 legal moves
         let num_legal = mask.count_ones();
@@ -145,7 +146,7 @@ mod tests {
     fn test_uniform_evaluator_no_legal_moves() {
         let eval = UniformEvaluator::new();
 
-        let result = eval.evaluate(&[], 0, 9).unwrap();
+        let result = eval.evaluate(&[], &LegalMask::new(9), 9).unwrap();
 
         // All zeros
         for p in &result.policy {
@@ -159,8 +160,8 @@ mod tests {
         let eval = UniformEvaluator::new();
 
         // All 9 moves legal
-        let mask = 0b111111111u64;
-        let result = eval.evaluate(&[], mask, 9).unwrap();
+        let mask = LegalMask::all_legal(9);
+        let result = eval.evaluate(&[], &mask, 9).unwrap();
 
         let expected_prob = 1.0 / 9.0;
         for p in &result.policy {

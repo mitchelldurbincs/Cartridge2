@@ -57,9 +57,10 @@ class ConvPolicyValueNetwork(BasePolicyValueNetwork):
     The observation is expected to be a flat tensor that will be reshaped
     to (batch, input_channels, board_height, board_width).
 
-    Input channels include board planes for each player and a derived
-    plane that encodes the current player (1 for first player, -1 for
-    second player).
+    Input channels include the game's spatial board planes (the count is
+    taken from ``config.input_channels``, e.g. 2 for one plane per player)
+    and a derived plane that encodes the current player (1 for first
+    player, -1 for second player).
     """
 
     def __init__(self, config: GameConfig):
@@ -70,9 +71,14 @@ class ConvPolicyValueNetwork(BasePolicyValueNetwork):
         self.action_size = config.num_actions
         self.board_height = config.board_height
         self.board_width = config.board_width
-        # Base board planes (one per player) plus a derived player-to-move plane
+        # Spatial board planes from the game config, plus a derived
+        # player-to-move plane for games with absolute (seat-fixed) board
+        # encodings. Player-relative observations must not see the seat:
+        # it is a side channel the value head can exploit (see
+        # GameConfig.player_relative_obs).
         self.board_planes = config.input_channels
-        self.input_channels = self.board_planes + 1
+        self.player_relative_obs = getattr(config, "player_relative_obs", False)
+        self.input_channels = self.board_planes + (0 if self.player_relative_obs else 1)
         self.num_filters = config.num_filters
 
         # Initial convolutional block
@@ -126,8 +132,8 @@ class ConvPolicyValueNetwork(BasePolicyValueNetwork):
             Spatial tensor of shape (batch, input_channels, height, width)
 
         The observation encoding is game-specific:
-        - First board_size elements: Player 1's pieces (1 where piece present)
-        - Next board_size elements: Player 2's pieces (1 where piece present)
+        - First board_planes * board_size elements: one spatial plane per
+          channel (e.g. one plane per player's pieces for 2-channel games)
         - Legal mask elements follow, then a 2-element one-hot player indicator
           (current player first/second). The CNN consumes the board planes plus
           a derived plane indicating the current player (1 or -1) broadcast over
@@ -147,13 +153,15 @@ class ConvPolicyValueNetwork(BasePolicyValueNetwork):
             )
             planes.append(plane)
 
-        # Current player plane: 1 for first player, -1 for second
-        player_one_hot = self.config.extract_player_indicator(x)
-        current_player = player_one_hot[:, :1] - player_one_hot[:, 1:]
-        player_plane = current_player.view(batch_size, 1, 1).expand(
-            batch_size, self.board_height, self.board_width
-        )
-        planes.append(player_plane)
+        # Current player plane (absolute encodings only): 1 for first
+        # player, -1 for second. Skipped for player-relative observations.
+        if not self.player_relative_obs:
+            player_one_hot = self.config.extract_player_indicator(x)
+            current_player = player_one_hot[:, :1] - player_one_hot[:, 1:]
+            player_plane = current_player.view(batch_size, 1, 1).expand(
+                batch_size, self.board_height, self.board_width
+            )
+            planes.append(player_plane)
 
         # Stack planes along channel dimension: (batch, channels, height, width)
         spatial = torch.stack(planes, dim=1)

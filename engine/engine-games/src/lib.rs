@@ -26,16 +26,19 @@ static INIT: Once = Once::new();
 /// - TicTacToe (`"tictactoe"`)
 /// - Connect 4 (`"connect4"`)
 /// - Othello (`"othello"`)
+/// - Generals (`"generals_8x8"`)
 pub fn register_all_games() {
     INIT.call_once(|| {
         games_tictactoe::register_tictactoe();
         games_connect4::register_connect4();
         games_othello::register_othello();
+        games_generals::register_generals();
     });
 }
 
 // Re-export individual registration functions for advanced use cases
 pub use games_connect4::register_connect4;
+pub use games_generals::register_generals;
 pub use games_othello::register_othello;
 pub use games_tictactoe::register_tictactoe;
 
@@ -51,6 +54,7 @@ mod tests {
         assert!(is_registered("tictactoe"));
         assert!(is_registered("connect4"));
         assert!(is_registered("othello"));
+        assert!(is_registered("generals_8x8"));
     }
 
     #[test]

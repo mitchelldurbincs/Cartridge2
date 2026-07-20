@@ -21,7 +21,7 @@
 //!
 //! ```rust,ignore
 //! use mcts::{MctsConfig, UniformEvaluator, run_mcts};
-//! use engine_core::EngineContext;
+//! use engine_core::{EngineContext, LegalMask};
 //! use rand_chacha::ChaCha20Rng;
 //! use rand::SeedableRng;
 //!
@@ -35,7 +35,8 @@
 //! // Set up MCTS
 //! let evaluator = UniformEvaluator::new();
 //! let config = MctsConfig::for_testing();
-//! let legal_mask = 0b111111111u64; // All 9 positions legal at the start
+//! // All 9 positions legal at the start (read from the obs in real code)
+//! let legal_mask = LegalMask::all_legal(9);
 //!
 //! // Run search
 //! let mut rng = ChaCha20Rng::seed_from_u64(42);

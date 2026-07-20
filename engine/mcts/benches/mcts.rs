@@ -9,7 +9,7 @@
 //! - Game comparison (TicTacToe vs Connect4)
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use engine_core::EngineContext;
+use engine_core::{EngineContext, LegalMask};
 use mcts::{MctsConfig, MctsSearch, MctsTree, UniformEvaluator};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -27,21 +27,19 @@ fn setup_connect4() -> EngineContext {
 }
 
 /// Helper to create a game state after playing a sequence of moves.
-fn play_moves(ctx: &mut EngineContext, seed: u64, moves: &[u32]) -> (Vec<u8>, Vec<u8>, u64) {
+fn play_moves(ctx: &mut EngineContext, seed: u64, moves: &[u32]) -> (Vec<u8>, Vec<u8>, LegalMask) {
     let reset = ctx.reset(seed, &[]).unwrap();
     let mut state = reset.state;
     let mut obs = reset.obs;
-    let mut info = 0b111111111u64; // All positions legal initially
 
     for &m in moves {
         let action = m.to_le_bytes().to_vec();
         let step = ctx.step(&state, &action).unwrap();
         state = step.state;
         obs = step.obs;
-        info = step.info;
     }
 
-    let legal_mask = info & 0x1FF;
+    let legal_mask = ctx.metadata().legal_mask_from_obs(&obs);
     (state, obs, legal_mask)
 }
 
@@ -62,7 +60,7 @@ fn bench_mcts_search_simulations(c: &mut Criterion) {
 
             b.iter(|| {
                 let reset = ctx.reset(42, &[]).unwrap();
-                let legal_mask = 0b111111111u64;
+                let legal_mask = LegalMask::all_legal(9);
                 let mut rng = ChaCha20Rng::seed_from_u64(42);
 
                 let mut search = MctsSearch::new(
@@ -100,7 +98,7 @@ fn bench_mcts_connect4(c: &mut Criterion) {
 
             b.iter(|| {
                 let reset = ctx.reset(42, &[]).unwrap();
-                let legal_mask = 0b1111111u64; // All 7 columns legal
+                let legal_mask = LegalMask::all_legal(7); // All 7 columns legal
                 let mut rng = ChaCha20Rng::seed_from_u64(42);
 
                 let mut search = MctsSearch::new(
@@ -137,7 +135,7 @@ fn bench_game_comparison(c: &mut Criterion) {
 
         b.iter(|| {
             let reset = ctx.reset(42, &[]).unwrap();
-            let legal_mask = 0b111111111u64;
+            let legal_mask = LegalMask::all_legal(9);
             let mut rng = ChaCha20Rng::seed_from_u64(42);
 
             let mut search = MctsSearch::new(
@@ -162,7 +160,7 @@ fn bench_game_comparison(c: &mut Criterion) {
 
         b.iter(|| {
             let reset = ctx.reset(42, &[]).unwrap();
-            let legal_mask = 0b1111111u64;
+            let legal_mask = LegalMask::all_legal(7);
             let mut rng = ChaCha20Rng::seed_from_u64(42);
 
             let mut search = MctsSearch::new(
@@ -194,7 +192,7 @@ fn bench_mcts_game_phases(c: &mut Criterion) {
 
         b.iter(|| {
             let reset = ctx.reset(42, &[]).unwrap();
-            let legal_mask = 0b111111111u64;
+            let legal_mask = LegalMask::all_legal(9);
             let mut rng = ChaCha20Rng::seed_from_u64(42);
 
             let mut search = MctsSearch::new(
@@ -262,11 +260,18 @@ fn bench_tree_operations(c: &mut Criterion) {
     // Benchmark node allocation
     group.bench_function("allocate_node", |b| {
         b.iter(|| {
-            let mut tree = MctsTree::new(0b111111111);
+            let mut tree = MctsTree::new(LegalMask::all_legal(9));
 
             // Allocate 100 child nodes
-            for i in 0..100u8 {
-                tree.add_child(tree.root(), i % 9, 0.11, 0b111111111, false, 0.0);
+            for i in 0..100u32 {
+                tree.add_child(
+                    tree.root(),
+                    i % 9,
+                    0.11,
+                    LegalMask::all_legal(9),
+                    false,
+                    0.0,
+                );
             }
 
             black_box(tree.len())
@@ -276,21 +281,21 @@ fn bench_tree_operations(c: &mut Criterion) {
     // Benchmark child selection (UCB calculation)
     group.bench_function("select_child", |b| {
         // Pre-build a tree with children
-        let mut tree = MctsTree::new(0b111111111);
+        let mut tree = MctsTree::new(LegalMask::all_legal(9));
 
         // Add 9 children with varying priors and visit counts
-        for i in 0..9u8 {
+        for i in 0..9u32 {
             let child_id = tree.add_child(
                 tree.root(),
                 i,
                 (i as f32 + 1.0) / 45.0, // Varying priors
-                0b111111111,
+                LegalMask::all_legal(9),
                 false,
                 0.0,
             );
             // Simulate some visits
             let child = tree.get_mut(child_id);
-            child.visit_count = (i as u32 + 1) * 10;
+            child.visit_count = (i + 1) * 10;
             child.value_sum = (i as f32 - 4.0) * 0.1 * child.visit_count as f32;
         }
 
@@ -305,7 +310,7 @@ fn bench_tree_operations(c: &mut Criterion) {
         b.iter_batched(
             || {
                 // Setup: create a tree with depth 5
-                let mut tree = MctsTree::new(0b111111111);
+                let mut tree = MctsTree::new(LegalMask::all_legal(9));
                 let mut parent = tree.root();
 
                 for i in 0..5 {
@@ -313,7 +318,7 @@ fn bench_tree_operations(c: &mut Criterion) {
                         parent,
                         i,
                         0.5,
-                        0b111111111,
+                        LegalMask::all_legal(9),
                         i == 4, // Last one is terminal
                         if i == 4 { 1.0 } else { 0.0 },
                     );
@@ -333,11 +338,18 @@ fn bench_tree_operations(c: &mut Criterion) {
     // Benchmark policy extraction
     group.bench_function("root_policy", |b| {
         // Pre-build a tree with children
-        let mut tree = MctsTree::new(0b111111111);
+        let mut tree = MctsTree::new(LegalMask::all_legal(9));
 
-        for i in 0..9u8 {
-            let child_id = tree.add_child(tree.root(), i, 1.0 / 9.0, 0b111111111, false, 0.0);
-            tree.get_mut(child_id).visit_count = (i as u32 + 1) * 50;
+        for i in 0..9u32 {
+            let child_id = tree.add_child(
+                tree.root(),
+                i,
+                1.0 / 9.0,
+                LegalMask::all_legal(9),
+                false,
+                0.0,
+            );
+            tree.get_mut(child_id).visit_count = (i + 1) * 50;
         }
 
         b.iter(|| black_box(tree.root_policy(9, 1.0)));
@@ -345,11 +357,18 @@ fn bench_tree_operations(c: &mut Criterion) {
 
     // Benchmark policy extraction with temperature scaling
     group.bench_function("root_policy_temperature", |b| {
-        let mut tree = MctsTree::new(0b111111111);
+        let mut tree = MctsTree::new(LegalMask::all_legal(9));
 
-        for i in 0..9u8 {
-            let child_id = tree.add_child(tree.root(), i, 1.0 / 9.0, 0b111111111, false, 0.0);
-            tree.get_mut(child_id).visit_count = (i as u32 + 1) * 50;
+        for i in 0..9u32 {
+            let child_id = tree.add_child(
+                tree.root(),
+                i,
+                1.0 / 9.0,
+                LegalMask::all_legal(9),
+                false,
+                0.0,
+            );
+            tree.get_mut(child_id).visit_count = (i + 1) * 50;
         }
 
         b.iter(|| black_box(tree.root_policy(9, 0.5)));
@@ -374,7 +393,7 @@ fn bench_mcts_configs(c: &mut Criterion) {
 
         b.iter(|| {
             let reset = ctx.reset(42, &[]).unwrap();
-            let legal_mask = 0b111111111u64;
+            let legal_mask = LegalMask::all_legal(9);
             let mut rng = ChaCha20Rng::seed_from_u64(42);
 
             let mut search = MctsSearch::new(
@@ -399,7 +418,7 @@ fn bench_mcts_configs(c: &mut Criterion) {
 
         b.iter(|| {
             let reset = ctx.reset(42, &[]).unwrap();
-            let legal_mask = 0b111111111u64;
+            let legal_mask = LegalMask::all_legal(9);
             let mut rng = ChaCha20Rng::seed_from_u64(42);
 
             let mut search = MctsSearch::new(
@@ -427,7 +446,7 @@ fn bench_mcts_configs(c: &mut Criterion) {
 
             b.iter(|| {
                 let reset = ctx.reset(42, &[]).unwrap();
-                let legal_mask = 0b111111111u64;
+                let legal_mask = LegalMask::all_legal(9);
                 let mut rng = ChaCha20Rng::seed_from_u64(42);
 
                 let mut search = MctsSearch::new(
@@ -472,7 +491,7 @@ fn bench_batch_sizes(c: &mut Criterion) {
 
                 b.iter(|| {
                     let reset = ctx.reset(42, &[]).unwrap();
-                    let legal_mask = 0b111111111u64;
+                    let legal_mask = LegalMask::all_legal(9);
                     let mut rng = ChaCha20Rng::seed_from_u64(42);
 
                     let mut search = MctsSearch::new(
@@ -505,7 +524,7 @@ fn bench_batch_sizes(c: &mut Criterion) {
 
                 b.iter(|| {
                     let reset = ctx.reset(42, &[]).unwrap();
-                    let legal_mask = 0b1111111u64;
+                    let legal_mask = LegalMask::all_legal(7);
                     let mut rng = ChaCha20Rng::seed_from_u64(42);
 
                     let mut search = MctsSearch::new(

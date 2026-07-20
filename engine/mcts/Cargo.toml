@@ -9,6 +9,14 @@ default = []
 onnx = ["ort", "ndarray"]
 coreml = ["ort/coreml"]
 
+[[example]]
+name = "generals_policy_probe"
+required-features = ["onnx"]
+
+[[example]]
+name = "generals_strength_probe"
+required-features = ["onnx"]
+
 [dependencies]
 # Engine core for game abstraction
 engine-core = { path = "../engine-core" }
