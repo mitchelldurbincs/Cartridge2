@@ -64,7 +64,9 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
     build-essential \
+    git \
     && rm -rf /var/lib/apt/lists/*
+# git is required: the trainer declares `crucible` as a pinned git dependency.
 
 # Create non-root user for security
 # Let system assign UID automatically to avoid conflicts with existing UIDs
@@ -91,8 +93,15 @@ COPY trainer/src/ ./trainer/src/
 # Install CPU-only PyTorch (avoids ~700MB CUDA download)
 RUN pip install --no-cache-dir --break-system-packages torch --index-url https://download.pytorch.org/whl/cpu
 
-# Install trainer package
+# Install trainer package (pulls in the pinned crucible orchestration core)
 RUN pip install --no-cache-dir --break-system-packages ./trainer
+
+# Smoke-check the *installed* package. Nothing else does: the test suite puts
+# trainer/src on sys.path directly, and CI's docker-build job never runs the
+# image. Without this, a packaging regression (a missing package-data entry, or
+# a dropped crucible dependency) passes every CI job and fails only in
+# production, at container start.
+RUN python -c "import crucible; from trainer.game_config import get_config; get_config('tictactoe')"
 
 # Create data directory with correct permissions
 RUN mkdir -p /app/data/models && chown -R cartridge:cartridge /app/data

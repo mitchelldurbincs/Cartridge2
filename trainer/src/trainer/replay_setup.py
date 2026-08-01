@@ -10,12 +10,73 @@ import logging
 from typing import TYPE_CHECKING
 
 from .backoff import wait_with_backoff as _wait_with_backoff
-from .game_config import GameConfig
 
 if TYPE_CHECKING:
     from .trainer import Trainer
 
 logger = logging.getLogger(__name__)
+
+
+# Layout fields: a disagreement here means the observations in the buffer are
+# not the shape the network expects, so training on them is meaningless.
+_FATAL_FIELDS = ("obs_size", "legal_mask_offset", "num_actions")
+
+# Descriptive fields: worth reporting, but they cannot corrupt learning.
+_COSMETIC_FIELDS = ("display_name", "board_width", "board_height")
+
+
+class MetadataMismatch(RuntimeError):
+    """The replay buffer was written by an engine that disagrees with ours."""
+
+
+def check_metadata_agrees(trainer: "Trainer", replay, env_id: str) -> None:
+    """Cross-check the engine's game metadata against the replay buffer's.
+
+    Game facts come from the engine-generated manifest (see ``game_config``),
+    not from the database — this only verifies the two agree.
+
+    The actor upserts its metadata row on every startup, so the row reflects
+    the actor binary that ran most recently. A layout disagreement therefore
+    means the running actor and the installed trainer were built from different
+    commits, and the transitions in the buffer do not match the network being
+    trained. Raising is the right outcome: the alternative is burning hours of
+    compute producing a model from mismatched observations.
+    """
+    db_metadata = replay.get_metadata(env_id)
+    if not db_metadata:
+        logger.warning(
+            f"No metadata in database for {env_id}; cannot cross-check the replay "
+            f"buffer's observation layout against the engine."
+        )
+        return
+
+    config = trainer.game_config
+
+    mismatches = [
+        f"{field}: engine={getattr(config, field)!r} database={getattr(db_metadata, field)!r}"
+        for field in _FATAL_FIELDS
+        if getattr(config, field) != getattr(db_metadata, field)
+    ]
+    if mismatches:
+        raise MetadataMismatch(
+            f"Replay buffer for '{env_id}' was written with a different observation "
+            f"layout than this trainer expects: " + "; ".join(mismatches) + ". "
+            "The actor and trainer are almost certainly built from different commits. "
+            "Rebuild both from the same revision, or clear the buffer."
+        )
+
+    cosmetic = [
+        f"{field}: engine={getattr(config, field)!r} database={getattr(db_metadata, field)!r}"
+        for field in _COSMETIC_FIELDS
+        if getattr(config, field) != getattr(db_metadata, field)
+    ]
+    if cosmetic:
+        logger.warning(
+            f"Game metadata for {env_id} differs from the database in descriptive "
+            f"fields (training is unaffected): " + "; ".join(cosmetic)
+        )
+    else:
+        logger.info(f"Game metadata for {env_id} matches the replay buffer")
 
 
 def wait_with_backoff(
@@ -60,31 +121,7 @@ def setup_replay(trainer: "Trainer", replay, env_id: str) -> None:
         deleted = replay.clear_transitions()
         logger.info(f"Cleared {deleted} transitions from replay buffer before training")
 
-    # Try to get game metadata from database (preferred, self-describing)
-    db_metadata = replay.get_metadata(env_id)
-    if db_metadata:
-        logger.info(f"Using game metadata from database for {env_id}")
-        # DB metadata only describes the observation layout; keep the
-        # network-architecture settings (network type, channel count, etc.)
-        # from the registry config the trainer was initialized with.
-        fallback = trainer.game_config
-        trainer.game_config = GameConfig(
-            env_id=db_metadata.env_id,
-            display_name=db_metadata.display_name,
-            board_width=db_metadata.board_width,
-            board_height=db_metadata.board_height,
-            num_actions=db_metadata.num_actions,
-            obs_size=db_metadata.obs_size,
-            legal_mask_offset=db_metadata.legal_mask_offset,
-            hidden_size=fallback.hidden_size,
-            network_type=fallback.network_type,
-            num_res_blocks=fallback.num_res_blocks,
-            num_filters=fallback.num_filters,
-            input_channels=fallback.input_channels,
-            player_relative_obs=fallback.player_relative_obs,
-        )
-    else:
-        logger.warning(f"No metadata in database for {env_id}, using fallback config")
+    check_metadata_agrees(trainer, replay, env_id)
 
     buffer_size = replay.count(env_id=env_id)
     logger.info(f"Replay buffer contains {buffer_size} transitions for {env_id}")

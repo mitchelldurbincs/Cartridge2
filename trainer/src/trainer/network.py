@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .game_config import get_config
+from .game_config import GameConfig, get_config
 
 
 class BasePolicyValueNetwork(nn.Module):
@@ -182,7 +182,9 @@ class AlphaZeroLoss:
         return total_loss, metrics
 
 
-def create_network(env_id: str = "tictactoe") -> nn.Module:
+def create_network(
+    env_id: str = "tictactoe", config: GameConfig | None = None
+) -> nn.Module:
     """Factory function to create a network for the specified environment.
 
     Automatically selects the appropriate architecture based on the game's
@@ -192,6 +194,11 @@ def create_network(env_id: str = "tictactoe") -> nn.Module:
 
     Args:
         env_id: Environment identifier (e.g., "tictactoe", "connect4")
+        config: Already-resolved config to build from. Callers that hold one
+            should pass it: looking the config up again here would build the
+            network from a different object than the caller goes on to use for
+            observation parsing, so any disagreement between them would surface
+            as a silent shape mismatch rather than an error.
 
     Returns:
         Neural network configured for the specified game.
@@ -199,7 +206,7 @@ def create_network(env_id: str = "tictactoe") -> nn.Module:
     Raises:
         ValueError: If the game is not registered or network_type is invalid.
     """
-    config = get_config(env_id)
+    config = config if config is not None else get_config(env_id)
 
     if config.network_type == "resnet":
         from .resnet import ConvPolicyValueNetwork

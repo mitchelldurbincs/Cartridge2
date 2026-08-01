@@ -20,6 +20,9 @@ cd web && cargo run
 cd web/frontend && npm install && npm run dev
 
 # Terminal 3: Train a model
+# This pulls the pinned `crucible` orchestration core from GitHub. If you are
+# also developing crucible, install your sibling checkout editable FIRST
+# (pip install -e ../../crucible) and pip will keep it.
 cd trainer && pip install -e .
 # Required: the trainer reads the replay-buffer connection string only from
 # this env var (config.toml's storage.postgres_url is not used by the trainer)
@@ -60,8 +63,11 @@ CARTRIDGE_COMMON_ENV_ID=connect4 docker compose up alphazero
 # Watch training logs
 docker compose logs -f alphazero
 
-# Run standalone evaluation
-docker compose run --rm alphazero python -m trainer evaluate --model /app/data/models/latest.onnx
+# Run standalone evaluation.
+# --entrypoint is required: the image's ENTRYPOINT is `python -m trainer loop`,
+# so a bare `run ... python -m trainer evaluate` gets appended to it.
+docker compose run --rm --entrypoint python alphazero \
+  -m trainer evaluate --model /app/data/models/latest.onnx
 ```
 
 ### Play Against Trained Model

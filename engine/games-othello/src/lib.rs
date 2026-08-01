@@ -518,6 +518,7 @@ impl Game for Othello {
             .with_board(COLS, ROWS)
             .with_actions(NUM_ACTIONS)
             .with_observation(OBS_SIZE, BOARD_SIZE * 2) // legal mask starts after board views
+            .with_obs_encoding(2, false) // one absolute plane per player
             .with_players(
                 2,
                 vec!["Black".to_string(), "White".to_string()],

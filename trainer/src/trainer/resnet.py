@@ -58,7 +58,7 @@ class ConvPolicyValueNetwork(BasePolicyValueNetwork):
     to (batch, input_channels, board_height, board_width).
 
     Input channels include the game's spatial board planes (the count is
-    taken from ``config.input_channels``, e.g. 2 for one plane per player)
+    taken from ``config.obs_channels``, e.g. 2 for one plane per player)
     and a derived plane that encodes the current player (1 for first
     player, -1 for second player).
     """
@@ -66,18 +66,22 @@ class ConvPolicyValueNetwork(BasePolicyValueNetwork):
     def __init__(self, config: GameConfig):
         super().__init__()
 
-        self.config = config
+        # Only plain ints are retained, never the config object itself: the
+        # network is then independent of which config type it was built from,
+        # and callers cannot accidentally pass one that lacks the accessor
+        # methods (storage.GameMetadata describes the same games but has none).
         self.obs_size = config.obs_size
         self.action_size = config.num_actions
         self.board_height = config.board_height
         self.board_width = config.board_width
+        self.player_indicator_offset = config.player_indicator_offset
         # Spatial board planes from the game config, plus a derived
         # player-to-move plane for games with absolute (seat-fixed) board
         # encodings. Player-relative observations must not see the seat:
         # it is a side channel the value head can exploit (see
         # GameConfig.player_relative_obs).
-        self.board_planes = config.input_channels
-        self.player_relative_obs = getattr(config, "player_relative_obs", False)
+        self.board_planes = config.obs_channels
+        self.player_relative_obs = config.player_relative_obs
         self.input_channels = self.board_planes + (0 if self.player_relative_obs else 1)
         self.num_filters = config.num_filters
 
@@ -156,7 +160,8 @@ class ConvPolicyValueNetwork(BasePolicyValueNetwork):
         # Current player plane (absolute encodings only): 1 for first
         # player, -1 for second. Skipped for player-relative observations.
         if not self.player_relative_obs:
-            player_one_hot = self.config.extract_player_indicator(x)
+            offset = self.player_indicator_offset
+            player_one_hot = x[:, offset : offset + 2]
             current_player = player_one_hot[:, :1] - player_one_hot[:, 1:]
             player_plane = current_player.view(batch_size, 1, 1).expand(
                 batch_size, self.board_height, self.board_width

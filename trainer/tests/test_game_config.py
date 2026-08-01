@@ -39,7 +39,7 @@ class TestGameConfig:
         assert config.network_type == "mlp"
         assert config.num_res_blocks == 4
         assert config.num_filters == 128
-        assert config.input_channels == 2
+        assert config.obs_channels == 2
 
     def test_game_config_custom(self):
         """Test GameConfig with custom values."""
@@ -55,14 +55,14 @@ class TestGameConfig:
             network_type="resnet",
             num_res_blocks=6,
             num_filters=256,
-            input_channels=3,
+            obs_channels=3,
         )
 
         assert config.hidden_size == 512
         assert config.network_type == "resnet"
         assert config.num_res_blocks == 6
         assert config.num_filters == 256
-        assert config.input_channels == 3
+        assert config.obs_channels == 3
 
     def test_board_size_property(self):
         """Test board_size property calculation."""
@@ -259,10 +259,12 @@ class TestConnect4Config:
         config = get_config("connect4")
 
         assert config.network_type == "resnet"
-        assert config.hidden_size == 512
         assert config.num_res_blocks == 4
         assert config.num_filters == 128
-        assert config.input_channels == 2
+        assert config.obs_channels == 2
+        # hidden_size is not carried for resnet games: the ResNet value head is
+        # a fixed 256-unit layer, so the field only affects the MLP path.
+        assert config.hidden_size == 128  # dataclass default, unused here
 
 
 class TestOthelloConfig:
@@ -297,10 +299,11 @@ class TestOthelloConfig:
         config = get_config("othello")
 
         assert config.network_type == "resnet"
-        assert config.hidden_size == 512
         assert config.num_res_blocks == 6
         assert config.num_filters == 256
-        assert config.input_channels == 2
+        assert config.obs_channels == 2
+        # See the Connect4 equivalent: hidden_size is unused on the resnet path.
+        assert config.hidden_size == 128  # dataclass default, unused here
 
 
 class TestGameConfigsRegistry:
@@ -324,6 +327,96 @@ class TestGameConfigsRegistry:
         """Test that GAME_CONFIGS is a dictionary."""
         assert isinstance(GAME_CONFIGS, dict)
         assert len(GAME_CONFIGS) >= 3
+
+
+class TestGeneralsConfig:
+    """Generals 8x8 — the only game with a non-trivial observation encoding."""
+
+    def test_generals_dimensions(self):
+        config = get_config("generals_8x8")
+
+        assert config.board_width == 8
+        assert config.board_height == 8
+        assert config.num_actions == 257  # 64 tiles * 4 directions + wait
+        assert config.obs_size == 835  # 576 planes + 257 legal + 2 player
+        assert config.legal_mask_offset == 576
+
+    def test_generals_uses_player_relative_resnet(self):
+        config = get_config("generals_8x8")
+
+        assert config.network_type == "resnet"
+        assert config.num_res_blocks == 6
+        assert config.num_filters == 128
+        # 9 generals_obs:v1 planes, encoded own/enemy relative to the player to
+        # act — so the network must not also receive the player indicator.
+        assert config.obs_channels == 9
+        assert config.player_relative_obs is True
+
+
+class TestManifestIntegrity:
+    """The manifest is the engine's word on game facts; check we honour it.
+
+    These tests are what make the single-source scheme real on the Python side.
+    The engine has matching assertions (engine-games), so a layout change that
+    slips past one has to get past the other too.
+    """
+
+    def test_manifest_is_loadable(self):
+        """Fail here, attributably, rather than at some other module's import.
+
+        Several modules call get_config() at import time, so a missing or
+        malformed manifest otherwise surfaces as a confusing collection error
+        in an unrelated test file.
+        """
+        assert GAME_CONFIGS, "manifest produced no games"
+
+    def test_every_game_has_a_network_choice(self):
+        """Adding a game in Rust must force a deliberate architecture choice.
+
+        If a manifest game could fall back to defaults it would silently get
+        network_type="mlp" — a dense net on a board, which trains to nothing
+        without ever erroring.
+        """
+        from trainer.game_config import _TRAINING_OVERRIDES
+
+        assert set(_TRAINING_OVERRIDES) == set(GAME_CONFIGS)
+
+    def test_observation_layout_invariants(self):
+        """Mirrors the engine-side assertions in engine-games."""
+        for env_id, config in GAME_CONFIGS.items():
+            assert config.obs_channels > 0, f"{env_id}: obs_channels unset"
+            assert (
+                config.legal_mask_offset == config.obs_channels * config.board_size
+            ), f"{env_id}: legal mask must start immediately after the board planes"
+            assert (
+                config.obs_size == config.legal_mask_offset + config.num_actions + 2
+            ), f"{env_id}: obs_size must be planes + legal mask + player one-hot"
+
+    def test_facts_are_not_restated_in_python(self):
+        """The registry must be built from the manifest, not hardcoded.
+
+        Guards against someone "fixing" a drift failure by pasting literals
+        back into game_config.py, which would reintroduce exactly the
+        two-sources-of-truth problem the manifest removed.
+        """
+        import json
+        from importlib.resources import files
+
+        manifest = json.loads(
+            files("trainer").joinpath("game_metadata.json").read_text(encoding="utf-8")
+        )
+        by_id = {g["env_id"]: g for g in manifest["games"]}
+
+        assert set(by_id) == set(GAME_CONFIGS)
+        for env_id, config in GAME_CONFIGS.items():
+            game = by_id[env_id]
+            for field in (
+                "obs_size",
+                "legal_mask_offset",
+                "num_actions",
+                "obs_channels",
+            ):
+                assert getattr(config, field) == game[field], f"{env_id}.{field}"
 
 
 if __name__ == "__main__":
