@@ -30,6 +30,12 @@ const COLS_PER_TRANSITION: usize = 15;
 /// Strips `--` line comments, splits on `;`, and drops empty statements.
 /// This intentionally does not handle `;` inside string literals or
 /// dollar-quoted bodies — the shared schema file contains neither.
+///
+/// Comment lines must be stripped *before* splitting; the Python twin
+/// (`trainer/src/trainer/storage/postgres.py::split_sql_statements`) once did
+/// it the other way round and silently discarded every statement that had a
+/// comment above it. Both sides assert the same statement count against
+/// `sql/schema.sql` so they cannot drift apart again unnoticed.
 fn split_sql_statements(sql: &str) -> Vec<String> {
     sql.lines()
         .filter(|line| !line.trim_start().starts_with("--"))
