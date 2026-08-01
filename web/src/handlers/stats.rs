@@ -183,6 +183,8 @@ mod tests {
             player1_wins: 45,
             player2_wins: 40,
             draws: 15,
+            episodes_abandoned: 0,
+            transitions_discarded: 0,
             avg_episode_length: 15.0,
             episodes_per_second: 2.5,
             runtime_seconds: 40.0,

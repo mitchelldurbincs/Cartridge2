@@ -397,6 +397,8 @@ fn test_actor_stats_serialization() {
         player1_wins: 450,
         player2_wins: 400,
         draws: 150,
+        episodes_abandoned: 3,
+        transitions_discarded: 1200,
         avg_episode_length: 15.0,
         episodes_per_second: 5.5,
         runtime_seconds: 180.0,
@@ -411,6 +413,10 @@ fn test_actor_stats_serialization() {
     assert!(json.contains("1000"));
     assert!(json.contains("player1_wins"));
     assert!(json.contains("450"));
+    // Discarded self-play data must reach the frontend, not just the logs.
+    assert!(json.contains("episodes_abandoned"));
+    assert!(json.contains("transitions_discarded"));
+    assert!(json.contains("1200"));
 }
 
 #[test]

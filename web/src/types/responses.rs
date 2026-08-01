@@ -182,6 +182,13 @@ pub struct ActorStats {
     /// Episodes that ended in draw
     #[serde(default)]
     pub draws: u32,
+    /// Episodes abandoned before reaching a terminal state; their
+    /// transitions never reached the replay buffer
+    #[serde(default)]
+    pub episodes_abandoned: u32,
+    /// Transitions discarded with those abandoned episodes
+    #[serde(default)]
+    pub transitions_discarded: u64,
     /// Average episode length
     #[serde(default)]
     pub avg_episode_length: f64,

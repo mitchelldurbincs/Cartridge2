@@ -119,7 +119,12 @@ actor_id = "actor-1"
 # Maximum episodes to run (-1 for unlimited)
 max_episodes = -1
 
-# Timeout per episode in seconds (Connect4 games can take 30+ moves)
+# Timeout per episode in seconds (Connect4 games can take 30+ moves).
+# Treated as a floor: the actor raises it to at least 1 second per move of
+# the game's horizon, so a value tuned for a short game does not silently
+# truncate a long one (generals_8x8 runs ~400 plies). Episodes that do hit
+# the limit are discarded whole and counted in actor_stats.json
+# (episodes_abandoned) and the actor_episodes_abandoned_total metric.
 episode_timeout_secs = 180
 
 # Interval to flush data to database in seconds

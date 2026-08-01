@@ -27,6 +27,10 @@ pub struct ActorStats {
     player2_wins: AtomicU32,
     /// Episodes that ended in draw (reward == 0)
     draws: AtomicU32,
+    /// Episodes abandoned before reaching a terminal state
+    episodes_abandoned: AtomicU32,
+    /// Transitions thrown away with those abandoned episodes
+    transitions_discarded: AtomicU64,
     /// Start time for rate calculations
     start_time: Instant,
     /// Path to write stats file
@@ -48,6 +52,13 @@ pub struct ActorStatsSnapshot {
     pub player1_wins: u32,
     pub player2_wins: u32,
     pub draws: u32,
+    /// Episodes abandoned before a terminal state (timeout or step guard).
+    /// Their transitions never reached the replay buffer, so a non-zero
+    /// value here means self-play data is being lost — and lost with a bias,
+    /// since the episodes that run out of wall clock are the long ones.
+    pub episodes_abandoned: u32,
+    /// Transitions discarded along with those episodes.
+    pub transitions_discarded: u64,
     pub avg_episode_length: f64,
     pub episodes_per_second: f64,
     pub runtime_seconds: f64,
@@ -71,6 +82,8 @@ impl ActorStats {
             player1_wins: AtomicU32::new(0),
             player2_wins: AtomicU32::new(0),
             draws: AtomicU32::new(0),
+            episodes_abandoned: AtomicU32::new(0),
+            transitions_discarded: AtomicU64::new(0),
             start_time: Instant::now(),
             stats_path,
             env_id: env_id.to_string(),
@@ -93,6 +106,18 @@ impl ActorStats {
         } else {
             self.draws.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Record an episode that was abandoned before reaching a terminal
+    /// state, along with the transitions discarded with it.
+    ///
+    /// Returns the new abandoned-episode total so the caller can report the
+    /// running rate — a single dropped episode is noise, a steady stream is
+    /// a silently shrinking (and length-biased) replay buffer.
+    pub fn record_abandoned_episode(&self, discarded: usize) -> u32 {
+        self.transitions_discarded
+            .fetch_add(discarded as u64, Ordering::Relaxed);
+        self.episodes_abandoned.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Record MCTS performance for an episode.
@@ -136,6 +161,8 @@ impl ActorStats {
             player1_wins: self.player1_wins.load(Ordering::Relaxed),
             player2_wins: self.player2_wins.load(Ordering::Relaxed),
             draws: self.draws.load(Ordering::Relaxed),
+            episodes_abandoned: self.episodes_abandoned.load(Ordering::Relaxed),
+            transitions_discarded: self.transitions_discarded.load(Ordering::Relaxed),
             avg_episode_length,
             episodes_per_second,
             runtime_seconds: runtime,
@@ -196,6 +223,27 @@ mod tests {
     use super::*;
     use std::path::Path;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_record_abandoned_episode_accumulates() {
+        let dir = tempdir().unwrap();
+        let stats = ActorStats::new(dir.path().to_str().unwrap(), "generals_8x8");
+
+        assert_eq!(stats.record_abandoned_episode(120), 1);
+        assert_eq!(stats.record_abandoned_episode(87), 2);
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.episodes_abandoned, 2);
+        assert_eq!(snapshot.transitions_discarded, 207);
+
+        // Abandoned episodes are not completed episodes: they must not
+        // inflate throughput or outcome counts.
+        assert_eq!(snapshot.episodes_completed, 0);
+        assert_eq!(snapshot.total_steps, 0);
+        assert_eq!(snapshot.player1_wins, 0);
+        assert_eq!(snapshot.player2_wins, 0);
+        assert_eq!(snapshot.draws, 0);
+    }
 
     #[test]
     fn test_record_episode() {

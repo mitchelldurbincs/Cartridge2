@@ -87,7 +87,7 @@ Pure game logic library. No network I/O. Library-only design (no gRPC).
 - `games-generals/` - Generals 8×8 implementation (29 tests); see the crate's
   lib.rs for the ruleset (full-info, alternating turns, territory
   adjudication, parity-randomized ply cap) and `generals_obs:v1` layout
-- `mcts/` - Monte Carlo Tree Search implementation (27 tests); legal masks are
+- `mcts/` - Monte Carlo Tree Search implementation (28 tests); legal masks are
   dynamic-width (`LegalMask`) and read from the observation, never `info_bits`.
   Two diagnostic examples: `generals_policy_probe` (visit-distribution health)
   and `generals_strength_probe` (MCTS+model vs random — the honest strength
@@ -95,7 +95,7 @@ Pure game logic library. No network I/O. Library-only design (no gRPC).
 - `model-watcher/` - Shared model hot-reload utilities (8 tests)
 
 ### Actor (Rust Binary) - `actor/`
-**Status: COMPLETE (86 tests)**
+**Status: COMPLETE (93 tests)**
 
 Self-play episode runner using engine-core directly:
 - Uses `EngineContext` for game simulation (no gRPC)
@@ -592,8 +592,8 @@ cd actor && cargo build --release
 cd web && cargo build --release
 
 # Run all tests
-cd engine && cargo test   # 260 tests (88 core + 19 config + 2 games + 26 tictactoe + 21 connect4 + 27 othello + 29 generals + 27 mcts + 3 metrics + 8 model-watcher)
-cd actor && cargo test    # 85 tests
+cd engine && cargo test   # 261 tests (88 core + 19 config + 2 games + 26 tictactoe + 21 connect4 + 27 othello + 29 generals + 28 mcts + 3 metrics + 8 model-watcher)
+cd actor && cargo test    # 92 tests
 cd web && cargo test      # 98 tests
 cd trainer && python -m pytest tests/ -v --tb=short  # 302 tests (needs crucible: pip install -e ../../crucible)
 
