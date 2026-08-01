@@ -9,6 +9,7 @@
 
 pub mod adapter;
 pub mod board_game;
+pub mod board_view;
 pub mod context;
 pub mod erased;
 pub mod game_utils;
@@ -20,6 +21,7 @@ pub mod typed;
 // Re-export main types for convenience
 pub use adapter::GameAdapter;
 pub use board_game::TwoPlayerObs;
+pub use board_view::{BoardView, CellKind, CellView};
 pub use context::{EngineContext, ResetResult, StepResult};
 pub use erased::ErasedGame;
 pub use legal_mask::LegalMask;

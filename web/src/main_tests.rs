@@ -12,6 +12,11 @@ use axum::{
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+/// Owner byte of every cell, for assertions that only care about occupancy.
+fn owners(response: &GameStateResponse) -> Vec<u8> {
+    response.cells.iter().map(|cell| cell.owner).collect()
+}
+
 /// Helper to make a GET request and return response body as string
 async fn get(app: Router, uri: &str) -> (StatusCode, String) {
     let response = app
@@ -65,7 +70,7 @@ async fn test_game_state_returns_initial_board() {
     assert_eq!(status, StatusCode::OK);
     let response: GameStateResponse = serde_json::from_str(&body).unwrap();
     assert_eq!(
-        response.board,
+        owners(&response),
         vec![0u8; 9],
         "Initial board should be empty"
     );
@@ -85,7 +90,7 @@ async fn test_new_game_player_first() {
     assert_eq!(status, StatusCode::OK);
     let response: GameStateResponse = serde_json::from_str(&body).unwrap();
     assert_eq!(
-        response.board,
+        owners(&response),
         vec![0u8; 9],
         "Board should be empty when player goes first"
     );
@@ -103,7 +108,7 @@ async fn test_new_game_bot_first() {
     assert_eq!(status, StatusCode::OK);
     let response: GameStateResponse = serde_json::from_str(&body).unwrap();
     // Bot should have made one move (one cell is non-zero)
-    let moves_made: usize = response.board.iter().filter(|&&x| x != 0).count();
+    let moves_made: usize = response.cells.iter().filter(|c| c.owner != 0).count();
     assert_eq!(moves_made, 1, "Bot should have made exactly one move");
     // When bot goes "first", it plays as X (since X always starts in TicTacToe)
     // After bot's move as X, it's O's turn (current_player = 2)
@@ -124,7 +129,7 @@ async fn test_new_game_default_player_first() {
     assert_eq!(status, StatusCode::OK);
     let response: GameStateResponse = serde_json::from_str(&body).unwrap();
     assert_eq!(
-        response.board,
+        owners(&response),
         vec![0u8; 9],
         "Board should be empty with default"
     );
@@ -163,7 +168,7 @@ async fn test_new_game_allows_same_game_type() {
 
     assert_eq!(status, StatusCode::OK);
     let response: GameStateResponse = serde_json::from_str(&body).unwrap();
-    assert_eq!(response.board, vec![0u8; 9]);
+    assert_eq!(owners(&response), vec![0u8; 9]);
 }
 
 #[tokio::test]
@@ -176,12 +181,18 @@ async fn test_move_valid() {
 
     assert_eq!(status, StatusCode::OK);
     let response: MoveResponse = serde_json::from_str(&body).unwrap();
-    assert_eq!(response.state.board[4], 1, "Player X should be at center");
+    assert_eq!(
+        response.state.cells[4].owner, 1,
+        "Player X should be at center"
+    );
     // Bot should have made a move (unless game over)
     if !response.state.game_over {
         assert!(response.bot_move.is_some(), "Bot should make a move");
         let bot_pos = response.bot_move.unwrap() as usize;
-        assert_eq!(response.state.board[bot_pos], 2, "Bot should have placed O");
+        assert_eq!(
+            response.state.cells[bot_pos].owner, 2,
+            "Bot should have placed O"
+        );
     }
 }
 
@@ -293,7 +304,7 @@ async fn test_state_updates_after_move() {
         get(app, "/game/state").await
     };
     let initial: GameStateResponse = serde_json::from_str(&initial_body).unwrap();
-    assert_eq!(initial.board, vec![0u8; 9]);
+    assert_eq!(owners(&initial), vec![0u8; 9]);
 
     // Make a move
     {
@@ -310,8 +321,11 @@ async fn test_state_updates_after_move() {
     let updated: GameStateResponse = serde_json::from_str(&updated_body).unwrap();
 
     // Verify board changed
-    assert_ne!(updated.board, vec![0u8; 9], "Board should have changed");
-    assert_eq!(updated.board[0], 1, "Player X should be at position 0");
+    assert_ne!(owners(&updated), vec![0u8; 9], "Board should have changed");
+    assert_eq!(
+        updated.cells[0].owner, 1,
+        "Player X should be at position 0"
+    );
 }
 
 #[tokio::test]
@@ -330,7 +344,7 @@ async fn test_new_game_resets_state() {
         get(app, "/game/state").await
     };
     let mid_game: GameStateResponse = serde_json::from_str(&body).unwrap();
-    assert_ne!(mid_game.board, vec![0u8; 9], "Board should have moves");
+    assert_ne!(owners(&mid_game), vec![0u8; 9], "Board should have moves");
 
     // Start new game
     {
@@ -344,7 +358,7 @@ async fn test_new_game_resets_state() {
         get(app, "/game/state").await
     };
     let new_game: GameStateResponse = serde_json::from_str(&body).unwrap();
-    assert_eq!(new_game.board, vec![0u8; 9], "Board should be reset");
+    assert_eq!(owners(&new_game), vec![0u8; 9], "Board should be reset");
     assert_eq!(new_game.current_player, 1);
     assert_eq!(new_game.winner, 0);
 }

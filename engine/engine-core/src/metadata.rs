@@ -73,6 +73,7 @@ pub struct GameMetadata {
     /// Board rendering type for the frontend
     /// - "grid": Simple grid where clicks place pieces directly (TicTacToe, Othello)
     /// - "drop_column": Column-based where pieces drop to bottom (Connect 4)
+    /// - "generals": Terrain grid with army counts; a move is select-then-direction
     pub board_type: String,
 }
 

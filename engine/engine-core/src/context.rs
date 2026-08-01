@@ -3,6 +3,7 @@
 //! This module provides `EngineContext`, a convenient wrapper for running
 //! game simulations without dealing with raw bytes and registry lookups.
 
+use crate::board_view::BoardView;
 use crate::erased::{ErasedGame, ErasedGameError};
 use crate::metadata::GameMetadata;
 use crate::registry::create_game;
@@ -106,6 +107,14 @@ impl EngineContext {
     /// Get the metadata for this game
     pub fn metadata(&self) -> GameMetadata {
         self.game.metadata()
+    }
+
+    /// Project an encoded state for display.
+    ///
+    /// Use this instead of reading `state` bytes directly — their layout is
+    /// private to each game.
+    pub fn view(&self, state: &[u8]) -> Result<BoardView, ErasedGameError> {
+        self.game.view(state)
     }
 
     /// Reset the game to initial state

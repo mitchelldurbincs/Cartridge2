@@ -127,7 +127,7 @@ fn test_game_info_response_serialization() {
 #[test]
 fn test_game_state_response_serialization() {
     let response = GameStateResponse {
-        board: vec![0, 1, 2, 0, 1, 0, 0, 2, 1],
+        cells: engine_core::BoardView::from_owners(&[0, 1, 2, 0, 1, 0, 0, 2, 1], 1, 0).cells,
         current_player: 1,
         human_player: 1,
         winner: 0,
@@ -137,7 +137,7 @@ fn test_game_state_response_serialization() {
     };
 
     let json = serde_json::to_string(&response).unwrap();
-    assert!(json.contains("board"));
+    assert!(json.contains("cells"));
     assert!(json.contains("current_player"));
     assert!(json.contains("legal_moves"));
     assert!(json.contains("message"));
@@ -146,7 +146,7 @@ fn test_game_state_response_serialization() {
 #[test]
 fn test_game_state_response_deserialization() {
     let json = r#"{
-        "board": [0, 0, 0, 1, 2, 0, 0, 0, 0],
+        "cells": [{"owner":0,"kind":"normal","value":0},{"owner":0,"kind":"normal","value":0},{"owner":0,"kind":"normal","value":0},{"owner":1,"kind":"normal","value":0},{"owner":2,"kind":"normal","value":0},{"owner":0,"kind":"normal","value":0},{"owner":0,"kind":"normal","value":0},{"owner":0,"kind":"normal","value":0},{"owner":0,"kind":"normal","value":0}],
         "current_player": 2,
         "human_player": 1,
         "winner": 0,
@@ -156,7 +156,7 @@ fn test_game_state_response_deserialization() {
     }"#;
 
     let response: GameStateResponse = serde_json::from_str(json).unwrap();
-    assert_eq!(response.board.len(), 9);
+    assert_eq!(response.cells.len(), 9);
     assert_eq!(response.current_player, 2);
     assert_eq!(response.human_player, 1);
     assert!(!response.game_over);
@@ -169,7 +169,7 @@ fn test_game_state_response_deserialization() {
 #[test]
 fn test_move_response_serialization_flattened() {
     let state = GameStateResponse {
-        board: vec![1, 0, 0, 0, 2, 0, 0, 0, 0],
+        cells: engine_core::BoardView::from_owners(&[1, 0, 0, 0, 2, 0, 0, 0, 0], 1, 0).cells,
         current_player: 1,
         human_player: 1,
         winner: 0,
@@ -185,7 +185,7 @@ fn test_move_response_serialization_flattened() {
 
     let json = serde_json::to_string(&response).unwrap();
     // Fields from GameStateResponse should be at top level due to flatten
-    assert!(json.contains("board"));
+    assert!(json.contains("cells"));
     assert!(json.contains("bot_move"));
     assert!(json.contains("4"));
 }
@@ -194,7 +194,7 @@ fn test_move_response_serialization_flattened() {
 fn test_move_response_deserialization() {
     // Note: flatten works both ways - when deserializing, fields are distributed
     let json = r#"{
-        "board": [1, 2, 0, 0, 0, 0, 0, 0, 0],
+        "cells": [{"owner":1,"kind":"normal","value":0},{"owner":2,"kind":"normal","value":0},{"owner":0,"kind":"normal","value":0},{"owner":0,"kind":"normal","value":0},{"owner":0,"kind":"normal","value":0},{"owner":0,"kind":"normal","value":0},{"owner":0,"kind":"normal","value":0},{"owner":0,"kind":"normal","value":0},{"owner":0,"kind":"normal","value":0}],
         "current_player": 1,
         "human_player": 1,
         "winner": 0,
@@ -206,7 +206,7 @@ fn test_move_response_deserialization() {
 
     let response: MoveResponse = serde_json::from_str(json).unwrap();
     assert_eq!(response.bot_move, Some(1));
-    assert_eq!(response.state.board[0], 1);
+    assert_eq!(response.state.cells[0].owner, 1);
 }
 
 // ========================================

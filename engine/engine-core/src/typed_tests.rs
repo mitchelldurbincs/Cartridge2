@@ -106,6 +106,11 @@ impl Game for TestGame {
         }
         Ok(())
     }
+
+    fn view(_state: &Self::State) -> crate::BoardView {
+        // Test double: no board to project.
+        crate::BoardView::from_owners(&[], 1, 0)
+    }
 }
 
 #[test]
@@ -237,6 +242,11 @@ impl Game for MultiDiscreteGame {
             out.extend_from_slice(&value.to_le_bytes());
         }
         Ok(())
+    }
+
+    fn view(_state: &Self::State) -> crate::BoardView {
+        // Test double: no board to project.
+        crate::BoardView::from_owners(&[], 1, 0)
     }
 }
 
@@ -387,6 +397,11 @@ impl Game for ContinuousGame {
             out.extend_from_slice(&value.to_le_bytes());
         }
         Ok(())
+    }
+
+    fn view(_state: &Self::State) -> crate::BoardView {
+        // Test double: no board to project.
+        crate::BoardView::from_owners(&[], 1, 0)
     }
 }
 

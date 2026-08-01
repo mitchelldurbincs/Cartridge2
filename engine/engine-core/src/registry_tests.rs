@@ -108,6 +108,11 @@ impl Game for TestGame {
         }
         Ok(())
     }
+
+    fn view(_state: &Self::State) -> crate::BoardView {
+        // Test double: no board to project.
+        crate::BoardView::from_owners(&[], 1, 0)
+    }
 }
 
 #[derive(Debug)]
@@ -202,6 +207,11 @@ impl Game for OverrideTestGame {
 
     fn encode_obs(_obs: &Self::Obs, _out: &mut Vec<u8>) -> Result<(), EncodeError> {
         Ok(())
+    }
+
+    fn view(_state: &Self::State) -> crate::BoardView {
+        // Test double: no board to project.
+        crate::BoardView::from_owners(&[], 1, 0)
     }
 }
 

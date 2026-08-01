@@ -34,7 +34,7 @@ use engine_core::game_utils::{calculate_reward, decode_action_u32, info_bits, op
 use engine_core::typed::{
     ActionSpace, Capabilities, DecodeError, EncodeError, Encoding, EngineId, Game,
 };
-use engine_core::{register_game, GameAdapter, GameMetadata};
+use engine_core::{register_game, BoardView, CellKind, CellView, GameAdapter, GameMetadata};
 use rand_chacha::ChaCha20Rng;
 
 pub mod action;
@@ -163,7 +163,9 @@ impl Game for Generals {
                 "Capture the enemy general! Full-information turn-based Generals: \
                  move armies, take cities, and grow your territory.",
             )
-            .with_board_type("grid")
+            // Not "grid": a cell here carries terrain and an army count, and a
+            // click is a (tile, direction) move rather than a placement.
+            .with_board_type("generals")
     }
 
     fn reset(&mut self, rng: &mut ChaCha20Rng, _hint: &[u8]) -> (Self::State, Self::Obs) {
@@ -346,6 +348,27 @@ impl Game for Generals {
     fn encode_obs(obs: &Self::Obs, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         obs.encode(out);
         Ok(())
+    }
+
+    fn view(state: &Self::State) -> BoardView {
+        BoardView {
+            cells: state
+                .tiles
+                .iter()
+                .map(|tile| CellView {
+                    owner: tile.owner,
+                    kind: match tile.kind {
+                        TileKind::Normal => CellKind::Normal,
+                        TileKind::General => CellKind::General,
+                        TileKind::City => CellKind::City,
+                        TileKind::Mountain => CellKind::Mountain,
+                    },
+                    value: tile.army,
+                })
+                .collect(),
+            current_player: state.current_player,
+            winner: state.winner,
+        }
     }
 }
 

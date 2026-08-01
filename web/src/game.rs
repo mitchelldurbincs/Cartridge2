@@ -3,7 +3,7 @@
 //! Wraps the EngineContext to provide a convenient API for the web server.
 
 use anyhow::{anyhow, Result};
-use engine_core::{EngineContext, GameMetadata};
+use engine_core::{BoardView, EngineContext, GameMetadata};
 #[cfg(feature = "onnx")]
 use mcts::{run_mcts, MctsConfig, OnnxEvaluator};
 use rand::SeedableRng;
@@ -48,12 +48,10 @@ pub struct GameSession {
     state: Vec<u8>,
     /// Current observation
     obs: Vec<u8>,
-    /// Decoded board for easy access (length = board_width * board_height)
-    board: Vec<u8>,
-    /// Current player (1=X, 2=O)
-    current_player: u8,
-    /// Winner (0=ongoing, 1=X, 2=O, 3=draw)
-    winner: u8,
+    /// The engine's display projection of `state` — board contents, player to
+    /// act, and winner. Never decoded here: state byte layout is private to
+    /// each game.
+    view: BoardView,
     /// Which player the human is (1 or 2). Set when game starts based on who goes first.
     human_player: u8,
     /// RNG for bot moves
@@ -93,7 +91,6 @@ impl GameSession {
 
         // Get game metadata
         let metadata = ctx.metadata();
-        let board_size = metadata.board_size();
 
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -101,9 +98,7 @@ impl GameSession {
             .as_nanos() as u64;
 
         let reset = ctx.reset(seed, &[])?;
-
-        // Parse the state (board_size + current_player + winner bytes)
-        let (board, current_player, winner) = Self::parse_state(&reset.state, board_size)?;
+        let view = ctx.view(&reset.state)?;
 
         // Configure MCTS for playing (less exploration than training)
         #[cfg(feature = "onnx")]
@@ -120,9 +115,7 @@ impl GameSession {
             metadata,
             state: reset.state,
             obs: reset.obs,
-            board,
-            current_player,
-            winner,
+            view,
             human_player: DEFAULT_HUMAN_PLAYER,
             rng: ChaCha20Rng::seed_from_u64(seed),
             evaluator,
@@ -133,28 +126,19 @@ impl GameSession {
         })
     }
 
-    /// Parse state bytes into board, current_player, winner
-    fn parse_state(state: &[u8], board_size: usize) -> Result<(Vec<u8>, u8, u8)> {
-        let expected_len = board_size + 2; // board + current_player + winner
-                                           // Use <= to allow games with extra state fields (like pass_count in Othello)
-        if state.len() < expected_len {
-            return Err(anyhow!(
-                "Invalid state length: expected at least {}, got {}",
-                expected_len,
-                state.len()
-            ));
-        }
+    /// Player to act (1 or 2)
+    pub fn current_player(&self) -> u8 {
+        self.view.current_player
+    }
 
-        let board = state[0..board_size].to_vec();
-        let current_player = state[board_size];
-        let winner = state[board_size + 1];
-
-        Ok((board, current_player, winner))
+    /// Winner (0=ongoing, 1, 2, 3=draw)
+    pub fn winner(&self) -> u8 {
+        self.view.winner
     }
 
     /// Get legal moves by extracting from observation using metadata
-    pub fn legal_moves(&self) -> Vec<u8> {
-        if self.winner != 0 {
+    pub fn legal_moves(&self) -> Vec<u32> {
+        if self.is_game_over() {
             return Vec::new();
         }
 
@@ -162,13 +146,13 @@ impl GameSession {
         self.metadata
             .extract_legal_moves(&self.obs)
             .into_iter()
-            .map(|i| i as u8)
+            .map(|i| i as u32)
             .collect()
     }
 
     /// Check if a move is legal by extracting from observation using metadata
-    pub fn is_legal_move(&self, position: u8) -> bool {
-        if self.winner != 0 {
+    pub fn is_legal_move(&self, position: u32) -> bool {
+        if self.is_game_over() {
             return false;
         }
 
@@ -178,7 +162,7 @@ impl GameSession {
 
     /// Check if game is over
     pub fn is_game_over(&self) -> bool {
-        self.winner != 0
+        self.view.game_over()
     }
 
     /// Set which player the human is (called when game starts)
@@ -188,17 +172,17 @@ impl GameSession {
 
     /// Check if it's the human's turn
     pub fn is_human_turn(&self) -> bool {
-        self.current_player == self.human_player
+        self.current_player() == self.human_player
     }
 
     /// Make a player move
-    pub fn player_move(&mut self, position: u8) -> Result<()> {
+    pub fn player_move(&mut self, position: u32) -> Result<()> {
         self.make_move(position)
     }
 
     /// Make a bot move using MCTS if model is available, otherwise random
     #[cfg(feature = "onnx")]
-    pub fn bot_move(&mut self) -> Result<u8> {
+    pub fn bot_move(&mut self) -> Result<u32> {
         let legal = self.legal_moves();
         if legal.is_empty() {
             return Err(anyhow!("No legal moves available"));
@@ -223,7 +207,7 @@ impl GameSession {
             // Try to use MCTS with neural network
             debug!("Attempting MCTS for bot move");
 
-            let mcts_result = (|| -> Result<u8> {
+            let mcts_result = (|| -> Result<u32> {
                 let guard = self
                     .evaluator
                     .read()
@@ -253,8 +237,7 @@ impl GameSession {
                     "MCTS selected move"
                 );
 
-                u8::try_from(result.action)
-                    .map_err(|_| anyhow!("Action {} does not fit in u8", result.action))
+                Ok(result.action)
             })();
 
             match mcts_result {
@@ -280,7 +263,7 @@ impl GameSession {
 
     /// Make a bot move using random selection (when ONNX is disabled)
     #[cfg(not(feature = "onnx"))]
-    pub fn bot_move(&mut self) -> Result<u8> {
+    pub fn bot_move(&mut self) -> Result<u32> {
         let legal = self.legal_moves();
         if legal.is_empty() {
             return Err(anyhow!("No legal moves available"));
@@ -295,20 +278,16 @@ impl GameSession {
     }
 
     /// Internal move execution
-    fn make_move(&mut self, position: u8) -> Result<()> {
+    fn make_move(&mut self, position: u32) -> Result<()> {
         // Encode action as u32 little-endian
-        let action = (position as u32).to_le_bytes().to_vec();
+        let action = position.to_le_bytes().to_vec();
 
         let step = self.ctx.step(&self.state, &action)?;
 
-        // Update state and observation
+        // Update state, observation and display projection
         self.state = step.state;
         self.obs = step.obs;
-        let board_size = self.metadata.board_size();
-        let (board, current_player, winner) = Self::parse_state(&self.state, board_size)?;
-        self.board = board;
-        self.current_player = current_player;
-        self.winner = winner;
+        self.view = self.ctx.view(&self.state)?;
 
         Ok(())
     }
@@ -318,7 +297,7 @@ impl GameSession {
         let human_symbol = self.metadata.player_symbols[(self.human_player - 1) as usize];
         let bot_symbol = self.metadata.player_symbols[(2 - self.human_player) as usize];
 
-        let message = match self.winner {
+        let message = match self.winner() {
             0 => {
                 if self.is_human_turn() {
                     format!("Your turn ({})", human_symbol)
@@ -332,10 +311,10 @@ impl GameSession {
         };
 
         GameStateResponse {
-            board: self.board.clone(),
-            current_player: self.current_player,
+            cells: self.view.cells.clone(),
+            current_player: self.current_player(),
             human_player: self.human_player,
-            winner: self.winner,
+            winner: self.winner(),
             game_over: self.is_game_over(),
             legal_moves: self.legal_moves(),
             message,
@@ -353,9 +332,9 @@ mod tests {
 
         let session = GameSession::new("tictactoe").unwrap();
 
-        assert_eq!(session.board, vec![0u8; 9]);
-        assert_eq!(session.current_player, 1);
-        assert_eq!(session.winner, 0);
+        assert_eq!(session.view.owners(), vec![0u8; 9]);
+        assert_eq!(session.current_player(), 1);
+        assert_eq!(session.winner(), 0);
         assert_eq!(session.legal_moves().len(), 9);
     }
 
@@ -366,8 +345,8 @@ mod tests {
         let mut session = GameSession::new("tictactoe").unwrap();
         session.player_move(4).unwrap(); // Center
 
-        assert_eq!(session.board[4], 1); // X placed
-        assert_eq!(session.current_player, 2); // Now O's turn
+        assert_eq!(session.view.cells[4].owner, 1); // X placed
+        assert_eq!(session.current_player(), 2); // Now O's turn
         assert!(!session.legal_moves().contains(&4));
     }
 
@@ -382,8 +361,8 @@ mod tests {
 
         assert!(bot_pos < 9);
         assert_ne!(bot_pos, 4);
-        assert_eq!(session.board[bot_pos as usize], 2); // O placed
-        assert_eq!(session.current_player, 1); // Back to X
+        assert_eq!(session.view.cells[bot_pos as usize].owner, 2); // O placed
+        assert_eq!(session.current_player(), 1); // Back to X
     }
 
     #[test]

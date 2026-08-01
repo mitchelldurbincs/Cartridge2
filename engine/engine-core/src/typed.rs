@@ -3,6 +3,7 @@
 //! This trait allows game implementations to work with strongly-typed state,
 //! action, and observation types while maintaining compile-time type safety.
 
+use crate::board_view::BoardView;
 use crate::metadata::GameMetadata;
 use rand_chacha::ChaCha20Rng;
 
@@ -103,6 +104,7 @@ pub struct Capabilities {
 /// #   fn encode_action(action: &Self::Action, out: &mut Vec<u8>) -> Result<(), EncodeError> { todo!() }
 /// #   fn decode_action(buf: &[u8]) -> Result<Self::Action, DecodeError> { todo!() }
 /// #   fn encode_obs(obs: &Self::Obs, out: &mut Vec<u8>) -> Result<(), EncodeError> { todo!() }
+/// #   fn view(state: &Self::State) -> engine_core::BoardView { todo!() }
 /// }
 /// ```
 pub trait Game: Send + Sync + std::fmt::Debug + 'static {
@@ -173,6 +175,17 @@ pub trait Game: Send + Sync + std::fmt::Debug + 'static {
 
     /// Encode observation to bytes
     fn encode_obs(obs: &Self::Obs, out: &mut Vec<u8>) -> Result<(), EncodeError>;
+
+    /// Project the state for display.
+    ///
+    /// This is how anything outside the engine learns what is on the board.
+    /// It is deliberately required rather than defaulted: the alternative is
+    /// callers decoding `encode_state` bytes themselves, which is what this
+    /// replaces.
+    ///
+    /// Games with one owner byte per cell can build the result with
+    /// [`BoardView::from_owners`].
+    fn view(state: &Self::State) -> BoardView;
 }
 
 /// Error type for encoding operations

@@ -24,7 +24,7 @@ use engine_core::game_utils::{
 use engine_core::typed::{
     ActionSpace, Capabilities, DecodeError, EncodeError, Encoding, EngineId, Game,
 };
-use engine_core::{register_game, GameAdapter, GameMetadata, TwoPlayerObs};
+use engine_core::{register_game, BoardView, GameAdapter, GameMetadata, TwoPlayerObs};
 use rand_chacha::ChaCha20Rng;
 
 /// Register TicTacToe with the global game registry
@@ -325,6 +325,10 @@ impl Game for TicTacToe {
     fn encode_obs(obs: &Self::Obs, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         obs.encode(out);
         Ok(())
+    }
+
+    fn view(state: &Self::State) -> BoardView {
+        BoardView::from_owners(&state.board, state.current_player, state.winner)
     }
 }
 

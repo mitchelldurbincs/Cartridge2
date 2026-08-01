@@ -94,6 +94,11 @@ impl Game for SimpleGame {
         out.extend_from_slice(&obs.to_le_bytes());
         Ok(())
     }
+
+    fn view(_state: &Self::State) -> crate::BoardView {
+        // Test double: no board to project.
+        crate::BoardView::from_owners(&[], 1, 0)
+    }
 }
 
 fn setup_registry() {

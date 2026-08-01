@@ -102,6 +102,10 @@ static REGISTRY: Lazy<Mutex<HashMap<String, GameFactory>>> =
 /// #     fn encode_obs(_obs: &Self::Obs, _out: &mut Vec<u8>) -> Result<(), EncodeError> {
 /// #         Ok(())
 /// #     }
+/// #
+/// #     fn view(_state: &Self::State) -> engine_core::BoardView {
+/// #         engine_core::BoardView::from_owners(&[], 1, 0)
+/// #     }
 /// # }
 ///
 /// fn my_game_factory() -> Box<dyn ErasedGame> {

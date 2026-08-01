@@ -124,6 +124,11 @@ impl Game for TestGame {
         }
         Ok(())
     }
+
+    fn view(_state: &Self::State) -> crate::BoardView {
+        // Test double: no board to project.
+        crate::BoardView::from_owners(&[], 1, 0)
+    }
 }
 
 #[test]
@@ -417,6 +422,11 @@ impl Game for CounterGame {
         out.extend_from_slice(obs);
         Ok(())
     }
+
+    fn view(_state: &Self::State) -> crate::BoardView {
+        // Test double: no board to project.
+        crate::BoardView::from_owners(&[], 1, 0)
+    }
 }
 
 #[test]
@@ -551,6 +561,11 @@ impl Game for ResetEncodingFailsGame {
     fn encode_obs(_obs: &Self::Obs, _out: &mut Vec<u8>) -> Result<(), EncodeError> {
         Ok(())
     }
+
+    fn view(_state: &Self::State) -> crate::BoardView {
+        // Test double: no board to project.
+        crate::BoardView::from_owners(&[], 1, 0)
+    }
 }
 
 #[test]
@@ -654,6 +669,11 @@ impl Game for StepEncodingFailsGame {
         } else {
             Ok(())
         }
+    }
+
+    fn view(_state: &Self::State) -> crate::BoardView {
+        // Test double: no board to project.
+        crate::BoardView::from_owners(&[], 1, 0)
     }
 }
 

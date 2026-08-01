@@ -44,7 +44,7 @@
         "B"
       ],
       "description": "Capture the enemy general! Full-information turn-based Generals: move armies, take cities, and grow your territory.",
-      "board_type": "grid"
+      "board_type": "generals"
     },
     {
       "env_id": "othello",

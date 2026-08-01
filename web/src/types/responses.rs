@@ -55,8 +55,10 @@ impl From<GameMetadata> for GameInfoResponse {
 /// Current game state.
 #[derive(Serialize, Deserialize)]
 pub struct GameStateResponse {
-    /// Board cells: 0=empty, 1=X (player), 2=O (bot)
-    pub board: Vec<u8>,
+    /// Board cells, row-major, straight from the engine's `BoardView`. Each
+    /// carries owner (0=empty, 1=player, 2=bot), terrain, and any per-cell
+    /// quantity — the flat games leave the latter two at their defaults.
+    pub cells: Vec<engine_core::CellView>,
     /// Current player: 1=X, 2=O
     pub current_player: u8,
     /// Which player the human is: 1 or 2 (depends on who went first)
@@ -65,8 +67,8 @@ pub struct GameStateResponse {
     pub winner: u8,
     /// Is the game over?
     pub game_over: bool,
-    /// Legal moves (positions)
-    pub legal_moves: Vec<u8>,
+    /// Legal moves (action indices; Generals has 257 of them, so not a u8)
+    pub legal_moves: Vec<u32>,
     /// Status message
     pub message: String,
 }
@@ -78,7 +80,7 @@ pub struct MoveResponse {
     #[serde(flatten)]
     pub state: GameStateResponse,
     /// Bot's move position (if bot moved)
-    pub bot_move: Option<u8>,
+    pub bot_move: Option<u32>,
 }
 
 /// Training history entry for loss visualization.

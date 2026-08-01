@@ -126,4 +126,61 @@ mod tests {
             );
         }
     }
+
+    /// `Game::view` is what every out-of-engine consumer (the web server, the
+    /// evaluation harness' position dump) uses instead of decoding state bytes
+    /// itself, so a game whose view is the wrong shape, or is a constant stub,
+    /// breaks them silently rather than failing to compile. Assert both here,
+    /// registry-wide, so a newly added game is covered without remembering to.
+    #[test]
+    fn test_every_game_projects_a_well_formed_view() {
+        register_all_games();
+
+        for env_id in list_registered_games() {
+            let mut ctx = engine_core::EngineContext::new(&env_id)
+                .unwrap_or_else(|| panic!("{env_id} registered but not constructible"));
+            let meta = ctx.metadata();
+            let reset = ctx.reset(7, &[]).expect("reset");
+
+            let view = ctx
+                .view(&reset.state)
+                .expect("view of a freshly reset state");
+
+            assert_eq!(
+                view.cells.len(),
+                meta.board_size(),
+                "{env_id}: view must have one cell per board position",
+            );
+            assert!(
+                (1..=meta.player_count as u8).contains(&view.current_player),
+                "{env_id}: current_player {} out of range",
+                view.current_player,
+            );
+            assert_eq!(view.winner, 0, "{env_id}: a fresh game cannot be decided");
+            for (i, cell) in view.cells.iter().enumerate() {
+                assert!(
+                    cell.owner as usize <= meta.player_count,
+                    "{env_id}: cell {i} owner {} is not a player or neutral",
+                    cell.owner,
+                );
+            }
+
+            // A constant stub would satisfy everything above. Playing a legal
+            // move must move the view.
+            let action = meta
+                .extract_legal_moves(&reset.obs)
+                .first()
+                .copied()
+                .unwrap_or_else(|| panic!("{env_id}: fresh game has no legal move"));
+            let step = ctx
+                .step(&reset.state, &(action as u32).to_le_bytes())
+                .expect("step");
+            let after = ctx.view(&step.state).expect("view after a move");
+
+            assert_ne!(
+                view, after,
+                "{env_id}: view did not change after a legal move — is it a stub?",
+            );
+        }
+    }
 }

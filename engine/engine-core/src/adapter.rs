@@ -7,6 +7,7 @@
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
+use crate::board_view::BoardView;
 use crate::erased::{ErasedGame, ErasedGameError};
 use crate::metadata::GameMetadata;
 use crate::typed::{Capabilities, EngineId, Game};
@@ -98,6 +99,10 @@ use crate::typed::{Capabilities, EngineId, Game};
 /// #
 /// #     fn encode_obs(_obs: &Self::Obs, _out: &mut Vec<u8>) -> Result<(), EncodeError> {
 /// #         Ok(())
+/// #     }
+/// #
+/// #     fn view(_state: &Self::State) -> engine_core::BoardView {
+/// #         engine_core::BoardView::from_owners(&[], 1, 0)
 /// #     }
 /// # }
 ///
@@ -207,6 +212,11 @@ impl<T: Game> ErasedGame for GameAdapter<T> {
         T::encode_obs(&obs, out_obs).map_err(|e| ErasedGameError::Encoding(e.to_string()))?;
 
         Ok((reward, done, info))
+    }
+
+    fn view(&self, state: &[u8]) -> Result<BoardView, ErasedGameError> {
+        let state = T::decode_state(state).map_err(|e| ErasedGameError::Decoding(e.to_string()))?;
+        Ok(T::view(&state))
     }
 }
 

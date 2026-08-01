@@ -26,7 +26,7 @@ fn internal_error(context: &str, e: impl std::fmt::Display) -> (StatusCode, Stri
 }
 
 /// Run the bot's move, recording its latency and converting errors to a 500.
-fn timed_bot_move(session: &mut GameSession) -> Result<u8, (StatusCode, String)> {
+fn timed_bot_move(session: &mut GameSession) -> Result<u32, (StatusCode, String)> {
     let bot_start = Instant::now();
     let pos = session
         .bot_move()
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn test_game_state_response_default() {
         let response = GameStateResponse {
-            board: vec![0u8; 9],
+            cells: engine_core::BoardView::from_owners(&[0u8; 9], 1, 0).cells,
             current_player: 1,
             human_player: 1,
             winner: 0,
@@ -275,7 +275,7 @@ mod tests {
             message: "Your turn (X)".to_string(),
         };
 
-        assert_eq!(response.board, vec![0u8; 9]);
+        assert_eq!(response.cells.len(), 9);
         assert_eq!(response.current_player, 1);
         assert_eq!(response.human_player, 1);
         assert_eq!(response.winner, 0);
@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn test_game_state_response_game_over() {
         let response = GameStateResponse {
-            board: vec![1, 1, 1, 0, 2, 0, 0, 0, 0],
+            cells: engine_core::BoardView::from_owners(&[1, 1, 1, 0, 2, 0, 0, 0, 0], 1, 0).cells,
             current_player: 2,
             human_player: 1,
             winner: 1,
@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn test_move_response_creation() {
         let state = GameStateResponse {
-            board: vec![1, 0, 0, 0, 2, 0, 0, 0, 0],
+            cells: engine_core::BoardView::from_owners(&[1, 0, 0, 0, 2, 0, 0, 0, 0], 1, 0).cells,
             current_player: 1,
             human_player: 1,
             winner: 0,
@@ -348,14 +348,14 @@ mod tests {
         };
 
         assert_eq!(response.bot_move, Some(4));
-        assert_eq!(response.state.board[0], 1); // Player move
-        assert_eq!(response.state.board[4], 2); // Bot move
+        assert_eq!(response.state.cells[0].owner, 1); // Player move
+        assert_eq!(response.state.cells[4].owner, 2); // Bot move
     }
 
     #[test]
     fn test_move_response_no_bot_move() {
         let state = GameStateResponse {
-            board: vec![1, 1, 1, 0, 2, 0, 0, 0, 0],
+            cells: engine_core::BoardView::from_owners(&[1, 1, 1, 0, 2, 0, 0, 0, 0], 1, 0).cells,
             current_player: 2,
             human_player: 1,
             winner: 1,
@@ -376,7 +376,7 @@ mod tests {
     #[test]
     fn test_game_state_response_serialization() {
         let response = GameStateResponse {
-            board: vec![0u8; 9],
+            cells: engine_core::BoardView::from_owners(&[0u8; 9], 1, 0).cells,
             current_player: 1,
             human_player: 1,
             winner: 0,
@@ -389,7 +389,7 @@ mod tests {
         assert!(json.is_ok());
 
         let json_str = json.unwrap();
-        assert!(json_str.contains("board"));
+        assert!(json_str.contains("cells"));
         assert!(json_str.contains("current_player"));
         assert!(json_str.contains("winner"));
         assert!(json_str.contains("game_over"));
@@ -432,7 +432,7 @@ mod tests {
     #[test]
     fn test_move_response_serialization() {
         let state = GameStateResponse {
-            board: vec![1, 0, 0, 0, 2, 0, 0, 0, 0],
+            cells: engine_core::BoardView::from_owners(&[1, 0, 0, 0, 2, 0, 0, 0, 0], 1, 0).cells,
             current_player: 1,
             human_player: 1,
             winner: 0,
@@ -452,6 +452,6 @@ mod tests {
         // The response should be flattened with state fields at top level
         let json_str = json.unwrap();
         assert!(json_str.contains("bot_move"));
-        assert!(json_str.contains("board"));
+        assert!(json_str.contains("cells"));
     }
 }

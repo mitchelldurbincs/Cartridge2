@@ -1,7 +1,19 @@
 // API client for the Cartridge2 backend
 
+/** Terrain of a cell. Mirrors engine_core::CellKind. */
+export type CellKind = 'normal' | 'general' | 'city' | 'mountain';
+
+/** One board cell, straight from the engine's BoardView. */
+export interface CellView {
+  /** 0 = empty/neutral, 1/2 = owning player. */
+  owner: number;
+  kind: CellKind;
+  /** Per-cell quantity (Generals' army count); 0 for the flat games. */
+  value: number;
+}
+
 export interface GameState {
-  board: number[];
+  cells: CellView[];
   current_player: number;
   human_player: number;
   winner: number;
@@ -20,7 +32,7 @@ export interface GameInfo {
   player_names: string[];
   player_symbols: string[];
   description: string;
-  board_type: 'grid' | 'drop_column';
+  board_type: 'grid' | 'drop_column' | 'generals';
 }
 
 export interface GamesListResponse {

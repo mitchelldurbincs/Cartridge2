@@ -4,6 +4,7 @@
 //! without generics. All typed games are converted to this interface via the
 //! adapter layer, enabling dynamic dispatch in the registry system.
 
+use crate::board_view::BoardView;
 use crate::metadata::GameMetadata;
 use crate::typed::{Capabilities, EngineId};
 
@@ -117,6 +118,14 @@ pub trait ErasedGame: Send + Sync + std::fmt::Debug + 'static {
         out_state: &mut Vec<u8>,
         out_obs: &mut Vec<u8>,
     ) -> Result<(f32, bool, u64), ErasedGameError>;
+
+    /// Project an encoded state for display.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ErasedGameError::Decoding` if the state bytes are not a valid
+    /// state for this game.
+    fn view(&self, state: &[u8]) -> Result<BoardView, ErasedGameError>;
 }
 
 #[cfg(test)]
@@ -214,6 +223,11 @@ mod tests {
             let info = new_step as u64;
 
             Ok((reward, done, info))
+        }
+
+        fn view(&self, _state: &[u8]) -> Result<BoardView, ErasedGameError> {
+            // Test double: no board to project.
+            Ok(BoardView::from_owners(&[], 1, 0))
         }
     }
 
