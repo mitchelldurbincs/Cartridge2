@@ -42,7 +42,7 @@ STEPS            ?= 400
         train play web frontend \
         test test-engine test-actor test-web test-trainer \
         lint lint-rust lint-python lint-frontend \
-        build build-actor build-web game-manifest \
+        build build-actor build-eval build-web game-manifest \
         clean clean-data clean-models clean-all \
         db-start db-stop db-reset
 
@@ -113,7 +113,7 @@ setup-frontend:
 
 # --- Build ---
 
-build: build-actor build-web
+build: build-actor build-eval build-web
 
 # Regenerate the game-metadata manifest the Python trainer reads. The engine is
 # the source of truth for board dimensions, action counts and observation
@@ -126,6 +126,12 @@ game-manifest:
 build-actor:
 	@echo "--- Building actor (release) $(CARGO_FEATURES) ---"
 	cd actor && $(CARGO) build --release $(CARGO_FEATURES)
+
+# The evaluation binary the trainer shells out to for every eval. Without it
+# `trainer loop` cannot gate promotions; see trainer/src/trainer/evaluator.py.
+build-eval:
+	@echo "--- Building cartridge-eval (release) ---"
+	$(CARGO) build --release --manifest-path engine/Cargo.toml -p evaluator
 
 build-web:
 	@echo "--- Building web server (release) ---"

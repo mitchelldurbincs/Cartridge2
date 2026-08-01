@@ -3,6 +3,7 @@ members = [
     "engine-core",
     "engine-config",
     "engine-games",
+    "evaluator",
     "games-tictactoe",
     "games-connect4",
     "games-othello",
