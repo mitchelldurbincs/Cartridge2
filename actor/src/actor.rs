@@ -114,6 +114,18 @@ impl EpisodeStats {
 /// only ever raises the budget, never lowers an explicitly configured one.
 const TIMEOUT_SECS_PER_MOVE: u64 = 1;
 
+/// The wall-clock budget a single episode actually gets, after the horizon
+/// floor is applied to the configured value.
+///
+/// Shared with the liveness probe: the health check must never be tighter than
+/// the budget an episode is legitimately allowed to use, or a long-but-healthy
+/// episode gets the process killed before it can finish. Deriving both from
+/// this one function is what keeps them consistent.
+pub(crate) fn effective_episode_timeout_secs(timeout_secs: u64, max_horizon: u32) -> u64 {
+    let horizon_floor = (max_horizon.max(1) as u64).saturating_mul(TIMEOUT_SECS_PER_MOVE);
+    timeout_secs.max(horizon_floor)
+}
+
 impl EpisodeContext {
     /// Create a new episode context with generated ID and timing.
     fn new(
@@ -124,9 +136,8 @@ impl EpisodeContext {
     ) -> Result<Self> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
         let id = format!("{}-ep-{}-{}", actor_id, episode_count, now.as_secs());
-        let horizon_floor =
-            Duration::from_secs((max_horizon.max(1) as u64).saturating_mul(TIMEOUT_SECS_PER_MOVE));
-        let timeout = Duration::from_secs(timeout_secs).max(horizon_floor);
+        let timeout =
+            Duration::from_secs(effective_episode_timeout_secs(timeout_secs, max_horizon));
         // Use 10x max_horizon as generous upper bound to protect against infinite loops
         let max_steps = max_horizon.saturating_mul(10).max(1000);
 
@@ -333,6 +344,19 @@ impl Actor {
     /// Run the actor main loop with health state tracking for Kubernetes probes.
     /// Records episode completions to the health state for liveness tracking.
     pub async fn run(&self, health: &HealthState) -> Result<()> {
+        // Size the liveness window from the same episode budget the episodes
+        // themselves use. Liveness measures progress in completed episodes, so
+        // a window shorter than one episode's budget would restart the process
+        // mid-episode — and for a game whose episodes always exceed it, would
+        // restart forever without a single episode completing.
+        {
+            let max_horizon = self.lock_engine()?.capabilities().max_horizon;
+            health.set_episode_budget_secs(effective_episode_timeout_secs(
+                self.config.episode_timeout_secs,
+                max_horizon,
+            ));
+        }
+
         let initial_rss = metrics::rss_mb().unwrap_or(0.0);
         info!(
             actor_id = %self.config.actor_id,
@@ -779,6 +803,42 @@ mod tests {
         assert_eq!(ctx.timeout, Duration::from_secs(1));
         std::thread::sleep(Duration::from_millis(1100));
         assert_eq!(ctx.limit_exceeded(0), Some(AbandonReason::Timeout));
+    }
+
+    #[test]
+    fn test_liveness_window_is_never_tighter_than_an_episode_budget() {
+        // Regression test: the liveness probe measures progress in *completed
+        // episodes*, so a window shorter than one episode's budget kills the
+        // process mid-episode. For a game whose episodes always exceed it,
+        // that is an unbreakable restart loop in which no episode ever
+        // completes. generals_8x8 (horizon 402) against the old fixed 300s
+        // window was exactly that case.
+        for (configured, horizon) in [
+            (180, 402), // generals: horizon floor raises the budget past 300s
+            (180, 42),  // connect4: configured value wins
+            (3600, 402),
+            (30, 9),
+        ] {
+            let budget = effective_episode_timeout_secs(configured, horizon);
+            let health = HealthState::new();
+            health.set_episode_budget_secs(budget);
+
+            assert!(
+                health.progress_timeout_secs() > budget,
+                "liveness window {} must exceed the {}s episode budget \
+                 (configured={configured}, horizon={horizon})",
+                health.progress_timeout_secs(),
+                budget,
+            );
+        }
+    }
+
+    #[test]
+    fn test_liveness_window_never_drops_below_the_default() {
+        let health = HealthState::new();
+        assert_eq!(health.progress_timeout_secs(), 300);
+        health.set_episode_budget_secs(1);
+        assert_eq!(health.progress_timeout_secs(), 300);
     }
 
     #[test]

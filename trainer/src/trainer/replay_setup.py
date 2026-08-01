@@ -19,10 +19,21 @@ logger = logging.getLogger(__name__)
 
 # Layout fields: a disagreement here means the observations in the buffer are
 # not the shape the network expects, so training on them is meaningless.
-_FATAL_FIELDS = ("obs_size", "legal_mask_offset", "num_actions")
+#
+# board_width/board_height belong here, not among the descriptive fields: the
+# ResNet reshapes the leading slice using board dimensions, and they are what
+# obs_channels is derived from below. Different dimensions with the same
+# obs_size reinterpret every plane.
+_FATAL_FIELDS = (
+    "obs_size",
+    "legal_mask_offset",
+    "num_actions",
+    "board_width",
+    "board_height",
+)
 
 # Descriptive fields: worth reporting, but they cannot corrupt learning.
-_COSMETIC_FIELDS = ("display_name", "board_width", "board_height")
+_COSMETIC_FIELDS = ("display_name",)
 
 
 class MetadataMismatch(RuntimeError):
@@ -41,6 +52,27 @@ def check_metadata_agrees(trainer: "Trainer", replay, env_id: str) -> None:
     commits, and the transitions in the buffer do not match the network being
     trained. Raising is the right outcome: the alternative is burning hours of
     compute producing a model from mismatched observations.
+
+    **What this does not do: validate replay lineage.** The metadata row is
+    mutable and describes the *current* actor, while individual transitions
+    carry no record of the schema that produced them. So this cannot detect
+    transitions written by an earlier actor whose encoding differed, whether
+    they sit alone in the buffer or mixed in with current ones — a new actor
+    simply overwrites the row and the check then passes.
+
+    Nor can it see changes that leave every stored dimension identical:
+    ``player_relative_obs`` is not a database column, and a same-width change
+    in what the planes *mean* is invisible here. (The realistic version of that
+    change also alters the channel count, which the derived check below does
+    catch.)
+
+    Closing those gaps needs an immutable per-transition schema identifier —
+    covering observation encoding, algorithm, payload schema and target
+    semantics — with replay sampling filtered by it. That belongs with the
+    general transition envelope, not here; a second mutable column on this row
+    would narrow one hole while implying a lineage guarantee that does not
+    exist. Until then, the practical mitigation is the loop's
+    ``clear_replay_on_start``, which drops the buffer between iterations.
     """
     db_metadata = replay.get_metadata(env_id)
     if not db_metadata:
@@ -57,6 +89,19 @@ def check_metadata_agrees(trainer: "Trainer", replay, env_id: str) -> None:
         for field in _FATAL_FIELDS
         if getattr(config, field) != getattr(db_metadata, field)
     ]
+    # obs_channels is not a database column, but it is fully determined by
+    # columns that are: the board planes occupy [0, obs_channels * board_size).
+    # Deriving it here covers the case where a game keeps its obs_size while
+    # redistributing it over a different number of planes.
+    db_board_size = db_metadata.board_width * db_metadata.board_height
+    if db_board_size and db_metadata.legal_mask_offset % db_board_size == 0:
+        db_channels = db_metadata.legal_mask_offset // db_board_size
+        if db_channels != config.obs_channels:
+            mismatches.append(
+                f"obs_channels: engine={config.obs_channels!r} "
+                f"database={db_channels!r} (derived from legal_mask_offset/board_size)"
+            )
+
     if mismatches:
         raise MetadataMismatch(
             f"Replay buffer for '{env_id}' was written with a different observation "

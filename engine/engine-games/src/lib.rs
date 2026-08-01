@@ -75,7 +75,8 @@ mod tests {
         assert_eq!(othello_count, 1);
     }
 
-    /// Every game's observation must be laid out as
+    /// Every game currently bundled conforms to the **AlphaZero spatial
+    /// observation profile**:
     /// `[obs_channels * board_size][legal mask: num_actions][player one-hot: 2]`.
     ///
     /// Both halves matter downstream: the trainer reshapes the leading slice
@@ -83,8 +84,20 @@ mod tests {
     /// `legal_mask_offset + num_actions`. A game that declares an encoding
     /// inconsistent with its own obs_size would mistrain silently, so assert
     /// it here for every registered game rather than per-crate.
+    ///
+    /// **This is a profile the current trainer requires, not a property of
+    /// `Game`.** It holds for every game in the registry today because every
+    /// game today is a two-player perfect-information board game trained by
+    /// AlphaZero. An environment that is not — a vector/scalar observation, a
+    /// recurrent or fog-of-war encoding, a simultaneous-turn adapter, anything
+    /// driven by PPO — will legitimately violate it, and the answer then is to
+    /// scope this assertion to the games claiming the profile rather than to
+    /// force the new environment into a board-shaped layout. Deliberately not
+    /// building that opt-out yet: there is no second algorithm to design it
+    /// against, and guessing the seam before one exists is how it ends up
+    /// fitting neither.
     #[test]
-    fn test_observation_layout_invariants_hold_for_every_game() {
+    fn test_bundled_games_conform_to_the_alphazero_spatial_profile() {
         register_all_games();
 
         for env_id in list_registered_games() {
