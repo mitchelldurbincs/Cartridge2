@@ -170,6 +170,8 @@ PyTorch training with AlphaZero-style learning and orchestration:
 - `python -m trainer evaluate` - Evaluate model against random baseline
 - `python -m trainer loop` - Synchronized AlphaZero training (actor + trainer + eval)
 - `python -m trainer solver-eval` - Score Connect4 model moves against the bitbully perfect solver
+- `python -m trainer register-players` - Add checkpoints to the player registry
+- `python -m trainer tournament` - Round-robin the registered players and rate them (Elo)
 
 **Features:**
 - Reads transitions from PostgreSQL replay buffer
@@ -327,6 +329,8 @@ cartridge2/
 │       │   ├── eval_runner.py  # Evaluation runner
 │       │   └── stats_manager.py # Stats aggregation
 │       ├── players.py     # Who occupies a seat in an evaluation game
+│       ├── registry.py    # Durable player records (data/players.json)
+│       ├── tournament.py  # Round-robin + Bradley-Terry Elo rating
 │       └── storage/       # Storage backends (PostgreSQL, S3, filesystem)
 ├── Dockerfile.alphazero   # Combined actor+trainer image for Docker
 ├── docker-compose.yml     # Local services (postgres, minio, training, web)
@@ -510,6 +514,11 @@ python -m trainer evaluate --model ./data/models/latest.onnx --games 100
 python -m trainer solver-eval --model ./data/models/latest.onnx --games 100
 python -m trainer solver-eval --all-checkpoints --games 100   # progression across checkpoints
 
+# Rate every checkpoint against every other; Elo anchored at random = 0.
+# A far better progress signal than win-rate-vs-random, which saturates.
+python -m trainer register-players --env-id connect4
+python -m trainer tournament --env-id connect4 --games 40
+
 # The loop runs solver eval automatically each evaluation (connect4) and can
 # log everything to W&B; opt into solver-based gatekeeping with:
 python -m trainer loop --env-id connect4 --wandb-enabled true --promotion-metric solver_optimal
@@ -552,6 +561,7 @@ python -m trainer train --steps 1000
 - [x] Engine-generated game-metadata manifest (single source of truth)
 - [x] Engine-owned state projection (`BoardView`); Generals playable in the web UI
 - [x] Evaluation moved into the engine (`cartridge-eval`); Python game mirrors deleted
+- [x] Player registry + round-robin tournaments with Bradley-Terry Elo
 
 ## API Endpoints
 
@@ -713,6 +723,11 @@ engine/mcts/benches/    # search microbenchmarks
   50-250 simulation budget, and 92% of games decided by territory adjudication
   at the round cap. Use `cargo run -p mcts --example generals_search_diag
   --release` to re-measure.
+- **Promotion still gates on win rate vs. the champion, not Elo.** The
+  tournament rates a whole field, but `should_promote` still compares the
+  candidate to `best.onnx` head-to-head. On the existing Connect 4 checkpoints
+  the tournament put `best.onnx` ~100-170 Elo below every step checkpoint,
+  which is the stale-champion problem solver-eval also found.
 - **Evaluation defaults to no search.** `[evaluation] simulations = 0` plays
   the policy head directly, preserving pre-migration eval numbers. Raising it
   measures the system as it actually plays — a Connect 4 checkpoint went 15/20

@@ -5,6 +5,8 @@ Provides subcommands for different operations:
     python -m trainer evaluate     - Evaluate model against random baseline
     python -m trainer loop         - Run synchronized AlphaZero training
     python -m trainer solver-eval  - Score Connect4 moves vs perfect solver
+    python -m trainer register-players - Add checkpoints to the player registry
+    python -m trainer tournament   - Round-robin the registered players, rate them
 
 For backwards compatibility, running without a subcommand defaults to 'train':
     python -m trainer --steps 1000
@@ -71,6 +73,20 @@ def cmd_solver_eval(args: argparse.Namespace) -> int:
     from .solver_eval import run_solver_evaluation
 
     return run_solver_evaluation(args)
+
+
+def cmd_register_players(args: argparse.Namespace) -> int:
+    """Add checkpoints to the player registry."""
+    from .tournament_cli import run_register_players
+
+    return run_register_players(args)
+
+
+def cmd_tournament(args: argparse.Namespace) -> int:
+    """Run a round-robin tournament over registered players."""
+    from .tournament_cli import run_tournament_command
+
+    return run_tournament_command(args)
 
 
 def cmd_loop(args: argparse.Namespace) -> int:
@@ -164,6 +180,32 @@ def setup_solver_eval_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.set_defaults(func=cmd_solver_eval)
 
 
+def setup_register_players_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Set up the register-players subcommand parser."""
+    from .tournament_cli import add_register_players_arguments
+
+    parser = subparsers.add_parser(
+        "register-players",
+        help="Add ONNX checkpoints to the player registry",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    add_register_players_arguments(parser)
+    parser.set_defaults(func=cmd_register_players)
+
+
+def setup_tournament_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Set up the tournament subcommand parser."""
+    from .tournament_cli import add_tournament_arguments
+
+    parser = subparsers.add_parser(
+        "tournament",
+        help="Round-robin the registered players and rate them (Elo)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    add_tournament_arguments(parser)
+    parser.set_defaults(func=cmd_tournament)
+
+
 def setup_loop_parser(subparsers: argparse._SubParsersAction) -> None:
     """Set up the loop subcommand parser."""
     parser = subparsers.add_parser(
@@ -194,6 +236,8 @@ def main() -> int:
         "evaluate",
         "loop",
         "solver-eval",
+        "register-players",
+        "tournament",
         "-h",
         "--help",
     ):
@@ -212,6 +256,8 @@ def main() -> int:
         setup_evaluate_parser(subparsers)
         setup_loop_parser(subparsers)
         setup_solver_eval_parser(subparsers)
+        setup_register_players_parser(subparsers)
+        setup_tournament_parser(subparsers)
 
         args, remaining = parser.parse_known_args()
 

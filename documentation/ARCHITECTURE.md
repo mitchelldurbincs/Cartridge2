@@ -686,6 +686,9 @@ trainer/
     ├── resnet.py          # ResNet architecture
     ├── evaluator.py       # Drives `cartridge-eval`; parses its summary
     ├── players.py         # Who occupies a seat in an evaluation game
+    ├── registry.py        # Durable player records (data/players.json)
+    ├── tournament.py      # Round-robin + Bradley-Terry Elo
+    ├── tournament_cli.py  # register-players / tournament commands
     ├── solver_eval/       # Perfect-solver move scoring (Connect4)
     ├── wandb_logger.py    # W&B wrapper (shim over crucible)
     ├── config.py          # TrainerConfig
@@ -884,6 +887,43 @@ per move. It defaults to `0`, meaning the policy head is played directly — wha
 the Python evaluator did, kept as the default so eval numbers stay comparable.
 Raising it makes evaluation measure the system as it actually plays: a Connect 4
 checkpoint that scores 15/20 vs random at `simulations = 0` scores 19/20 at 100.
+
+### Player Registry and Tournaments
+
+A *player* is anything that can occupy a seat: the random baseline, a
+checkpoint, the same checkpoint given a search budget, later a PPO checkpoint.
+`data/players.json` makes them explicit rather than identified by filename
+convention, and `trainer/registry.py` resolves a record into the player spec
+`cartridge-eval` consumes.
+
+```bash
+trainer register-players --env-id connect4     # every checkpoint + the baseline
+trainer tournament --env-id connect4 --games 40
+```
+
+`trainer/tournament.py` plays every pairing once and fits Bradley-Terry ratings
+on the Elo scale, anchored so `random` sits at 0. It uses the
+minorization-maximization iteration rather than sequential Elo updates: the
+latter depend on the order games happen to be played, so the same round-robin
+would rate differently depending on scheduling.
+
+**Why a round-robin rather than win rate vs. random.** Win rate against one
+opponent depends entirely on who that opponent was, and saturates — every decent
+Connect 4 checkpoint beats random ~75% and the curve goes flat exactly where you
+want resolution. Ratings separate them. On the existing checkpoints this
+immediately showed that `best.onnx` sits ~100-170 Elo *below* every step
+checkpoint, while looking identical to `latest` on win-rate-vs-random (both
+15-5).
+
+**Play temperature is not optional here.** Two greedy models on a deterministic
+opening replay the same game every time, so a 40-game match is one game counted
+20 times per seat, and the ratings come out confident and meaningless — measured:
+every model-vs-model pairing scored exactly 0-20, 10-10 or 20-0. Registered
+players default to temperature 0.2, and a tournament warns when two or more of
+its field are deterministic.
+
+Nothing in either module knows how a player was trained. A PPO checkpoint enters
+the same pool and gets a comparable rating.
 
 ### Perfect-Solver Evaluation (Connect 4)
 

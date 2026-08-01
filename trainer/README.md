@@ -39,6 +39,8 @@ trainer train \
 |---------|-------------|
 | `trainer train` | Train on replay buffer data |
 | `trainer evaluate` | Evaluate model against random baseline |
+| `trainer register-players` | Add ONNX checkpoints to the player registry |
+| `trainer tournament` | Round-robin the registered players, rate them (Elo) |
 | `trainer loop` | Run synchronized AlphaZero training (actor + trainer + eval) |
 
 All commands support `--help` for detailed argument information.
@@ -304,6 +306,8 @@ src/trainer/
 ├── resnet.py         # ResNet architecture (ConvPolicyValueNetwork, ResidualBlock)
 ├── evaluator.py      # Drives the cartridge-eval binary; parses its summary
 ├── players.py        # Who occupies a seat in an evaluation game
+├── registry.py       # Durable player records (data/players.json)
+├── tournament.py     # Round-robin + Bradley-Terry Elo rating
 ├── game_config.py    # Game-specific configurations (dimensions, network type)
 ├── stats.py          # TrainerStats, EvalStats, load/write functions
 ├── config.py         # TrainerConfig dataclass
