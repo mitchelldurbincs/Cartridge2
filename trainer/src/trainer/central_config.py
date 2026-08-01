@@ -97,6 +97,11 @@ class EvaluationConfig:
     games: int = 50
     win_threshold: float = 0.55  # Win rate needed to become new best model
     eval_vs_random: bool = True  # Also evaluate against random baseline
+    # MCTS simulations per move during evaluation. 0 plays the policy head
+    # directly, which is what evaluation did before it moved into the engine;
+    # above 0 the models play with search, which is how they actually play and
+    # a fairer measure of strength, at proportionally more eval wall-time.
+    simulations: int = 0
     # Perfect-solver move scoring during loop evaluation (connect4 only)
     solver_games: int = 100  # Games per solver eval (0 = disable)
     solver_seed: int = 42  # Fixed seed so rates are comparable across iterations

@@ -31,6 +31,7 @@ interval = 1
 games = 50
 win_threshold = 0.55      # Win rate needed to become new best model
 eval_vs_random = true     # Also evaluate against random baseline
+simulations = 0           # MCTS sims per move in eval (0 = policy head only, no search)
 solver_games = 100        # Perfect-solver eval games per evaluation, 0 = disable (connect4 only)
 solver_seed = 42          # Fixed seed so solver rates are comparable across iterations
 promotion_metric = "win_rate"   # "win_rate" or "solver_optimal"

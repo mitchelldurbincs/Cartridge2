@@ -19,7 +19,8 @@ from .checkpoint import (
     save_onnx_checkpoint,
     save_pytorch_checkpoint,
 )
-from .evaluator import OnnxPolicy, RandomPolicy, evaluate
+from .evaluator import evaluate
+from .players import ModelPlayer, RandomPlayer
 from .stats import EvalStats
 from .step_metrics import write_stats
 
@@ -108,8 +109,8 @@ def evaluate_checkpoint(trainer: "Trainer", checkpoint_path: Path, step: int) ->
 
     eval_start = time.time()
     try:
-        model_policy = OnnxPolicy(str(checkpoint_path), temperature=0.0)
-        random_policy = RandomPolicy()
+        model_policy = ModelPlayer(str(checkpoint_path), temperature=0.0)
+        random_policy = RandomPlayer()
 
         results = evaluate(
             player1=model_policy,

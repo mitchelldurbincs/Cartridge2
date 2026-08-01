@@ -25,7 +25,9 @@ from trainer.solver_eval import SolverEvalResults, judge_move
 from trainer.structured_logging import get_trace_context
 
 
-class StubPolicy:
+class StubPlayer:
+    """Stand-in for the ModelPlayer the shim's policy_loader builds."""
+
     def __init__(self, model_path, temperature=0.0):
         self.model_path = str(model_path)
         self.temperature = temperature
@@ -34,8 +36,8 @@ class StubPolicy:
     def name(self):
         return f"Stub({self.model_path})"
 
-    def select_action(self, state, config):
-        return state.legal_moves()[0]
+    def cli_args(self, slot):
+        return [f"--{slot}", self.model_path]
 
 
 class FakeReplayBuffer:
@@ -133,7 +135,7 @@ class TestEvalRunnerComposition:
 
         # The shims read these module globals when constructing/scoring, so
         # patching them before construction stubs every external backend.
-        monkeypatch.setattr(eval_runner_shim, "OnnxPolicy", StubPolicy)
+        monkeypatch.setattr(eval_runner_shim, "_model_player", StubPlayer)
         monkeypatch.setattr(
             eval_runner_shim,
             "run_eval",

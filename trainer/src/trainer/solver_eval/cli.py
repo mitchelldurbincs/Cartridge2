@@ -11,9 +11,8 @@ import sys
 from collections.abc import Iterable
 from pathlib import Path
 
-from ..evaluator import get_game_metadata_or_config
 from ..logging_utils import silence_noisy_loggers
-from ..policies import OnnxPolicy, RandomPolicy
+from ..players import ModelPlayer, RandomPlayer
 from .results import CHECKPOINT_PATTERN, SolverEvalResults, infer_step_from_filename
 from .scorer import SolverScorer, solver_evaluate
 
@@ -165,8 +164,6 @@ def run_solver_evaluation(args: argparse.Namespace) -> int:
             return 1
         model_paths = [model_path]
 
-    config = get_game_metadata_or_config(args.env_id)
-
     try:
         scorer = SolverScorer()
     except (ImportError, RuntimeError) as e:
@@ -182,19 +179,14 @@ def run_solver_evaluation(args: argparse.Namespace) -> int:
 
     all_results = []
     for model_path in model_paths:
-        try:
-            model = OnnxPolicy(str(model_path), temperature=args.temperature)
-        except Exception as e:
-            logger.error(f"Failed to load model {model_path}: {e}")
-            return 1
+        model = ModelPlayer(str(model_path), temperature=args.temperature)
 
         logger.info(f"Evaluating {model.name} over {args.games} games vs random")
         results = solver_evaluate(
             model=model,
-            opponent=RandomPolicy(),
+            opponent=RandomPlayer(),
             scorer=scorer,
             env_id=args.env_id,
-            config=config,
             num_games=args.games,
             seed=args.seed,
             verbose=args.verbose,

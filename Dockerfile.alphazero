@@ -50,6 +50,12 @@ RUN if [ -z "$CARGO_FEATURES" ]; then \
         cargo build --release --features "$CARGO_FEATURES"; \
     fi
 
+# The evaluation binary. The trainer shells out to it for every evaluation, so
+# without it in the image `trainer loop` cannot gate promotions at all. Its
+# features are actor-independent (ONNX is always on), hence no CARGO_FEATURES.
+WORKDIR /app/engine
+RUN cargo build --release -p evaluator
+
 # ============================================
 # Stage 2: Python Runtime with Actor Binary
 # ============================================
@@ -80,6 +86,9 @@ WORKDIR /app
 # Copy actor binary from rust builder
 COPY --from=rust-builder /app/actor/target/release/actor /app/actor
 
+# Copy the evaluation binary (see ENV CARTRIDGE_EVAL_BINARY below)
+COPY --from=rust-builder /app/engine/target/release/cartridge-eval /app/cartridge-eval
+
 # Copy SQL schema files (needed by PostgreSQL storage backend)
 COPY sql/ /usr/local/sql/
 
@@ -102,6 +111,20 @@ RUN pip install --no-cache-dir --break-system-packages ./trainer
 # a dropped crucible dependency) passes every CI job and fails only in
 # production, at container start.
 RUN python -c "import crucible; from trainer.game_config import get_config; get_config('tictactoe')"
+
+# Set before the smoke check below so it resolves the binary exactly the way
+# the running container will, rather than via the fallback candidate paths.
+ENV CARTRIDGE_EVAL_BINARY="/app/cartridge-eval"
+
+# Smoke-check the evaluation path end to end: locating the binary and playing a
+# game through the real engine. A missing or unrunnable binary would otherwise
+# surface only when the first iteration tried to gate a promotion.
+RUN python -c "\
+from trainer.evaluator import evaluate, find_eval_binary; \
+from trainer.players import RandomPlayer; \
+print('eval binary:', find_eval_binary()); \
+r = evaluate(player1=RandomPlayer(), player2=RandomPlayer(), env_id='tictactoe', num_games=2); \
+assert r.games_played == 2, r"
 
 # Create data directory with correct permissions
 RUN mkdir -p /app/data/models && chown -R cartridge:cartridge /app/data

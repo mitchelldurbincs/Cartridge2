@@ -15,15 +15,33 @@ from crucible.orchestrator.eval_runner import (
     should_promote,
 )
 
-from ..evaluator import OnnxPolicy, RandomPolicy
 from ..evaluator import evaluate as run_eval
 from ..game_config import get_config as get_game_config
+from ..players import ModelPlayer, RandomPlayer
 from ..solver_eval import SolverScorer, solver_evaluate
 from .config import LoopConfig
 from .eval_reporting import EvalReportingMixin
 
 if TYPE_CHECKING:
     from ..wandb_logger import WandbLogger
+
+
+def _model_player(model_path: str, temperature: float) -> ModelPlayer:
+    """crucible's ``policy_loader`` seam: build a player for a model file.
+
+    The seam passes only (path, temperature), so the search budget is bound
+    here from ``[evaluation] simulations``. Zero — the default — plays the
+    policy head with no search, which is what evaluation did before it moved
+    into the engine, so eval numbers stay comparable; raising it makes the
+    models actually search during evaluation.
+    """
+    from ..central_config import get_config as get_central_config
+
+    return ModelPlayer(
+        model_path=model_path,
+        temperature=temperature,
+        simulations=get_central_config().evaluation.simulations,
+    )
 
 
 class _Cartridge2SolverHooks:
@@ -50,7 +68,7 @@ class EvalRunner(EvalReportingMixin, _CoreEvalRunner):
     injection and defaults its solver-stats appender to a no-op; this
     subclass restores pre-move behavior exactly:
 
-    - policies load via ``OnnxPolicy`` / ``RandomPolicy``,
+    - players are described by ``ModelPlayer`` / ``RandomPlayer``,
     - head-to-head games run via ``evaluator.evaluate``,
     - game configs come from ``game_config.get_config``,
     - solver scoring uses ``SolverScorer`` + ``solver_evaluate`` (keeping
@@ -87,8 +105,8 @@ class EvalRunner(EvalReportingMixin, _CoreEvalRunner):
         super().__init__(
             config,
             wandb_logger,
-            policy_loader=OnnxPolicy,
-            baseline_policy_factory=RandomPolicy,
+            policy_loader=_model_player,
+            baseline_policy_factory=RandomPlayer,
             run_eval=run_eval,
             game_config_getter=get_game_config,
             solver=_Cartridge2SolverHooks(),
