@@ -1018,6 +1018,7 @@ version = "0.1.0"
 dependencies = [
  "once_cell",
  "serde",
+ "tempfile",
  "toml",
  "tracing",
  "tracing-subscriber",
