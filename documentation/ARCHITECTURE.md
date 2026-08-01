@@ -182,6 +182,7 @@ engine/
 │       ├── context.rs         # EngineContext high-level API
 │       ├── registry.rs        # Static game registration
 │       ├── metadata.rs        # GameMetadata for UI/config
+│       ├── board_view.rs      # BoardView (display projection of a state)
 │       ├── legal_mask.rs      # LegalMask (dynamic-width action mask)
 │       ├── game_utils.rs      # Shared helpers for game implementations
 │       └── board_game.rs      # TwoPlayerObs generic type
@@ -193,6 +194,12 @@ engine/
 │   │       └── gen-game-manifest.rs   # `make game-manifest`
 │   └── tests/
 │       └── manifest_golden.rs # Fails when the committed manifest drifts
+├── evaluator/                 # `cartridge-eval`: plays evaluation games
+│   └── src/
+│       ├── lib.rs             # Match loop, seat alternation, position dump
+│       ├── player.rs          # Random or model (with optional MCTS) seats
+│       ├── results.rs         # EvalSummary + PositionRecord wire formats
+│       └── main.rs            # CLI
 ├── metrics-common/            # Prometheus registration/encoding shared by actor + web
 ├── games-tictactoe/           # TicTacToe implementation
 ├── games-connect4/            # Connect 4 implementation
@@ -472,16 +479,18 @@ indicator — hence `player_relative_obs = true`.
 **Current status.** The engine and trainer paths are complete and training runs
 end to end, but no model has yet beaten random at local compute scale.
 Diagnostics live in `engine/mcts/examples/`: `generals_policy_probe` (visit
-distribution health), `generals_strength_probe` (MCTS+model vs random — the
-honest strength measure; the trainer's built-in eval is argmax-only and
-understates models), and `generals_search_diag` (branching factor vs search
-budget, and how much of the visit distribution a temperature schedule discards).
+distribution health), `generals_strength_probe` (MCTS+model vs random), and
+`generals_search_diag` (branching factor vs search budget, and how much of the
+visit distribution a temperature schedule discards). Note that `cartridge-eval
+--p1-sims N` now measures the same thing as the strength probe, through the
+regular evaluation path.
 
-**The web UI cannot show Generals yet.** The blocker is state decoding, not
-rendering: `web/src/game.rs::parse_state` assumes a flat
-`[board][current_player][winner]` layout, while Generals encodes a 12-byte
-header plus 64 x 6-byte tiles (396 bytes). The length check passes, so a session
-would render garbage rather than fail — hence the game is not exposed in the UI.
+**Generals in the web UI.** Rendering goes through `BoardView`, so the web
+server no longer decodes state bytes and the game's 12-byte header plus 64 x
+6-byte tiles is a non-issue. Its `board_type` is `"generals"`: a move is
+`(tile * 4) + direction` rather than a placement, so the frontend selects a
+source tile and then an adjacent target. Its 257 actions are also why the web
+API's action indices are `u32` rather than `u8`.
 
 ### Model Watcher
 
@@ -675,7 +684,8 @@ trainer/
     ├── trainer.py         # Training loop
     ├── network.py         # MLP architecture
     ├── resnet.py          # ResNet architecture
-    ├── evaluator.py       # Model evaluation
+    ├── evaluator.py       # Drives `cartridge-eval`; parses its summary
+    ├── players.py         # Who occupies a seat in an evaluation game
     ├── solver_eval/       # Perfect-solver move scoring (Connect4)
     ├── wandb_logger.py    # W&B wrapper (shim over crucible)
     ├── config.py          # TrainerConfig
@@ -700,8 +710,6 @@ trainer/
     │   ├── actor_runner.py # Actor process management
     │   ├── eval_runner.py # Evaluation runner
     │   └── stats_manager.py # Stats aggregation
-    ├── policies/          # Random + ONNX policies (for evaluation)
-    ├── games/             # Pure Python game logic (for evaluation)
     └── storage/
         ├── base.py        # Abstract interfaces
         ├── factory.py     # Backend factory
@@ -846,11 +854,48 @@ fail loudly. `wandb login` (or `WANDB_API_KEY`) is needed when enabled;
 `WANDB_MODE=offline` logs locally with no network, `WANDB_MODE=disabled` forces
 it off, and `WANDB_PROJECT` / `WANDB_ENTITY` override the config.
 
+### Evaluation
+
+Evaluation games are played by the Rust `cartridge-eval` binary, not by Python:
+the trainer launches it as a subprocess, exactly as it launches the actor for
+self-play, and reads back a JSON summary.
+
+```
+trainer.evaluator.evaluate()
+  -> cartridge-eval --env-id X --games N --p1 <model|random> --p2 ...
+       (plays through EngineContext; optional MCTS per seat)
+  -> eval.json  --> EvalResults --> promotion gate
+```
+
+The binary is found via `CARTRIDGE_EVAL_BINARY`, then
+`engine/target/{release,debug}/cartridge-eval` (`/app/cartridge-eval` in the
+Docker image). `make build-eval` builds it.
+
+**Why it lives in the engine.** Playing in Python required a second
+implementation of every game's rules (`trainer/games/`) that nothing kept in
+sync with the engine — the promotion gate could silently score a different game
+from the one being trained, and games nobody had reimplemented (Othello) could
+not be evaluated at all. The two implementations had in fact already diverged:
+the Python Connect 4 mirror stored its board column-major while the engine
+stores it row-major.
+
+**Search during evaluation.** `[evaluation] simulations` sets the MCTS budget
+per move. It defaults to `0`, meaning the policy head is played directly — what
+the Python evaluator did, kept as the default so eval numbers stay comparable.
+Raising it makes evaluation measure the system as it actually plays: a Connect 4
+checkpoint that scores 15/20 vs random at `simulations = 0` scores 19/20 at 100.
+
 ### Perfect-Solver Evaluation (Connect 4)
 
 `trainer solver-eval` scores model decisions against the `bitbully` perfect
 solver, reporting value-optimal-move rate, blunder rate and exact-best rate,
 broken down overall / by ply bucket / by seat.
+
+The engine plays and Python judges: `cartridge-eval --dump-positions` writes
+every decision it made as JSONL, and the scorer replays that through bitbully,
+cross-checking its mirrored board against the engine's own position at every
+query. (Previously it played its own Python games and cross-checked bitbully
+against *those*, so nothing compared either to the engine.)
 
 It is not only a standalone command: the loop runs it automatically each
 evaluation for Connect 4 (`solver_games`, `solver_seed`), and

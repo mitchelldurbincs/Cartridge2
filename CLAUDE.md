@@ -4,7 +4,7 @@
 
 Cartridge2 is a simplified AlphaZero training and visualization platform. It enables training neural network game agents via self-play and lets users play against trained models through a web interface.
 
-**Target Games:** TicTacToe (complete), Connect 4 (complete), Othello (complete), Generals 8×8 (`generals_8x8` — engine/trainer complete; training does not yet beat random at local compute scale; not playable in the web UI, because `web/src/game.rs::parse_state` assumes a flat `[board][player][winner]` layout and generals uses a 12-byte header + 64×6-byte tiles)
+**Target Games:** TicTacToe (complete), Connect 4 (complete), Othello (complete), Generals 8×8 (`generals_8x8` — engine/trainer/web complete; training does not yet beat random at local compute scale)
 
 **Key Difference from Cartridge1:** local processes over shared storage instead of microservices talking gRPC. K8s manifests (`k8s/`) and Terraform modules (`terraform/`) do exist for cloud deployment — what's avoided is service-to-service RPC, not orchestration.
 
@@ -91,9 +91,13 @@ npm run build   # Build
 
 Pure game logic library. No network I/O. Library-only design (no gRPC).
 
-- `engine-core/` - Game trait, erased adapter, registry, EngineContext API, GameMetadata, LegalMask
+- `engine-core/` - Game trait, erased adapter, registry, EngineContext API, GameMetadata, LegalMask, BoardView
 - `engine-config/` - Centralized configuration loading from config.toml
-- `engine-games/` - Registration of all bundled games; observation-layout invariants; the game-metadata manifest generator (`make game-manifest`) and its golden drift test
+- `engine-games/` - Registration of all bundled games; observation-layout invariants; the `Game::view` invariants; the game-metadata manifest generator (`make game-manifest`) and its golden drift test
+- `evaluator/` - `cartridge-eval`: plays evaluation games through the engine and
+  writes a JSON summary (plus, optionally, every position it saw). The trainer
+  shells out to this instead of implementing games in Python; see
+  `documentation/ARCHITECTURE.md` for why
 - `games-tictactoe/` - TicTacToe implementation
 - `games-connect4/` - Connect 4 implementation
 - `games-othello/` - Othello implementation
@@ -172,6 +176,8 @@ PyTorch training with AlphaZero-style learning and orchestration:
 - MCTS policy distributions as soft targets
 - Game outcome propagation for value targets
 - MLP network for TicTacToe, ResNet for spatial games (Connect4, Othello, Generals)
+- Evaluation games are played by the `cartridge-eval` binary (subprocess, like
+  the actor), so the trainer holds no game rules; `make build-eval` builds it
 - Game facts read from the engine-generated manifest (`game_metadata.json`);
   only network architecture is chosen trainer-side
 - Exports ONNX models with atomic write-then-rename
@@ -251,6 +257,7 @@ cartridge2/
 │   │   │   └── tests.rs    # Unit tests
 │   │   └── SCHEMA.md       # Configuration schema documentation
 │   ├── engine-games/      # Registration + manifest generator + golden test
+│   ├── evaluator/         # cartridge-eval binary (evaluation games)
 │   ├── metrics-common/    # Prometheus plumbing shared by actor and web
 │   ├── games-tictactoe/   # TicTacToe implementation
 │   ├── games-connect4/    # Connect 4 implementation
@@ -319,13 +326,7 @@ cartridge2/
 │       │   ├── actor_runner.py # Actor process management
 │       │   ├── eval_runner.py  # Evaluation runner
 │       │   └── stats_manager.py # Stats aggregation
-│       ├── policies/      # Policy implementations
-│       │   ├── random.py  # Random baseline policy
-│       │   └── onnx.py    # ONNX model policy
-│       ├── games/         # Pure Python game implementations (for evaluation)
-│       │   ├── tictactoe.py
-│       │   ├── connect4.py
-│       │   └── generals.py # Mirrors engine/games-generals rules exactly
+│       ├── players.py     # Who occupies a seat in an evaluation game
 │       └── storage/       # Storage backends (PostgreSQL, S3, filesystem)
 ├── Dockerfile.alphazero   # Combined actor+trainer image for Docker
 ├── docker-compose.yml     # Local services (postgres, minio, training, web)
@@ -448,6 +449,9 @@ cargo test --manifest-path actor/Cargo.toml
 cargo test --manifest-path web/Cargo.toml
 cd trainer && python -m pytest tests/ -v --tb=short
 
+# Build the evaluation binary the trainer shells out to for every eval
+make build-eval
+
 # Regenerate the game-metadata manifest after changing any game's metadata()
 # (cargo test fails if the committed manifest is stale)
 make game-manifest
@@ -546,6 +550,8 @@ python -m trainer train --steps 1000
 - [x] Weights & Biases logging
 - [x] Orchestration core extracted to the `crucible` sibling repo
 - [x] Engine-generated game-metadata manifest (single source of truth)
+- [x] Engine-owned state projection (`BoardView`); Generals playable in the web UI
+- [x] Evaluation moved into the engine (`cartridge-eval`); Python game mirrors deleted
 
 ## API Endpoints
 
@@ -707,11 +713,11 @@ engine/mcts/benches/    # search microbenchmarks
   50-250 simulation budget, and 92% of games decided by territory adjudication
   at the round cap. Use `cargo run -p mcts --example generals_search_diag
   --release` to re-measure.
-- **Generals is not playable in the web UI** — `web/src/game.rs::parse_state`
-  cannot decode its state layout (see Project Overview).
-- **No Othello in the pure-Python game mirrors** (`trainer/src/trainer/games/`),
-  so `create_game_state("othello")` raises. Othello is engine-side only for
-  evaluation purposes.
+- **Evaluation defaults to no search.** `[evaluation] simulations = 0` plays
+  the policy head directly, preserving pre-migration eval numbers. Raising it
+  measures the system as it actually plays — a Connect 4 checkpoint went 15/20
+  vs random at 0 sims and 19/20 at 100 — at proportionally more eval wall-time.
+  Promotion is still gated on the searchless number until this is raised.
 
 ## Reference
 

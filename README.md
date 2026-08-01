@@ -117,6 +117,7 @@ cartridge2/
 |   |       |-- metadata.rs    # GameMetadata for game configuration
 |   |       +-- registry.rs    # Static game registry
 |   |-- engine-games/          # Game registration + metadata manifest generator
+|   |-- evaluator/              # cartridge-eval: plays evaluation games
 |   |-- games-generals/         # Generals 8x8 implementation
 |   |-- metrics-common/         # Prometheus plumbing shared by actor and web
 |   |-- games-tictactoe/       # TicTacToe implementation
@@ -157,9 +158,8 @@ cartridge2/
 |       |-- config.py          # TrainerConfig dataclass
 |       |-- checkpoint.py      # Checkpoint utilities
 |       |-- central_config.py  # Central config.toml loading
-|       |-- games/             # Pure-Python game implementations (for evaluation)
 |       |-- orchestrator/      # Synchronized AlphaZero orchestrator
-|       |-- policies/          # Policy implementations (ONNX, random)
+|       |-- players.py           # Who occupies a seat in an evaluation game
 |       +-- storage/           # Storage backends (PostgreSQL, S3, filesystem)
 |
 |-- data/                      # Runtime data (gitignored)

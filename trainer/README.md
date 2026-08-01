@@ -302,7 +302,8 @@ src/trainer/
 ├── lr_scheduler.py   # LR scheduling (warmup + cosine annealing)
 ├── network.py        # MLP network + AlphaZeroLoss + create_network() factory
 ├── resnet.py         # ResNet architecture (ConvPolicyValueNetwork, ResidualBlock)
-├── evaluator.py      # Model evaluation against baselines
+├── evaluator.py      # Drives the cartridge-eval binary; parses its summary
+├── players.py        # Who occupies a seat in an evaluation game
 ├── game_config.py    # Game-specific configurations (dimensions, network type)
 ├── stats.py          # TrainerStats, EvalStats, load/write functions
 ├── config.py         # TrainerConfig dataclass
@@ -466,6 +467,13 @@ black .
 
 The evaluator measures how well a trained model plays against random opponents.
 
+**Games are played by the engine, not by Python.** `trainer evaluate` shells out
+to the Rust `cartridge-eval` binary — the same subprocess-over-files pattern the
+orchestrator uses for the actor — and parses the JSON summary it writes. Build
+it first (`make build-eval`) or point `CARTRIDGE_EVAL_BINARY` at it; otherwise
+evaluation fails with the build command in the error. This is why the trainer
+carries no game rules of its own.
+
 ### Quick Start
 
 ```bash
@@ -476,8 +484,8 @@ trainer evaluate --model ../data/models/latest.onnx --games 100
 # More games for statistical confidence
 trainer evaluate --model ../data/models/latest.onnx --games 500
 
-# Verbose mode to see individual game moves
-trainer evaluate --model ../data/models/latest.onnx --games 10 --verbose
+# Play with search instead of the bare policy head (the honest strength measure)
+trainer evaluate --model ../data/models/latest.onnx --games 100 --simulations 100
 
 # Compare different checkpoints
 trainer evaluate --model ../data/models/model_step_000100.onnx --games 100
@@ -493,7 +501,9 @@ Note: game metadata comes from the engine-generated `game_metadata.json` shipped
 | `--env-id` | `tictactoe` | Game environment to evaluate |
 | `--games` | 100 | Number of games to play |
 | `--temperature` | 0.0 | Sampling temperature (0 = greedy/argmax) |
-| `--verbose` | false | Print individual game moves |
+| `--simulations` | 0 | MCTS simulations per move (0 = play the policy head) |
+| `--seed` | 42 | Base RNG seed; game N uses seed + N |
+| `--verbose` | false | Log the full results summary |
 | `--log-level` | INFO | Logging level |
 
 ### Output Example

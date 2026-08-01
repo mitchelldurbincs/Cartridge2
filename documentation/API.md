@@ -254,7 +254,7 @@ Host: localhost:8080
 | `player_names` | string[] | Player names for display |
 | `player_symbols` | string[] | Player symbols for board rendering |
 | `description` | string | Game description |
-| `board_type` | string | `"grid"` or `"drop_column"` |
+| `board_type` | string | `"grid"`, `"drop_column"`, or `"generals"` |
 
 **Board Types**
 
@@ -262,12 +262,12 @@ Host: localhost:8080
 |------|-------|-------------|
 | `grid` | TicTacToe, Othello | Click any empty cell |
 | `drop_column` | Connect4 | Click column, piece drops to bottom |
+| `generals` | Generals 8x8 | Click a source tile, then an adjacent target |
 
-> `generals_8x8` also reports `board_type: "grid"`, but is **not playable through
-> this API**: the web server cannot decode its state layout
-> (`web/src/game.rs::parse_state` assumes `[board][player][winner]`, while
-> Generals encodes a 12-byte header plus 64 x 6-byte tiles). Configuring it as
-> the current game will not produce a usable session.
+> `generals_8x8` actions are `(tile * 4) + direction` (direction 0=up, 1=right,
+> 2=down, 3=left) plus a wait action at index 256, so a single click is not a
+> move; the frontend selects a source tile first. This is also why `position`
+> in `POST /move` is not limited to a byte.
 
 **Status Codes**
 
@@ -308,7 +308,17 @@ Host: localhost:8080
 
 ```json
 {
-  "board": [0, 0, 0, 0, 1, 0, 0, 0, 2],
+  "cells": [
+    {"owner": 0, "kind": "normal", "value": 0},
+    {"owner": 0, "kind": "normal", "value": 0},
+    {"owner": 0, "kind": "normal", "value": 0},
+    {"owner": 0, "kind": "normal", "value": 0},
+    {"owner": 1, "kind": "normal", "value": 0},
+    {"owner": 0, "kind": "normal", "value": 0},
+    {"owner": 0, "kind": "normal", "value": 0},
+    {"owner": 0, "kind": "normal", "value": 0},
+    {"owner": 2, "kind": "normal", "value": 0}
+  ],
   "current_player": 1,
   "human_player": 1,
   "winner": 0,
@@ -322,12 +332,22 @@ Host: localhost:8080
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `board` | number[] | Board cells (0=empty, 1=player1, 2=player2) |
+| `cells` | Cell[] | Board cells, row-major (see below) |
 | `current_player` | number | Whose turn: 1 or 2 |
 | `human_player` | number | Which player is human: 1 or 2 |
 | `winner` | number | Game result: 0=ongoing, 1=P1 wins, 2=P2 wins, 3=draw |
 | `game_over` | boolean | Is the game finished? |
-| `legal_moves` | number[] | Valid positions/columns for next move |
+| `legal_moves` | number[] | Valid action indices for the next move |
+
+Each entry of `cells` is the engine's own projection of that board square
+(`engine_core::CellView`), so the server never has to decode a game's private
+state encoding:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `owner` | number | 0=empty/neutral, 1=player1, 2=player2 |
+| `kind` | string | `"normal"`, `"general"`, `"city"`, or `"mountain"` |
+| `value` | number | Per-cell quantity (Generals' army count); 0 elsewhere |
 | `message` | string | Human-readable status message |
 
 **Board Layout**
@@ -397,7 +417,7 @@ Content-Type: application/json
 When `first: "player"`:
 ```json
 {
-  "board": [0, 0, 0, 0, 0, 0, 0, 0, 0],
+  "cells": [ /* 9 cells, all {"owner": 0, "kind": "normal", "value": 0} */ ],
   "current_player": 1,
   "human_player": 1,
   "winner": 0,
@@ -410,7 +430,7 @@ When `first: "player"`:
 When `first: "bot"`:
 ```json
 {
-  "board": [0, 0, 0, 0, 1, 0, 0, 0, 0],
+  "cells": [ /* 9 cells; index 4 is {"owner": 1, "kind": "normal", "value": 0} */ ],
   "current_player": 2,
   "human_player": 2,
   "winner": 0,
@@ -490,7 +510,7 @@ Content-Type: application/json
 
 ```json
 {
-  "board": [0, 0, 0, 0, 1, 2, 0, 0, 0],
+  "cells": [ /* 9 cells; index 4 owner 1, index 5 owner 2 */ ],
   "current_player": 1,
   "human_player": 1,
   "winner": 0,
@@ -817,12 +837,18 @@ interface GameInfo {
   player_names: string[];
   player_symbols: string[];
   description: string;
-  board_type: 'grid' | 'drop_column';
+  board_type: 'grid' | 'drop_column' | 'generals';
 }
 
 // Game session
+interface Cell {
+  owner: number;
+  kind: 'normal' | 'general' | 'city' | 'mountain';
+  value: number;
+}
+
 interface GameState {
-  board: number[];
+  cells: Cell[];
   current_player: number;
   human_player: number;
   winner: number;
@@ -1090,18 +1116,18 @@ curl http://localhost:8080/game-info/tictactoe
 curl -X POST http://localhost:8080/game/new \
   -H "Content-Type: application/json" \
   -d '{"first": "player", "game": "tictactoe"}'
-# Response: {"board":[0,0,0,0,0,0,0,0,0],"current_player":1,...}
+# Response: {"cells":[{"owner":0,"kind":"normal","value":0},...],"current_player":1,...}
 
 # 4. Make moves until game ends
 curl -X POST http://localhost:8080/move \
   -H "Content-Type: application/json" \
   -d '{"position": 4}'
-# Response: {"board":[0,0,0,0,1,2,0,0,0],"bot_move":5,...}
+# Response: {"cells":[...],"bot_move":5,...}
 
 curl -X POST http://localhost:8080/move \
   -H "Content-Type: application/json" \
   -d '{"position": 0}'
-# Response: {"board":[1,0,2,0,1,2,0,0,0],"bot_move":2,...}
+# Response: {"cells":[...],"bot_move":2,...}
 
 # 5. Continue until winner != 0 or game_over == true
 ```
