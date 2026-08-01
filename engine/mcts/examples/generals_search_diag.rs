@@ -2,9 +2,12 @@
 //!
 //! Part A measures the game's shape under random play (branching factor,
 //! episode length, terminal type). Part B runs the actor's search config at
-//! several simulation budgets and reports how the root visit counts spread,
-//! then what the stored training target looks like after the actor's
-//! temperature schedule is applied.
+//! several simulation budgets and reports how the root visit counts spread.
+//!
+//! Part B prints two targets per row. `tau=1` is what the search now stores
+//! for training. `tau=0.1` is what it used to store, when the late-game play
+//! temperature was also applied to the training target — kept here to show
+//! how much of the visit distribution that discarded.
 //!
 //! Run: cargo run -p mcts --example generals_search_diag --release
 
@@ -141,7 +144,7 @@ fn main() {
 
     println!("\n=== Part B: root visit spread (UniformEvaluator, actor training config) ===");
     println!(
-        "ply  legal | sims | visited  ms/search | tau=1 target: top1 perplex | tau=0.1 stored: top1 perplex"
+        "ply  legal | sims | visited  ms/search | stored now (tau=1): top1 perplex | was (tau=0.1): top1 perplex"
     );
 
     for &probe in &probe_plies {

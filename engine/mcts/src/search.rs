@@ -187,11 +187,12 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             "MCTS search stats"
         );
 
-        // Extract result
+        // Extract result. The returned policy is the training target and is
+        // always the raw visit distribution (tau = 1); the configured
+        // temperature only decides which action we play from it. See
+        // `SearchResult::policy`.
         let root = self.tree.get(self.tree.root());
-        let policy = self
-            .tree
-            .root_policy(self.num_actions, self.config.temperature);
+        let policy = self.tree.root_policy(self.num_actions, 1.0);
 
         let action = if self.config.temperature < 1e-6 {
             // Greedy
@@ -199,9 +200,16 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
                 .best_action()
                 .map(|(a, _)| a)
                 .ok_or(SearchError::NoLegalMoves)?
-        } else {
-            // Sample from policy
+        } else if (self.config.temperature - 1.0).abs() < 1e-6 {
+            // Play temperature matches the target; sample from it directly.
             sample_action(&policy, rng)?
+        } else {
+            // Sample from the temperature-scaled distribution, leaving the
+            // stored target untouched.
+            let play_policy = self
+                .tree
+                .root_policy(self.num_actions, self.config.temperature);
+            sample_action(&play_policy, rng)?
         };
 
         Ok(SearchResult {

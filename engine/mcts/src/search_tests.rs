@@ -260,6 +260,61 @@ fn test_mcts_generals_257_actions() {
 }
 
 #[test]
+fn test_policy_target_is_independent_of_play_temperature() {
+    // Regression test: the stored training target is the raw visit
+    // distribution and must never be sharpened by the play temperature.
+    // Storing `counts^(1/tau)` under the actor's late-game tau of 0.1 means
+    // `counts^10`, which collapses the target onto a near one-hot vector.
+    // That is fatal in long games (generals averages ~385 plies), where the
+    // low-temperature phase covers almost every ply of every episode.
+    let mut ctx = setup_tictactoe();
+    let evaluator = UniformEvaluator::new();
+    let legal_mask = LegalMask::from_u64(0b111111111, 9);
+
+    let policy_for = |ctx: &mut EngineContext, temperature: f32| {
+        let config = MctsConfig::for_testing()
+            .with_simulations(200)
+            .with_eval_batch_size(16)
+            .with_temperature(temperature);
+        let reset = ctx.reset(42, &[]).unwrap();
+        let mut rng = ChaCha20Rng::seed_from_u64(7);
+        run_mcts(
+            ctx,
+            &evaluator,
+            config,
+            reset.state,
+            reset.obs,
+            legal_mask.clone(),
+            &mut rng,
+        )
+        .unwrap()
+        .policy
+    };
+
+    let greedy = policy_for(&mut ctx, 0.0);
+    let late_game = policy_for(&mut ctx, 0.1);
+    let full = policy_for(&mut ctx, 1.0);
+
+    assert_eq!(
+        greedy, full,
+        "greedy play must not change the stored training target"
+    );
+    assert_eq!(
+        late_game, full,
+        "late-game play temperature must not sharpen the stored target"
+    );
+
+    // ...and the target must stay a distribution, not a spike.
+    let support = full.iter().filter(|&&p| p > 0.0).count();
+    assert!(
+        support >= 5,
+        "target should spread over children, support={} policy={:?}",
+        support,
+        full
+    );
+}
+
+#[test]
 fn test_single_batch_search_spreads_visits() {
     // Regression test for the virtual-loss sign bug: when all simulations
     // fit in one evaluation batch (sims <= eval_batch_size), virtual loss

@@ -16,7 +16,10 @@ use tracing::{debug, warn};
 pub struct MctsPolicyResult {
     /// Selected action as bytes
     pub action: Vec<u8>,
-    /// Policy distribution from MCTS (for training)
+    /// Policy distribution from MCTS (for training).
+    ///
+    /// The raw root visit distribution, unaffected by the temperature
+    /// schedule below — that only decides which action gets played.
     pub policy: Vec<f32>,
     /// Value estimate from MCTS root
     pub value: f32,
