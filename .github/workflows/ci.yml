@@ -182,10 +182,10 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: trainer/pyproject.toml
-      - name: Install crucible (orchestration core, sibling repo)
-        # Pinned to a commit for reproducible CI; bump deliberately.
-        run: pip install "crucible @ git+https://github.com/mitchelldurbincs/crucible.git@d7eb32c2a2f1724d0a1206fd4137e3893e436e38"
       - name: Install package with dev dependencies
+        # Pulls the pinned `crucible` orchestration core, which is declared in
+        # trainer/pyproject.toml. Do not re-add an explicit crucible install
+        # here: that pinned the SHA in two places, and the copies would drift.
         run: pip install -e ".[dev]"
       - name: Run pytest
         run: pytest

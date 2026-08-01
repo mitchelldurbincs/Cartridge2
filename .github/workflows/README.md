@@ -31,13 +31,14 @@ Regenerate with `make game-manifest`.
 | Job | What it does | Auto-fixes on PR? |
 |-----|-------------|-------------------|
 | **python-lint** | Runs `ruff check --fix` and `black` on `trainer/src/` | Yes - commits fixed code |
-| **python-test** | Installs the pinned `crucible` orchestration core from GitHub, then the trainer with dev deps, then runs `pytest` | No |
+| **python-test** | Installs the trainer with dev deps (which pulls the pinned `crucible` orchestration core), then runs `pytest` | No |
 | **python-security-audit** | `pip-audit` (non-blocking) | No |
 
 `crucible` is a hard, import-time dependency of `trainer.orchestrator`. It is
-declared in `trainer/pyproject.toml` pinned to a commit; CI installs the same
-pin explicitly. A local `pytest` on a fresh clone needs it too — `pip install -e
-"trainer/.[dev]"` pulls it, or install a sibling checkout editable first.
+declared in `trainer/pyproject.toml`, pinned to a commit — the single place that
+pin lives. A local `pytest` on a fresh clone gets it automatically from
+`pip install -e "trainer/.[dev]"`; install a sibling checkout editable first if
+you are developing crucible alongside.
 
 ### Frontend
 
