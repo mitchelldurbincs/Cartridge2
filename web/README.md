@@ -1,6 +1,6 @@
 # Cartridge2 Web Interface
 
-Minimal web interface for playing TicTacToe against the AI and monitoring training.
+Minimal web interface for playing the currently configured game (`common.env_id`) against the trained model, and monitoring training.
 
 ## Architecture
 
@@ -71,12 +71,12 @@ npm run build
 cargo build --release
 ```
 
-The frontend builds to `frontend/dist/` which can be served by the Rust backend.
+The frontend builds to `frontend/dist/`, which is served by **nginx** in the `frontend` container — the Axum router registers API routes only and has no static-file service.
 
 ### Run tests
 
 ```bash
-cargo test  # ~27 tests
+cargo test
 ```
 
 ## Configuration

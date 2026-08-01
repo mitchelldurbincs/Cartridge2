@@ -4,9 +4,22 @@
 
 Cartridge2 is a simplified AlphaZero training and visualization platform. It enables training neural network game agents via self-play and lets users play against trained models through a web interface.
 
-**Target Games:** TicTacToe (complete), Connect 4 (complete), Othello (complete), Generals 8×8 (`generals_8x8` — engine/trainer complete, training does not yet beat random at local compute scale; no web renderer yet)
+**Target Games:** TicTacToe (complete), Connect 4 (complete), Othello (complete), Generals 8×8 (`generals_8x8` — engine/trainer complete; training does not yet beat random at local compute scale; not playable in the web UI, because `web/src/game.rs::parse_state` assumes a flat `[board][player][winner]` layout and generals uses a 12-byte header + 64×6-byte tiles)
 
-**Key Difference from Cartridge1:** This is a monolithic/filesystem approach vs. Cartridge1's microservices architecture. No Kubernetes, no gRPC between services—just shared filesystem and local processes.
+**Key Difference from Cartridge1:** local processes over shared storage instead of microservices talking gRPC. K8s manifests (`k8s/`) and Terraform modules (`terraform/`) do exist for cloud deployment — what's avoided is service-to-service RPC, not orchestration.
+
+**Where things are documented.** This file covers commands, conventions and
+gotchas for working in the repo. It deliberately does not restate facts that
+have an authoritative home elsewhere — every previous copy had drifted:
+
+| For | Read |
+|-----|------|
+| Architecture, data flow, schemas, metrics | [`documentation/ARCHITECTURE.md`](documentation/ARCHITECTURE.md) |
+| REST API reference | [`documentation/API.md`](documentation/API.md) |
+| Deploying / running | [`documentation/DEPLOYMENT.md`](documentation/DEPLOYMENT.md) |
+| Every config key and default | [`config.defaults.toml`](config.defaults.toml), [`engine/engine-config/SCHEMA.md`](engine/engine-config/SCHEMA.md) |
+| Database schema | [`sql/schema.sql`](sql/schema.sql) |
+| Test counts | `make test` — they change every commit |
 
 ## Architecture
 
@@ -78,33 +91,39 @@ npm run build   # Build
 
 Pure game logic library. No network I/O. Library-only design (no gRPC).
 
-- `engine-core/` - Game trait, erased adapter, registry, EngineContext API, GameMetadata, LegalMask (88 tests)
-- `engine-config/` - Centralized configuration loading from config.toml (19 tests)
-- `engine-games/` - One-call registration of all bundled games (2 tests)
-- `games-tictactoe/` - TicTacToe implementation (26 tests)
-- `games-connect4/` - Connect 4 implementation (21 tests)
-- `games-othello/` - Othello implementation (27 tests)
-- `games-generals/` - Generals 8×8 implementation (29 tests); see the crate's
+- `engine-core/` - Game trait, erased adapter, registry, EngineContext API, GameMetadata, LegalMask
+- `engine-config/` - Centralized configuration loading from config.toml
+- `engine-games/` - Registration of all bundled games; observation-layout invariants; the game-metadata manifest generator (`make game-manifest`) and its golden drift test
+- `games-tictactoe/` - TicTacToe implementation
+- `games-connect4/` - Connect 4 implementation
+- `games-othello/` - Othello implementation
+- `games-generals/` - Generals 8×8 implementation; see the crate's
   lib.rs for the ruleset (full-info, alternating turns, territory
   adjudication, parity-randomized ply cap) and `generals_obs:v1` layout
-- `mcts/` - Monte Carlo Tree Search implementation (28 tests); legal masks are
+- `mcts/` - Monte Carlo Tree Search implementation; legal masks are
   dynamic-width (`LegalMask`) and read from the observation, never `info_bits`.
-  Two diagnostic examples: `generals_policy_probe` (visit-distribution health)
-  and `generals_strength_probe` (MCTS+model vs random — the honest strength
-  measure; the trainer's built-in eval is argmax-only and understates models)
-- `model-watcher/` - Shared model hot-reload utilities (8 tests)
+  Three diagnostic examples: `generals_policy_probe` (visit-distribution
+  health), `generals_strength_probe` (MCTS+model vs random — the honest
+  strength measure; the trainer's built-in eval is argmax-only and understates
+  models), and `generals_search_diag` (branching factor vs search budget)
+- `model-watcher/` - Shared model hot-reload utilities
+- `metrics-common/` - Prometheus registration/encoding shared by actor and web
 
 ### Actor (Rust Binary) - `actor/`
-**Status: COMPLETE (93 tests)**
+**Status: COMPLETE**
 
 Self-play episode runner using engine-core directly:
 - Uses `EngineContext` for game simulation (no gRPC)
 - PostgreSQL storage backend (local development or K8s)
 - MCTS policy with ONNX neural network evaluation
 - Hot-reloads model when `latest.onnx` changes (via model_watcher)
-- Stores MCTS visit distributions as policy targets
+- Stores MCTS visit distributions as policy targets (raw tau=1, never sharpened
+  by the play temperature)
 - Game outcome backfill for value targets
-- Auto-derives game configuration from GameMetadata
+- Auto-derives game configuration from GameMetadata (`game_config.rs` is a type
+  alias over it)
+- Episodes that time out are discarded whole — there is no outcome to backfill —
+  and counted in `actor_stats.json` and `actor_episodes_abandoned_total`
 
 ### Web Server (Rust Binary) - `web/`
 **Status: COMPLETE**
@@ -121,96 +140,12 @@ Axum HTTP server for frontend interaction:
 - `/actor-stats` - Read actor self-play stats
 - `/model` - Get info about loaded model
 
-#### API Endpoints Documentation
+#### API Endpoints
 
-**Health Check**
-```
-GET /health
-Response: {"status": "ok"}
-```
+Full reference with request/response shapes: [`documentation/API.md`](documentation/API.md).
+Routes are registered in `web/src/startup.rs`; response types live in
+`web/src/types/responses.rs`.
 
-**List Games**
-```
-GET /games
-Response: {"games": ["connect4"]}
-```
-Only the currently configured game (`common.env_id`) is returned, so the UI
-matches the game the loaded model was trained for.
-
-**Get Game Info**
-```
-GET /game-info/:id
-Response: {
-  "env_id": "tictactoe",
-  "display_name": "Tic-Tac-Toe",
-  "board_width": 3,
-  "board_height": 3,
-  "num_actions": 9,
-  "obs_size": 29,
-  "legal_mask_offset": 18,
-  "board_type": "grid",
-  ...
-}
-```
-Requesting a game other than the current one returns `403 Forbidden`.
-
-**Start New Game**
-```
-POST /game/new
-Body: {"first": "player"}  // or "bot"
-Response: GameStateResponse
-```
-
-**Get Game State**
-```
-GET /game/state
-Response: {
-  "board": [0,0,0,0,0,0,0,0,0],
-  "current_player": 1,
-  "human_player": 1,
-  "winner": 0,
-  "game_over": false,
-  "legal_moves": [0,1,2,3,4,5,6,7,8],
-  "message": "Your turn (X)"
-}
-```
-
-**Make Move**
-```
-POST /move
-Body: {"position": 4}
-Response: all GameStateResponse fields plus the bot's reply:
-{
-  "board": [0,0,2,0,1,0,0,0,0],
-  "current_player": 1,
-  ...,
-  "bot_move": 2
-}
-```
-
-**Get Training Stats**
-```
-GET /stats
-Response: {
-  "step": 1500,
-  "total_steps": 5000,
-  "total_loss": 0.23,
-  "policy_loss": 0.12,
-  "value_loss": 0.11,
-  "learning_rate": 0.001,
-  "replay_buffer_size": 12500,
-  "env_id": "connect4",
-  "last_eval": {...},
-  "eval_history": [...],
-  "history": [...]
-}
-```
-
-**Prometheus Metrics**
-```
-GET /metrics
-Response: Prometheus-format metrics
-```
 
 ### Web Frontend (Svelte + TypeScript) - `web/frontend/`
 **Status: COMPLETE**
@@ -222,7 +157,7 @@ Svelte 5 frontend with Vite:
 - Responsive dark-mode UI
 
 ### Trainer (Python) - `trainer/`
-**Status: COMPLETE (302 tests)**
+**Status: COMPLETE**
 
 PyTorch training with AlphaZero-style learning and orchestration:
 
@@ -236,7 +171,9 @@ PyTorch training with AlphaZero-style learning and orchestration:
 - Reads transitions from PostgreSQL replay buffer
 - MCTS policy distributions as soft targets
 - Game outcome propagation for value targets
-- MLP network for TicTacToe, ResNet for spatial games (Connect4, Othello)
+- MLP network for TicTacToe, ResNet for spatial games (Connect4, Othello, Generals)
+- Game facts read from the engine-generated manifest (`game_metadata.json`);
+  only network architecture is chosen trainer-side
 - Exports ONNX models with atomic write-then-rename
 - Writes `stats.json` and `eval_stats.json` telemetry
 - Cosine annealing LR schedule with warmup
@@ -289,7 +226,6 @@ cartridge2/
 │       ├── config.rs       # CLI configuration (uses engine-config)
 │       ├── game_config.rs  # Game-specific config derived from metadata
 │       ├── mcts_policy.rs  # MCTS policy implementation
-│       ├── model_watcher.rs # ONNX model hot-reload via file watching
 │       ├── health.rs       # Health check endpoint
 │       ├── metrics.rs      # Prometheus metrics
 │       ├── stats.rs        # Self-play statistics
@@ -314,7 +250,8 @@ cartridge2/
 │   │   │   ├── loader.rs   # Loading logic + env overrides
 │   │   │   └── tests.rs    # Unit tests
 │   │   └── SCHEMA.md       # Configuration schema documentation
-│   ├── engine-games/      # One-call registration of all bundled games
+│   ├── engine-games/      # Registration + manifest generator + golden test
+│   ├── metrics-common/    # Prometheus plumbing shared by actor and web
 │   ├── games-tictactoe/   # TicTacToe implementation
 │   ├── games-connect4/    # Connect 4 implementation
 │   ├── games-othello/    # Othello implementation
@@ -331,11 +268,11 @@ cartridge2/
 ├── web/                    # Web server + frontend
 │   ├── Cargo.toml         # Axum server
 │   ├── src/
-│   │   ├── main.rs        # HTTP server setup, routing (uses engine-config)
+│   │   ├── main.rs        # Thin entry point
+│   │   ├── startup.rs     # Router, AppState, CORS, shutdown
 │   │   ├── game.rs        # Game session management
 │   │   ├── metrics.rs     # Prometheus metrics
-│   │   ├── model_watcher.rs # Model hot-reload for web
-│   │   ├── handlers/      # Route handlers (game, health, stats)
+│   │   │   ├── handlers/      # Route handlers (game, health, stats)
 │   │   └── types/         # Request/response types
 │   ├── frontend/          # Svelte frontend
 │   │   ├── package.json
@@ -361,7 +298,9 @@ cartridge2/
 │       ├── network.py     # Neural network (MLP, used for TicTacToe)
 │       ├── resnet.py      # ResNet architecture (used for Connect4, Othello)
 │       ├── evaluator.py   # Model evaluation
-│       ├── solver_eval.py # Perfect-solver move-quality evaluation (Connect4)
+│       ├── solver_eval/   # Perfect-solver move-quality evaluation (Connect4)
+│       ├── replay_setup.py # Buffer setup + engine/DB metadata cross-check
+│       ├── game_metadata.json # GENERATED by `make game-manifest`
 │       ├── wandb_logger.py # W&B wrapper (null-logger fallback, used by loop)
 │       ├── game_config.py # Game-specific configs (auto-selects network type)
 │       ├── stats.py       # Training statistics
@@ -397,7 +336,6 @@ cartridge2/
 ├── .github/workflows/
 │   └── ci.yml             # CI pipeline (Rust fmt/clippy/test, Python lint/test, frontend build)
 ├── documentation/
-│   ├── MVP.md             # Design document
 │   ├── ARCHITECTURE.md    # Comprehensive architecture reference
 │   └── API.md             # REST API documentation with examples
 ├── data/                  # Runtime data (gitignored)
@@ -408,130 +346,40 @@ cartridge2/
 
 ## Configuration
 
-All settings are centralized in `config.toml` at the project root. This single file controls all components (actor, trainer, web server).
+All settings live in `config.toml` at the project root, layered over the
+checked-in defaults in `config.defaults.toml`. Both are read by every component
+(actor, trainer, web).
+
+**The key reference is not duplicated here.** `config.defaults.toml` lists every
+key with its default and a comment, and is the single source of truth; the
+schema reference is [`engine/engine-config/SCHEMA.md`](engine/engine-config/SCHEMA.md).
 
 ### Configuration Priority
 
-Settings are loaded with the following priority (highest to lowest):
-1. **CLI arguments** - Direct command-line flags
-2. **Environment variables** - `CARTRIDGE_*` or legacy `ALPHAZERO_*`
-3. **config.toml** - Central configuration file
-4. **Built-in defaults** - Hardcoded fallbacks
+Highest to lowest:
 
-### config.toml Structure
+1. **CLI arguments** - direct flags
+2. **Environment variables** - `CARTRIDGE_<SECTION>_<KEY>` (or legacy `ALPHAZERO_*`)
+3. **`config.toml`** - your local overrides
+4. **`config.defaults.toml`** - checked-in defaults
 
-```toml
-[common]
-data_dir = "./data"      # Base data directory
-env_id = "tictactoe"     # Game: tictactoe, connect4, othello, generals_8x8
-log_level = "info"       # trace, debug, info, warn, error
+### Gotchas worth knowing
 
-[training]
-iterations = 100         # Training iterations
-start_iteration = 1      # For resuming training
-episodes_per_iteration = 500
-steps_per_iteration = 1000
-batch_size = 64
-learning_rate = 0.001
-weight_decay = 0.0001    # L2 regularization
-grad_clip_norm = 1.0     # Gradient clipping (0 to disable)
-device = "auto"          # auto, cpu, cuda, mps
-checkpoint_interval = 250
-max_checkpoints = 10
-num_actors = 6           # Parallel actor processes for self-play
-
-[evaluation]
-interval = 1             # Evaluate every N iterations (0=disable)
-games = 50               # Games per evaluation
-win_threshold = 0.55     # Win rate to become new best model
-eval_vs_random = true    # Also evaluate against random baseline
-solver_games = 100       # Perfect-solver eval games per evaluation, 0=disable (connect4 only)
-solver_seed = 42         # Fixed seed so solver rates are comparable across iterations
-promotion_metric = "win_rate"   # "win_rate" or "solver_optimal"
-promotion_margin = 0.01  # solver_optimal: candidate must exceed best's rate by this
-
-[actor]
-actor_id = "actor-1"
-max_episodes = -1        # -1 for unlimited
-episode_timeout_secs = 180
-flush_interval_secs = 5
-log_interval = 50
-
-[web]
-host = "0.0.0.0"
-port = 8080
-# allowed_origins = []   # CORS origins (empty = allow all in dev)
-
-[mcts]
-# Simulation ramping: starts low, increases over iterations
-start_sims = 50          # Simulations for first iteration
-max_sims = 250           # Maximum simulations after ramping
-sim_ramp_rate = 10       # Simulations added per iteration
-num_simulations = 200    # Legacy setting (used if ramping not configured)
-c_puct = 1.0
-temperature = 1.0
-temp_threshold = 15      # Move number to reduce temperature (0 = disabled)
-dirichlet_alpha = 0.4
-dirichlet_weight = 0.25
-eval_batch_size = 64     # Batch size for NN evaluation during MCTS
-onnx_intra_threads = 1   # Threads for ONNX inference (1 = best for multi-actor)
-
-[logging]
-format = "text"          # "text" or "json" (structured for cloud)
-include_timestamps = true
-include_target = true
-
-[storage]
-model_backend = "filesystem"  # filesystem or s3
-postgres_url = "postgresql://cartridge:cartridge@localhost:5432/cartridge"
-pool_max_size = 16
-pool_connect_timeout = 30
-pool_idle_timeout = 300
-# s3_bucket = "cartridge-models"      # For S3 backend
-# s3_endpoint = "http://minio:9000"   # For MinIO
-
-[wandb]
-enabled = false           # One W&B run per `trainer loop`: train/, eval/, solver/, loop/ metrics
-required = false          # true: fail loudly instead of no-op fallback
-project = "cartridge2"
-entity = ""               # Empty = logged-in default entity
-group = ""
-tags = []
-init_timeout_seconds = 30.0
-```
-
-W&B notes: requires `wandb login` (or `WANDB_API_KEY`) when enabled; `WANDB_MODE=offline`
-logs locally with no network; `WANDB_MODE=disabled` force-disables; `WANDB_PROJECT` /
-`WANDB_ENTITY` env vars override the config. All metrics share the global-training-step
-x-axis. Enable per run with `--wandb-enabled true`.
-
-### Environment Variable Overrides
-
-All components (actor, trainer, web) support the `CARTRIDGE_*` format:
-```bash
-CARTRIDGE_COMMON_ENV_ID=connect4
-CARTRIDGE_COMMON_DATA_DIR=/data
-CARTRIDGE_TRAINING_ITERATIONS=50
-CARTRIDGE_EVALUATION_GAMES=100
-CARTRIDGE_WEB_HOST=127.0.0.1
-CARTRIDGE_WEB_PORT=3000
-CARTRIDGE_STORAGE_MODEL_BACKEND=s3
-CARTRIDGE_STORAGE_POSTGRES_URL=postgresql://user:pass@host/db
-```
-
-Additional overrides:
-```bash
-CARTRIDGE_LOGGING_FORMAT=json        # Structured JSON logging (for cloud)
-CARTRIDGE_MCTS_START_SIMS=100       # MCTS simulation ramping
-CARTRIDGE_MCTS_MAX_SIMS=400
-```
-
-Legacy format (Python trainer only):
-```bash
-ALPHAZERO_ENV_ID=connect4
-ALPHAZERO_ITERATIONS=50
-ALPHAZERO_EVAL_GAMES=100
-```
+- **The two languages do not honour the same env vars.** Python parses
+  `CARTRIDGE_<SECTION>_<KEY>` generically, so anything can be overridden. Rust
+  matches an explicit list in `engine/engine-config/src/loader.rs`, so keys
+  outside it — `logging.format`, the MCTS ramping keys, `num_actors`,
+  `allowed_origins`, `health_port` — are honoured by the trainer but **ignored
+  by the actor and web server**. Put those in `config.toml`.
+- **`[wandb]` and the solver-eval keys are Python-only.** They have no
+  counterpart in the Rust `CentralConfig`, so setting them does nothing for the
+  actor or web server.
+- **Empty `allowed_origins` does not mean "allow all".** `configure_cors` in
+  `web/src/startup.rs` is deny-by-default: empty falls back to a localhost
+  allowlist.
+- **The trainer reads the replay DSN only from `CARTRIDGE_STORAGE_POSTGRES_URL`.**
+  `storage.postgres_url` in `config.toml` is used by the Rust actor and web
+  server, but *not* by the Python trainer.
 
 ## Quick Start
 
@@ -591,11 +439,18 @@ cd actor && cargo build --release
 # Build web server
 cd web && cargo build --release
 
-# Run all tests
-cd engine && cargo test   # 261 tests (88 core + 19 config + 2 games + 26 tictactoe + 21 connect4 + 27 othello + 29 generals + 28 mcts + 3 metrics + 8 model-watcher)
-cd actor && cargo test    # 92 tests
-cd web && cargo test      # 98 tests
-cd trainer && python -m pytest tests/ -v --tb=short  # 302 tests (needs crucible: pip install -e ../../crucible)
+# Run all tests (engine + actor + web + trainer)
+make test
+
+# Or individually
+cargo test --manifest-path engine/Cargo.toml
+cargo test --manifest-path actor/Cargo.toml
+cargo test --manifest-path web/Cargo.toml
+cd trainer && python -m pytest tests/ -v --tb=short
+
+# Regenerate the game-metadata manifest after changing any game's metadata()
+# (cargo test fails if the committed manifest is stale)
+make game-manifest
 
 # Format and lint
 cd engine && cargo fmt && cargo clippy
@@ -668,24 +523,29 @@ python -m trainer train --steps 1000
 
 ## Current Status
 
-- [x] Engine core abstractions (Game trait, adapter, registry, metadata) - 70 tests
+- [x] Engine core abstractions (Game trait, adapter, registry, metadata)
 - [x] EngineContext high-level API
-- [x] TicTacToe game implementation - 26 tests
-- [x] Connect 4 game implementation - 20 tests
-- [x] Othello game implementation - 25 tests
+- [x] TicTacToe game implementation
+- [x] Connect 4 game implementation
+- [x] Othello game implementation
 - [x] Removed gRPC/proto dependencies (library-only)
-- [x] Actor core (episode runner, pluggable storage backends) - 86 tests
+- [x] Actor core (episode runner, pluggable storage backends)
 - [x] MCTS integration in actor with ONNX evaluation
-- [x] Model hot-reload via file watching (model-watcher crate) - 5 tests
+- [x] Model hot-reload via file watching (model-watcher crate)
 - [x] Auto-derived game configuration from GameMetadata
 - [x] Web server (Axum, game API)
 - [x] Web frontend (Svelte, play UI, stats, loss visualization)
-- [x] MCTS implementation - 25 tests
-- [x] Python trainer (PyTorch, ONNX export, evaluator) - 245 tests
+- [x] MCTS implementation
+- [x] Python trainer (PyTorch, ONNX export, evaluator)
 - [x] ResNet architecture for spatial games (Connect4, Othello)
 - [x] MCTS policy targets + game outcome propagation
 - [x] Storage backends (PostgreSQL, S3, filesystem)
 - [x] CI pipeline (GitHub Actions)
+- [x] Generals 8×8 game + dynamic-width legal masks
+- [x] Perfect-solver evaluation + solver-based promotion (Connect 4)
+- [x] Weights & Biases logging
+- [x] Orchestration core extracted to the `crucible` sibling repo
+- [x] Engine-generated game-metadata manifest (single source of truth)
 
 ## API Endpoints
 
@@ -792,15 +652,24 @@ let config = MctsConfig::for_training()
     .with_simulations(800)
     .with_temperature(1.0);
 
-// Run search
-let legal_mask = 0b111111111u64; // All 9 positions legal initially
+// Run search. The mask is a dynamic-width LegalMask read from the observation —
+// never a u64 (that capped action spaces at 64) and never from info_bits.
+let legal_mask = ctx.metadata().legal_mask_from_obs(&reset.obs);
 let mut rng = ChaCha20Rng::seed_from_u64(42);
-let result = run_mcts(&mut ctx, &evaluator, config, reset.state, legal_mask, &mut rng).unwrap();
+let result = run_mcts(
+    &mut ctx, &evaluator, config, reset.state, reset.obs, legal_mask, &mut rng,
+).unwrap();
 
 println!("Best action: {}", result.action);
-println!("Policy: {:?}", result.policy);
+println!("Policy: {:?}", result.policy);  // tau=1 visit distribution
 println!("Value: {}", result.value);
 ```
+
+**`SearchResult.policy` is the training target and is always the raw tau=1 visit
+distribution** — it is never sharpened by `MctsConfig::temperature`, which
+controls only which action gets *played*. Sharpening the target destroys the
+soft-target signal policy learning depends on (at tau=0.1 the visit counts are
+raised to the 10th power, collapsing the target to near one-hot).
 
 ### MCTS Architecture
 
@@ -811,7 +680,14 @@ engine/mcts/src/
 ├── evaluator.rs    # Evaluator trait + UniformEvaluator
 ├── node.rs         # MctsNode (visit_count, value_sum, prior, children)
 ├── tree.rs         # MctsTree with arena allocation
-└── search.rs       # Select, expand, backpropagate, run_search
+├── search.rs       # Select, expand, backpropagate, run_search
+├── sampling.rs     # Dirichlet noise + action sampling
+├── types.rs        # SearchResult, SearchStats, errors
+└── onnx.rs         # OnnxEvaluator (feature-gated)
+
+engine/mcts/examples/   # generals_policy_probe, generals_strength_probe,
+                        # generals_search_diag
+engine/mcts/benches/    # search microbenchmarks
 ```
 
 ** Also, remember that if you are working on MCTS, that we have benchmarks for that. It may be a good idea to run those if you are making major changes to performance for it.**
@@ -824,11 +700,20 @@ engine/mcts/src/
 - `UniformEvaluator` - Returns uniform policy (for testing without neural network)
 - `SearchResult` - Contains best action, policy distribution, value estimate
 
-## Next Steps
+## Known Gaps
 
-1. **Analysis/Replay Mode** - Add a page to step through saved games and see MCTS visit counts
+- **Generals training does not yet beat random** at local compute scale. The
+  measured shape of the problem: mean branching factor 37 (p90 71) against a
+  50-250 simulation budget, and 92% of games decided by territory adjudication
+  at the round cap. Use `cargo run -p mcts --example generals_search_diag
+  --release` to re-measure.
+- **Generals is not playable in the web UI** — `web/src/game.rs::parse_state`
+  cannot decode its state layout (see Project Overview).
+- **No Othello in the pure-Python game mirrors** (`trainer/src/trainer/games/`),
+  so `create_game_state("othello")` raises. Othello is engine-side only for
+  evaluation purposes.
 
 ## Reference
 
 - [alpha-zero-general](https://github.com/suragnair/alpha-zero-general) - Python AlphaZero reference
-- MVP.md in documentation/ - Full design document
+- [`documentation/ARCHITECTURE.md`](documentation/ARCHITECTURE.md) - full architecture reference

@@ -95,9 +95,10 @@ Metrics scraped from:
 |---------|------|-------------|
 | `alphazero` | 9090, 9091 (internal) | Synchronized training (actor + trainer) |
 | `web` | 8080 | Backend API server |
-| `frontend` | 80 | Nginx serving Svelte app |
+| `frontend` | 80 (host) -> 8080 (container) | Nginx serving Svelte app |
 | `postgres` | 5432 | Replay buffer database |
 | `minio` | 9000 (API), 9001 (console) | S3-compatible model storage |
+| `minio-setup` | - | One-shot bucket initialiser. `alphazero` and `web` both wait on it via `service_completed_successfully`, so starting them without it blocks. |
 | `prometheus` | 9092 | Metrics collection |
 
 ### MinIO Console
@@ -134,7 +135,13 @@ docker compose -f docker-compose.yml -f docker-compose.k8s.yml up alphazero
 docker compose -f docker-compose.yml -f docker-compose.k8s.yml up web frontend
 ```
 
-For actual Kubernetes deployment, see `k8s/README.md`. For GCP infrastructure provisioning, see `terraform/README.md`.
+For actual Kubernetes deployment the Kustomize manifests are in `k8s/`:
+
+```bash
+kubectl apply -k k8s/overlays/dev
+```
+
+See `k8s/README.md` for details, and `terraform/README.md` for GCP infrastructure provisioning.
 
 ## Storage Backends
 
@@ -165,4 +172,14 @@ All deployment modes read from `config.toml`. See `engine/engine-config/SCHEMA.m
 1. CLI arguments (highest)
 2. Environment variables (`CARTRIDGE_<SECTION>_<KEY>`)
 3. `config.toml`
-4. Built-in defaults (lowest)
+4. `config.defaults.toml` — checked-in defaults, and the source of truth for
+   every key (lowest)
+
+> **Caveat:** Rust honours only an explicit list of `CARTRIDGE_*` variables
+> (`engine/engine-config/src/loader.rs`), while the Python trainer parses them
+> generically. Keys outside that list — `logging.format`, the MCTS ramping keys,
+> `num_actors`, `allowed_origins`, `health_port` — take effect for the trainer
+> but are ignored by the actor and web server. Set those in `config.toml`.
+>
+> `[wandb]` and the solver-eval keys (`solver_games`, `solver_seed`,
+> `promotion_metric`, `promotion_margin`) are read only by the Python trainer.
