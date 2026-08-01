@@ -12,6 +12,7 @@
       "legal_mask_offset": 84,
       "obs_channels": 2,
       "player_relative_obs": false,
+      "alternating_turns": true,
       "player_count": 2,
       "player_names": [
         "Red",
@@ -34,6 +35,7 @@
       "legal_mask_offset": 576,
       "obs_channels": 9,
       "player_relative_obs": true,
+      "alternating_turns": true,
       "player_count": 2,
       "player_names": [
         "Red",
@@ -56,6 +58,7 @@
       "legal_mask_offset": 128,
       "obs_channels": 2,
       "player_relative_obs": false,
+      "alternating_turns": true,
       "player_count": 2,
       "player_names": [
         "Black",
@@ -78,6 +81,7 @@
       "legal_mask_offset": 18,
       "obs_channels": 2,
       "player_relative_obs": false,
+      "alternating_turns": true,
       "player_count": 2,
       "player_names": [
         "X",

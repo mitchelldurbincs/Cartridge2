@@ -154,6 +154,10 @@ impl Game for Generals {
             // generals_obs:v1 planes are own/enemy relative to the player to
             // act, so the network must not also get the player indicator.
             .with_obs_encoding(obs::NUM_CHANNELS, true)
+            // This 8x8 variant is deliberately restricted to one move per
+            // turn; the full Generals ruleset is not, and relaxing that
+            // would have to flip this flag (see GameMetadata docs).
+            .with_alternating_turns(true)
             .with_players(
                 2,
                 vec!["Red".to_string(), "Blue".to_string()],

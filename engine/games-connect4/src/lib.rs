@@ -306,6 +306,7 @@ impl Game for Connect4 {
             .with_actions(COLS)
             .with_observation(OBS_SIZE, BOARD_SIZE * 2) // legal mask starts after board views
             .with_obs_encoding(2, false) // one absolute plane per player
+            .with_alternating_turns(true) // players strictly alternate drops
             .with_players(
                 2,
                 vec!["Red".to_string(), "Yellow".to_string()],

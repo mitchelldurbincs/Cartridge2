@@ -463,10 +463,18 @@ impl Othello {
     /// (bits 24-31) fields.
     ///
     /// CAVEAT: Othello's legal move mask spans all 64 board positions, so mask
-    /// bits 16 and above collide with the player/winner/pass fields. The packed
-    /// info value is therefore ambiguous and cannot be reliably decoded with
-    /// `info_bits::extract_*`. Consumers should read legal moves and the current
-    /// player from the observation instead (see `GameMetadata::extract_legal_moves`).
+    /// bits 16 and above collide with the player/winner/pass fields. **While
+    /// the game is in progress** the packed info value is therefore ambiguous
+    /// and cannot be reliably decoded with `info_bits::extract_*`. Consumers
+    /// should read legal moves and the current player from the observation
+    /// instead (see `GameMetadata::extract_legal_moves`).
+    ///
+    /// The one exception is a **terminal** state: `legal_moves_mask()` returns
+    /// 0 once `is_done()`, so nothing collides and the winner field at bits
+    /// 20-23 is exact. `info_bits::outcome_from_info` relies on precisely that,
+    /// and `engine_games::tests::test_terminal_info_bits_report_the_true_winner`
+    /// asserts it for every registered game — so if this ever stops holding,
+    /// that test fails rather than self-play win attribution silently rotting.
     fn compute_info_bits(state: &State) -> u64 {
         let legal_mask = state.legal_moves_mask();
         let player = state.current_player;
@@ -519,6 +527,9 @@ impl Game for Othello {
             .with_actions(NUM_ACTIONS)
             .with_observation(OBS_SIZE, BOARD_SIZE * 2) // legal mask starts after board views
             .with_obs_encoding(2, false) // one absolute plane per player
+            // A forced pass is an explicit action (PASS_ACTION) and consumes
+            // a step, so the acting player still alternates every step.
+            .with_alternating_turns(true)
             .with_players(
                 2,
                 vec!["Black".to_string(), "White".to_string()],

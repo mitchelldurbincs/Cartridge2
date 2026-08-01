@@ -236,6 +236,7 @@ impl Game for TicTacToe {
             .with_actions(9)
             .with_observation(29, 18) // 29 floats, legal mask starts at index 18
             .with_obs_encoding(2, false) // one absolute plane per player
+            .with_alternating_turns(true) // X and O strictly alternate
             .with_players(2, vec!["X".to_string(), "O".to_string()], vec!['X', 'O'])
             .with_description("Get three in a row to win!")
     }

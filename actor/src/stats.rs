@@ -7,6 +7,7 @@
 //!
 //! Stats are written to a JSON file for the web frontend to display.
 
+use engine_core::GameOutcome;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -21,11 +22,11 @@ pub struct ActorStats {
     episodes_completed: AtomicU32,
     /// Total game steps across all episodes
     total_steps: AtomicU64,
-    /// Episodes that ended in player 1 win (reward > 0)
+    /// Episodes won by the seat that moves first
     player1_wins: AtomicU32,
-    /// Episodes that ended in player 2 win (reward < 0)
+    /// Episodes won by the seat that moves second
     player2_wins: AtomicU32,
-    /// Episodes that ended in draw (reward == 0)
+    /// Episodes that ended without a winner
     draws: AtomicU32,
     /// Episodes abandoned before reaching a terminal state
     episodes_abandoned: AtomicU32,
@@ -93,19 +94,22 @@ impl ActorStats {
     }
 
     /// Record a completed episode.
-    pub fn record_episode(&self, steps: u32, final_reward: f32) {
+    ///
+    /// Takes a decoded [`GameOutcome`] rather than a reward on purpose. This
+    /// used to accept the episode's summed reward and read its sign as a seat,
+    /// which cannot work: rewards are relative to the player who just moved
+    /// and the winning move is made by the winner, so every decisive game
+    /// looked like a player-1 win and `player2_wins` never left zero.
+    pub fn record_episode(&self, steps: u32, outcome: GameOutcome) {
         self.episodes_completed.fetch_add(1, Ordering::Relaxed);
         self.total_steps.fetch_add(steps as u64, Ordering::Relaxed);
 
-        // Categorize outcome based on final reward
-        // Positive = player 1 wins, negative = player 2 wins, zero = draw
-        if final_reward > 0.0 {
-            self.player1_wins.fetch_add(1, Ordering::Relaxed);
-        } else if final_reward < 0.0 {
-            self.player2_wins.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.draws.fetch_add(1, Ordering::Relaxed);
-        }
+        let counter = match outcome {
+            GameOutcome::Player1Win => &self.player1_wins,
+            GameOutcome::Player2Win => &self.player2_wins,
+            GameOutcome::Draw => &self.draws,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record an episode that was abandoned before reaching a terminal
@@ -251,9 +255,9 @@ mod tests {
         let stats = ActorStats::new(dir.path().to_str().unwrap(), "tictactoe");
 
         // Record some episodes
-        stats.record_episode(9, 1.0); // P1 win
-        stats.record_episode(8, -1.0); // P2 win
-        stats.record_episode(9, 0.0); // Draw
+        stats.record_episode(9, GameOutcome::Player1Win);
+        stats.record_episode(8, GameOutcome::Player2Win);
+        stats.record_episode(9, GameOutcome::Draw);
 
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.episodes_completed, 3);
@@ -268,7 +272,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let stats = ActorStats::new(dir.path().to_str().unwrap(), "tictactoe");
 
-        stats.record_episode(9, 1.0);
+        stats.record_episode(9, GameOutcome::Player1Win);
         stats.write_stats();
 
         // Verify file exists and is valid JSON
@@ -304,7 +308,7 @@ mod tests {
         let stats = ActorStats::new(dir.path().to_str().unwrap(), "tictactoe");
 
         // Record episode but no MCTS stats
-        stats.record_episode(5, 1.0);
+        stats.record_episode(5, GameOutcome::Player1Win);
 
         let snapshot = stats.snapshot();
 
@@ -313,51 +317,54 @@ mod tests {
         assert!(!snapshot.mcts_avg_inference_us.is_nan());
     }
 
+    /// Each outcome increments exactly one counter, and only that one.
+    ///
+    /// Replaces three tests that asserted the sign of a reward selected the
+    /// seat ("any positive reward is a P1 win"). That mapping was the bug:
+    /// the terminal reward is relative to the mover, so it is `+1.0` for
+    /// either seat's win and `player2_wins` could never be non-zero.
     #[test]
-    fn test_outcome_categorization_positive_reward() {
-        let dir = tempdir().unwrap();
-        let stats = ActorStats::new(dir.path().to_str().unwrap(), "tictactoe");
+    fn test_each_outcome_increments_only_its_own_counter() {
+        let cases = [
+            (GameOutcome::Player1Win, (1, 0, 0)),
+            (GameOutcome::Player2Win, (0, 1, 0)),
+            (GameOutcome::Draw, (0, 0, 1)),
+        ];
 
-        // Any positive reward is a P1 win
-        stats.record_episode(5, 0.001); // Small positive
-        stats.record_episode(5, 1.0); // Normal win
-        stats.record_episode(5, 100.0); // Large positive
+        for (outcome, (p1, p2, draws)) in cases {
+            let dir = tempdir().unwrap();
+            let stats = ActorStats::new(dir.path().to_str().unwrap(), "tictactoe");
 
-        let snapshot = stats.snapshot();
-        assert_eq!(snapshot.player1_wins, 3);
-        assert_eq!(snapshot.player2_wins, 0);
-        assert_eq!(snapshot.draws, 0);
+            stats.record_episode(5, outcome);
+
+            let snapshot = stats.snapshot();
+            assert_eq!(snapshot.player1_wins, p1, "p1 count for {outcome:?}");
+            assert_eq!(snapshot.player2_wins, p2, "p2 count for {outcome:?}");
+            assert_eq!(snapshot.draws, draws, "draw count for {outcome:?}");
+            assert_eq!(snapshot.episodes_completed, 1);
+        }
     }
 
+    /// Regression test for the reason this fix exists.
+    ///
+    /// A run in which player 2 wins every game must report exactly that. The
+    /// old reward-sign mapping reported it as 100% player-1 wins, which is
+    /// also what the frontend's outcome bar rendered — so a seat-imbalanced
+    /// run, the failure this metric exists to catch, was indistinguishable
+    /// from a healthy one.
     #[test]
-    fn test_outcome_categorization_negative_reward() {
+    fn test_a_run_of_player2_wins_is_not_reported_as_player1() {
         let dir = tempdir().unwrap();
         let stats = ActorStats::new(dir.path().to_str().unwrap(), "tictactoe");
 
-        // Any negative reward is a P2 win
-        stats.record_episode(5, -0.001); // Small negative
-        stats.record_episode(5, -1.0); // Normal loss
-        stats.record_episode(5, -100.0); // Large negative
+        for _ in 0..10 {
+            stats.record_episode(9, GameOutcome::Player2Win);
+        }
 
         let snapshot = stats.snapshot();
+        assert_eq!(snapshot.player2_wins, 10);
         assert_eq!(snapshot.player1_wins, 0);
-        assert_eq!(snapshot.player2_wins, 3);
         assert_eq!(snapshot.draws, 0);
-    }
-
-    #[test]
-    fn test_outcome_categorization_zero_reward() {
-        let dir = tempdir().unwrap();
-        let stats = ActorStats::new(dir.path().to_str().unwrap(), "tictactoe");
-
-        // Exactly zero is a draw
-        stats.record_episode(5, 0.0);
-        stats.record_episode(7, 0.0);
-
-        let snapshot = stats.snapshot();
-        assert_eq!(snapshot.player1_wins, 0);
-        assert_eq!(snapshot.player2_wins, 0);
-        assert_eq!(snapshot.draws, 2);
     }
 
     #[test]
@@ -401,8 +408,8 @@ mod tests {
         let stats = ActorStats::new(dir.path().to_str().unwrap(), "tictactoe");
 
         // Record episodes (note: there will be some real elapsed time)
-        stats.record_episode(9, 1.0);
-        stats.record_episode(9, 1.0);
+        stats.record_episode(9, GameOutcome::Player1Win);
+        stats.record_episode(9, GameOutcome::Player1Win);
 
         let snapshot = stats.snapshot();
 
@@ -420,9 +427,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let stats = ActorStats::new(dir.path().to_str().unwrap(), "tictactoe");
 
-        stats.record_episode(5, 1.0);
-        stats.record_episode(9, -1.0);
-        stats.record_episode(7, 0.0);
+        stats.record_episode(5, GameOutcome::Player1Win);
+        stats.record_episode(9, GameOutcome::Player2Win);
+        stats.record_episode(7, GameOutcome::Draw);
 
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.total_steps, 5 + 9 + 7);
@@ -433,9 +440,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let stats = ActorStats::new(dir.path().to_str().unwrap(), "tictactoe");
 
-        stats.record_episode(6, 1.0);
-        stats.record_episode(10, -1.0);
-        stats.record_episode(8, 0.0);
+        stats.record_episode(6, GameOutcome::Player1Win);
+        stats.record_episode(10, GameOutcome::Player2Win);
+        stats.record_episode(8, GameOutcome::Draw);
 
         let snapshot = stats.snapshot();
         // Average: (6 + 10 + 8) / 3 = 8.0
@@ -446,7 +453,7 @@ mod tests {
     fn test_timestamp_is_recent() {
         let dir = tempdir().unwrap();
         let stats = ActorStats::new(dir.path().to_str().unwrap(), "tictactoe");
-        stats.record_episode(5, 1.0);
+        stats.record_episode(5, GameOutcome::Player1Win);
 
         let snapshot = stats.snapshot();
         let now = std::time::SystemTime::now()
@@ -464,7 +471,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let stats = ActorStats::new(dir.path().to_str().unwrap(), "tictactoe");
 
-        stats.record_episode(9, 1.0);
+        stats.record_episode(9, GameOutcome::Player1Win);
         stats.record_mcts_stats(100, 50000);
 
         let snapshot = stats.snapshot();
@@ -485,7 +492,7 @@ mod tests {
         let stats = ActorStats::new(dir.path().to_str().unwrap(), "tictactoe");
 
         // Write initial stats
-        stats.record_episode(5, 1.0);
+        stats.record_episode(5, GameOutcome::Player1Win);
         stats.write_stats();
 
         // Read and verify
@@ -495,7 +502,7 @@ mod tests {
         assert_eq!(parsed1.episodes_completed, 1);
 
         // Update and write again
-        stats.record_episode(7, -1.0);
+        stats.record_episode(7, GameOutcome::Player2Win);
         stats.write_stats();
 
         // Should see updated value
@@ -518,7 +525,7 @@ mod tests {
             let stats_clone = Arc::clone(&stats);
             let handle = thread::spawn(move || {
                 for _ in 0..100 {
-                    stats_clone.record_episode(5, 1.0);
+                    stats_clone.record_episode(5, GameOutcome::Player1Win);
                 }
             });
             handles.push(handle);
