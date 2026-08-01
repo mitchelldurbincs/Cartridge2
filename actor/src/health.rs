@@ -17,6 +17,13 @@ pub struct HealthState {
     healthy: Arc<AtomicBool>,
     /// Timestamp of last successful episode completion (Unix seconds).
     last_episode_time: Arc<AtomicU64>,
+    /// Process start time (Unix seconds).
+    ///
+    /// Progress is measured from whichever is later, this or the last
+    /// completed episode. Without it, "no episode has ever completed" was
+    /// treated as permanently healthy, so an actor that failed every episode
+    /// from startup reported 200 forever and was never restarted.
+    started_at: Arc<AtomicU64>,
     /// Seconds without a completed episode before liveness reports unhealthy.
     ///
     /// Derived from the effective episode timeout rather than fixed, because
@@ -41,6 +48,7 @@ impl HealthState {
             ready: Arc::new(AtomicBool::new(false)),
             healthy: Arc::new(AtomicBool::new(true)),
             last_episode_time: Arc::new(AtomicU64::new(0)),
+            started_at: Arc::new(AtomicU64::new(unix_now())),
             progress_timeout_secs: Arc::new(AtomicU64::new(DEFAULT_PROGRESS_TIMEOUT_SECS)),
         }
     }
@@ -72,8 +80,11 @@ impl HealthState {
     }
 
     /// Mark the actor as unhealthy (will trigger restart).
-    /// Called when the actor encounters a fatal error that requires restart.
-    #[allow(dead_code)]
+    ///
+    /// Called by the main loop once episodes have failed consecutively enough
+    /// times that the process is not going to recover on its own. Health
+    /// *reporting* lives here; deciding that the actor is broken belongs to
+    /// the loop, which is the only place that sees the failures.
     pub fn set_unhealthy(&self) {
         self.healthy.store(false, Ordering::SeqCst);
         error!("Actor marked as unhealthy");
@@ -95,13 +106,22 @@ impl HealthState {
     }
 
     /// Check if the actor has completed an episode recently (within timeout).
+    ///
+    /// Measured from the last completed episode, or from process start if none
+    /// has completed yet. That second case is the point: an actor whose every
+    /// episode fails — unreachable database, corrupt model, a game that panics
+    /// on some state — never reaches `record_episode_complete`, and used to be
+    /// reported healthy indefinitely because "no episodes yet" was treated as
+    /// startup. Kubernetes therefore never restarted it, and the fleet went
+    /// quietly idle with every probe green.
+    ///
+    /// A genuinely slow first episode is still safe: the window is sized from
+    /// the effective per-episode budget (see `set_episode_budget_secs`), which
+    /// already accounts for long-horizon games like generals.
     pub fn is_making_progress(&self, timeout_secs: u64) -> bool {
         let last = self.last_episode_time.load(Ordering::SeqCst);
-        if last == 0 {
-            // No episodes completed yet, but that's ok during startup
-            return true;
-        }
-        unix_now().saturating_sub(last) < timeout_secs
+        let reference = last.max(self.started_at.load(Ordering::SeqCst));
+        unix_now().saturating_sub(reference) < timeout_secs
     }
 }
 
@@ -268,6 +288,42 @@ mod tests {
 
         // Record an episode completion
         state.record_episode_complete();
+        assert!(state.is_making_progress(300));
+    }
+
+    /// An actor that has never completed an episode must eventually fail
+    /// liveness.
+    ///
+    /// Regression test: `last_episode_time == 0` used to short-circuit to
+    /// "making progress", so a process whose every episode failed from startup
+    /// reported healthy forever and was never restarted. Progress is now
+    /// measured from process start until the first episode lands.
+    #[test]
+    fn test_no_episode_ever_completed_eventually_fails_liveness() {
+        let state = HealthState::new();
+
+        // Still inside the window: this is ordinary startup.
+        assert!(state.is_making_progress(300));
+
+        // Pretend the process started well before the window.
+        state.started_at.store(unix_now() - 600, Ordering::SeqCst);
+        assert!(
+            !state.is_making_progress(300),
+            "an actor that has never completed an episode must not stay healthy \
+             indefinitely"
+        );
+    }
+
+    /// A completed episode resets the reference point, even one that arrives
+    /// long after a slow start.
+    #[test]
+    fn test_a_completed_episode_restores_progress() {
+        let state = HealthState::new();
+        state.started_at.store(unix_now() - 600, Ordering::SeqCst);
+        assert!(!state.is_making_progress(300));
+
+        state.record_episode_complete();
+
         assert!(state.is_making_progress(300));
     }
 

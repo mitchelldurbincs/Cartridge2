@@ -114,6 +114,26 @@ impl EpisodeStats {
 /// only ever raises the budget, never lowers an explicitly configured one.
 const TIMEOUT_SECS_PER_MOVE: u64 = 1;
 
+/// Consecutive episode failures after which the actor stops calling itself
+/// healthy.
+///
+/// Episode errors are retried indefinitely because most are transient — a
+/// database connection blipping, a model file caught mid-write. But nothing
+/// distinguished "transient" from "this dependency is gone", so a permanently
+/// broken actor looped forever while `/health` stayed 200. Five in a row is
+/// well past any plausible transient and still far short of a restart loop on
+/// a flaky-but-working system.
+const MAX_CONSECUTIVE_EPISODE_FAILURES: u32 = 5;
+
+/// Whether a run of back-to-back episode failures has gone on long enough that
+/// the actor should stop reporting itself healthy.
+///
+/// A named function rather than an inline comparison so the rule can be tested
+/// without standing up an `Actor` (which needs PostgreSQL).
+pub(crate) fn is_persistent_failure(consecutive_failures: u32) -> bool {
+    consecutive_failures >= MAX_CONSECUTIVE_EPISODE_FAILURES
+}
+
 /// The wall-clock budget a single episode actually gets, after the horizon
 /// floor is applied to the configured value.
 ///
@@ -403,6 +423,9 @@ impl Actor {
 
         info!("Entering main event loop");
 
+        // Episodes that failed back-to-back with no success in between.
+        let mut consecutive_failures: u32 = 0;
+
         loop {
             // Check shutdown signal
             if self.shutdown_signal.load(Ordering::Relaxed) {
@@ -453,7 +476,11 @@ impl Actor {
 
             // Run an episode
             let episode_start = Instant::now();
-            match self.run_episode().await {
+            let episode_result = self.run_episode().await;
+            if episode_result.is_ok() {
+                consecutive_failures = 0;
+            }
+            match episode_result {
                 Ok(EpisodeOutcome::Abandoned {
                     reason,
                     steps,
@@ -556,8 +583,30 @@ impl Actor {
                 }
                 Err(e) => {
                     let count = self.episode_count.load(Ordering::Relaxed);
-                    error!("Episode {} failed: {}", count + 1, e);
-                    // Continue with next episode rather than stopping
+                    consecutive_failures += 1;
+                    error!(
+                        episode = count + 1,
+                        consecutive_failures,
+                        error = %e,
+                        "Episode failed"
+                    );
+
+                    // Continue with the next episode: a single failure is
+                    // usually transient (a blipping database connection).
+                    // A sustained run of them is not, and the process cannot
+                    // fix itself — so stop reporting healthy and let the
+                    // orchestrator restart us. Without this the loop spins
+                    // forever on a permanently broken dependency while every
+                    // probe stays green.
+                    if is_persistent_failure(consecutive_failures) {
+                        error!(
+                            consecutive_failures,
+                            "Episodes have failed {} times in a row; marking the actor \
+                             unhealthy so it can be restarted",
+                            consecutive_failures
+                        );
+                        health.set_unhealthy();
+                    }
                 }
             }
         }
@@ -879,6 +928,48 @@ mod tests {
                 budget,
             );
         }
+    }
+
+    /// A transient failure must not flip the actor unhealthy, and a sustained
+    /// run of them must.
+    ///
+    /// Episode errors were previously logged and retried forever with no
+    /// escalation path, so an actor whose database had gone away spun
+    /// indefinitely while `/health` stayed 200 and Kubernetes never restarted
+    /// it.
+    #[test]
+    fn test_only_a_sustained_run_of_failures_is_persistent() {
+        assert!(!is_persistent_failure(0));
+        assert!(!is_persistent_failure(1));
+        assert!(!is_persistent_failure(MAX_CONSECUTIVE_EPISODE_FAILURES - 1));
+        assert!(is_persistent_failure(MAX_CONSECUTIVE_EPISODE_FAILURES));
+        assert!(is_persistent_failure(
+            MAX_CONSECUTIVE_EPISODE_FAILURES + 100
+        ));
+    }
+
+    /// The counter resets on success, so a flaky-but-working actor is never
+    /// escalated: interleaved failures must not accumulate across successes.
+    #[test]
+    fn test_a_success_clears_the_failure_run() {
+        // Mirrors the run() loop: reset on Ok, increment on Err.
+        let mut consecutive_failures = 0u32;
+        let episode_results = [false, false, false, true, false, false, false, false];
+
+        let mut ever_escalated = false;
+        for succeeded in episode_results {
+            if succeeded {
+                consecutive_failures = 0;
+            } else {
+                consecutive_failures += 1;
+            }
+            ever_escalated |= is_persistent_failure(consecutive_failures);
+        }
+
+        assert!(
+            !ever_escalated,
+            "7 failures broken up by one success must not trip the threshold"
+        );
     }
 
     #[test]
