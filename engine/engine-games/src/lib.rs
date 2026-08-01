@@ -14,6 +14,8 @@
 
 use std::sync::Once;
 
+pub mod manifest;
+
 static INIT: Once = Once::new();
 
 /// Register all available games with the engine-core registry.
@@ -71,5 +73,57 @@ mod tests {
         assert_eq!(tictactoe_count, 1);
         assert_eq!(connect4_count, 1);
         assert_eq!(othello_count, 1);
+    }
+
+    /// Every game currently bundled conforms to the **AlphaZero spatial
+    /// observation profile**:
+    /// `[obs_channels * board_size][legal mask: num_actions][player one-hot: 2]`.
+    ///
+    /// Both halves matter downstream: the trainer reshapes the leading slice
+    /// using `obs_channels`, and reads the player indicator at
+    /// `legal_mask_offset + num_actions`. A game that declares an encoding
+    /// inconsistent with its own obs_size would mistrain silently, so assert
+    /// it here for every registered game rather than per-crate.
+    ///
+    /// **This is a profile the current trainer requires, not a property of
+    /// `Game`.** It holds for every game in the registry today because every
+    /// game today is a two-player perfect-information board game trained by
+    /// AlphaZero. An environment that is not — a vector/scalar observation, a
+    /// recurrent or fog-of-war encoding, a simultaneous-turn adapter, anything
+    /// driven by PPO — will legitimately violate it, and the answer then is to
+    /// scope this assertion to the games claiming the profile rather than to
+    /// force the new environment into a board-shaped layout. Deliberately not
+    /// building that opt-out yet: there is no second algorithm to design it
+    /// against, and guessing the seam before one exists is how it ends up
+    /// fitting neither.
+    #[test]
+    fn test_bundled_games_conform_to_the_alphazero_spatial_profile() {
+        register_all_games();
+
+        for env_id in list_registered_games() {
+            let meta = engine_core::create_game(&env_id)
+                .unwrap_or_else(|| panic!("{env_id} registered but not constructible"))
+                .metadata();
+            let board_size = meta.board_size();
+
+            assert!(
+                meta.obs_channels > 0,
+                "{env_id}: obs_channels must be declared (got 0)"
+            );
+            assert!(board_size > 0, "{env_id}: board_size must be non-zero");
+            assert_eq!(
+                meta.legal_mask_offset,
+                meta.obs_channels * board_size,
+                "{env_id}: legal mask must start immediately after the board planes \
+                 (obs_channels={} * board_size={})",
+                meta.obs_channels,
+                board_size,
+            );
+            assert_eq!(
+                meta.obs_size,
+                meta.legal_mask_offset + meta.num_actions + 2,
+                "{env_id}: obs_size must be planes + legal mask + 2-element player one-hot",
+            );
+        }
     }
 }

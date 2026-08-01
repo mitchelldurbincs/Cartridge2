@@ -42,7 +42,7 @@ STEPS            ?= 400
         train play web frontend \
         test test-engine test-actor test-web test-trainer \
         lint lint-rust lint-python lint-frontend \
-        build build-actor build-web \
+        build build-actor build-web game-manifest \
         clean clean-data clean-models clean-all \
         db-start db-stop db-reset
 
@@ -114,6 +114,14 @@ setup-frontend:
 # --- Build ---
 
 build: build-actor build-web
+
+# Regenerate the game-metadata manifest the Python trainer reads. The engine is
+# the source of truth for board dimensions, action counts and observation
+# layout; this renders them to trainer/src/trainer/game_metadata.json.
+# `cargo test` fails if the committed file drifts from the game crates.
+game-manifest:
+	@echo "--- Regenerating game metadata manifest ---"
+	$(CARGO) run -q --manifest-path engine/Cargo.toml --bin gen-game-manifest
 
 build-actor:
 	@echo "--- Building actor (release) $(CARGO_FEATURES) ---"

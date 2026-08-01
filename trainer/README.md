@@ -115,7 +115,7 @@ For games using the ResNet architecture, the following parameters are configurab
 | `network_type` | Architecture to use | `"resnet"` | `"resnet"` |
 | `num_res_blocks` | Number of residual blocks in tower | 4 | 6 |
 | `num_filters` | Filters per convolutional layer | 128 | 256 |
-| `input_channels` | Board encoding channels | 2 | 2 |
+| `obs_channels` | Board encoding planes (engine-owned) | 2 | 2 |
 | `board_height` | Board height for reshaping | 6 | 8 |
 | `board_width` | Board width for reshaping | 7 | 8 |
 
@@ -346,31 +346,30 @@ class GameConfig:
     # CNN-specific (when network_type="resnet")
     num_res_blocks: int = 4    # Residual blocks in tower
     num_filters: int = 128     # Filters per conv layer
-    input_channels: int = 2    # Board encoding channels
+
+    # Observation layout (engine-owned, read from game_metadata.json)
+    obs_channels: int = 2          # Board encoding planes
+    player_relative_obs: bool = False
 ```
 
 ### Adding a New Game
 
-1. Add a `GameConfig` entry in `game_config.py`
-2. Choose `network_type="mlp"` for simple games or `network_type="resnet"` for spatial games
-3. For ResNet, set appropriate `num_res_blocks`, `num_filters`, and `input_channels`
-4. Ensure `obs_size` matches the Rust engine's observation encoding
+Board dimensions, action count and observation layout are **not** written
+here — they come from the engine via `game_metadata.json`. Only the network
+architecture is a trainer-side choice.
 
-Example for a hypothetical 4x4 game:
+1. Implement and register the game in the Rust engine
+2. Run `make game-manifest` to regenerate the manifest
+3. Add a `_TRAINING_OVERRIDES` entry in `game_config.py` choosing the
+   architecture. This is required: a game present in the manifest with no
+   entry raises at import, so a new spatial game cannot silently default to
+   an MLP.
+
 ```python
-"my_game": GameConfig(
-    env_id="my_game",
-    display_name="My Game",
-    board_width=4,
-    board_height=4,
-    num_actions=16,
-    obs_size=50,  # 16*2 (board) + 16 (legal) + 2 (player)
-    legal_mask_offset=32,
-    network_type="resnet",
-    num_res_blocks=3,
-    num_filters=64,
-    input_channels=2,
-)
+_TRAINING_OVERRIDES = {
+    ...
+    "my_game": {"network_type": "resnet", "num_res_blocks": 3, "num_filters": 64},
+}
 ```
 
 ## Storage Backends
@@ -423,15 +422,18 @@ replay = create_replay_buffer(backend="postgres", connection_string="...")
 ## Development
 
 Some trainer modules (e.g. `trainer.wandb_logger`) are shims that re-export
-from the `crucible` package, which is not yet a declared dependency:
-install it editable from the sibling checkout before running the trainer or
-its tests. Formal dependency declaration + CI wiring happens in Task B8.
+from the [`crucible`](https://github.com/mitchelldurbincs/crucible) package,
+which holds the orchestration core. It is a declared dependency pinned to a
+commit in `pyproject.toml` — the single place that pin lives — so a plain
+install pulls it. Install a sibling checkout editable *first* if you are
+developing crucible alongside; pip then keeps it.
 
 ```bash
 # Install with dev dependencies
 pip install -e ".[dev]"
 
-# Install crucible from the sibling checkout (required)
+# Only if you are developing crucible alongside (the install above already
+# pulls the pinned release)
 pip install -e ../../crucible
 
 # Run tests
@@ -483,7 +485,7 @@ trainer evaluate --model ../data/models/model_step_000100.onnx --games 100
 
 ### CLI Arguments
 
-Note: Game metadata is loaded from PostgreSQL (via `CARTRIDGE_STORAGE_POSTGRES_URL`) or falls back to hardcoded configs.
+Note: game metadata comes from the engine-generated `game_metadata.json` shipped with the package. The PostgreSQL `game_metadata` row is cross-checked against it at startup, not used as the source.
 
 | Argument | Default | Description |
 |----------|---------|-------------|

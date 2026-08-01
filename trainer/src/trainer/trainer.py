@@ -55,7 +55,7 @@ class Trainer:
         Path(config.stats_path).parent.mkdir(parents=True, exist_ok=True)
 
         # Initialize network
-        self.network = create_network(config.env_id)
+        self.network = create_network(config.env_id, config=self.game_config)
         self.network.to(self.device)
 
         # Initialize optimizer

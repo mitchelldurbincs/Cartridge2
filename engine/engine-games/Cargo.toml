@@ -5,10 +5,15 @@ edition = "2021"
 description = "Game registration for Cartridge engine"
 
 [dependencies]
+engine-core = { path = "../engine-core" }
 games-tictactoe = { path = "../games-tictactoe" }
 games-connect4 = { path = "../games-connect4" }
 games-othello = { path = "../games-othello" }
 games-generals = { path = "../games-generals" }
 
-[dev-dependencies]
-engine-core = { path = "../engine-core" }
+# Used by the game-metadata manifest generator (src/manifest.rs). Kept a real
+# dependency rather than feature-gated: `required-features` binaries are
+# excluded from `cargo clippy --all-targets`, which is the wrong trade for a
+# build tool that must stay lint-clean.
+serde = { workspace = true }
+serde_json = { workspace = true }

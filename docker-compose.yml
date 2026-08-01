@@ -19,7 +19,9 @@
 #   # Open http://localhost in browser
 #
 #   # Run standalone evaluation
-#   docker compose run --rm alphazero python -m trainer evaluate --model /app/data/models/latest.onnx
+#   # (--entrypoint is required: the image's ENTRYPOINT is `python -m trainer loop`,
+#   #  so a bare `run ... python -m trainer evaluate` would be appended to it.)
+#   docker compose run --rm --entrypoint python alphazero -m trainer evaluate --model /app/data/models/latest.onnx
 #
 #   # Watch training progress
 #   docker compose logs -f alphazero

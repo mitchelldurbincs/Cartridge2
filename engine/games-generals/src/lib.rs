@@ -151,6 +151,9 @@ impl Game for Generals {
             .with_board(params::WIDTH, params::HEIGHT)
             .with_actions(NUM_ACTIONS)
             .with_observation(OBS_SIZE, LEGAL_MASK_OFFSET)
+            // generals_obs:v1 planes are own/enemy relative to the player to
+            // act, so the network must not also get the player indicator.
+            .with_obs_encoding(obs::NUM_CHANNELS, true)
             .with_players(
                 2,
                 vec!["Red".to_string(), "Blue".to_string()],

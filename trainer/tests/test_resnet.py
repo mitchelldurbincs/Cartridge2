@@ -16,10 +16,10 @@ from trainer.game_config import GameConfig, get_config
 from trainer.resnet import ConvPolicyValueNetwork
 
 
-def make_config(input_channels: int, width: int = 5, height: int = 4) -> GameConfig:
+def make_config(obs_channels: int, width: int = 5, height: int = 4) -> GameConfig:
     """Build a synthetic resnet GameConfig with N spatial channels.
 
-    Observation layout: input_channels board planes, then legal mask
+    Observation layout: obs_channels board planes, then legal mask
     (num_actions), then the 2-element player one-hot.
     """
     board_size = width * height
@@ -30,12 +30,12 @@ def make_config(input_channels: int, width: int = 5, height: int = 4) -> GameCon
         board_width=width,
         board_height=height,
         num_actions=num_actions,
-        obs_size=input_channels * board_size + num_actions + 2,
-        legal_mask_offset=input_channels * board_size,
+        obs_size=obs_channels * board_size + num_actions + 2,
+        legal_mask_offset=obs_channels * board_size,
         network_type="resnet",
         num_res_blocks=1,
         num_filters=16,
-        input_channels=input_channels,
+        obs_channels=obs_channels,
     )
 
 

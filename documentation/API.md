@@ -263,13 +263,19 @@ Host: localhost:8080
 | `grid` | TicTacToe, Othello | Click any empty cell |
 | `drop_column` | Connect4 | Click column, piece drops to bottom |
 
+> `generals_8x8` also reports `board_type: "grid"`, but is **not playable through
+> this API**: the web server cannot decode its state layout
+> (`web/src/game.rs::parse_state` assumes `[board][player][winner]`, while
+> Generals encodes a 12-byte header plus 64 x 6-byte tiles). Configuring it as
+> the current game will not produce a usable session.
+
 **Status Codes**
 
 | Code | Description |
 |------|-------------|
 | 200 | Success |
 | 403 | Game exists but is not the currently configured game |
-| 404 | Game not found |
+| 404 | Game not found — in practice unreachable: the 403 check runs before lookup, so an unknown id also returns 403. Only reachable if the *configured* game is itself unregistered. |
 
 **Error Response (403)**
 
@@ -732,6 +738,8 @@ Host: localhost:8080
   "player1_wins": 640,
   "player2_wins": 545,
   "draws": 65,
+  "episodes_abandoned": 0,
+  "transitions_discarded": 0,
   "avg_episode_length": 25.5,
   "episodes_per_second": 3.2,
   "runtime_seconds": 390.6,
@@ -750,6 +758,8 @@ Host: localhost:8080
 | `player1_wins` | number | Episodes won by player 1 |
 | `player2_wins` | number | Episodes won by player 2 |
 | `draws` | number | Episodes ending in a draw |
+| `episodes_abandoned` | number | Episodes that ended without reaching a terminal state (wall-clock timeout or step guard). Their transitions were **discarded** — non-zero means self-play data is being lost, biased toward the longest episodes. |
+| `transitions_discarded` | number | Transitions discarded with those episodes |
 | `avg_episode_length` | number | Average moves per episode |
 | `episodes_per_second` | number | Self-play throughput |
 | `runtime_seconds` | number | Total actor runtime |
@@ -886,6 +896,8 @@ interface ActorStats {
   player1_wins: number;
   player2_wins: number;
   draws: number;
+  episodes_abandoned: number;
+  transitions_discarded: number;
   avg_episode_length: number;
   episodes_per_second: number;
   runtime_seconds: number;
@@ -1068,7 +1080,7 @@ The server handles requests as fast as possible. For production deployments, con
 ```bash
 # 1. Check available games
 curl http://localhost:8080/games
-# Response: {"games":["tictactoe","connect4"]}
+# Response: {"games":["connect4"]}   <- only the configured game
 
 # 2. Get game info
 curl http://localhost:8080/game-info/tictactoe

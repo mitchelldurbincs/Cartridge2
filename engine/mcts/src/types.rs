@@ -57,7 +57,18 @@ pub struct SearchResult {
     /// Best action to take
     pub action: u32,
 
-    /// Policy distribution over actions (visit counts normalized)
+    /// Training target: the root visit distribution at temperature 1
+    /// (raw visit counts, normalized).
+    ///
+    /// Deliberately NOT sharpened by [`MctsConfig::temperature`]. That
+    /// temperature governs which action is *played*; the stored target must
+    /// keep the search's full relative-visit information. Raising counts to
+    /// `1/tau` for a small tau destroys it — the actor's late-game tau of
+    /// 0.1 means `counts^10`, so two moves with 12 and 9 visits become a
+    /// 17.8:1 target and a typical 250-simulation search collapses onto a
+    /// near one-hot vector. That throws away the soft-target signal
+    /// AlphaZero policy learning depends on, and is worst in long games
+    /// where the low-temperature phase covers almost the whole episode.
     pub policy: Vec<f32>,
 
     /// Value estimate at root

@@ -30,7 +30,7 @@ struct EpisodeContext {
 
 /// Aggregated MCTS stats for an episode.
 #[derive(Debug, Default)]
-struct EpisodeStats {
+pub(crate) struct EpisodeStats {
     /// Number of MCTS searches performed
     pub search_count: u32,
     /// Total wall-clock time across all searches (microseconds)
@@ -102,6 +102,30 @@ impl EpisodeStats {
     }
 }
 
+/// Wall-clock seconds granted per move of a game's horizon when deriving the
+/// floor for an episode's timeout.
+///
+/// `episode_timeout_secs` is a single global setting, but episode cost scales
+/// with game length: a generals episode runs ~400 plies to connect4's ~25, at
+/// the same simulation count per ply. A timeout tuned for a short game turns
+/// into a data filter on a long one — and a biased filter, because the
+/// episodes it kills are the long ones. Treat the configured value as a floor
+/// and guarantee every game at least this much per move of its horizon. This
+/// only ever raises the budget, never lowers an explicitly configured one.
+const TIMEOUT_SECS_PER_MOVE: u64 = 1;
+
+/// The wall-clock budget a single episode actually gets, after the horizon
+/// floor is applied to the configured value.
+///
+/// Shared with the liveness probe: the health check must never be tighter than
+/// the budget an episode is legitimately allowed to use, or a long-but-healthy
+/// episode gets the process killed before it can finish. Deriving both from
+/// this one function is what keeps them consistent.
+pub(crate) fn effective_episode_timeout_secs(timeout_secs: u64, max_horizon: u32) -> u64 {
+    let horizon_floor = (max_horizon.max(1) as u64).saturating_mul(TIMEOUT_SECS_PER_MOVE);
+    timeout_secs.max(horizon_floor)
+}
+
 impl EpisodeContext {
     /// Create a new episode context with generated ID and timing.
     fn new(
@@ -112,7 +136,8 @@ impl EpisodeContext {
     ) -> Result<Self> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
         let id = format!("{}-ep-{}-{}", actor_id, episode_count, now.as_secs());
-        let timeout = Duration::from_secs(timeout_secs);
+        let timeout =
+            Duration::from_secs(effective_episode_timeout_secs(timeout_secs, max_horizon));
         // Use 10x max_horizon as generous upper bound to protect against infinite loops
         let max_steps = max_horizon.saturating_mul(10).max(1000);
 
@@ -128,6 +153,61 @@ impl EpisodeContext {
     fn is_timed_out(&self) -> bool {
         self.start_time.elapsed() > self.timeout
     }
+
+    /// Whether this episode must be abandoned, and why.
+    fn limit_exceeded(&self, steps_taken: u32) -> Option<AbandonReason> {
+        if self.is_timed_out() {
+            Some(AbandonReason::Timeout)
+        } else if steps_taken >= self.max_steps {
+            Some(AbandonReason::MaxSteps)
+        } else {
+            None
+        }
+    }
+}
+
+/// Why an episode ended without reaching a terminal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AbandonReason {
+    /// The wall-clock budget ran out.
+    Timeout,
+    /// The step guard tripped: the game never reported `done`.
+    MaxSteps,
+}
+
+impl AbandonReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            AbandonReason::Timeout => "timeout",
+            AbandonReason::MaxSteps => "max_steps",
+        }
+    }
+}
+
+/// Result of one self-play episode attempt.
+#[derive(Debug)]
+pub(crate) enum EpisodeOutcome {
+    /// Reached a terminal state; its transitions were stored.
+    Completed {
+        steps: u32,
+        total_reward: f32,
+        stats: EpisodeStats,
+    },
+    /// Ended early, so its transitions were **discarded**.
+    ///
+    /// Without a terminal state there is no game outcome to backfill, and
+    /// value targets are the game outcome. Storing the episode anyway would
+    /// push the trainer onto its `mcts_value` fallback, which degrades
+    /// training quietly rather than loudly. Dropping it is correct — but the
+    /// caller must account for the loss so it can never pass unnoticed.
+    Abandoned {
+        reason: AbandonReason,
+        steps: u32,
+        discarded: usize,
+        /// The effective budget that was exceeded — the configured timeout
+        /// after the horizon floor is applied, not the raw config value.
+        timeout_secs: u64,
+    },
 }
 
 pub struct Actor {
@@ -264,6 +344,19 @@ impl Actor {
     /// Run the actor main loop with health state tracking for Kubernetes probes.
     /// Records episode completions to the health state for liveness tracking.
     pub async fn run(&self, health: &HealthState) -> Result<()> {
+        // Size the liveness window from the same episode budget the episodes
+        // themselves use. Liveness measures progress in completed episodes, so
+        // a window shorter than one episode's budget would restart the process
+        // mid-episode — and for a game whose episodes always exceed it, would
+        // restart forever without a single episode completing.
+        {
+            let max_horizon = self.lock_engine()?.capabilities().max_horizon;
+            health.set_episode_budget_secs(effective_episode_timeout_secs(
+                self.config.episode_timeout_secs,
+                max_horizon,
+            ));
+        }
+
         let initial_rss = metrics::rss_mb().unwrap_or(0.0);
         info!(
             actor_id = %self.config.actor_id,
@@ -353,7 +446,43 @@ impl Actor {
             // Run an episode
             let episode_start = Instant::now();
             match self.run_episode().await {
-                Ok((steps, total_reward, episode_stats)) => {
+                Ok(EpisodeOutcome::Abandoned {
+                    reason,
+                    steps,
+                    discarded,
+                    timeout_secs,
+                }) => {
+                    let abandoned = self.stats.record_abandoned_episode(discarded);
+                    metrics::EPISODES_ABANDONED
+                        .with_label_values(&[reason.as_str()])
+                        .inc();
+                    metrics::TRANSITIONS_DISCARDED.inc_by(discarded as u64);
+
+                    // Report the running rate, not just this one episode: a
+                    // stray drop is noise, a steady stream means the replay
+                    // buffer is quietly losing its longest games.
+                    let completed = self.episode_count.load(Ordering::Relaxed);
+                    let attempted = completed + abandoned;
+                    warn!(
+                        reason = reason.as_str(),
+                        steps,
+                        discarded,
+                        timeout_secs,
+                        abandoned_total = abandoned,
+                        attempted,
+                        abandoned_pct =
+                            format!("{:.1}", 100.0 * abandoned as f64 / attempted.max(1) as f64),
+                        "Episode abandoned before terminal state; its transitions were discarded. \
+                         Raise actor.episode_timeout_secs if this persists."
+                    );
+
+                    self.stats.write_stats();
+                }
+                Ok(EpisodeOutcome::Completed {
+                    steps,
+                    total_reward,
+                    stats: episode_stats,
+                }) => {
                     let new_count = self.episode_count.fetch_add(1, Ordering::Relaxed) + 1;
                     let duration = episode_start.elapsed().as_secs_f64();
                     debug!(
@@ -454,35 +583,6 @@ impl Actor {
             .map_err(|e| anyhow!("MCTS policy lock poisoned: {}", e))
     }
 
-    /// Check episode limits and return error if exceeded.
-    fn check_episode_limits(&self, ctx: &EpisodeContext, steps_taken: u32) -> Result<()> {
-        if ctx.is_timed_out() {
-            warn!(
-                "Episode {} timed out after {:?} ({} steps taken)",
-                ctx.id,
-                ctx.start_time.elapsed(),
-                steps_taken
-            );
-            return Err(anyhow!(
-                "Episode timed out after {} seconds",
-                ctx.timeout.as_secs()
-            ));
-        }
-
-        if steps_taken >= ctx.max_steps {
-            warn!(
-                "Episode {} exceeded max steps ({}) without terminating",
-                ctx.id, ctx.max_steps
-            );
-            return Err(anyhow!(
-                "Episode exceeded {} steps without terminating",
-                ctx.max_steps
-            ));
-        }
-
-        Ok(())
-    }
-
     /// Backfill game outcomes and store transitions.
     async fn finalize_episode(
         &self,
@@ -520,7 +620,7 @@ impl Actor {
         Ok(())
     }
 
-    async fn run_episode(&self) -> Result<(u32, f32, EpisodeStats)> {
+    async fn run_episode(&self) -> Result<EpisodeOutcome> {
         let episode_count = self.episode_count.load(Ordering::Relaxed);
 
         // Get max_horizon and reset the game
@@ -560,7 +660,14 @@ impl Actor {
         let mut episode_stats = EpisodeStats::default();
 
         loop {
-            self.check_episode_limits(&ctx, steps_taken)?;
+            if let Some(reason) = ctx.limit_exceeded(steps_taken) {
+                return Ok(EpisodeOutcome::Abandoned {
+                    reason,
+                    steps: steps_taken,
+                    discarded: transitions.len(),
+                    timeout_secs: ctx.timeout.as_secs(),
+                });
+            }
 
             // Select action using MCTS policy
             let policy_result = {
@@ -626,7 +733,11 @@ impl Actor {
                 );
                 self.finalize_episode(transitions, step_result.reward, &ctx.id)
                     .await?;
-                break;
+                return Ok(EpisodeOutcome::Completed {
+                    steps: steps_taken,
+                    total_reward,
+                    stats: episode_stats,
+                });
             }
 
             // Update state for next step
@@ -637,14 +748,105 @@ impl Actor {
             current_legal_mask = self.game_config.legal_mask_from_obs(&current_obs);
             step_number += 1;
         }
-
-        Ok((steps_taken, total_reward, episode_stats))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================
+    // Episode limit / abandonment tests
+    // ========================================
+
+    #[test]
+    fn test_timeout_floor_scales_with_game_horizon() {
+        // A connect4-sized timeout must not silently truncate a long game.
+        // generals_8x8 has max_horizon 402, so a 180s config value is raised
+        // to the horizon floor rather than acting as a length filter.
+        let ctx = EpisodeContext::new("a", 0, 180, 402).unwrap();
+        assert_eq!(ctx.timeout, Duration::from_secs(402));
+    }
+
+    #[test]
+    fn test_timeout_floor_never_lowers_configured_value() {
+        // Short games keep the configured budget: the floor only raises.
+        let ctx = EpisodeContext::new("a", 0, 180, 42).unwrap();
+        assert_eq!(ctx.timeout, Duration::from_secs(180));
+
+        // ...including when the operator sets a very generous timeout.
+        let ctx = EpisodeContext::new("a", 0, 3600, 402).unwrap();
+        assert_eq!(ctx.timeout, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn test_limit_exceeded_reports_no_reason_within_budget() {
+        let ctx = EpisodeContext::new("a", 0, 300, 42).unwrap();
+        assert_eq!(ctx.limit_exceeded(0), None);
+        assert_eq!(ctx.limit_exceeded(ctx.max_steps - 1), None);
+    }
+
+    #[test]
+    fn test_limit_exceeded_reports_max_steps() {
+        let ctx = EpisodeContext::new("a", 0, 300, 42).unwrap();
+        assert_eq!(
+            ctx.limit_exceeded(ctx.max_steps),
+            Some(AbandonReason::MaxSteps)
+        );
+    }
+
+    #[test]
+    fn test_limit_exceeded_reports_timeout() {
+        // Zero-second budget with a 1-move horizon: the floor is 1s, so sleep
+        // past it and confirm timeout wins over the (untripped) step guard.
+        let ctx = EpisodeContext::new("a", 0, 0, 1).unwrap();
+        assert_eq!(ctx.timeout, Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(1100));
+        assert_eq!(ctx.limit_exceeded(0), Some(AbandonReason::Timeout));
+    }
+
+    #[test]
+    fn test_liveness_window_is_never_tighter_than_an_episode_budget() {
+        // Regression test: the liveness probe measures progress in *completed
+        // episodes*, so a window shorter than one episode's budget kills the
+        // process mid-episode. For a game whose episodes always exceed it,
+        // that is an unbreakable restart loop in which no episode ever
+        // completes. generals_8x8 (horizon 402) against the old fixed 300s
+        // window was exactly that case.
+        for (configured, horizon) in [
+            (180, 402), // generals: horizon floor raises the budget past 300s
+            (180, 42),  // connect4: configured value wins
+            (3600, 402),
+            (30, 9),
+        ] {
+            let budget = effective_episode_timeout_secs(configured, horizon);
+            let health = HealthState::new();
+            health.set_episode_budget_secs(budget);
+
+            assert!(
+                health.progress_timeout_secs() > budget,
+                "liveness window {} must exceed the {}s episode budget \
+                 (configured={configured}, horizon={horizon})",
+                health.progress_timeout_secs(),
+                budget,
+            );
+        }
+    }
+
+    #[test]
+    fn test_liveness_window_never_drops_below_the_default() {
+        let health = HealthState::new();
+        assert_eq!(health.progress_timeout_secs(), 300);
+        health.set_episode_budget_secs(1);
+        assert_eq!(health.progress_timeout_secs(), 300);
+    }
+
+    #[test]
+    fn test_abandon_reason_labels_are_stable() {
+        // These are Prometheus label values; changing them breaks dashboards.
+        assert_eq!(AbandonReason::Timeout.as_str(), "timeout");
+        assert_eq!(AbandonReason::MaxSteps.as_str(), "max_steps");
+    }
 
     fn test_config() -> Config {
         // These tests require a running PostgreSQL instance
@@ -690,11 +892,20 @@ mod tests {
         let result = actor.run_episode().await;
         assert!(result.is_ok());
 
-        let (steps, reward, _stats) = result.unwrap();
-        assert!(steps > 0, "Episode should have at least one step");
-        // TicTacToe gives reward at end of game
-        // Steps and reward are validated by assertions above
-        debug!(steps, reward, "Episode completed");
+        match result.unwrap() {
+            EpisodeOutcome::Completed {
+                steps,
+                total_reward,
+                ..
+            } => {
+                assert!(steps > 0, "Episode should have at least one step");
+                // TicTacToe gives reward at end of game
+                debug!(steps, total_reward, "Episode completed");
+            }
+            EpisodeOutcome::Abandoned { reason, steps, .. } => {
+                panic!("TicTacToe episode abandoned ({reason:?}) after {steps} steps");
+            }
+        }
     }
 
     #[tokio::test]

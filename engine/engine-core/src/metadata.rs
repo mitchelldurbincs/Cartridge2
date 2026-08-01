@@ -37,6 +37,27 @@ pub struct GameMetadata {
     /// (index of first legal move indicator in the obs array)
     pub legal_mask_offset: usize,
 
+    /// Number of spatial board planes at the front of the observation.
+    ///
+    /// The observation layout is
+    /// `[obs_channels * board_size][legal mask: num_actions][player one-hot: 2]`,
+    /// so this is what a convolutional network reshapes the leading slice into
+    /// (2 for one plane per player's pieces, 9 for the richer Generals
+    /// encoding). Declared by the game rather than derived from
+    /// `legal_mask_offset / board_size`: the division is only correct while no
+    /// game inserts scalar features between the planes and the mask, and a
+    /// silently wrong channel count is not something a test could catch.
+    pub obs_channels: usize,
+
+    /// Whether the board planes are already encoded from the perspective of
+    /// the player to act (own/enemy) rather than in absolute terms.
+    ///
+    /// When true the network must NOT additionally receive the current-player
+    /// indicator: against a seat-relative board it is a pure side channel, and
+    /// a systematically advantaged seat lets the value head collapse into a
+    /// seat detector instead of learning positions.
+    pub player_relative_obs: bool,
+
     /// Number of players (typically 2)
     pub player_count: usize,
 
@@ -66,6 +87,8 @@ impl GameMetadata {
             num_actions: 0,
             obs_size: 0,
             legal_mask_offset: 0,
+            obs_channels: 0,
+            player_relative_obs: false,
             player_count: 2,
             player_names: vec!["Player 1".to_string(), "Player 2".to_string()],
             player_symbols: vec!['1', '2'],
@@ -91,6 +114,17 @@ impl GameMetadata {
     pub fn with_observation(mut self, obs_size: usize, legal_mask_offset: usize) -> Self {
         self.obs_size = obs_size;
         self.legal_mask_offset = legal_mask_offset;
+        self
+    }
+
+    /// Builder method for the observation encoding: how many spatial board
+    /// planes lead the observation, and whether they are seat-relative.
+    ///
+    /// Invariant, checked for every registered game:
+    /// `legal_mask_offset == obs_channels * board_size`.
+    pub fn with_obs_encoding(mut self, obs_channels: usize, player_relative_obs: bool) -> Self {
+        self.obs_channels = obs_channels;
+        self.player_relative_obs = player_relative_obs;
         self
     }
 

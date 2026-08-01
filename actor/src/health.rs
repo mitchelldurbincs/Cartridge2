@@ -17,7 +17,23 @@ pub struct HealthState {
     healthy: Arc<AtomicBool>,
     /// Timestamp of last successful episode completion (Unix seconds).
     last_episode_time: Arc<AtomicU64>,
+    /// Seconds without a completed episode before liveness reports unhealthy.
+    ///
+    /// Derived from the effective episode timeout rather than fixed, because
+    /// progress here is measured in *completed episodes* — a coarse signal. A
+    /// fixed threshold shorter than one episode's legitimate budget restarts
+    /// the process mid-episode and, for a game whose episodes always exceed
+    /// it, restarts forever without a single episode ever completing.
+    progress_timeout_secs: Arc<AtomicU64>,
 }
+
+/// Fallback liveness window used until the game's horizon is known.
+const DEFAULT_PROGRESS_TIMEOUT_SECS: u64 = 300;
+
+/// How many episode budgets may elapse with no completion before the actor is
+/// considered stuck. Two, so an episode that legitimately runs to its full
+/// budget and is abandoned still leaves room for the next one to finish.
+const PROGRESS_TIMEOUT_EPISODE_BUDGETS: u64 = 2;
 
 impl HealthState {
     pub fn new() -> Self {
@@ -25,7 +41,28 @@ impl HealthState {
             ready: Arc::new(AtomicBool::new(false)),
             healthy: Arc::new(AtomicBool::new(true)),
             last_episode_time: Arc::new(AtomicU64::new(0)),
+            progress_timeout_secs: Arc::new(AtomicU64::new(DEFAULT_PROGRESS_TIMEOUT_SECS)),
         }
+    }
+
+    /// Size the liveness window from the effective per-episode budget.
+    ///
+    /// Call once the game's horizon is known. Never tightens below the default.
+    pub fn set_episode_budget_secs(&self, effective_episode_timeout_secs: u64) {
+        let window = effective_episode_timeout_secs
+            .saturating_mul(PROGRESS_TIMEOUT_EPISODE_BUDGETS)
+            .max(DEFAULT_PROGRESS_TIMEOUT_SECS);
+        self.progress_timeout_secs.store(window, Ordering::SeqCst);
+        info!(
+            liveness_window_secs = window,
+            episode_budget_secs = effective_episode_timeout_secs,
+            "Liveness progress window sized from episode budget"
+        );
+    }
+
+    /// The current liveness window in seconds.
+    pub fn progress_timeout_secs(&self) -> u64 {
+        self.progress_timeout_secs.load(Ordering::SeqCst)
     }
 
     /// Mark the actor as ready to receive traffic.
@@ -159,9 +196,10 @@ pub async fn start_health_server(
 
 async fn health_handler(state: HealthState) -> axum::http::StatusCode {
     // Liveness: is the process fundamentally healthy?
-    // Check both health flag and progress (no stuck episodes)
-    // 5 minute timeout for progress
-    if state.is_healthy() && state.is_making_progress(300) {
+    // Check both health flag and progress (no stuck episodes). The progress
+    // window is sized from the game's effective episode budget, not fixed —
+    // see HealthState::set_episode_budget_secs.
+    if state.is_healthy() && state.is_making_progress(state.progress_timeout_secs()) {
         axum::http::StatusCode::OK
     } else {
         axum::http::StatusCode::SERVICE_UNAVAILABLE

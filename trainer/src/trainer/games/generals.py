@@ -241,7 +241,9 @@ class GeneralsState:
             cap_plies=self.cap_plies,
         )
 
-    def _valid_move_target(self, player: int, from_idx: int, direction: int) -> int | None:
+    def _valid_move_target(
+        self, player: int, from_idx: int, direction: int
+    ) -> int | None:
         """Mirror of the Rust ``valid_move_target``."""
         if self.owner[from_idx] != player or self.army[from_idx] <= 1:
             return None

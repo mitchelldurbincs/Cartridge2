@@ -1,17 +1,27 @@
 """Game configuration registry for the trainer.
 
-This module provides game-specific configuration that the trainer needs
-for neural network architecture and observation parsing.
+Game *facts* — board dimensions, action count, observation layout — come from
+``game_metadata.json``, which is generated from the Rust engine by
+``make game-manifest``. The engine is the single source of truth for them; this
+module must never restate them, or the two drift and the trainer silently
+mistrains against an observation layout the actor is not producing.
+(``cargo test`` fails if the committed manifest falls out of date.)
 
-IMPORTANT: The preferred way to get configuration is from the replay database
-via ReplayBuffer.get_metadata(). The hardcoded values here are fallbacks
-for backward compatibility with databases that don't have metadata.
+Training *hyperparameters* — which network architecture to build for a game —
+are a trainer-side choice with no engine counterpart, and live in
+``_TRAINING_OVERRIDES`` below.
+
+Keeping those two categories apart is the point. They used to be mixed in one
+hand-maintained table, and a DB-metadata path that rebuilt only the fact half
+silently reset the rest to defaults.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+import json
+from dataclasses import dataclass, fields
+from importlib.resources import files
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import torch
@@ -43,9 +53,11 @@ class GameConfig:
     # CNN-specific settings (used when network_type="resnet")
     num_res_blocks: int = 4  # Number of residual blocks
     num_filters: int = 128  # Filters per conv layer
-    # Number of spatial board planes in the observation (game-specific;
-    # e.g. 2 for one plane per player's pieces, or more for richer encodings)
-    input_channels: int = 2
+
+    # --- Observation-layout facts (engine-owned, from the manifest) ---
+    # Number of spatial board planes at the front of the observation
+    # (2 for one plane per player's pieces, 9 for the Generals encoding).
+    obs_channels: int = 2
     # True when the obs board planes are already encoded from the
     # current player's perspective (own/enemy), in which case the network
     # must NOT receive the current-player indicator: with a seat-relative
@@ -99,65 +111,94 @@ class GameConfig:
         return obs[:, offset : offset + 2]  # type: ignore[index]
 
 
-# Game configuration registry (fallback values - prefer reading from DB)
-# These values MUST match the Rust engine implementations exactly.
-GAME_CONFIGS: dict[str, GameConfig] = {
-    "tictactoe": GameConfig(
-        env_id="tictactoe",
-        display_name="Tic-Tac-Toe",
-        board_width=3,
-        board_height=3,
-        num_actions=9,
-        obs_size=29,  # 18 (board) + 9 (legal) + 2 (player)
-        legal_mask_offset=18,
-        hidden_size=128,
-    ),
-    "connect4": GameConfig(
-        env_id="connect4",
-        display_name="Connect 4",
-        board_width=7,
-        board_height=6,
-        num_actions=7,
-        obs_size=93,  # 42 (Red) + 42 (Yellow) + 7 (legal) + 2 (player) = 93
-        legal_mask_offset=84,  # Board views end at 42*2 = 84
-        hidden_size=512,
-        network_type="resnet",
-        num_res_blocks=4,
-        num_filters=128,
-        input_channels=2,  # Red positions, Yellow positions
-    ),
-    "othello": GameConfig(
-        env_id="othello",
-        display_name="Othello",
-        board_width=8,
-        board_height=8,
-        num_actions=65,  # 64 board positions + 1 pass action
-        obs_size=195,  # 128 (board: 64*2) + 65 (legal) + 2 (player) = 195
-        legal_mask_offset=128,
-        hidden_size=512,
-        network_type="resnet",
-        num_res_blocks=6,
-        num_filters=256,
-        input_channels=2,  # Black positions, White positions
-    ),
-    "generals_8x8": GameConfig(
-        env_id="generals_8x8",
-        display_name="Generals 8×8",
-        board_width=8,
-        board_height=8,
-        num_actions=257,  # 64 tiles * 4 directions + 1 wait
-        obs_size=835,  # 576 (9 channels * 64) + 257 (legal) + 2 (player)
-        legal_mask_offset=576,
-        hidden_size=512,
-        network_type="resnet",
-        num_res_blocks=6,
-        num_filters=128,
-        # generals_obs:v1 spatial planes: own/enemy/neutral territory,
-        # own/enemy log-armies, cities, mountains, generals, turn progress
-        input_channels=9,
-        player_relative_obs=True,
-    ),
+MANIFEST_FILENAME = "game_metadata.json"
+REGENERATE_HINT = (
+    f"Run `make game-manifest` to regenerate {MANIFEST_FILENAME} from the Rust engine."
+)
+
+# Fields the engine owns. Deliberately an explicit whitelist rather than
+# `set(manifest) & {f.name for f in fields(GameConfig)}`: with an intersection,
+# adding a field to the Rust GameMetadata that happens to share a name with a
+# trainer hyperparameter would silently let the engine start dictating it.
+_ENGINE_FACT_FIELDS = (
+    "env_id",
+    "display_name",
+    "board_width",
+    "board_height",
+    "num_actions",
+    "obs_size",
+    "legal_mask_offset",
+    "obs_channels",
+    "player_relative_obs",
+)
+
+# Trainer-side network architecture, keyed by env_id. No engine counterpart:
+# which network to train is our choice, not a property of the game.
+#
+# `hidden_size` only affects the MLP path — the ResNet value head is a fixed
+# 256-unit layer (see resnet.py), so it is omitted for resnet games rather than
+# carrying a number that does nothing.
+_TRAINING_OVERRIDES: dict[str, dict[str, Any]] = {
+    "tictactoe": {"network_type": "mlp", "hidden_size": 128},
+    "connect4": {"network_type": "resnet", "num_res_blocks": 4, "num_filters": 128},
+    "othello": {"network_type": "resnet", "num_res_blocks": 6, "num_filters": 256},
+    "generals_8x8": {"network_type": "resnet", "num_res_blocks": 6, "num_filters": 128},
 }
+
+
+def _load_manifest() -> list[dict[str, Any]]:
+    """Read the engine-generated game manifest shipped inside this package."""
+    resource = files("trainer").joinpath(MANIFEST_FILENAME)
+    try:
+        raw = resource.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError) as exc:
+        raise RuntimeError(
+            f"Game metadata manifest is missing ({resource}). {REGENERATE_HINT}"
+        ) from exc
+
+    try:
+        return json.loads(raw)["games"]
+    except (ValueError, KeyError) as exc:
+        raise RuntimeError(
+            f"Game metadata manifest at {resource} is malformed. {REGENERATE_HINT}"
+        ) from exc
+
+
+def _build_registry() -> dict[str, GameConfig]:
+    """Combine engine-owned facts with trainer-owned network settings."""
+    valid_fields = {f.name for f in fields(GameConfig)}
+    registry: dict[str, GameConfig] = {}
+
+    for game in _load_manifest():
+        env_id = game["env_id"]
+        try:
+            overrides = _TRAINING_OVERRIDES[env_id]
+        except KeyError as exc:
+            # Failing loudly here is the point. Defaulting instead would give a
+            # newly-added spatial game `network_type="mlp"` and train a dense
+            # net on a board — a regression that produces no error, only a
+            # model that never gets good.
+            raise RuntimeError(
+                f"Game '{env_id}' is in the engine manifest but has no entry in "
+                f"_TRAINING_OVERRIDES. Add one in game_config.py choosing its "
+                f"network architecture."
+            ) from exc
+
+        unknown = set(overrides) - valid_fields
+        if unknown:
+            raise RuntimeError(
+                f"_TRAINING_OVERRIDES['{env_id}'] has unknown field(s): {sorted(unknown)}"
+            )
+
+        facts = {k: game[k] for k in _ENGINE_FACT_FIELDS}
+        registry[env_id] = GameConfig(**facts, **overrides)
+
+    return registry
+
+
+# Game configuration registry: engine facts from the manifest, network
+# architecture from _TRAINING_OVERRIDES.
+GAME_CONFIGS: dict[str, GameConfig] = _build_registry()
 
 
 def get_config(env_id: str) -> GameConfig:

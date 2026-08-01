@@ -8,7 +8,9 @@
 //! the `metrics-common` crate.
 
 use lazy_static::lazy_static;
-use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, IntGaugeVec, Opts, Registry};
+use prometheus::{
+    Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+};
 use std::sync::Once;
 
 lazy_static! {
@@ -89,6 +91,19 @@ lazy_static! {
         Opts::new("actor_transitions_stored_total", "Total transitions written to replay buffer")
     ).unwrap();
 
+    /// Episodes abandoned before reaching a terminal state, by reason.
+    /// Abandoned episodes contribute nothing to the replay buffer, so this
+    /// rising means self-play data is being dropped.
+    pub static ref EPISODES_ABANDONED: IntCounterVec = IntCounterVec::new(
+        Opts::new("actor_episodes_abandoned_total", "Episodes abandoned before reaching a terminal state"),
+        &["reason"]
+    ).unwrap();
+
+    /// Total transitions discarded with abandoned episodes
+    pub static ref TRANSITIONS_DISCARDED: IntCounter = IntCounter::with_opts(
+        Opts::new("actor_transitions_discarded_total", "Total transitions discarded with abandoned episodes")
+    ).unwrap();
+
     /// Database write latency (seconds)
     pub static ref DB_WRITE_SECONDS: Histogram = Histogram::with_opts(
         HistogramOpts::new("actor_db_write_seconds", "Database write latency")
@@ -165,6 +180,8 @@ pub fn init_metrics() {
                 Box::new(MCTS_SEARCH_SECONDS.clone()),
                 Box::new(MCTS_SIMULATIONS_PER_SEARCH.clone()),
                 Box::new(TRANSITIONS_STORED.clone()),
+                Box::new(EPISODES_ABANDONED.clone()),
+                Box::new(TRANSITIONS_DISCARDED.clone()),
                 Box::new(DB_WRITE_SECONDS.clone()),
                 Box::new(DB_POOL_SIZE.clone()),
                 Box::new(DB_POOL_AVAILABLE.clone()),

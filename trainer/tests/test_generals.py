@@ -267,7 +267,7 @@ class TestObservation:
         assert CONFIG.num_actions == NUM_ACTIONS == 257
         assert CONFIG.obs_size == 9 * BOARD_SIZE + NUM_ACTIONS + 2 == 835
         assert CONFIG.legal_mask_offset == 9 * BOARD_SIZE == 576
-        assert CONFIG.input_channels == 9
+        assert CONFIG.obs_channels == 9
 
         obs = flat_state().to_observation(CONFIG)
         assert obs.shape == (835,)
