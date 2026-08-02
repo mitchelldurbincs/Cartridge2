@@ -42,6 +42,20 @@ fn generate_span_id() -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Preflight the central config BEFORE Config::parse().
+    //
+    // clap resolves `default_value_t` expressions during parse(), and those
+    // read the CENTRAL_CONFIG Lazy -- a context with no way to return an
+    // error. So a config.toml that exists but cannot be parsed has to be
+    // caught here, at the last point where failing is still possible.
+    // Otherwise it degrades silently into "run on built-in defaults", which
+    // most damagingly resets env_id and fills the replay buffer with a
+    // different game than the trainer expects.
+    //
+    // The result is discarded: this call only decides whether to continue.
+    // Config::parse() re-reads the same (now known-good) file.
+    engine_config::try_load_config()?;
+
     // Parse configuration
     let config = Config::parse();
 

@@ -37,6 +37,33 @@ def _load_schema() -> str:
     return _SCHEMA_PATH.read_text()
 
 
+def split_sql_statements(sql: str) -> list[str]:
+    """Split a SQL script into executable statements.
+
+    Strips ``--`` line comments, splits on ``;``, and drops empty statements.
+    This intentionally does not handle ``;`` inside string literals or
+    dollar-quoted bodies -- the shared schema file contains neither.
+
+    Comment lines must be removed *before* splitting. Splitting first leaves
+    each statement's leading comment attached to it, so a "does this chunk
+    start with ``--``?" test discards the statement along with its comment.
+    That is not hypothetical: it silently dropped both ``CREATE TABLE``s in
+    ``sql/schema.sql`` while still reporting success.
+
+    Kept byte-for-byte equivalent to ``split_sql_statements`` in
+    ``actor/src/storage/postgres.rs``; both are pinned to the same statement
+    count by tests so they cannot diverge again unnoticed.
+    """
+    without_comments = "\n".join(
+        line for line in sql.splitlines() if not line.lstrip().startswith("--")
+    )
+    return [
+        statement
+        for statement in (raw.strip() for raw in without_comments.split(";"))
+        if statement
+    ]
+
+
 class PostgresReplayBuffer(ReplayBufferBase):
     """PostgreSQL-backed replay buffer implementation.
 
@@ -111,20 +138,23 @@ class PostgresReplayBuffer(ReplayBufferBase):
         self._pool.closeall()
 
     def _ensure_schema(self) -> None:
-        """Create tables if they don't exist using the shared schema file."""
-        schema_sql = _load_schema()
+        """Create tables if they don't exist using the shared schema file.
+
+        Every statement in the schema is ``IF NOT EXISTS``, so this is safe to
+        run on every connect and safe to race with the Rust actor, which
+        applies the same file at startup.
+        """
+        statements = split_sql_statements(_load_schema())
         with self._connection() as conn:
             with conn.cursor() as cur:
-                # Execute each statement from the shared schema file
-                for statement in schema_sql.split(";"):
-                    stmt = statement.strip()
-                    # Skip empty statements and comment-only lines
-                    if not stmt or stmt.startswith("--"):
-                        continue
-                    cur.execute(stmt)
+                for statement in statements:
+                    cur.execute(statement)
 
                 conn.commit()
-                logger.info("PostgreSQL schema validated/created")
+                logger.info(
+                    "PostgreSQL schema validated/created (%d statements)",
+                    len(statements),
+                )
 
     def count(self, env_id: str | None = None) -> int:
         """Get total number of transitions in the buffer."""

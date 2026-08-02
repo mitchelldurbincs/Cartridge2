@@ -19,6 +19,26 @@ Both files share the same core tables (`transitions`, `game_metadata`). The `ini
 
 For local development, the actor and trainer create tables automatically if they don't exist. For Docker/K8s, `init-postgres.sql` is mounted into the PostgreSQL container's `docker-entrypoint-initdb.d/` directory and runs on first startup.
 
+### Who actually creates the tables
+
+Every statement in `schema.sql` is `IF NOT EXISTS`, so it is safe for more than
+one component to apply it, and more than one does:
+
+| Applier | When |
+|---------|------|
+| Python trainer (`trainer/storage/postgres.py::_ensure_schema`) | every replay-buffer connect |
+| Rust actor (`actor/src/storage/postgres.rs::ensure_schema`) | actor startup |
+| `../scripts/init-postgres.sql` | first startup of the Docker Compose postgres volume |
+| `k8s/base/postgres/init-configmap.yaml` | first startup of the K8s postgres volume |
+
+The **trainer** is usually first: `python -m trainer loop` clears the replay
+buffer before it spawns any actor, so a native (non-Docker) setup has no other
+schema creator at that point. `make setup-db` deliberately creates only the
+database and role — not the tables.
+
+Note that four copies of this DDL exist (the two SQL files above plus the K8s
+ConfigMap, which inlines it again). Consolidating them is open follow-up work.
+
 ## Tables
 
 ### transitions

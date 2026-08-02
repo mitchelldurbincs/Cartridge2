@@ -22,6 +22,7 @@ pub use adapter::GameAdapter;
 pub use board_game::TwoPlayerObs;
 pub use context::{EngineContext, ResetResult, StepResult};
 pub use erased::ErasedGame;
+pub use game_utils::GameOutcome;
 pub use legal_mask::LegalMask;
 pub use metadata::GameMetadata;
 pub use registry::{

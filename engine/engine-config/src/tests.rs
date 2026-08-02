@@ -202,3 +202,104 @@ fn test_config_clone() {
     assert_eq!(config.common.env_id, cloned.common.env_id);
     assert_eq!(config.actor.actor_id, cloned.actor.actor_id);
 }
+
+// ============================================================================
+// Config file loading
+//
+// A config.toml that exists but cannot be parsed must be an error: silently
+// substituting defaults reverts env_id (among everything else) to the built-in
+// value, so self-play fills the replay buffer with a different game than the
+// trainer expects -- visible only hours later, in the model. None of this path
+// had any coverage before.
+// ============================================================================
+
+use std::io::Write;
+
+/// Write `contents` to a `config.toml` inside a fresh temp dir.
+fn config_file(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("config.toml");
+    let mut file = std::fs::File::create(&path).expect("create config");
+    file.write_all(contents.as_bytes()).expect("write config");
+    (dir, path)
+}
+
+#[test]
+fn load_from_path_parses_a_valid_file() {
+    let (_dir, path) = config_file(
+        r#"
+[common]
+env_id = "connect4"
+data_dir = "/tmp/cartridge"
+"#,
+    );
+
+    let config = load_from_path(&path).expect("valid config should load");
+
+    assert_eq!(config.common.env_id, "connect4");
+    assert_eq!(config.common.data_dir, "/tmp/cartridge");
+}
+
+#[test]
+fn load_from_path_fills_unspecified_sections_from_defaults() {
+    // Partial files are legitimate: only the keys present should override.
+    let (_dir, path) = config_file("[common]\nenv_id = \"othello\"\n");
+
+    let config = load_from_path(&path).expect("partial config should load");
+
+    assert_eq!(config.common.env_id, "othello");
+    assert_eq!(config.web.port, CentralConfig::default().web.port);
+}
+
+#[test]
+fn load_from_path_rejects_malformed_toml() {
+    let (_dir, path) = config_file("[common\nenv_id = \"connect4\"\n");
+
+    let err = load_from_path(&path).expect_err("malformed TOML must not load");
+
+    assert!(matches!(err, ConfigError::Parse { .. }));
+    assert_eq!(err.path(), path);
+}
+
+#[test]
+fn load_from_path_rejects_a_schema_violation() {
+    // Right TOML, wrong types. Previously this discarded the whole file.
+    let (_dir, path) = config_file("[web]\nport = \"not-a-number\"\n");
+
+    let err = load_from_path(&path).expect_err("bad value must not load");
+
+    assert!(matches!(err, ConfigError::Parse { .. }));
+}
+
+#[test]
+fn load_from_path_reports_an_unreadable_file() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let missing = dir.path().join("does-not-exist.toml");
+
+    let err = load_from_path(&missing).expect_err("missing file must be an error here");
+
+    assert!(matches!(err, ConfigError::Read { .. }));
+}
+
+#[test]
+fn config_error_message_names_the_file_and_the_cause() {
+    // An operator reading this line should not have to guess which file.
+    let (_dir, path) = config_file("[common\n");
+
+    let err = load_from_path(&path).unwrap_err();
+    let message = err.to_string();
+
+    assert!(message.contains(&path.display().to_string()), "{message}");
+    assert!(message.contains("parse"), "{message}");
+}
+
+#[test]
+fn load_config_still_falls_back_so_the_clap_lazy_cannot_panic() {
+    // load_config() is infallible by design: the actor's Lazy<CentralConfig>
+    // is forced from clap default_value_t and has nowhere to return an error.
+    // try_load_config() runs first, in main(), to catch a broken file.
+    let (_dir, path) = config_file("[common\n");
+
+    assert!(load_from_path(&path).is_err());
+    let _ = load_config(); // must not panic regardless of what is on disk
+}

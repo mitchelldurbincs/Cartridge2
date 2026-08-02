@@ -1,7 +1,7 @@
 //! Actor implementation using engine-core library directly
 
 use anyhow::{anyhow, Result};
-use engine_core::EngineContext;
+use engine_core::{game_utils::info_bits, EngineContext, GameOutcome};
 use indicatif::{ProgressBar, ProgressStyle};
 use mcts::{MctsConfig, SearchStats};
 use model_watcher::ModelWatcher;
@@ -114,6 +114,26 @@ impl EpisodeStats {
 /// only ever raises the budget, never lowers an explicitly configured one.
 const TIMEOUT_SECS_PER_MOVE: u64 = 1;
 
+/// Consecutive episode failures after which the actor stops calling itself
+/// healthy.
+///
+/// Episode errors are retried indefinitely because most are transient — a
+/// database connection blipping, a model file caught mid-write. But nothing
+/// distinguished "transient" from "this dependency is gone", so a permanently
+/// broken actor looped forever while `/health` stayed 200. Five in a row is
+/// well past any plausible transient and still far short of a restart loop on
+/// a flaky-but-working system.
+const MAX_CONSECUTIVE_EPISODE_FAILURES: u32 = 5;
+
+/// Whether a run of back-to-back episode failures has gone on long enough that
+/// the actor should stop reporting itself healthy.
+///
+/// A named function rather than an inline comparison so the rule can be tested
+/// without standing up an `Actor` (which needs PostgreSQL).
+pub(crate) fn is_persistent_failure(consecutive_failures: u32) -> bool {
+    consecutive_failures >= MAX_CONSECUTIVE_EPISODE_FAILURES
+}
+
 /// The wall-clock budget a single episode actually gets, after the horizon
 /// floor is applied to the configured value.
 ///
@@ -190,7 +210,15 @@ pub(crate) enum EpisodeOutcome {
     /// Reached a terminal state; its transitions were stored.
     Completed {
         steps: u32,
-        total_reward: f32,
+        /// Which seat won, decoded from the terminal step's info bits.
+        ///
+        /// Not derived from the reward: `calculate_reward` is relative to the
+        /// player who just moved and the winning move is made by the winner,
+        /// so a decisive game ends on `+1.0` either way. Summing rewards and
+        /// reading the sign as a seat — which this used to do — recorded every
+        /// decisive game as a player-1 win and left `player2_wins` pinned at
+        /// zero.
+        outcome: GameOutcome,
         stats: EpisodeStats,
     },
     /// Ended early, so its transitions were **discarded**.
@@ -395,6 +423,9 @@ impl Actor {
 
         info!("Entering main event loop");
 
+        // Episodes that failed back-to-back with no success in between.
+        let mut consecutive_failures: u32 = 0;
+
         loop {
             // Check shutdown signal
             if self.shutdown_signal.load(Ordering::Relaxed) {
@@ -445,7 +476,11 @@ impl Actor {
 
             // Run an episode
             let episode_start = Instant::now();
-            match self.run_episode().await {
+            let episode_result = self.run_episode().await;
+            if episode_result.is_ok() {
+                consecutive_failures = 0;
+            }
+            match episode_result {
                 Ok(EpisodeOutcome::Abandoned {
                     reason,
                     steps,
@@ -480,21 +515,24 @@ impl Actor {
                 }
                 Ok(EpisodeOutcome::Completed {
                     steps,
-                    total_reward,
+                    outcome,
                     stats: episode_stats,
                 }) => {
                     let new_count = self.episode_count.fetch_add(1, Ordering::Relaxed) + 1;
                     let duration = episode_start.elapsed().as_secs_f64();
                     debug!(
                         episode = new_count,
-                        steps, total_reward, duration, "Episode completed"
+                        steps,
+                        outcome = outcome.as_str(),
+                        duration,
+                        "Episode completed"
                     );
 
                     // Record Prometheus metrics for this episode
                     metrics::EPISODES_TOTAL.inc();
                     metrics::EPISODE_DURATION.observe(duration);
                     metrics::EPISODE_STEPS.observe(steps as f64);
-                    metrics::record_outcome(total_reward);
+                    metrics::record_outcome(outcome);
 
                     // Update throughput gauge (episodes per second based on last episode duration)
                     if duration > 0.0 {
@@ -505,7 +543,7 @@ impl Actor {
                     health.record_episode_complete();
 
                     // Record episode in stats tracker
-                    self.stats.record_episode(steps, total_reward);
+                    self.stats.record_episode(steps, outcome);
                     self.stats.record_mcts_stats(
                         episode_stats.search_count,
                         episode_stats.inference_time_us,
@@ -545,8 +583,30 @@ impl Actor {
                 }
                 Err(e) => {
                     let count = self.episode_count.load(Ordering::Relaxed);
-                    error!("Episode {} failed: {}", count + 1, e);
-                    // Continue with next episode rather than stopping
+                    consecutive_failures += 1;
+                    error!(
+                        episode = count + 1,
+                        consecutive_failures,
+                        error = %e,
+                        "Episode failed"
+                    );
+
+                    // Continue with the next episode: a single failure is
+                    // usually transient (a blipping database connection).
+                    // A sustained run of them is not, and the process cannot
+                    // fix itself — so stop reporting healthy and let the
+                    // orchestrator restart us. Without this the loop spins
+                    // forever on a permanently broken dependency while every
+                    // probe stays green.
+                    if is_persistent_failure(consecutive_failures) {
+                        error!(
+                            consecutive_failures,
+                            "Episodes have failed {} times in a row; marking the actor \
+                             unhealthy so it can be restarted",
+                            consecutive_failures
+                        );
+                        health.set_unhealthy();
+                    }
                 }
             }
         }
@@ -584,12 +644,36 @@ impl Actor {
     }
 
     /// Backfill game outcomes and store transitions.
+    ///
+    /// # Requires strictly alternating turns
+    ///
+    /// The sign of each transition's value target is derived from step-index
+    /// parity below, which assumes the acting player changes on every recorded
+    /// step. A game where one player can move twice in a row would get half
+    /// its value targets sign-inverted — and nothing would error, because the
+    /// only symptom is a value head that never converges.
+    ///
+    /// So the assumption is checked against what the game actually declares
+    /// rather than left as a comment. Games opt in with
+    /// `GameMetadata::with_alternating_turns`; the default is `false`, so a
+    /// new game that forgets fails here loudly instead of silently poisoning
+    /// its own training data.
     async fn finalize_episode(
         &self,
         mut transitions: Vec<Transition>,
         final_reward: f32,
         episode_id: &str,
     ) -> Result<()> {
+        if !self.game_config.alternating_turns {
+            return Err(anyhow!(
+                "Game '{}' does not declare alternating turns, but the value-target \
+                 backfill derives each transition's sign from step parity. Either \
+                 declare .with_alternating_turns(true) in its metadata, or give the \
+                 actor a backfill that records the acting player per transition.",
+                self.config.env_id
+            ));
+        }
+
         let total_steps = transitions.len() as u32;
 
         // Backfill game outcomes for all transitions
@@ -655,7 +739,6 @@ impl Actor {
         let mut current_legal_mask = self.game_config.legal_mask_from_obs(&current_obs);
         let mut step_number = 0u32;
         let mut steps_taken = 0u32;
-        let mut total_reward = 0.0f32;
         let mut transitions: Vec<Transition> = Vec::with_capacity(12);
         let mut episode_stats = EpisodeStats::default();
 
@@ -696,7 +779,6 @@ impl Actor {
                 engine.step(&current_state, &policy_result.action)?
             };
 
-            total_reward += step_result.reward;
             steps_taken += 1;
 
             // Create transition (moves current_state/obs to avoid cloning)
@@ -725,17 +807,32 @@ impl Actor {
             });
 
             if step_result.done {
+                // Read the winner from the terminal step's info bits rather
+                // than from the reward, which is relative to the mover and so
+                // cannot distinguish the seats. Safe here specifically because
+                // the position is terminal: a finished game has no legal moves,
+                // so the mask that otherwise overlaps the winner field is zero.
+                // Locked by engine_games' terminal-info invariant test.
+                let outcome = info_bits::outcome_from_info(step_result.info).ok_or_else(|| {
+                    anyhow!(
+                        "Episode {} reported done but its info bits decode no winner \
+                         (info=0x{:x}); refusing to record an outcome we cannot attribute",
+                        ctx.id,
+                        step_result.info
+                    )
+                })?;
+
                 debug!(
-                    "Episode {} completed in {} steps, total reward: {:.2}",
+                    "Episode {} completed in {} steps, outcome: {}",
                     ctx.id,
                     step_number + 1,
-                    total_reward
+                    outcome.as_str()
                 );
                 self.finalize_episode(transitions, step_result.reward, &ctx.id)
                     .await?;
                 return Ok(EpisodeOutcome::Completed {
                     steps: steps_taken,
-                    total_reward,
+                    outcome,
                     stats: episode_stats,
                 });
             }
@@ -833,12 +930,104 @@ mod tests {
         }
     }
 
+    /// A transient failure must not flip the actor unhealthy, and a sustained
+    /// run of them must.
+    ///
+    /// Episode errors were previously logged and retried forever with no
+    /// escalation path, so an actor whose database had gone away spun
+    /// indefinitely while `/health` stayed 200 and Kubernetes never restarted
+    /// it.
+    #[test]
+    fn test_only_a_sustained_run_of_failures_is_persistent() {
+        assert!(!is_persistent_failure(0));
+        assert!(!is_persistent_failure(1));
+        assert!(!is_persistent_failure(MAX_CONSECUTIVE_EPISODE_FAILURES - 1));
+        assert!(is_persistent_failure(MAX_CONSECUTIVE_EPISODE_FAILURES));
+        assert!(is_persistent_failure(
+            MAX_CONSECUTIVE_EPISODE_FAILURES + 100
+        ));
+    }
+
+    /// The counter resets on success, so a flaky-but-working actor is never
+    /// escalated: interleaved failures must not accumulate across successes.
+    #[test]
+    fn test_a_success_clears_the_failure_run() {
+        // Mirrors the run() loop: reset on Ok, increment on Err.
+        let mut consecutive_failures = 0u32;
+        let episode_results = [false, false, false, true, false, false, false, false];
+
+        let mut ever_escalated = false;
+        for succeeded in episode_results {
+            if succeeded {
+                consecutive_failures = 0;
+            } else {
+                consecutive_failures += 1;
+            }
+            ever_escalated |= is_persistent_failure(consecutive_failures);
+        }
+
+        assert!(
+            !ever_escalated,
+            "7 failures broken up by one success must not trip the threshold"
+        );
+    }
+
     #[test]
     fn test_liveness_window_never_drops_below_the_default() {
         let health = HealthState::new();
         assert_eq!(health.progress_timeout_secs(), 300);
         health.set_episode_budget_secs(1);
         assert_eq!(health.progress_timeout_secs(), 300);
+    }
+
+    /// The regression this whole change exists for.
+    ///
+    /// Plays a real tictactoe game to a **player 2** win and checks the actor
+    /// would attribute it correctly. The old code summed step rewards and read
+    /// the sign as a seat; because the terminal reward is relative to whoever
+    /// just moved, this game also ends on `+1.0` and was therefore recorded as
+    /// a player-1 win. `player2_wins` was structurally unreachable.
+    ///
+    /// Uses EngineContext directly so it needs no database, unlike the
+    /// `run_episode` tests below.
+    #[test]
+    fn test_a_player2_win_is_attributed_to_player2() {
+        engine_games::register_all_games();
+        let mut ctx = EngineContext::new("tictactoe").expect("tictactoe registered");
+
+        // X (player 1) takes 0, 1, 6 -- no line. O (player 2) takes 3, 4, 5,
+        // completing the middle row on the final move.
+        let moves = [0u32, 3, 1, 4, 6, 5];
+
+        let reset = ctx.reset(7, &[]).unwrap();
+        let mut state = reset.state;
+        let mut last = None;
+
+        for (i, action) in moves.iter().enumerate() {
+            let step = ctx.step(&state, &action.to_le_bytes()).unwrap();
+            let is_final = i == moves.len() - 1;
+            assert_eq!(
+                step.done,
+                is_final,
+                "move {i} ({action}) should{} end the game",
+                if is_final { "" } else { " not" }
+            );
+            state = step.state.clone();
+            last = Some(step);
+        }
+
+        let terminal = last.unwrap();
+
+        // The reward is +1: it is relative to O, who just made the winning
+        // move. Identical to what a player-1 win produces -- which is exactly
+        // why the reward cannot be used to attribute a seat.
+        assert_eq!(terminal.reward, 1.0);
+
+        assert_eq!(
+            info_bits::outcome_from_info(terminal.info),
+            Some(GameOutcome::Player2Win),
+            "player 2 completed the middle row and must be credited with the win"
+        );
     }
 
     #[test]
@@ -893,14 +1082,9 @@ mod tests {
         assert!(result.is_ok());
 
         match result.unwrap() {
-            EpisodeOutcome::Completed {
-                steps,
-                total_reward,
-                ..
-            } => {
+            EpisodeOutcome::Completed { steps, outcome, .. } => {
                 assert!(steps > 0, "Episode should have at least one step");
-                // TicTacToe gives reward at end of game
-                debug!(steps, total_reward, "Episode completed");
+                debug!(steps, outcome = outcome.as_str(), "Episode completed");
             }
             EpisodeOutcome::Abandoned { reason, steps, .. } => {
                 panic!("TicTacToe episode abandoned ({reason:?}) after {steps} steps");

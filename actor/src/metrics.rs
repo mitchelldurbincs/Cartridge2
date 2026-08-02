@@ -7,6 +7,7 @@
 //! `web/src/metrics.rs`); the shared registration/encoding plumbing lives in
 //! the `metrics-common` crate.
 
+use engine_core::GameOutcome;
 use lazy_static::lazy_static;
 use prometheus::{
     Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
@@ -227,15 +228,19 @@ pub fn update_memory_metrics() {
     }
 }
 
-/// Record a game outcome
-pub fn record_outcome(reward: f32) {
-    // Reward convention: +1 = player 1 wins, -1 = player 2 wins, 0 = draw
-    if reward > 0.5 {
-        PLAYER1_WINS.inc();
-    } else if reward < -0.5 {
-        PLAYER2_WINS.inc();
-    } else {
-        DRAWS.inc();
+/// Record a game outcome.
+///
+/// Takes a decoded [`GameOutcome`], not a reward. Rewards are relative to the
+/// player who just moved, and the winning move is always made by the winner,
+/// so the previous `reward > 0.5 => player 1` mapping counted every decisive
+/// game as a player-1 win and left `actor_player2_wins_total` at zero forever.
+/// That mattered: seat imbalance is a known training-collapse mode here, and
+/// this is the metric that would surface it.
+pub fn record_outcome(outcome: GameOutcome) {
+    match outcome {
+        GameOutcome::Player1Win => PLAYER1_WINS.inc(),
+        GameOutcome::Player2Win => PLAYER2_WINS.inc(),
+        GameOutcome::Draw => DRAWS.inc(),
     }
 }
 
@@ -258,16 +263,19 @@ mod tests {
     }
 
     #[test]
-    fn test_record_outcome() {
-        // Reset counters by reading them
-        let _ = PLAYER1_WINS.get();
-        let _ = PLAYER2_WINS.get();
-        let _ = DRAWS.get();
+    fn test_record_outcome_increments_the_matching_counter() {
+        // Prometheus counters are process-global, so assert on deltas rather
+        // than absolutes: other tests in this binary also record outcomes.
+        let before = (PLAYER1_WINS.get(), PLAYER2_WINS.get(), DRAWS.get());
 
-        record_outcome(1.0);
-        record_outcome(-1.0);
-        record_outcome(0.0);
+        record_outcome(GameOutcome::Player1Win);
+        record_outcome(GameOutcome::Player2Win);
+        record_outcome(GameOutcome::Player2Win);
+        record_outcome(GameOutcome::Draw);
 
-        // Just verify no panic
+        assert_eq!(PLAYER1_WINS.get() - before.0, 1);
+        // The old reward-based mapping could never move this one.
+        assert_eq!(PLAYER2_WINS.get() - before.1, 2);
+        assert_eq!(DRAWS.get() - before.2, 1);
     }
 }

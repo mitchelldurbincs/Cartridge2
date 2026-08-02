@@ -58,6 +58,23 @@ pub struct GameMetadata {
     /// seat detector instead of learning positions.
     pub player_relative_obs: bool,
 
+    /// Whether the acting player alternates on **every** recorded step.
+    ///
+    /// The actor's value-target backfill derives each transition's sign from
+    /// step-index parity, which is only correct under this assumption. A game
+    /// where one player can move twice in a row would get half its value
+    /// targets sign-inverted — silently, because nothing errors and the only
+    /// symptom is a value head that never converges.
+    ///
+    /// Defaults to `false` so that forgetting to declare it is a loud actor
+    /// error rather than an inherited claim the actor then trusts. Games that
+    /// alternate must say so with
+    /// [`with_alternating_turns`](Self::with_alternating_turns).
+    ///
+    /// A "pass" that is an explicit action still alternates: it consumes a
+    /// step like any other move (Othello works this way).
+    pub alternating_turns: bool,
+
     /// Number of players (typically 2)
     pub player_count: usize,
 
@@ -89,6 +106,9 @@ impl GameMetadata {
             legal_mask_offset: 0,
             obs_channels: 0,
             player_relative_obs: false,
+            // Deliberately false: see the field docs. An undeclared turn order
+            // must fail loudly in the actor, not be assumed.
+            alternating_turns: false,
             player_count: 2,
             player_names: vec!["Player 1".to_string(), "Player 2".to_string()],
             player_symbols: vec!['1', '2'],
@@ -125,6 +145,15 @@ impl GameMetadata {
     pub fn with_obs_encoding(mut self, obs_channels: usize, player_relative_obs: bool) -> Self {
         self.obs_channels = obs_channels;
         self.player_relative_obs = player_relative_obs;
+        self
+    }
+
+    /// Declare that the acting player alternates on every recorded step.
+    ///
+    /// See [`alternating_turns`](Self::alternating_turns). Games must opt in;
+    /// the actor refuses to backfill value targets otherwise.
+    pub fn with_alternating_turns(mut self, alternating: bool) -> Self {
+        self.alternating_turns = alternating;
         self
     }
 

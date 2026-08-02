@@ -81,9 +81,57 @@ pub fn decode_action_u32(buf: &[u8]) -> Result<u32, DecodeError> {
     Ok(u32::from_le_bytes(buf.try_into().unwrap()))
 }
 
+/// Which seat won a finished two-player game.
+///
+/// Exists because the step reward cannot answer this question.
+/// [`calculate_reward`] is relative to the player who just moved, and the
+/// winning move is by definition made by the winner — so a decisive game ends
+/// on `+1.0` whichever seat won. Anything that needs to attribute a result to
+/// a seat (self-play statistics, win-rate metrics) must carry this instead of
+/// a reward, or it silently records every win for player 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GameOutcome {
+    /// Player 1 (the seat that moves first) won.
+    Player1Win,
+    /// Player 2 won.
+    Player2Win,
+    /// The game ended without a winner.
+    Draw,
+}
+
+impl GameOutcome {
+    /// Decode from the `winner` field's wire encoding.
+    ///
+    /// Returns `None` for `0` (game still ongoing) and for values outside the
+    /// documented range.
+    #[inline]
+    pub fn from_winner(winner: u8) -> Option<Self> {
+        match winner {
+            1 => Some(GameOutcome::Player1Win),
+            2 => Some(GameOutcome::Player2Win),
+            3 => Some(GameOutcome::Draw),
+            _ => None,
+        }
+    }
+
+    /// Stable label for metrics and logs. Changing these breaks dashboards.
+    #[inline]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GameOutcome::Player1Win => "player1_win",
+            GameOutcome::Player2Win => "player2_win",
+            GameOutcome::Draw => "draw",
+        }
+    }
+}
+
 /// Calculate reward for a two-player zero-sum game.
 ///
 /// Returns the reward from the perspective of the player who just moved.
+///
+/// **This is not a seat attribution.** See [`GameOutcome`]: because the
+/// winning move is made by the winner, a decisive game always ends on `+1.0`
+/// regardless of which seat won.
 ///
 /// # Arguments
 /// * `winner` - Winner indicator: 0=ongoing, 1=player1 wins, 2=player2 wins, 3=draw
@@ -203,6 +251,32 @@ pub mod info_bits {
     #[inline]
     pub fn extract_moves_played(info: u64) -> u64 {
         (info >> MOVES_PLAYED_SHIFT) & 0xFF
+    }
+
+    /// Decode the game outcome from a **terminal** step's info bits.
+    ///
+    /// Returns `None` while the game is still running.
+    ///
+    /// # Only valid on a terminal step
+    ///
+    /// The legal-move mask shares this `u64` and is packed at bit 0 with no
+    /// width limit, so a game with more than 16 actions overlaps the player
+    /// and winner fields *during play*. Othello (65 actions) is the live case
+    /// and documents it on its own `compute_info_bits`.
+    ///
+    /// What makes this safe at the end of a game is that a finished position
+    /// has no legal moves: every bundled game packs a zero mask once it is
+    /// done, leaving bits 20-23 clean. That is an invariant of the games, not
+    /// of this function, so it is asserted for every registered game by
+    /// `engine_games::tests::test_terminal_info_bits_report_the_true_winner`.
+    /// A new game that reports legal moves in a terminal state would break
+    /// this, and that test is what will catch it.
+    ///
+    /// Do not reach for [`extract_current_player`] mid-episode for the same
+    /// reason — there is no equivalent invariant protecting it.
+    #[inline]
+    pub fn outcome_from_info(info: u64) -> Option<crate::game_utils::GameOutcome> {
+        super::GameOutcome::from_winner(extract_winner(info))
     }
 }
 

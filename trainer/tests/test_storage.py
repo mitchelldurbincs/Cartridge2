@@ -19,6 +19,7 @@ import pytest
 
 from trainer.storage.base import GameMetadata, Transition
 from trainer.storage.factory import create_model_store, create_replay_buffer
+from trainer.storage.postgres import _load_schema, split_sql_statements
 
 # Check PostgreSQL availability for integration tests
 postgres_available = bool(os.environ.get("CARTRIDGE_STORAGE_POSTGRES_URL"))
@@ -86,6 +87,64 @@ def sample_transition():
         mcts_value=0.5,
         game_outcome=None,
     )
+
+
+class TestSchemaStatementSplitting:
+    """The schema splitter, which needs no database.
+
+    These are the regression tests for a bug where `_ensure_schema` split
+    `sql/schema.sql` on ';' first and then discarded any chunk starting with
+    '--'. Because every statement in that file has a comment line above it,
+    the comment led its own chunk and took the statement with it: both
+    CREATE TABLEs were dropped while the method logged success.
+
+    The Rust actor applies the same file via its own splitter and asserts the
+    same counts in `actor/src/storage/postgres.rs`. Keep the two in step.
+    """
+
+    def test_no_statement_is_a_comment(self):
+        statements = split_sql_statements(_load_schema())
+
+        assert statements, "schema.sql must yield statements"
+        for statement in statements:
+            assert not statement.startswith("--")
+            assert "--" not in statement
+
+    def test_schema_yields_every_table_and_index(self):
+        statements = split_sql_statements(_load_schema())
+
+        tables = [s for s in statements if s.startswith("CREATE TABLE")]
+        indices = [s for s in statements if s.startswith("CREATE INDEX")]
+
+        assert len(tables) == 2, "expected transitions + game_metadata tables"
+        assert len(indices) == 3, "expected three transitions indices"
+        assert len(statements) == len(tables) + len(indices)
+
+    def test_both_tables_are_created(self):
+        # The exact failure: these two statements were silently dropped.
+        statements = split_sql_statements(_load_schema())
+        created = {s.split("(")[0].strip() for s in statements}
+
+        assert "CREATE TABLE IF NOT EXISTS transitions" in created
+        assert "CREATE TABLE IF NOT EXISTS game_metadata" in created
+
+    def test_comment_above_statement_is_stripped_not_the_statement(self):
+        sql = (
+            "-- leading comment\n"
+            "CREATE TABLE a (x INT);\n"
+            "-- another\n"
+            "CREATE INDEX i ON a(x);"
+        )
+
+        statements = split_sql_statements(sql)
+
+        assert len(statements) == 2
+        assert statements[0].startswith("CREATE TABLE a")
+        assert statements[1].startswith("CREATE INDEX i")
+
+    def test_empty_and_comment_only_input_yields_nothing(self):
+        assert split_sql_statements("  ;; \n -- only a comment\n ;") == []
+        assert split_sql_statements("") == []
 
 
 @requires_postgres

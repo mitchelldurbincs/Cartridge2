@@ -126,4 +126,121 @@ mod tests {
             );
         }
     }
+
+    /// Every bundled game must declare its turn order.
+    ///
+    /// The actor derives each transition's value-target sign from step-index
+    /// parity, which is only valid when the acting player alternates on every
+    /// recorded step. `alternating_turns` defaults to `false` precisely so a
+    /// game that forgets trips the actor rather than inheriting a claim; this
+    /// test makes "forgot to declare it" a build failure instead of a runtime
+    /// one for the games we ship.
+    ///
+    /// A future non-alternating game is legitimate — it just cannot use the
+    /// parity backfill, so it should land together with a per-transition
+    /// acting-player record rather than by flipping this assertion.
+    #[test]
+    fn test_bundled_games_declare_alternating_turns() {
+        register_all_games();
+
+        for env_id in list_registered_games() {
+            let meta = engine_core::create_game(&env_id)
+                .unwrap_or_else(|| panic!("{env_id} registered but not constructible"))
+                .metadata();
+
+            assert!(
+                meta.alternating_turns,
+                "{env_id}: must declare .with_alternating_turns(...). Every game \
+                 bundled today alternates; if a new one does not, it needs a \
+                 value-target backfill that does not rely on step parity."
+            );
+        }
+    }
+
+    /// A terminal step's info bits must report the true winner.
+    ///
+    /// This is the invariant that makes `info_bits::outcome_from_info` safe.
+    /// The legal-move mask shares the same `u64` starting at bit 0, so for a
+    /// game with more than 16 actions it overlaps the winner field at bits
+    /// 20-23 *during play* — Othello (65 actions) documents exactly that on
+    /// its own `compute_info_bits`. What rescues the terminal step is that a
+    /// finished position has no legal moves, so the mask is zero and the
+    /// winner field is clean.
+    ///
+    /// That is a property of the games, not of the decoder, so assert it here
+    /// for every registered game. A game that reported legal moves in a
+    /// terminal state would silently corrupt self-play win/loss attribution;
+    /// this is what catches it.
+    #[test]
+    fn test_terminal_info_bits_report_the_true_winner() {
+        use engine_core::{EngineContext, GameOutcome};
+        use rand::seq::SliceRandom;
+        use rand::SeedableRng;
+
+        register_all_games();
+
+        for env_id in list_registered_games() {
+            let mut ctx = EngineContext::new(&env_id).expect("registered game");
+            let meta = ctx.metadata();
+
+            // A few seeds per game: different playouts reach different
+            // terminal shapes (wins for either seat, draws, adjudication).
+            let mut reached_terminal = 0;
+            for seed in 0..8u64 {
+                let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
+                let reset = ctx.reset(seed, &[]).expect("reset");
+                let mut state = reset.state;
+                let mut obs = reset.obs;
+
+                for _ in 0..meta.num_actions * 64 {
+                    let legal = meta.extract_legal_moves(&obs);
+                    let Some(&action) = legal.choose(&mut rng) else {
+                        break;
+                    };
+
+                    let step = ctx
+                        .step(&state, &(action as u32).to_le_bytes())
+                        .expect("step");
+
+                    if step.done {
+                        // The decoded outcome must match the winner byte the
+                        // game itself recorded in its terminal state.
+                        let decoded =
+                            engine_core::game_utils::info_bits::outcome_from_info(step.info);
+                        assert!(
+                            decoded.is_some(),
+                            "{env_id}: terminal step decoded no outcome \
+                             (info=0x{:x}); the legal mask is probably still \
+                             set and is colliding with the winner field",
+                            step.info,
+                        );
+
+                        // Cross-check against the reward, which is relative to
+                        // the mover: a decisive game must not decode as a draw
+                        // and vice versa.
+                        let is_draw = decoded == Some(GameOutcome::Draw);
+                        assert_eq!(
+                            is_draw,
+                            step.reward == 0.0,
+                            "{env_id}: outcome {decoded:?} disagrees with \
+                             terminal reward {}",
+                            step.reward,
+                        );
+
+                        reached_terminal += 1;
+                        break;
+                    }
+
+                    state = step.state;
+                    obs = step.obs;
+                }
+            }
+
+            assert!(
+                reached_terminal > 0,
+                "{env_id}: no random playout reached a terminal state, so the \
+                 invariant was never exercised"
+            );
+        }
+    }
 }

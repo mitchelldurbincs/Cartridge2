@@ -17,3 +17,8 @@ games-generals = { path = "../games-generals" }
 # build tool that must stay lint-clean.
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# Random playouts for the cross-game terminal-state invariant test.
+rand = { workspace = true }
+rand_chacha = { workspace = true }
