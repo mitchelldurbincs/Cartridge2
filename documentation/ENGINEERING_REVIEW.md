@@ -4,7 +4,13 @@
 **Scope:** whole repository at `a1267ff` (engine, actor, web, trainer, frontend, infra, CI, docs)
 **Method:** full source read of the Rust workspaces and Python package, plus targeted
 reproduction of suspected defects. `cargo test --manifest-path engine/Cargo.toml` was run
-and passes. No code was changed.
+and passes. No code was changed *as part of the review*.
+
+**Update — six findings have since been fixed on this branch.** C1, C2, C3, H1, H2 and H7
+each carry a `Status: FIXED` line below describing what shipped. The rest of the document
+is unchanged and still describes live issues; H5 (cross-language observation conformance)
+is now the highest-value remaining item. Two claims in the original text were wrong and are
+corrected in place — see C1 and §5 item 2.
 
 ---
 
@@ -48,6 +54,13 @@ improving" rather than as a test failure.
 Fix the silent failures, close the two cross-language duplication gaps, pin the Rust
 dependency graph, and this repository is in good shape for multi-year maintenance. There
 is no case here for a redesign, and no case for adding layers, interfaces, or services.
+
+**Where that stands now.** All three Critical findings are fixed, along with three of the
+eight High ones (H1 liveness, H2 dependency pinning, H7 the turn-order invariant). One of
+the two cross-language duplication gaps is closed — the SQL splitter, whose two copies are
+now pinned to each other by matching tests. **The other is not**: the Python game mirrors
+described above remain unchecked against the engine, and closing that (H5) is the single
+highest-value piece of work left. H3, H4, H6 and H8 are also untouched.
 
 ---
 
@@ -141,14 +154,27 @@ actor/ (binary)                          web/ (binary)                          
   `"PostgreSQL schema validated/created"`.
 - **Why it is a problem:** Against a fresh database the two surviving `CREATE INDEX`
   statements fail with `UndefinedTable`, and the error message points at an index rather
-  than at the missing table. Against an existing database it "works" only because the Rust
-  actor created the schema first — the Python path has never actually been exercised. The
-  same logic exists correctly 40 lines away in Rust (`split_sql_statements` strips comment
-  *lines* before splitting); this is a duplicated concept where one copy is wrong.
-- **Realistic consequence:** `python -m trainer train` against a new database, or in any
-  deployment where the trainer starts before the actor, fails with a misleading error. If
-  a future schema change adds a column, the trainer will report success while having
-  applied nothing.
+  than at the missing table. Against an existing database it "works" only because something
+  else created the schema — `scripts/init-postgres.sql` via the Compose initdb mount, or
+  `k8s/base/postgres/init-configmap.yaml`, or the Rust actor. The Python path has never
+  actually been exercised. The same logic exists correctly 40 lines away in Rust
+  (`split_sql_statements` strips comment *lines* before splitting); this is a duplicated
+  concept where one copy is wrong.
+
+  *Correction, found while planning the fix:* an earlier draft of this section assumed the
+  actor always reaches the database first. It does not. The orchestrator's documented
+  iteration order (`trainer/src/trainer/orchestrator/__init__.py:21-26`) is *clear replay
+  buffer → run actor*, so the Python trainer is the **first** DB contact in
+  `make train` / `docker compose up alphazero`;
+  `trainer/tests/test_orchestrator_composition.py:237-269` shows `clear_calls == 1` in an
+  iteration where no actor process ever spawns. The bug has stayed invisible because
+  `make setup-db` is the only setup path that creates no tables, and Docker/K8s users get
+  the schema from their initdb mounts.
+- **Realistic consequence:** `python -m trainer train` against a new database, or a native
+  (non-Docker) setup following `make setup-db`, fails with a misleading error. If a future
+  schema change adds a column, the trainer will report success while having applied nothing.
+- **Status: FIXED** — `split_sql_statements` now mirrors the Rust implementation, and both
+  sides assert the same statement count against `sql/schema.sql`.
 - **Recommended change:** Delete the Python splitter and port the Rust one verbatim: filter
   out lines whose `lstrip()` starts with `--`, join, split on `;`, drop empties. Add a
   regression test asserting the splitter yields exactly the 5 statements in `schema.sql`
@@ -200,6 +226,11 @@ actor/ (binary)                          web/ (binary)                          
 - **Scope:** small · **Risk:** low — this changes startup behavior for currently-broken
   configs only · **Validation:** unit tests for `load_from_path` on valid/invalid/missing
   files; a smoke test asserting the actor exits non-zero on a corrupt `config.toml`.
+- **Status: FIXED** — `try_load_config` is now the binaries' entry point. A *missing* config
+  still falls back to defaults (the Kubernetes path, which mounts none); a *found but
+  broken* one aborts startup naming the file and parse location. `load_config` keeps its
+  infallible signature for the actor's clap-forced `Lazy`, which preflights in `main()`.
+  Seven tests added — this path previously had none at all.
 
 ---
 
@@ -243,6 +274,16 @@ actor/ (binary)                          web/ (binary)                          
   **Risk:** low · **Validation:** an actor-level test playing a scripted tictactoe game to a
   player-2 win and asserting `snapshot.player2_wins == 1`. Note the existing tests
   (`stats.rs:317-346`) assert the *current* wrong mapping and must be rewritten.
+- **Status: FIXED** — no new engine API was needed: `StepResult.info` already carried the
+  winner at bits 20-23 and the actor was discarding it. Added `GameOutcome` and
+  `info_bits::outcome_from_info`, threaded the decoded outcome through instead of an `f32`,
+  and left `finalize_episode` untouched (it takes the last-mover reward, which was always
+  correct) so **no training data changed**. The three tests asserting the reward-sign
+  mapping were replaced, and the scripted player-2 win is now a regression test. Decoding
+  info bits is only sound at a terminal step — a finished position has no legal moves, so
+  the mask that otherwise overlaps the winner field is zero — and that is a property of the
+  games rather than the decoder, so it is asserted for every registered game by random
+  playout in `engine-games`.
 
 ---
 
@@ -279,6 +320,12 @@ actor/ (binary)                          web/ (binary)                          
   (generals, horizon 402) so a genuinely slow first episode is not killed ·
   **Validation:** extend the existing `test_progress_*` tests with a "never completed an
   episode, window elapsed" case.
+- **Status: FIXED** — `HealthState` now records `started_at` and measures progress from
+  `max(last_episode, started_at)`, so "has never worked" is distinguishable from "is
+  starting up". `set_unhealthy()` has a caller: the run loop counts consecutive episode
+  failures, resets on any success, and escalates past a named threshold
+  (`is_persistent_failure`, extracted so the rule is testable without PostgreSQL). The
+  budget-derived window sizing is unchanged, so long-horizon games are unaffected.
 
 ---
 
@@ -311,6 +358,15 @@ actor/ (binary)                          web/ (binary)                          
   without the substance.
 - **Scope:** small · **Risk:** low; expect a one-time flurry of advisories to triage ·
   **Validation:** CI green with `--locked`; deliberate `cargo update` PRs thereafter.
+- **Status: FIXED** — all three lockfiles committed and `--locked` added to CI clippy, test
+  and build. The audit turned out to be worse than described: the steps passed
+  `--manifest-path`, which cargo-audit does not accept (it audits a *lockfile*, via
+  `--file`), so every step was exiting on a CLI usage error that `continue-on-error` then
+  swallowed — the audit had **never actually run**. Fixed the flag and removed the
+  suppression. Its first real run surfaced four advisories, all needing semver-major bumps
+  (`prometheus 0.13` → protobuf; the `rustls 0.21` chain, reached only through
+  feature-gated deps). They are listed explicitly in `ci.yml` with justifications rather
+  than suppressed, so the job gates on anything new. gitleaks now gates too.
 
 ---
 
@@ -493,6 +549,13 @@ actor/ (binary)                          web/ (binary)                          
 - **Scope:** small (assertion + metadata field) or medium (per-transition player) ·
   **Risk:** low · **Validation:** a test asserting the sign pattern for a scripted 5-move
   and 6-move episode, and that a synthetic non-alternating game trips the assertion.
+- **Status: FIXED** (assertion form; the per-transition acting player remains the eventual
+  robust fix) — `GameMetadata::alternating_turns` added, defaulting to **`false`** so a game
+  that forgets to declare it fails loudly in the actor rather than inheriting a claim the
+  backfill then trusts. Declared by all four bundled games, checked in `finalize_episode`,
+  and asserted for every registered game alongside the existing observation-profile test.
+  It flows into `game_metadata.json` automatically; the Python whitelist ignores it by
+  design, so the trainer needed no change.
 
 ---
 
@@ -855,15 +918,21 @@ cost for no isolation benefit.
 
 **2. Replay-buffer schema**
 - *Lacks a single applier.* `sql/schema.sql` is the artifact; two independent splitters
-  apply it, one broken (C1).
+  apply it, one broken (C1) — and the DDL itself exists in **four** copies.
 - *Interacting components:* `actor/src/storage/postgres.rs`,
-  `trainer/storage/postgres.py`, `scripts/init-postgres.sql`, k8s init.
-- *Should own it:* one splitter, shared. Simplest correct answer: make the Rust actor the
-  only component that runs DDL, and have the Python trainer *verify* the schema exists
-  rather than create it — which matches reality, since the actor always starts first in
-  every documented workflow.
-- *How information should cross:* the trainer raises a clear "schema not initialized; start
-  the actor or run `make setup-db`" error instead of silently doing nothing.
+  `trainer/storage/postgres.py`, `scripts/init-postgres.sql` (a superset, adding
+  `training_stats` and `model_versions`), `k8s/base/postgres/init-configmap.yaml` (a third
+  inline copy).
+- *Should own it:* `sql/schema.sql`, applied by whoever connects first. Every statement is
+  `IF NOT EXISTS`, so concurrent appliers are safe and no single owner is needed for
+  *creation*. What is missing is a single owner for the **DDL text**: the K8s ConfigMap and
+  `init-postgres.sql` are hand-maintained copies that can drift from `schema.sql` silently.
+  ~~Make the Rust actor the only component that runs DDL and have the trainer verify
+  instead~~ — rejected: the trainer reaches the database first (see C1's correction), so a
+  verify-only trainer would break `python -m trainer loop` outright.
+- *How information should cross:* generate the ConfigMap and the initdb superset from
+  `sql/schema.sql` rather than transcribing them, so there is one editable copy. Open
+  follow-up; not addressed by the C1 fix, which only repaired the splitter.
 
 **3. "Is this actor healthy?"**
 - *No owner.* `HealthState` holds the flag; nothing sets it.
@@ -1082,31 +1151,32 @@ unbounded collection.
 
 ## 9. Top ten recommended actions
 
-Ordered by impact relative to effort.
+Ordered by impact relative to effort. Items marked ✅ shipped on this branch.
 
-1. **Fix `_ensure_schema()`'s statement splitter** (C1) — five lines; removes a
+1. ✅ **Fix `_ensure_schema()`'s statement splitter** (C1) — five lines; removes a
    confirmed silent no-op and a divergent duplicate of correct Rust code.
-2. **Make a malformed `config.toml` fatal in Rust** (C2) — small; prevents training the
+2. ✅ **Make a malformed `config.toml` fatal in Rust** (C2) — small; prevents training the
    wrong game for hours behind a single `warn!`.
-3. **Replace the `f32` outcome with an explicit enum** (C3) — small; restores the seat-bias
+3. ✅ **Replace the `f32` outcome with an explicit enum** (C3) — small; restores the seat-bias
    diagnostic the codebase itself identifies as a training-collapse detector.
-4. **Commit `Cargo.lock` for all three workspaces and make security audits gate** (H2) —
+4. ✅ **Commit `Cargo.lock` for all three workspaces and make security audits gate** (H2) —
    trivial; the precondition for reproducing and bisecting anything else.
-5. **Fix actor liveness so a never-succeeding actor fails its probe** (H1) — small; turns a
+5. ✅ **Fix actor liveness so a never-succeeding actor fails its probe** (H1) — small; turns a
    silently idle pod into a restarting one.
 6. **Add the cross-language observation conformance test** (H5) — medium; closes the largest
-   remaining silent-drift risk and unblocks §8 Phase 2.
-7. **Assert the alternating-turns invariant in `finalize_episode`** (H7) — small; converts a
+   remaining silent-drift risk and unblocks §8 Phase 2. **Now the top remaining action.**
+7. ✅ **Assert the alternating-turns invariant in `finalize_episode`** (H7) — small; converts a
    future half-inverted-value-targets disaster into a startup assertion.
 8. **Replace CI's auto-commit formatting with `--check`, and add a Postgres service** (H8,
    §7) — small; makes CI a gate, unblocks fork contributions, and starts running the four
-   storage tests that have never executed.
+   storage tests that have never executed. *(Partially addressed: `--locked` and gating
+   audits landed with item 4; the auto-commit jobs and the Postgres service did not.)*
 9. **Delete `get_game_metadata_or_config` so evaluation stops depending on DB reachability**
    (H6) — small; one owner for game facts, and removes a union return type from four call
    sites.
 10. **Remove the per-step `COUNT(*)` from `sample()`** (H4) — small; restores the caching
     the trainer already attempted and removes a full scan from the hottest path.
 
-Items 1–5 and 7 are each under an hour and independently mergeable. Item 6 is the one that
-warrants real time, and it is the one that protects the training loop's correctness for the
-next several years.
+Items 1–5 and 7 were each under an hour and are done. Item 6 is the one that warrants real
+time, and it is the one that protects the training loop's correctness for the next several
+years — it is what to pick up next.
