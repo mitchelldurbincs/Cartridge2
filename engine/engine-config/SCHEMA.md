@@ -22,7 +22,7 @@ Shared configuration across all components.
 |-------|------|---------|-------------|
 | `data_dir` | string | `"./data"` | Base data directory for models, stats, replay buffer |
 | `env_id` | string | `"tictactoe"` | Default game environment ID |
-| `log_level` | string | `"info"` | Log level: trace, debug, info, warn, error |
+| `log_level` | string | `"info"` | Rust: trace, debug, info, warn, error. Python: debug, info, warning, error |
 
 ### [training]
 
@@ -41,7 +41,7 @@ Training loop configuration (used by trainer).
 | `device` | string | `"cpu"` | Device: auto, cpu, cuda, mps |
 | `checkpoint_interval` | i32 | `100` | Steps between checkpoints |
 | `max_checkpoints` | i32 | `10` | Maximum checkpoints to keep |
-| `num_actors` | i32 | `6` | Parallel actor processes for self-play |
+| `num_actors` | i32 | `1` | Parallel actor processes for self-play |
 
 ### [evaluation]
 
@@ -65,6 +65,7 @@ Self-play actor configuration.
 | `episode_timeout_secs` | u64 | `30` | Timeout per episode in seconds |
 | `flush_interval_secs` | u64 | `5` | Interval to flush replay buffer |
 | `log_interval` | u32 | `50` | Episodes between log messages |
+| `health_port` | u16 | `8081` | Actor health-check server port |
 
 ### [web]
 
@@ -74,6 +75,7 @@ Web server configuration.
 |-------|------|---------|-------------|
 | `host` | string | `"0.0.0.0"` | Server bind address |
 | `port` | u16 | `8080` | Server port |
+| `allowed_origins` | string[] | `[]` | CORS origins; empty uses the localhost-only development allowlist |
 
 ### [mcts]
 
@@ -82,12 +84,12 @@ Monte Carlo Tree Search configuration.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `start_sims` | u32 | `50` | Simulations for first iteration (ramping start) |
-| `max_sims` | u32 | `250` | Maximum simulations after ramping completes |
-| `sim_ramp_rate` | u32 | `10` | Simulations added per iteration |
+| `max_sims` | u32 | `400` | Maximum simulations after ramping completes |
+| `sim_ramp_rate` | u32 | `20` | Simulations added per iteration |
 | `num_simulations` | u32 | `800` | Legacy: MCTS simulations per move (used if ramping not configured) |
 | `c_puct` | f64 | `1.4` | Exploration constant |
 | `temperature` | f64 | `1.0` | Action selection temperature |
-| `temp_threshold` | u32 | `15` | Move number after which to reduce temperature (0 = disabled) |
+| `temp_threshold` | u32 | `0` | Move number after which to reduce temperature (0 = disabled) |
 | `dirichlet_alpha` | f64 | `0.3` | Dirichlet noise alpha |
 | `dirichlet_weight` | f64 | `0.25` | Dirichlet noise weight |
 | `eval_batch_size` | usize | `32` | Batch size for ONNX evaluation during MCTS |
@@ -125,6 +127,12 @@ All configuration values can be overridden via environment variables using the p
 CARTRIDGE_<SECTION>_<KEY>=value
 ```
 
+Non-empty known overrides are parsed and validated during startup. A malformed
+value is fatal rather than being ignored. Empty values are treated as unset so
+Docker Compose placeholders such as `${VALUE:-}` continue to defer to TOML or
+defaults. Boolean overrides accept `true/false`, `1/0`, `yes/no`, and `on/off`.
+List values use JSON array syntax.
+
 ### Examples
 
 ```bash
@@ -150,6 +158,7 @@ CARTRIDGE_ACTOR_MAX_EPISODES=1000
 # Web
 CARTRIDGE_WEB_HOST=127.0.0.1
 CARTRIDGE_WEB_PORT=3000
+CARTRIDGE_WEB_ALLOWED_ORIGINS='["https://example.com"]'
 
 # MCTS
 CARTRIDGE_MCTS_NUM_SIMULATIONS=1600
@@ -170,7 +179,9 @@ Configuration is searched in the following order:
 3. `../config.toml` (parent directory)
 4. `/app/config.toml` (Docker container)
 
-If no config file is found, built-in defaults are used.
+If no config file is found, built-in defaults are used. A non-empty explicit
+`CARTRIDGE_CONFIG` path that is missing, unreadable, or malformed is a startup
+error. An empty `CARTRIDGE_CONFIG` placeholder is treated as unset.
 
 ## Python Trainer Alignment
 

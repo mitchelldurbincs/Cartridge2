@@ -42,6 +42,10 @@ fn generate_span_id() -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Fail before clap evaluates central-config-backed defaults if the requested
+    // file or any known environment override is invalid.
+    config::initialize_central_config()?;
+
     // Parse configuration
     let config = Config::parse();
 

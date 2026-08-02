@@ -4,6 +4,11 @@
 # - Starting new games
 # - Making moves (human vs bot)
 # - Getting training stats
+#
+# SAFETY: Keep the backend at one replica until the API has per-client session
+# IDs or shared session storage. AppState currently owns one process-local
+# GameSession, so multiple pods would serve divergent game state. Recreate also
+# prevents a rollout from temporarily routing requests to old and new sessions.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -14,7 +19,12 @@ metadata:
     app.kubernetes.io/component: api
     app.kubernetes.io/part-of: cartridge2
 spec:
-  replicas: 2
+  replicas: 1
+  strategy:
+    type: Recreate
+    # Clear the RollingUpdate fields persisted by an existing Deployment;
+    # Kubernetes rejects them when strategy.type changes to Recreate.
+    rollingUpdate: null
   selector:
     matchLabels:
       app.kubernetes.io/name: web

@@ -12,6 +12,8 @@ Example:
 
 import os
 import tempfile
+import uuid
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +21,7 @@ import pytest
 
 from trainer.storage.base import GameMetadata, Transition
 from trainer.storage.factory import create_model_store, create_replay_buffer
+from trainer.storage.postgres import PostgresReplayBuffer
 
 # Check PostgreSQL availability for integration tests
 postgres_available = bool(os.environ.get("CARTRIDGE_STORAGE_POSTGRES_URL"))
@@ -29,6 +32,8 @@ requires_postgres = pytest.mark.skipif(
     reason="PostgreSQL not configured (set CARTRIDGE_STORAGE_POSTGRES_URL)",
 )
 
+TEST_ENV_IDS = ("testgame", "game1", "game2")
+
 
 @pytest.fixture
 def replay_buffer():
@@ -36,13 +41,15 @@ def replay_buffer():
     url = os.environ.get("CARTRIDGE_STORAGE_POSTGRES_URL")
     buffer = create_replay_buffer(url)
 
-    # Clean up any existing data
-    buffer.clear_transitions()
+    # Isolate test games without deleting replay data for unrelated environments.
+    for env_id in TEST_ENV_IDS:
+        buffer.clear_transitions(env_id)
 
     yield buffer
 
     # Cleanup after test
-    buffer.clear_transitions()
+    for env_id in TEST_ENV_IDS:
+        buffer.clear_transitions(env_id)
     buffer.close()
 
 
@@ -111,6 +118,82 @@ class TestPostgresConnection:
         metadata = replay_buffer.get_metadata()
         # Returns None if no data, but shouldn't error
         assert metadata is None or isinstance(metadata, GameMetadata)
+
+    def test_schema_created_in_fresh_isolated_postgres_schema(self):
+        """Run the real shared SQL script where neither table exists yet."""
+        import psycopg2
+        from psycopg2 import sql
+
+        class SingleConnectionPool:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def getconn(self):
+                return self.connection
+
+            def putconn(self, connection, close=False):
+                assert connection is self.connection
+                if close:
+                    connection.close()
+
+        url = os.environ["CARTRIDGE_STORAGE_POSTGRES_URL"]
+        connection = psycopg2.connect(url)
+        schema_name = f"cartridge_schema_test_{uuid.uuid4().hex}"
+
+        try:
+            with connection.cursor() as cur:
+                cur.execute(
+                    sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name))
+                )
+                cur.execute(
+                    sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name))
+                )
+            connection.commit()
+
+            buffer = object.__new__(PostgresReplayBuffer)
+            buffer._pool = SingleConnectionPool(connection)
+            buffer._ensure_schema()
+
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT to_regclass('transitions'), to_regclass('game_metadata')"
+                )
+                transitions, game_metadata = cur.fetchone()
+                cur.execute(
+                    "SELECT indexname FROM pg_indexes WHERE schemaname = %s",
+                    (schema_name,),
+                )
+                indexes = {row[0] for row in cur.fetchall()}
+
+            assert transitions is not None
+            assert game_metadata is not None
+            assert {
+                "idx_transitions_timestamp",
+                "idx_transitions_episode",
+                "idx_transitions_env_id",
+            } <= indexes
+        finally:
+            if not connection.closed:
+                connection.rollback()
+                with connection.cursor() as cur:
+                    cur.execute("SET search_path TO public")
+                    cur.execute(
+                        sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                            sql.Identifier(schema_name)
+                        )
+                    )
+                connection.commit()
+                connection.close()
+
+    def test_failed_statement_does_not_poison_next_pool_borrower(self, replay_buffer):
+        import psycopg2
+
+        with pytest.raises(psycopg2.Error):
+            with replay_buffer._connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 / 0")
+
+        assert replay_buffer.count(env_id="testgame") == 0
 
     def test_multiple_connections(self):
         """Test that multiple connections work."""
@@ -213,7 +296,7 @@ class TestTransitionOperations:
 
     def test_count_increases_with_data(self, replay_buffer):
         """Test that count reflects added transitions."""
-        initial_count = replay_buffer.count()
+        initial_count = replay_buffer.count(env_id="testgame")
 
         # Insert data manually
         with replay_buffer._connection() as conn:
@@ -244,7 +327,7 @@ class TestTransitionOperations:
                 )
                 conn.commit()
 
-        new_count = replay_buffer.count()
+        new_count = replay_buffer.count(env_id="testgame")
         assert new_count == initial_count + 1
 
     def test_sample_returns_transitions(self, replay_buffer):
@@ -323,8 +406,8 @@ class TestTransitionOperations:
                 conn.commit()
 
         # Sample different sizes
-        batch_3 = replay_buffer.sample(3)
-        batch_10 = replay_buffer.sample(10)
+        batch_3 = replay_buffer.sample(3, env_id="testgame")
+        batch_10 = replay_buffer.sample(10, env_id="testgame")
 
         assert len(batch_3) == 3
         assert len(batch_10) == 10
@@ -461,72 +544,54 @@ class TestTransitionOperations:
 class TestBufferManagement:
     """Tests for buffer operations (clear, cleanup, vacuum)."""
 
-    def test_clear_transitions(self, replay_buffer):
-        """Test clearing all transitions."""
-        # Insert data
-        with replay_buffer._connection() as conn:
-            with conn.cursor() as cur:
-                for i in range(10):
-                    cur.execute(
-                        """INSERT INTO transitions
-                           (id, env_id, episode_id, step_number, state, action,
-                            next_state, observation, next_observation, reward, done,
-                            timestamp, policy_probs, mcts_value, game_outcome)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (
-                            f"test-{i}",
-                            "testgame",
-                            "ep-001",
-                            i,
-                            b"state",
-                            b"\x00",
-                            b"next",
-                            b"obs",
-                            b"next_obs",
-                            0.0,
-                            False,
-                            1234567890,
-                            None,
-                            0.5,
-                            None,
-                        ),
-                    )
-                conn.commit()
+    def test_clear_transitions_only_deletes_requested_environment(
+        self, replay_buffer, sample_transition
+    ):
+        """Clearing one game must not delete another game's replay."""
+        replay_buffer.store_batch(
+            [
+                replace(sample_transition, id=f"game1-{i}", env_id="game1")
+                for i in range(5)
+            ]
+            + [
+                replace(sample_transition, id=f"game2-{i}", env_id="game2")
+                for i in range(4)
+            ]
+        )
 
-        initial_count = replay_buffer.count()
-        assert initial_count >= 10
+        deleted = replay_buffer.clear_transitions("game1")
 
-        # Clear
-        deleted = replay_buffer.clear_transitions()
+        assert deleted == 5
+        assert replay_buffer.count(env_id="game1") == 0
+        assert replay_buffer.count(env_id="game2") == 4
 
-        assert deleted >= 10
-        assert replay_buffer.count() == 0
+    def test_cleanup_only_trims_requested_environment(
+        self, replay_buffer, sample_transition
+    ):
+        """A high-volume game cannot evict another game's samples."""
+        replay_buffer.store_batch(
+            [
+                replace(sample_transition, id=f"game1-{i}", env_id="game1")
+                for i in range(5)
+            ]
+            + [
+                replace(sample_transition, id=f"game2-{i}", env_id="game2")
+                for i in range(4)
+            ]
+        )
+
+        deleted = replay_buffer.cleanup(2, env_id="game1")
+
+        assert deleted == 3
+        assert replay_buffer.count(env_id="game1") == 2
+        assert replay_buffer.count(env_id="game2") == 4
 
     def test_clear_preserves_metadata(self, replay_buffer, sample_metadata):
         """Test that clear_transitions preserves metadata."""
-        # Insert metadata
-        with replay_buffer._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """INSERT INTO game_metadata
-                       (env_id, display_name, board_width, board_height,
-                        num_actions, obs_size, legal_mask_offset, player_count)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                    (
-                        sample_metadata.env_id,
-                        sample_metadata.display_name,
-                        sample_metadata.board_width,
-                        sample_metadata.board_height,
-                        sample_metadata.num_actions,
-                        sample_metadata.obs_size,
-                        sample_metadata.legal_mask_offset,
-                        sample_metadata.player_count,
-                    ),
-                )
-                conn.commit()
+        replay_buffer.store_metadata(sample_metadata)
 
         # Clear transitions
-        replay_buffer.clear_transitions()
+        replay_buffer.clear_transitions("testgame")
 
         # Metadata should still exist
         metadata = replay_buffer.get_metadata("testgame")
@@ -538,7 +603,7 @@ class TestBufferManagement:
         replay_buffer.vacuum()
 
         # Buffer is still usable afterwards
-        assert replay_buffer.count() == 0
+        assert replay_buffer.count(env_id="testgame") == 0
 
 
 @requires_postgres
@@ -597,10 +662,12 @@ class TestSampleBatchTensors:
     def test_sample_batch_tensors_not_enough_data(self, replay_buffer):
         """Test that sample_batch_tensors returns None if not enough data."""
         # Clear buffer
-        replay_buffer.clear_transitions()
+        replay_buffer.clear_transitions("testgame")
 
         # Try to sample more than available
-        result = replay_buffer.sample_batch_tensors(100, num_actions=9)
+        result = replay_buffer.sample_batch_tensors(
+            100, num_actions=9, env_id="testgame"
+        )
 
         assert result is None
 

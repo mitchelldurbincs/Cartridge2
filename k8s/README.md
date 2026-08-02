@@ -16,7 +16,7 @@ This directory contains Kubernetes manifests for deploying Cartridge2 with horiz
               ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
               │    Frontend     │     │   Web Backend   │     │     Stats       │
               │   (Svelte UI)   │     │  (Axum Server)  │     │    /stats       │
-              │    replicas: 2  │     │   replicas: 2   │     │                 │
+              │    replicas: 2  │     │   replicas: 1   │     │                 │
               └─────────────────┘     └────────┬────────┘     └─────────────────┘
                                                │
                                                │ Model Loading
@@ -53,10 +53,25 @@ This directory contains Kubernetes manifests for deploying Cartridge2 with horiz
 |-----------|---------|-----------|
 | **Actor** | Self-play episode generation using MCTS | ✅ Yes (HPA enabled) |
 | **Trainer** | Neural network training | ❌ No (single replica) |
-| **Web** | Game API backend | ✅ Yes |
+| **Web** | Game API backend | ❌ No (temporary single-replica constraint) |
 | **Frontend** | Svelte UI | ✅ Yes |
 | **PostgreSQL** | Replay buffer storage | ❌ Single instance |
 | **MinIO** | S3-compatible model storage | ❌ Single instance |
+
+### Web backend replica constraint
+
+Do not scale the `web` Deployment above one replica. `AppState` currently owns
+one process-local `GameSession`; the API has no client/session identifier and
+no shared session store. Multiple backend pods would therefore hold divergent
+boards, and the Service could route consecutive requests from one browser to
+different games. The manifest also uses the `Recreate` deployment strategy so
+old and new backend pods do not overlap during a rollout.
+
+One replica prevents cross-pod state divergence, but it does **not** provide
+per-user isolation: all browsers still share the same in-process game, so one
+client can reset or move another client's board. Limit the game API to trusted,
+single-user use until opaque session IDs (or an equivalent shared-state design)
+are implemented. The stateless frontend may remain horizontally scaled.
 
 ## Quick Start
 

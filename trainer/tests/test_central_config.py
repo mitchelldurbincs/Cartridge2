@@ -11,6 +11,9 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
+import trainer.central_config as central_config_module
 from trainer.central_config import (
     CommonConfig,
     Config,
@@ -108,6 +111,28 @@ class TestEnvironmentVariableOverrides:
 
         assert config.evaluation.eval_vs_random is False
 
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("yes", True),
+            ("on", True),
+            ("1", True),
+            ("no", False),
+            ("off", False),
+            ("0", False),
+        ],
+    )
+    def test_env_override_bool_compatible_spellings(
+        self, monkeypatch, tmp_path, value, expected
+    ):
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+        monkeypatch.setenv("CARTRIDGE_EVALUATION_EVAL_VS_RANDOM", value)
+
+        config = get_config(reload=True)
+
+        assert config.evaluation.eval_vs_random is expected
+
     def test_legacy_env_override(self, monkeypatch):
         """Test legacy ALPHAZERO_* environment variables."""
         reset_config()
@@ -130,6 +155,15 @@ class TestEnvironmentVariableOverrides:
 
         # Should use default, not empty string
         assert config.common.env_id == "tictactoe"
+
+    def test_empty_numeric_env_placeholder_is_ignored(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+        monkeypatch.setenv("CARTRIDGE_TRAINING_ITERATIONS", "")
+
+        config = get_config(reload=True)
+
+        assert config.training.iterations == 100
 
 
 class TestConfigDataclasses:
@@ -318,19 +352,43 @@ class TestThreadSafety:
 class TestConfigEdgeCases:
     """Test edge cases and error handling."""
 
-    def test_invalid_env_var_for_int_uses_string(self, monkeypatch, tmp_path):
-        """Test that invalid int env var gets stored as string (may cause errors later)."""
+    def test_invalid_non_empty_integer_env_var_is_fatal(self, monkeypatch, tmp_path):
+        """A known malformed integer override must not silently change type."""
         # Isolate from repo's config.toml by changing to temp directory
         monkeypatch.chdir(tmp_path)
         reset_config()
-        # Invalid integer - code currently stores it as string
         monkeypatch.setenv("CARTRIDGE_TRAINING_ITERATIONS", "not_a_number")
 
-        # The code doesn't validate at load time, it stores as string
-        # This may cause errors later when trying to use the value
+        with pytest.raises(ValueError, match="CARTRIDGE_TRAINING_ITERATIONS"):
+            get_config(reload=True)
+
+    def test_invalid_non_empty_boolean_env_var_is_fatal(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+        monkeypatch.setenv("CARTRIDGE_EVALUATION_EVAL_VS_RANDOM", "maybe")
+
+        with pytest.raises(ValueError, match="CARTRIDGE_EVALUATION_EVAL_VS_RANDOM"):
+            get_config(reload=True)
+
+    def test_invalid_numeric_range_is_fatal(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+        monkeypatch.setenv("CARTRIDGE_STORAGE_POOL_MAX_SIZE", "0")
+
+        with pytest.raises(ValueError, match="storage.pool_max_size"):
+            get_config(reload=True)
+
+    def test_valid_env_override_repairs_lower_priority_wrong_type(
+        self, monkeypatch, tmp_path
+    ):
+        (tmp_path / "config.toml").write_text('[training]\niterations = "bad"\n')
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+        monkeypatch.setenv("CARTRIDGE_TRAINING_ITERATIONS", "2")
+
         config = get_config(reload=True)
-        # Value is stored as string since conversion failed
-        assert config.training.iterations == "not_a_number"
+
+        assert config.training.iterations == 2
 
     def test_invalid_env_var_uses_string_fallback(self, monkeypatch):
         """Test that invalid env var for string fields works fine."""
@@ -349,6 +407,158 @@ class TestConfigEdgeCases:
         assert len(DEFAULTS_SEARCH_PATHS) > 0
         assert all(isinstance(p, Path) for p in CONFIG_SEARCH_PATHS)
         assert all(isinstance(p, Path) for p in DEFAULTS_SEARCH_PATHS)
+
+    def test_explicit_missing_config_is_fatal(self, monkeypatch, tmp_path):
+        reset_config()
+        missing = tmp_path / "missing.toml"
+        monkeypatch.setenv("CARTRIDGE_CONFIG", str(missing))
+
+        with pytest.raises(FileNotFoundError, match="CARTRIDGE_CONFIG"):
+            get_config(reload=True)
+
+    def test_explicit_malformed_config_is_fatal(self, monkeypatch, tmp_path):
+        reset_config()
+        config_path = tmp_path / "broken.toml"
+        config_path.write_text("[training\niterations = 10")
+        monkeypatch.setenv("CARTRIDGE_CONFIG", str(config_path))
+
+        with pytest.raises(central_config_module.tomllib.TOMLDecodeError):
+            get_config(reload=True)
+
+    def test_explicit_unreadable_config_is_fatal(self, monkeypatch, tmp_path):
+        reset_config()
+        config_directory = tmp_path / "config.toml"
+        config_directory.mkdir()
+        monkeypatch.setenv("CARTRIDGE_CONFIG", str(config_directory))
+
+        with pytest.raises(IsADirectoryError):
+            get_config(reload=True)
+
+    def test_empty_explicit_config_placeholder_is_unset(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+        monkeypatch.setenv("CARTRIDGE_CONFIG", "")
+
+        config = get_config(reload=True)
+
+        assert config.common.env_id == "tictactoe"
+
+    def test_unknown_toml_keys_warn_and_are_ignored(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        (tmp_path / "config.toml").write_text("""
+[training]
+batch_szie = 256
+
+[future_feature]
+enabled = true
+""")
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+
+        with caplog.at_level("WARNING"):
+            config = get_config(reload=True)
+
+        assert config.training.batch_size == 64
+        assert "training.batch_szie" in caplog.text
+        assert "future_feature" in caplog.text
+
+    def test_cross_language_keys_are_recognized(self, monkeypatch, tmp_path, caplog):
+        (tmp_path / "config.toml").write_text("""
+[actor]
+health_port = 9091
+
+[web]
+allowed_origins = ["https://example.com"]
+""")
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+
+        with caplog.at_level("WARNING"):
+            config = get_config(reload=True)
+
+        assert config.actor.health_port == 9091
+        assert config.web.allowed_origins == ["https://example.com"]
+        assert "Unknown configuration" not in caplog.text
+
+    def test_known_section_unknown_env_key_warns(self, monkeypatch, tmp_path, caplog):
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+        monkeypatch.setenv("CARTRIDGE_TRAINING_ITERATONS", "50")
+
+        with caplog.at_level("WARNING"):
+            config = get_config(reload=True)
+
+        assert config.training.iterations == 100
+        assert "CARTRIDGE_TRAINING_ITERATONS" in caplog.text
+
+    @pytest.mark.parametrize(
+        "env_var",
+        ["CARTRIDGE_STORAGE_GCS_BUCKET", "CARTRIDGE_STORAGE_REPLAY_BACKEND"],
+    )
+    def test_operational_storage_env_vars_do_not_warn(
+        self, monkeypatch, tmp_path, caplog, env_var
+    ):
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+        monkeypatch.setenv(env_var, "configured-elsewhere")
+
+        with caplog.at_level("WARNING"):
+            get_config(reload=True)
+
+        assert env_var not in caplog.text
+
+    @pytest.mark.parametrize(
+        ("env_var", "value"),
+        [
+            ("CARTRIDGE_TRAINING_DEVICE", "CPU"),
+            ("CARTRIDGE_EVALUATION_PROMOTION_METRIC", "WIN_RATE"),
+        ],
+    )
+    def test_choice_values_are_case_sensitive(
+        self, monkeypatch, tmp_path, env_var, value
+    ):
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+        monkeypatch.setenv(env_var, value)
+
+        with pytest.raises(ValueError, match="must be one of"):
+            get_config(reload=True)
+
+    @pytest.mark.parametrize(
+        ("toml_text", "message"),
+        [
+            (
+                '[evaluation]\neval_vs_random = "false"\n',
+                "evaluation.eval_vs_random",
+            ),
+            (
+                '[logging]\ninclude_timestamps = "false"\n',
+                "logging.include_timestamps",
+            ),
+            ('[wandb]\nenabled = "false"\n', "wandb.enabled"),
+            ("[storage]\npostgres_url = 123\n", "storage.postgres_url"),
+            ("[evaluation]\nsolver_seed = true\n", "evaluation.solver_seed"),
+        ],
+    )
+    def test_wrong_toml_types_are_fatal(
+        self, monkeypatch, tmp_path, toml_text, message
+    ):
+        (tmp_path / "config.toml").write_text(toml_text)
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+
+        with pytest.raises(ValueError, match=message):
+            get_config(reload=True)
+
+    @pytest.mark.parametrize("level", ["trace", "warn", "critical"])
+    def test_unsupported_python_log_level_is_fatal(self, monkeypatch, tmp_path, level):
+        (tmp_path / "config.toml").write_text(f'[common]\nlog_level = "{level}"\n')
+        monkeypatch.chdir(tmp_path)
+        reset_config()
+
+        with pytest.raises(ValueError, match="common.log_level"):
+            get_config(reload=True)
 
 
 class TestLoggingConfigSection:

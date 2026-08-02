@@ -134,7 +134,7 @@ pub fn create_app_with_cors(state: Arc<AppState>, allowed_origins: &[String]) ->
 }
 
 /// Create the application router with the given state.
-/// Uses permissive CORS (empty allowed_origins = development mode).
+/// Uses the localhost-only development CORS allowlist.
 pub fn create_app(state: Arc<AppState>) -> Router {
     create_app_with_cors(state, &[])
 }

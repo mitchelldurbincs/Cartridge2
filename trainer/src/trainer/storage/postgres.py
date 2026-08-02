@@ -93,18 +93,33 @@ class PostgresReplayBuffer(ReplayBufferBase):
         """Get a connection from the pool."""
         return self._pool.getconn()
 
-    def _put_conn(self, conn: "PgConnection") -> None:
-        """Return a connection to the pool."""
-        self._pool.putconn(conn)
+    def _put_conn(self, conn: "PgConnection", *, close: bool = False) -> None:
+        """Return a connection to the pool, optionally discarding it."""
+        self._pool.putconn(conn, close=close)
 
     @contextmanager
     def _connection(self) -> Generator["PgConnection", None, None]:
-        """Context manager for connection pool access."""
+        """Check out a connection and return it in a reusable state.
+
+        PostgreSQL starts a transaction even for ordinary reads and leaves an
+        aborted transaction after most statement errors. Roll back on every
+        exit (a no-op after an explicit commit); if reset is impossible,
+        discard the connection instead of poisoning the next pool borrower.
+        """
         conn = self._get_conn()
         try:
             yield conn
         finally:
-            self._put_conn(conn)
+            discard = bool(getattr(conn, "closed", False))
+            if not discard:
+                try:
+                    conn.rollback()
+                except Exception:
+                    discard = True
+                    logger.exception(
+                        "Failed to reset PostgreSQL connection; discarding it"
+                    )
+            self._put_conn(conn, close=discard)
 
     def close(self) -> None:
         """Close all connections in the pool."""
@@ -115,14 +130,9 @@ class PostgresReplayBuffer(ReplayBufferBase):
         schema_sql = _load_schema()
         with self._connection() as conn:
             with conn.cursor() as cur:
-                # Execute each statement from the shared schema file
-                for statement in schema_sql.split(";"):
-                    stmt = statement.strip()
-                    # Skip empty statements and comment-only lines
-                    if not stmt or stmt.startswith("--"):
-                        continue
-                    cur.execute(stmt)
-
+                # psycopg2/PostgreSQL accept a trusted multi-statement script.
+                # Executing it intact avoids treating SQL comments as a parser.
+                cur.execute(schema_sql)
                 conn.commit()
                 logger.info("PostgreSQL schema validated/created")
 
@@ -288,17 +298,17 @@ class PostgresReplayBuffer(ReplayBufferBase):
             for row in rows
         ]
 
-    def clear_transitions(self) -> int:
-        """Delete all transitions from the buffer."""
+    def clear_transitions(self, env_id: str) -> int:
+        """Delete transitions for one environment from the buffer."""
         with self._connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM transitions")
+                cur.execute("DELETE FROM transitions WHERE env_id = %s", (env_id,))
                 count = cur.rowcount
                 conn.commit()
                 return count
 
-    def cleanup(self, window_size: int) -> int:
-        """Delete old transitions to maintain a sliding window.
+    def cleanup(self, window_size: int, *, env_id: str) -> int:
+        """Delete old transitions for one environment to maintain a sliding window.
 
         Returns the number of deleted transitions.
         """
@@ -307,13 +317,15 @@ class PostgresReplayBuffer(ReplayBufferBase):
                 cur.execute(
                     """
                     DELETE FROM transitions
-                    WHERE id NOT IN (
+                    WHERE env_id = %s
+                    AND id NOT IN (
                         SELECT id FROM transitions
+                        WHERE env_id = %s
                         ORDER BY created_at DESC
                         LIMIT %s
                     )
                     """,
-                    (window_size,),
+                    (env_id, env_id, window_size),
                 )
                 count = cur.rowcount
                 conn.commit()

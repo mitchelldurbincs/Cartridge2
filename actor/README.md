@@ -137,7 +137,7 @@ impl ReplayStore for PostgresReplayStore {
     async fn store(&self, transition: &Transition) -> Result<()>;
     async fn store_batch(&self, transitions: &[Transition]) -> Result<()>;
     async fn count(&self) -> Result<usize>;
-    async fn clear(&self) -> Result<()>;
+    async fn clear(&self, env_id: &str) -> Result<()>;
     async fn store_metadata(&self, metadata: &GameMetadata) -> Result<()>;
 }
 ```

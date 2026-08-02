@@ -64,8 +64,8 @@ pub trait ReplayStore: Send + Sync {
     /// Store or update game metadata (upsert)
     async fn store_metadata(&self, metadata: &GameMetadata) -> Result<()>;
 
-    /// Clear all transitions (preserves metadata)
-    async fn clear(&self) -> Result<()>;
+    /// Clear transitions for one environment (preserves metadata)
+    async fn clear(&self, env_id: &str) -> Result<()>;
 }
 
 /// Configuration for creating a replay store.
@@ -236,8 +236,11 @@ pub mod mock {
             Ok(())
         }
 
-        async fn clear(&self) -> Result<()> {
-            self.transitions.lock().unwrap().clear();
+        async fn clear(&self, env_id: &str) -> Result<()> {
+            self.transitions
+                .lock()
+                .unwrap()
+                .retain(|transition| transition.env_id != env_id);
             Ok(())
         }
     }
@@ -293,16 +296,18 @@ pub mod mock {
         }
 
         #[tokio::test]
-        async fn test_mock_clear() {
+        async fn test_mock_clear_only_removes_requested_environment() {
             let store = MockReplayStore::new();
-            store
-                .store_batch(&[sample_transition("t1", "ep1", 0)])
-                .await
-                .unwrap();
+            let tictactoe = sample_transition("t1", "ep1", 0);
+            let mut connect4 = sample_transition("c1", "ep2", 0);
+            connect4.env_id = "connect4".to_string();
+            store.store_batch(&[tictactoe, connect4]).await.unwrap();
 
-            store.clear().await.unwrap();
+            store.clear("tictactoe").await.unwrap();
 
-            assert_eq!(store.count().await.unwrap(), 0);
+            let remaining = store.get_transitions();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].env_id, "connect4");
         }
 
         #[tokio::test]

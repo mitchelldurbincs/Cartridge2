@@ -293,6 +293,12 @@ curl http://localhost:8080/game-info/connect4
 
 ### 5.3 Game Session
 
+> **Current ownership model:** These endpoints operate on one process-global
+> game, not on a per-client session. Requests do not carry a session identifier,
+> so all browsers share and can modify the same board. Run exactly one backend
+> replica to avoid divergent per-process games; this deployment constraint does
+> not provide isolation between users.
+
 #### GET /game/state
 
 Get the current game board state.

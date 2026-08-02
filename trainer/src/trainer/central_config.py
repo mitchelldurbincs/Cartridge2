@@ -25,13 +25,15 @@ Usage:
     print(config.training.iterations)
 """
 
+import json
 import logging
+import math
 import os
 import sys
 import threading
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args, get_origin
 
 # Use tomllib for Python 3.11+, tomli for 3.10
 if sys.version_info >= (3, 11):
@@ -118,6 +120,7 @@ class ActorConfig:
     episode_timeout_secs: int = 30
     flush_interval_secs: int = 5
     log_interval: int = 50
+    health_port: int = 8081
 
 
 @dataclass
@@ -126,6 +129,7 @@ class WebConfig:
 
     host: str = "0.0.0.0"
     port: int = 8080
+    allowed_origins: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -223,6 +227,235 @@ class Config:
     def eval_stats_path(self) -> Path:
         return self.data_dir / "eval_stats.json"
 
+    def validate(self) -> None:
+        """Reject values with unambiguous invalid or unsafe semantics."""
+
+        _require_non_empty_string("common.data_dir", self.common.data_dir)
+        _require_non_empty_string("common.env_id", self.common.env_id)
+        _require_choice(
+            "common.log_level",
+            self.common.log_level,
+            # Match the choices accepted by the Python entry points. Rust also
+            # supports trace and uses warn rather than warning.
+            {"debug", "info", "warning", "error"},
+        )
+
+        for name, value in (
+            ("training.iterations", self.training.iterations),
+            ("training.start_iteration", self.training.start_iteration),
+            (
+                "training.episodes_per_iteration",
+                self.training.episodes_per_iteration,
+            ),
+            ("training.steps_per_iteration", self.training.steps_per_iteration),
+            ("training.batch_size", self.training.batch_size),
+            ("training.checkpoint_interval", self.training.checkpoint_interval),
+            ("training.num_actors", self.training.num_actors),
+        ):
+            _require_positive_int(name, value)
+        _require_non_negative_int(
+            "training.max_checkpoints", self.training.max_checkpoints
+        )
+        _require_positive_number("training.learning_rate", self.training.learning_rate)
+        _require_non_negative_number(
+            "training.weight_decay", self.training.weight_decay
+        )
+        _require_non_negative_number(
+            "training.grad_clip_norm", self.training.grad_clip_norm
+        )
+        _require_choice(
+            "training.device",
+            self.training.device,
+            {"auto", "cpu", "cuda", "mps"},
+        )
+
+        _require_non_negative_int("evaluation.interval", self.evaluation.interval)
+        _require_positive_int("evaluation.games", self.evaluation.games)
+        _require_unit_interval(
+            "evaluation.win_threshold", self.evaluation.win_threshold
+        )
+        _require_bool("evaluation.eval_vs_random", self.evaluation.eval_vs_random)
+        _require_non_negative_int("evaluation.simulations", self.evaluation.simulations)
+        _require_non_negative_int(
+            "evaluation.solver_games", self.evaluation.solver_games
+        )
+        _require_int("evaluation.solver_seed", self.evaluation.solver_seed)
+        _require_choice(
+            "evaluation.promotion_metric",
+            self.evaluation.promotion_metric,
+            {"win_rate", "solver_optimal"},
+        )
+        _require_non_negative_number(
+            "evaluation.promotion_margin", self.evaluation.promotion_margin
+        )
+
+        _require_non_empty_string("actor.actor_id", self.actor.actor_id)
+        _require_int("actor.max_episodes", self.actor.max_episodes)
+        if self.actor.max_episodes != -1 and self.actor.max_episodes <= 0:
+            raise ValueError(
+                "actor.max_episodes must be -1 (unlimited) or greater than zero"
+            )
+        _require_positive_int(
+            "actor.episode_timeout_secs", self.actor.episode_timeout_secs
+        )
+        _require_positive_int(
+            "actor.flush_interval_secs", self.actor.flush_interval_secs
+        )
+        _require_non_negative_int("actor.log_interval", self.actor.log_interval)
+        _require_port("actor.health_port", self.actor.health_port)
+
+        _require_non_empty_string("web.host", self.web.host)
+        _require_port("web.port", self.web.port)
+        if not isinstance(self.web.allowed_origins, list) or not all(
+            isinstance(origin, str) and origin.strip()
+            for origin in self.web.allowed_origins
+        ):
+            raise ValueError("web.allowed_origins must be a list of non-empty strings")
+
+        _require_positive_int("mcts.num_simulations", self.mcts.num_simulations)
+        _require_non_negative_number("mcts.c_puct", self.mcts.c_puct)
+        _require_non_negative_number("mcts.temperature", self.mcts.temperature)
+        _require_non_negative_int("mcts.temp_threshold", self.mcts.temp_threshold)
+        _require_non_negative_number("mcts.dirichlet_alpha", self.mcts.dirichlet_alpha)
+        _require_unit_interval("mcts.dirichlet_weight", self.mcts.dirichlet_weight)
+        _require_positive_int("mcts.start_sims", self.mcts.start_sims)
+        _require_positive_int("mcts.max_sims", self.mcts.max_sims)
+        if self.mcts.start_sims > self.mcts.max_sims:
+            raise ValueError("mcts.start_sims must not exceed mcts.max_sims")
+        _require_non_negative_int("mcts.sim_ramp_rate", self.mcts.sim_ramp_rate)
+        _require_positive_int("mcts.eval_batch_size", self.mcts.eval_batch_size)
+        # Zero is documented as ONNX Runtime auto-detection.
+        _require_non_negative_int(
+            "mcts.onnx_intra_threads", self.mcts.onnx_intra_threads
+        )
+
+        _require_choice(
+            "storage.model_backend",
+            self.storage.model_backend,
+            {"filesystem", "s3"},
+        )
+        _require_non_empty_string("storage.postgres_url", self.storage.postgres_url)
+        _require_optional_string("storage.s3_bucket", self.storage.s3_bucket)
+        _require_optional_string("storage.s3_endpoint", self.storage.s3_endpoint)
+        _require_positive_int("storage.pool_max_size", self.storage.pool_max_size)
+        _require_positive_int(
+            "storage.pool_connect_timeout", self.storage.pool_connect_timeout
+        )
+        _require_positive_int(
+            "storage.pool_idle_timeout", self.storage.pool_idle_timeout
+        )
+        _require_choice("logging.format", self.logging.format, {"text", "json"})
+        _require_bool("logging.include_timestamps", self.logging.include_timestamps)
+        _require_bool("logging.include_target", self.logging.include_target)
+        _require_bool("wandb.enabled", self.wandb.enabled)
+        _require_bool("wandb.required", self.wandb.required)
+        _require_non_empty_string("wandb.project", self.wandb.project)
+        _require_string("wandb.entity", self.wandb.entity)
+        _require_string("wandb.group", self.wandb.group)
+        _require_positive_number(
+            "wandb.init_timeout_seconds", self.wandb.init_timeout_seconds
+        )
+        if not isinstance(self.wandb.tags, list) or not all(
+            isinstance(tag, str) for tag in self.wandb.tags
+        ):
+            raise ValueError("wandb.tags must be a list of strings")
+
+
+def _require_int(name: str, value: Any) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+
+
+def _require_bool(name: str, value: Any) -> None:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean")
+
+
+def _require_positive_int(name: str, value: Any) -> None:
+    _require_int(name, value)
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than zero")
+
+
+def _require_non_negative_int(name: str, value: Any) -> None:
+    _require_int(name, value)
+    if value < 0:
+        raise ValueError(f"{name} must be zero or greater")
+
+
+def _require_finite_number(name: str, value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        raise ValueError(f"{name} must be finite")
+    return numeric
+
+
+def _require_positive_number(name: str, value: Any) -> None:
+    if _require_finite_number(name, value) <= 0:
+        raise ValueError(f"{name} must be greater than zero")
+
+
+def _require_non_negative_number(name: str, value: Any) -> None:
+    if _require_finite_number(name, value) < 0:
+        raise ValueError(f"{name} must be zero or greater")
+
+
+def _require_unit_interval(name: str, value: Any) -> None:
+    numeric = _require_finite_number(name, value)
+    if not 0 <= numeric <= 1:
+        raise ValueError(f"{name} must be between zero and one")
+
+
+def _require_non_empty_string(name: str, value: Any) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+
+
+def _require_string(name: str, value: Any) -> None:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+
+
+def _require_optional_string(name: str, value: Any) -> None:
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{name} must be a string when set")
+
+
+def _require_choice(name: str, value: Any, choices: set[str]) -> None:
+    _require_non_empty_string(name, value)
+    if value not in choices:
+        expected = ", ".join(sorted(choices))
+        raise ValueError(f"{name} must be one of {expected}")
+
+
+def _require_port(name: str, value: Any) -> None:
+    _require_int(name, value)
+    if not 1 <= value <= 65535:
+        raise ValueError(f"{name} must be between 1 and 65535")
+
+
+_CONFIG_SECTION_TYPES = {
+    "common": CommonConfig,
+    "training": TrainingConfig,
+    "evaluation": EvaluationConfig,
+    "actor": ActorConfig,
+    "web": WebConfig,
+    "mcts": MctsConfig,
+    "storage": StorageConfig,
+    "logging": LoggingConfig,
+    "wandb": WandbConfig,
+}
+
+# Operational settings consumed outside the central configuration model. They
+# share a recognized section prefix, so list them explicitly to avoid reporting
+# valid deployment variables as typos.
+_NON_CENTRAL_CARTRIDGE_ENV_VARS = {
+    "CARTRIDGE_STORAGE_GCS_BUCKET",
+    "CARTRIDGE_STORAGE_REPLAY_BACKEND",
+}
+
 
 def _find_defaults_file() -> Path | None:
     """Find the config.defaults.toml file in standard locations."""
@@ -238,9 +471,9 @@ def _find_config_file() -> Path | None:
     env_path = os.environ.get("CARTRIDGE_CONFIG")
     if env_path:
         path = Path(env_path)
-        if path.exists():
-            return path
-        logger.warning(f"CARTRIDGE_CONFIG={env_path} not found, searching defaults")
+        if not path.exists():
+            raise FileNotFoundError(f"CARTRIDGE_CONFIG points to missing file: {path}")
+        return path
 
     # Search default locations
     for path in CONFIG_SEARCH_PATHS:
@@ -259,6 +492,32 @@ def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]
         else:
             result[key] = value
     return result
+
+
+def _warn_unknown_config_keys(data: dict[str, Any], source: Path) -> None:
+    """Warn about unknown TOML keys without rejecting cross-version configs."""
+    for section_name, section_data in data.items():
+        section_type = _CONFIG_SECTION_TYPES.get(section_name)
+        if section_type is None:
+            logger.warning(
+                "Unknown configuration section [%s] in %s; ignoring it",
+                section_name,
+                source,
+            )
+            continue
+        if not isinstance(section_data, dict):
+            raise ValueError(
+                f"Configuration section [{section_name}] in {source} must be a table"
+            )
+
+        valid_fields = {config_field.name for config_field in fields(section_type)}
+        for key in sorted(set(section_data) - valid_fields):
+            logger.warning(
+                "Unknown configuration key %s.%s in %s; ignoring it",
+                section_name,
+                key,
+                source,
+            )
 
 
 def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
@@ -292,13 +551,16 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
             if section not in data:
                 data[section] = {}
             # Convert to appropriate type
-            data[section][key] = _convert_value(value, section, key, data)
+            data[section][key] = _convert_value(value, section, key, env_var=env_var)
             logger.debug(f"Applied legacy override {env_var}={value}")
 
     # Apply CARTRIDGE_* overrides (higher priority)
     prefix = "CARTRIDGE_"
     for env_var, value in os.environ.items():
         if not env_var.startswith(prefix):
+            continue
+
+        if env_var in _NON_CENTRAL_CARTRIDGE_ENV_VARS:
             continue
 
         # Skip empty values
@@ -311,40 +573,84 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
             continue
 
         section, key = parts
-        if section not in data:
+        section_type = _CONFIG_SECTION_TYPES.get(section)
+        if section_type is None:
+            # Other Cartridge components use operational variables such as
+            # CARTRIDGE_TRACE_ID and CARTRIDGE_EVAL_BINARY. They are not
+            # central-config overrides.
+            continue
+        valid_fields = {config_field.name for config_field in fields(section_type)}
+        if key not in valid_fields:
+            logger.warning(
+                "Unknown central configuration environment variable %s; ignoring it",
+                env_var,
+            )
+            continue
+
+        if section not in data or not isinstance(data[section], dict):
             data[section] = {}
 
-        data[section][key] = _convert_value(value, section, key, data)
+        data[section][key] = _convert_value(value, section, key, env_var=env_var)
         logger.debug(f"Applied override {env_var}={value}")
 
     return data
 
 
-def _convert_value(value: str, section: str, key: str, data: dict) -> Any:
-    """Convert string value to appropriate type based on existing config."""
-    # Try to infer type from existing value
-    existing = data.get(section, {}).get(key)
+def _convert_value(
+    value: str,
+    section: str,
+    key: str,
+    *,
+    env_var: str,
+) -> Any:
+    """Convert an environment value using the known central-config schema."""
+    # Always derive the type from the dataclass schema. A malformed lower-
+    # priority TOML value must not change how a valid env override is parsed.
+    section_type = _CONFIG_SECTION_TYPES[section]
+    config_field = next(
+        config_field
+        for config_field in fields(section_type)
+        if config_field.name == key
+    )
+    annotation = config_field.type
+    if annotation in (bool, int, float, str):
+        expected_type: type[Any] | None = annotation
+    elif get_origin(annotation) is list:
+        expected_type = list
+    else:
+        expected_type = next(
+            (
+                candidate
+                for candidate in get_args(annotation)
+                if candidate in (bool, int, float, str, list)
+            ),
+            str,
+        )
 
-    if existing is not None:
-        if isinstance(existing, bool):
-            return value.lower() in ("true", "1", "yes")
-        elif isinstance(existing, int):
+    try:
+        if expected_type is bool:
+            normalized = value.lower()
+            if normalized in ("true", "1", "yes", "on"):
+                return True
+            if normalized in ("false", "0", "no", "off"):
+                return False
+            raise ValueError("expected true/false, 1/0, yes/no, or on/off")
+        if expected_type is int:
             return int(value)
-        elif isinstance(existing, float):
+        if expected_type is float:
             return float(value)
-
-    # Default type inference
-    if value.lower() in ("true", "false"):
-        return value.lower() == "true"
-    try:
-        return int(value)
-    except ValueError:
-        pass
-    try:
-        return float(value)
-    except ValueError:
-        pass
-    return value
+        if expected_type is list:
+            parsed = json.loads(value)
+            if not isinstance(parsed, list):
+                raise ValueError("expected a JSON array")
+            return parsed
+        return value
+    except (TypeError, ValueError) as error:
+        type_name = expected_type.__name__ if expected_type is not None else "value"
+        raise ValueError(
+            f"Invalid value {value!r} for environment variable {env_var}; "
+            f"expected {type_name}"
+        ) from error
 
 
 def _dict_to_config(data: dict[str, Any]) -> Config:
@@ -352,18 +658,15 @@ def _dict_to_config(data: dict[str, Any]) -> Config:
 
     def build_section(cls: type, section_name: str) -> Any:
         section_data = data.get(section_name, {})
+        if not isinstance(section_data, dict):
+            raise ValueError(f"Configuration section [{section_name}] must be a table")
         valid_fields = {f.name for f in fields(cls)}
         filtered = {k: v for k, v in section_data.items() if k in valid_fields}
-        ignored = sorted(k for k in section_data if k not in valid_fields)
-        if ignored:
-            logger.debug(
-                "Ignoring unsupported config keys for %s: %s",
-                section_name,
-                ", ".join(ignored),
-            )
+        # Source-specific warnings were emitted before defaults/user data were
+        # merged. Filtering here must stay silent to avoid duplicate warnings.
         return cls(**filtered)
 
-    return Config(
+    config = Config(
         common=build_section(CommonConfig, "common"),
         training=build_section(TrainingConfig, "training"),
         evaluation=build_section(EvaluationConfig, "evaluation"),
@@ -374,6 +677,8 @@ def _dict_to_config(data: dict[str, Any]) -> Config:
         logging=build_section(LoggingConfig, "logging"),
         wandb=build_section(WandbConfig, "wandb"),
     )
+    config.validate()
+    return config
 
 
 # Cached config instance
@@ -414,6 +719,7 @@ def get_config(reload: bool = False) -> Config:
             logger.debug(f"Loading defaults from {defaults_path}")
             with open(defaults_path, "rb") as f:
                 data = tomllib.load(f)
+            _warn_unknown_config_keys(data, defaults_path)
         else:
             logger.warning("No config.defaults.toml found, using hardcoded defaults")
             data = {}
@@ -424,6 +730,7 @@ def get_config(reload: bool = False) -> Config:
             logger.info(f"Loading user configuration from {config_path}")
             with open(config_path, "rb") as f:
                 user_data = tomllib.load(f)
+            _warn_unknown_config_keys(user_data, config_path)
             data = _deep_merge(data, user_data)
 
         # Step 3: Apply environment variable overrides

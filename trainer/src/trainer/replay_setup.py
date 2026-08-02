@@ -163,8 +163,11 @@ def setup_replay(trainer: "Trainer", replay, env_id: str) -> None:
         WaitTimeout: If max_wait is exceeded waiting for data.
     """
     if trainer.config.clear_replay_on_start:
-        deleted = replay.clear_transitions()
-        logger.info(f"Cleared {deleted} transitions from replay buffer before training")
+        deleted = replay.clear_transitions(env_id)
+        logger.info(
+            f"Cleared {deleted} transitions for {env_id} from replay buffer "
+            "before training"
+        )
 
     check_metadata_agrees(trainer, replay, env_id)
 
@@ -200,11 +203,11 @@ def handle_replay_cleanup(
         trainer.config.replay_window > 0
         and global_step % trainer._replay_cleanup_every == 0
     ):
-        deleted = replay.cleanup(trainer.config.replay_window)
+        deleted = replay.cleanup(trainer.config.replay_window, env_id=env_id)
         if deleted > 0:
             logger.info(
                 f"Replay cleanup removed {deleted} old transitions "
-                f"(window={trainer.config.replay_window})"
+                f"for {env_id} (window={trainer.config.replay_window})"
             )
         trainer._buffer_size_cache = replay.count(env_id=env_id)
         trainer.stats.replay_buffer_size = trainer._buffer_size_cache

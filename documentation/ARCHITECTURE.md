@@ -1030,6 +1030,14 @@ web/
 
 ### GameSession
 
+`AppState` owns one process-global `Mutex<GameSession>`. There is currently no
+client/session identifier or shared session store, so all callers of the game
+API operate on that same board. Kubernetes therefore keeps the web backend at
+one replica (with a `Recreate` rollout); multiple replicas would diverge and
+requests routed between pods would observe different games. The single-replica
+constraint does not provide user isolation—separate browsers can still reset
+or move one another's game.
+
 ```rust
 pub struct GameSession {
     ctx: EngineContext,

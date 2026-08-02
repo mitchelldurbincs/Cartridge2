@@ -322,12 +322,12 @@ impl ReplayStore for PostgresReplayStore {
         Ok(())
     }
 
-    async fn clear(&self) -> Result<()> {
+    async fn clear(&self, env_id: &str) -> Result<()> {
         let client = self.client().await?;
         client
-            .execute("DELETE FROM transitions", &[])
+            .execute("DELETE FROM transitions WHERE env_id = $1", &[&env_id])
             .await
-            .context("failed to clear transitions")?;
+            .with_context(|| format!("failed to clear transitions for game '{env_id}'"))?;
         Ok(())
     }
 }

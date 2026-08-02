@@ -1,5 +1,7 @@
 # Production overlay
-# Higher replicas, production-grade settings, external storage
+# Higher actor capacity, production-grade settings, external storage.
+# The web backend intentionally remains at the base's single replica because
+# its GameSession is process-local; see k8s/README.md.
 #
 # Deploy with: kubectl apply -k k8s/overlays/prod
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -73,6 +75,23 @@ patches:
       kind: PersistentVolumeClaim
       name: models-shared
 
+  # Override production training settings on the base ConfigMap. This is a
+  # resource patch rather than a configMapGenerator merge because the base is
+  # a checked-in ConfigMap, not a generated resource.
+  - patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: cartridge-config
+      data:
+        TRAINING_ITERATIONS: "1000"
+        EPISODES_PER_ITERATION: "1000"
+        STEPS_PER_ITERATION: "800"
+        MCTS_MAX_SIMS: "800"
+    target:
+      kind: ConfigMap
+      name: cartridge-config
+
   # Use EFS storage class for ReadWriteMany (AWS)
   - patch: |-
       apiVersion: v1
@@ -96,14 +115,3 @@ images:
   - name: cartridge-frontend
     newName: your-registry.example.com/cartridge/frontend
     newTag: v1.0.0
-
-# Production ConfigMap patches
-configMapGenerator:
-  - name: cartridge-config
-    behavior: merge
-    literals:
-      # Production training settings
-      - TRAINING_ITERATIONS=1000
-      - EPISODES_PER_ITERATION=1000
-      - STEPS_PER_ITERATION=800
-      - MCTS_MAX_SIMS=800

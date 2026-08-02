@@ -370,12 +370,14 @@ Highest to lowest:
 
 ### Gotchas worth knowing
 
-- **The two languages do not honour the same env vars.** Python parses
-  `CARTRIDGE_<SECTION>_<KEY>` generically, so anything can be overridden. Rust
-  matches an explicit list in `engine/engine-config/src/loader.rs`, so keys
-  outside it — `logging.format`, the MCTS ramping keys, `num_actors`,
-  `allowed_origins`, `health_port` — are honoured by the trainer but **ignored
-  by the actor and web server**. Put those in `config.toml`.
+- **Rust enumerates its environment variables explicitly.** Every field in the
+  Rust `CentralConfig` has a `CARTRIDGE_<SECTION>_<KEY>` override in
+  `engine/engine-config/src/loader.rs`; list values such as `allowed_origins`
+  use JSON array syntax. Python additionally supports its Python-only fields.
+- **Invalid requested configuration fails startup.** A non-empty explicit
+  `CARTRIDGE_CONFIG` must exist and parse successfully, and non-empty known env
+  overrides must have the declared type and a valid range. Empty environment
+  placeholders remain unset for Docker Compose compatibility.
 - **`[wandb]` and the solver-eval keys are Python-only.** They have no
   counterpart in the Rust `CentralConfig`, so setting them does nothing for the
   actor or web server.

@@ -46,11 +46,13 @@ class FakeReplayBuffer:
     def __init__(self, transitions: int = 0):
         self.transitions = transitions
         self.clear_calls = 0
+        self.cleared_env_ids = []
         self.vacuum_calls = 0
         self.close_calls = 0
 
-    def clear_transitions(self) -> int:
+    def clear_transitions(self, env_id: str) -> int:
         self.clear_calls += 1
+        self.cleared_env_ids.append(env_id)
         return 0
 
     def vacuum(self) -> None:
@@ -265,6 +267,7 @@ class TestOrchestratorComposition:
         assert stats.transitions_generated == 5
         assert stats.eval_win_rate is None  # eval ran without a model
         assert buffer.clear_calls == 1
+        assert buffer.cleared_env_ids == ["tictactoe"]
         assert buffer.vacuum_calls == 1
         assert buffer.close_calls == 1
         with open(config.loop_stats_path) as f:

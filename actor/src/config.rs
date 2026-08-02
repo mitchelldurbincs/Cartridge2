@@ -5,8 +5,10 @@
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
-use once_cell::sync::Lazy;
+use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
+use std::str::FromStr;
 use std::time::Duration;
 use tracing::level_filters::LevelFilter;
 
@@ -14,59 +16,90 @@ use crate::storage::PoolConfig;
 use engine_config::{load_config, CentralConfig};
 
 // Load central config once at startup
-static CENTRAL_CONFIG: Lazy<CentralConfig> = Lazy::new(load_config);
+static CENTRAL_CONFIG: OnceCell<CentralConfig> = OnceCell::new();
+
+/// Load and validate central configuration before clap evaluates its defaults.
+pub fn initialize_central_config() -> Result<&'static CentralConfig> {
+    CENTRAL_CONFIG.get_or_try_init(|| load_config().map_err(anyhow::Error::from))
+}
 
 /// Central config.toml settings, loaded once per process.
 pub fn central_config() -> &'static CentralConfig {
-    &CENTRAL_CONFIG
+    initialize_central_config().expect("central configuration must be valid")
+}
+
+fn env_string(key: &'static str) -> Option<String> {
+    match std::env::var(key) {
+        Ok(value) if value.is_empty() => None,
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("invalid value for environment variable {key}: expected valid Unicode")
+        }
+    }
+}
+
+fn env_or<T>(key: &'static str, fallback: T) -> T
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    let Some(value) = env_string(key) else {
+        return fallback;
+    };
+    parse_env_value(key, &value).unwrap_or_else(|message| panic!("{message}"))
+}
+
+fn parse_env_value<T>(key: &'static str, value: &str) -> std::result::Result<T, String>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    value
+        .parse()
+        .map_err(|error| format!("invalid value {value:?} for environment variable {key}: {error}"))
 }
 
 // Default value functions - env var -> central config fallback
 fn default_actor_id() -> String {
-    std::env::var("ACTOR_ACTOR_ID").unwrap_or_else(|_| CENTRAL_CONFIG.actor.actor_id.clone())
+    env_string("ACTOR_ACTOR_ID").unwrap_or_else(|| central_config().actor.actor_id.clone())
 }
 
 fn default_env_id() -> String {
-    std::env::var("ACTOR_ENV_ID").unwrap_or_else(|_| CENTRAL_CONFIG.common.env_id.clone())
+    env_string("ACTOR_ENV_ID").unwrap_or_else(|| central_config().common.env_id.clone())
 }
 
 fn default_max_episodes() -> i32 {
-    std::env::var("ACTOR_MAX_EPISODES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(CENTRAL_CONFIG.actor.max_episodes)
+    env_or("ACTOR_MAX_EPISODES", central_config().actor.max_episodes)
 }
 
 fn default_episode_timeout() -> u64 {
-    std::env::var("ACTOR_EPISODE_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(CENTRAL_CONFIG.actor.episode_timeout_secs)
+    env_or(
+        "ACTOR_EPISODE_TIMEOUT",
+        central_config().actor.episode_timeout_secs,
+    )
 }
 
 fn default_flush_interval() -> u64 {
-    std::env::var("ACTOR_FLUSH_INTERVAL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(CENTRAL_CONFIG.actor.flush_interval_secs)
+    env_or(
+        "ACTOR_FLUSH_INTERVAL",
+        central_config().actor.flush_interval_secs,
+    )
 }
 
 fn default_log_level() -> String {
-    std::env::var("ACTOR_LOG_LEVEL").unwrap_or_else(|_| CENTRAL_CONFIG.common.log_level.clone())
+    env_string("ACTOR_LOG_LEVEL").unwrap_or_else(|| central_config().common.log_level.clone())
 }
 
 fn default_log_interval() -> u32 {
-    std::env::var("ACTOR_LOG_INTERVAL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(CENTRAL_CONFIG.actor.log_interval)
+    env_or("ACTOR_LOG_INTERVAL", central_config().actor.log_interval)
 }
 
 fn default_postgres_url() -> String {
-    std::env::var("CARTRIDGE_STORAGE_POSTGRES_URL")
-        .or_else(|_| std::env::var("ACTOR_POSTGRES_URL"))
-        .unwrap_or_else(|_| {
-            CENTRAL_CONFIG
+    env_string("CARTRIDGE_STORAGE_POSTGRES_URL")
+        .or_else(|| env_string("ACTOR_POSTGRES_URL"))
+        .unwrap_or_else(|| {
+            central_config()
                 .storage
                 .postgres_url
                 .clone()
@@ -77,43 +110,40 @@ fn default_postgres_url() -> String {
 }
 
 fn default_data_dir() -> String {
-    std::env::var("ACTOR_DATA_DIR").unwrap_or_else(|_| CENTRAL_CONFIG.common.data_dir.clone())
+    env_string("ACTOR_DATA_DIR").unwrap_or_else(|| central_config().common.data_dir.clone())
 }
 
 fn default_num_simulations() -> u32 {
-    std::env::var("ACTOR_NUM_SIMULATIONS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(CENTRAL_CONFIG.mcts.num_simulations)
+    env_or(
+        "ACTOR_NUM_SIMULATIONS",
+        central_config().mcts.num_simulations,
+    )
 }
 
 fn default_temp_threshold() -> u32 {
-    std::env::var("ACTOR_TEMP_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
+    env_or("ACTOR_TEMP_THRESHOLD", central_config().mcts.temp_threshold)
 }
 
 fn default_eval_batch_size() -> usize {
-    std::env::var("ACTOR_EVAL_BATCH_SIZE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(CENTRAL_CONFIG.mcts.eval_batch_size)
+    env_or(
+        "ACTOR_EVAL_BATCH_SIZE",
+        central_config().mcts.eval_batch_size,
+    )
 }
 
 fn default_onnx_intra_threads() -> usize {
-    std::env::var("ACTOR_ONNX_INTRA_THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(CENTRAL_CONFIG.mcts.onnx_intra_threads)
+    env_or(
+        "ACTOR_ONNX_INTRA_THREADS",
+        central_config().mcts.onnx_intra_threads,
+    )
 }
 
 fn default_health_port() -> u16 {
-    std::env::var("ACTOR_HEALTH_PORT")
-        .or_else(|_| std::env::var("HEALTH_PORT"))
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(CENTRAL_CONFIG.actor.health_port)
+    if let Some(value) = env_string("ACTOR_HEALTH_PORT") {
+        return parse_env_value("ACTOR_HEALTH_PORT", &value)
+            .unwrap_or_else(|message| panic!("{message}"));
+    }
+    env_or("HEALTH_PORT", central_config().actor.health_port)
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize)]
@@ -195,11 +225,16 @@ impl Default for Config {
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
-        if self.actor_id.is_empty() {
+        if self.actor_id.trim().is_empty() {
             return Err(anyhow!("actor_id cannot be empty"));
         }
-        if self.env_id.is_empty() {
+        if self.env_id.trim().is_empty() {
             return Err(anyhow!("env_id cannot be empty"));
+        }
+        if self.max_episodes != -1 && self.max_episodes <= 0 {
+            return Err(anyhow!(
+                "max_episodes must be -1 (unlimited) or greater than 0"
+            ));
         }
         if self.episode_timeout_secs == 0 {
             return Err(anyhow!("episode_timeout_secs must be greater than 0"));
@@ -213,8 +248,20 @@ impl Config {
                 self.log_level
             ));
         }
-        if self.postgres_url.is_empty() {
+        if self.data_dir.trim().is_empty() {
+            return Err(anyhow!("data_dir cannot be empty"));
+        }
+        if self.num_simulations == 0 {
+            return Err(anyhow!("num_simulations must be greater than 0"));
+        }
+        if self.eval_batch_size == 0 {
+            return Err(anyhow!("eval_batch_size must be greater than 0"));
+        }
+        if self.postgres_url.trim().is_empty() {
             return Err(anyhow!("postgres_url cannot be empty"));
+        }
+        if self.health_port == 0 {
+            return Err(anyhow!("health_port must be greater than 0"));
         }
 
         Ok(())
@@ -237,9 +284,9 @@ impl Config {
     /// Get the connection pool configuration from central config.
     pub fn pool_config(&self) -> PoolConfig {
         PoolConfig {
-            max_size: CENTRAL_CONFIG.storage.pool_max_size,
-            connect_timeout_secs: CENTRAL_CONFIG.storage.pool_connect_timeout,
-            idle_timeout_secs: CENTRAL_CONFIG.storage.pool_idle_timeout,
+            max_size: central_config().storage.pool_max_size,
+            connect_timeout_secs: central_config().storage.pool_connect_timeout,
+            idle_timeout_secs: central_config().storage.pool_idle_timeout,
         }
     }
 }
@@ -336,6 +383,45 @@ mod tests {
         let mut cfg = base_config();
         cfg.max_episodes = -1;
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_other_non_positive_max_episodes() {
+        for value in [-2, 0] {
+            let mut cfg = base_config();
+            cfg.max_episodes = value;
+            assert!(cfg
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("max_episodes"));
+        }
+    }
+
+    #[test]
+    fn validate_rejects_zero_mcts_work_sizes() {
+        let mut cfg = base_config();
+        cfg.num_simulations = 0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("num_simulations"));
+
+        let mut cfg = base_config();
+        cfg.eval_batch_size = 0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("eval_batch_size"));
+    }
+
+    #[test]
+    fn invalid_legacy_numeric_value_is_rejected_instead_of_falling_back() {
+        let error = parse_env_value::<u32>("ACTOR_NUM_SIMULATIONS", "many").unwrap_err();
+        assert!(error.contains("ACTOR_NUM_SIMULATIONS"));
+        assert!(error.contains("many"));
     }
 
     #[test]

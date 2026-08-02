@@ -48,7 +48,7 @@ health_port = 8081        # Port for health check HTTP server
 [web]
 host = "0.0.0.0"
 port = 8080
-# CORS allowed origins (empty = allow all origins with warning for development)
+# CORS allowed origins (empty = localhost-only development allowlist)
 # Production: set to ["https://your-domain.com"]
 allowed_origins = []
 

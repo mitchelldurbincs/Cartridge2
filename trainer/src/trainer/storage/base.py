@@ -149,10 +149,13 @@ class ReplayBufferBase(ABC):
         pass
 
     @abstractmethod
-    def clear_transitions(self) -> int:
-        """Delete all transitions from the buffer.
+    def clear_transitions(self, env_id: str) -> int:
+        """Delete transitions for one environment from the buffer.
 
         Preserves game_metadata. Used for synchronized AlphaZero training.
+
+        Args:
+            env_id: Environment whose transitions should be deleted.
 
         Returns:
             Number of deleted transitions.
@@ -160,11 +163,12 @@ class ReplayBufferBase(ABC):
         pass
 
     @abstractmethod
-    def cleanup(self, window_size: int) -> int:
-        """Delete old transitions to maintain a sliding window.
+    def cleanup(self, window_size: int, *, env_id: str) -> int:
+        """Delete old transitions for one environment to maintain a sliding window.
 
         Args:
             window_size: Maximum number of transitions to keep.
+            env_id: Environment whose replay window should be trimmed.
 
         Returns:
             Number of deleted transitions.

@@ -11,11 +11,13 @@ wrapper class was chosen over ``functools.partial`` so
 from this module (cli.py and test imports stay untouched) and
 isinstance/type checks keep working.
 
-Factory bindings (pre-move behavior, verbatim):
+Factory bindings (with a local replay-scope safety adaptation):
 
 - ``replay_buffer_factory``: this repo's ``storage.create_replay_buffer``,
-  resolved from this module's globals at construction time (pre-move test
-  seam preserved: monkeypatching that name here still takes effect).
+  wrapped with the configured environment ID so crucible's environment-agnostic
+  replay lifecycle calls cannot clear another game's data. The factory is
+  resolved from this module's globals at construction time (pre-move test seam
+  preserved: monkeypatching that name here still takes effect).
 - ``trainer_factory``: ``_make_trainer`` converts the core ``TrainSpec``
   into a real ``TrainerConfig`` field-for-field and builds a ``Trainer``;
   the import stays lazy (as pre-move) and resolves at call time, so
@@ -79,6 +81,28 @@ def _start_iteration_trace() -> str:
     return trace_id
 
 
+class _EnvironmentScopedReplayBuffer:
+    """Bind crucible's replay lifecycle API to one Cartridge2 environment.
+
+    The extracted orchestrator predates Cartridge2's multi-game replay table
+    and calls ``clear_transitions()`` without a scope. Keep that core API
+    compatible while making the actual storage operation environment-safe.
+    """
+
+    def __init__(self, replay, env_id: str):
+        self._replay = replay
+        self._env_id = env_id
+
+    def clear_transitions(self) -> int:
+        return self._replay.clear_transitions(self._env_id)
+
+    def cleanup(self, window_size: int) -> int:
+        return self._replay.cleanup(window_size, env_id=self._env_id)
+
+    def __getattr__(self, name):
+        return getattr(self._replay, name)
+
+
 class Orchestrator(_CoreOrchestrator):
     """Cartridge2 Orchestrator: the core loop with this repo's backends bound.
 
@@ -87,9 +111,12 @@ class Orchestrator(_CoreOrchestrator):
     """
 
     def __init__(self, config: LoopConfig):
+        def replay_buffer_factory():
+            return _EnvironmentScopedReplayBuffer(create_replay_buffer(), config.env_id)
+
         super().__init__(
             config,
-            replay_buffer_factory=create_replay_buffer,
+            replay_buffer_factory=replay_buffer_factory,
             trainer_factory=_make_trainer,
             actor_runner_factory=ActorRunner,
             eval_runner_factory=EvalRunner,

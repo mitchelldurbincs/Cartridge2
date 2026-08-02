@@ -8,11 +8,17 @@ the buffer's observations do not match the network's input layout.
 
 import logging
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
 from trainer.game_config import get_config
-from trainer.replay_setup import MetadataMismatch, check_metadata_agrees
+from trainer.replay_setup import (
+    MetadataMismatch,
+    check_metadata_agrees,
+    handle_replay_cleanup,
+    setup_replay,
+)
 
 
 class FakeReplay:
@@ -28,6 +34,41 @@ class FakeReplay:
 class FakeTrainer:
     def __init__(self, config):
         self.game_config = config
+
+
+class LifecycleReplay(FakeReplay):
+    """Replay stand-in that records destructive-operation scopes."""
+
+    def __init__(self, metadata, count=8):
+        super().__init__(metadata)
+        self.transition_count = count
+        self.clear_calls = []
+        self.cleanup_calls = []
+
+    def clear_transitions(self, env_id):
+        self.clear_calls.append(env_id)
+        return 3
+
+    def cleanup(self, window_size, *, env_id):
+        self.cleanup_calls.append((window_size, env_id))
+        return 2
+
+    def count(self, env_id):
+        return self.transition_count
+
+
+def lifecycle_trainer(env_id="connect4"):
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            clear_replay_on_start=True,
+            batch_size=4,
+            replay_window=100,
+        ),
+        game_config=get_config(env_id),
+        stats=SimpleNamespace(replay_buffer_size=0),
+        _buffer_size_cache=0,
+        _replay_cleanup_every=10,
+    )
 
 
 def trainer_for(env_id="connect4"):
@@ -107,3 +148,23 @@ def test_cosmetic_mismatch_only_warns(caplog):
 
     assert "display_name" in caplog.text
     assert trainer.game_config is config
+
+
+def test_setup_replay_clears_only_the_requested_environment():
+    trainer = lifecycle_trainer()
+    replay = LifecycleReplay(trainer.game_config)
+
+    setup_replay(trainer, replay, "connect4")
+
+    assert replay.clear_calls == ["connect4"]
+    assert trainer._buffer_size_cache == 8
+
+
+def test_periodic_cleanup_trims_only_the_requested_environment():
+    trainer = lifecycle_trainer()
+    replay = LifecycleReplay(trainer.game_config)
+
+    handle_replay_cleanup(trainer, global_step=20, replay=replay, env_id="connect4")
+
+    assert replay.cleanup_calls == [(100, "connect4")]
+    assert trainer._buffer_size_cache == 8

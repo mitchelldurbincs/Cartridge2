@@ -141,6 +141,14 @@ For actual Kubernetes deployment the Kustomize manifests are in `k8s/`:
 kubectl apply -k k8s/overlays/dev
 ```
 
+> **Web backend safety constraint:** Keep the `web` Deployment at one replica.
+> Its game state is currently a single process-local `GameSession`, with no
+> client/session identifier or shared state store. The checked-in manifest uses
+> one replica and a `Recreate` rollout so requests cannot be routed between
+> divergent backend processes. This still does not isolate users: all browsers
+> share that one game and can reset or move one another's board. Treat the game
+> API as trusted single-user functionality until per-session ownership exists.
+
 See `k8s/README.md` for details, and `terraform/README.md` for GCP infrastructure provisioning.
 
 ## Storage Backends
@@ -175,11 +183,15 @@ All deployment modes read from `config.toml`. See `engine/engine-config/SCHEMA.m
 4. `config.defaults.toml` — checked-in defaults, and the source of truth for
    every key (lowest)
 
-> **Caveat:** Rust honours only an explicit list of `CARTRIDGE_*` variables
-> (`engine/engine-config/src/loader.rs`), while the Python trainer parses them
-> generically. Keys outside that list — `logging.format`, the MCTS ramping keys,
-> `num_actors`, `allowed_origins`, `health_port` — take effect for the trainer
-> but are ignored by the actor and web server. Set those in `config.toml`.
+> Rust enumerates `CARTRIDGE_*` variables explicitly in
+> `engine/engine-config/src/loader.rs`, with one override for every field in its
+> `CentralConfig`. List overrides such as `CARTRIDGE_WEB_ALLOWED_ORIGINS` use a
+> JSON array. Python additionally supports its Python-only fields.
 >
 > `[wandb]` and the solver-eval keys (`solver_games`, `solver_seed`,
 > `promotion_metric`, `promotion_margin`) are read only by the Python trainer.
+
+A non-empty explicit `CARTRIDGE_CONFIG` path must exist and parse successfully.
+Known, non-empty environment overrides are parsed and range-checked at startup;
+malformed values stop the process. Empty `${VALUE:-}` placeholders remain unset
+and defer to the file/default value.

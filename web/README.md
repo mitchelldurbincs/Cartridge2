@@ -18,6 +18,15 @@ Minimal web interface for playing the currently configured game (`common.env_id`
               └──────────┘              └──────────────┘
 ```
 
+## Runtime state limitation
+
+The backend currently keeps exactly one `GameSession` in process-wide
+`AppState`. The API has no browser/session identifier, so every client talks to
+the same board. Deploy exactly one backend process: multiple replicas would
+hold divergent boards and a load balancer could route consecutive requests to
+different games. One replica avoids that cross-process failure but does not
+isolate users; one client can still reset or move another client's game.
+
 ## API Endpoints
 
 | Endpoint | Method | Description |

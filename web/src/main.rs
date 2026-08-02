@@ -38,7 +38,7 @@ pub use startup::{create_app, create_app_with_cors, AppState, ModelInfo, OnnxEva
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Load configuration first (needed for logging config)
-    let config = load_config();
+    let config = load_config()?;
 
     // Initialize tracing with JSON support for cloud deployments
     engine_config::init_tracing("info", &["web=info"], &config.logging);

@@ -312,7 +312,7 @@ pub struct WebConfig {
     pub host: String,
     #[serde(default = "d_port")]
     pub port: u16,
-    /// CORS allowed origins. Empty = allow all origins (development mode with warning).
+    /// CORS allowed origins. Empty uses the localhost-only development allowlist.
     /// Set to specific domains in production (e.g., ["https://your-domain.com"]).
     #[serde(default = "d_allowed_origins")]
     pub allowed_origins: Vec<String>,
