@@ -302,15 +302,21 @@ impl State {
             };
 
             if !opponent_has_moves {
-                // Both players have no moves - game ends
+                // Neither player can move - game ends here, without needing
+                // either of them to execute a pass.
                 new_state.determine_winner();
-            } else {
-                // Current player must pass, but opponent had moves
-                // This is the first pass - increment and continue
-                new_state.pass_count = 1;
-                // Note: The frontend/web layer should detect this and auto-pass
-                // or the next move attempt will be PASS_ACTION
             }
+            // Otherwise the current player must pass, but the game continues.
+            //
+            // pass_count is deliberately NOT touched here. It counts passes
+            // that were actually *executed*, and this player has not passed
+            // yet -- PASS_ACTION is merely their only legal move. Pre-setting
+            // it to 1 meant their explicit pass incremented it to 2, which
+            // `make_move` reads as "two consecutive passes" and ends the game
+            // one move later. That truncated 80 of 200 random playouts, in one
+            // case while the opponent still had 13 legal board moves, and
+            // every truncated game contributed a wrong final score as the
+            // value target for all of its transitions.
         }
 
         new_state

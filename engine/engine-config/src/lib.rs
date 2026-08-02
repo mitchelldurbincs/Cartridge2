@@ -38,7 +38,7 @@ mod structs;
 
 pub use defaults::*;
 pub use loader::{
-    apply_env_overrides, load_config, load_from_path, try_load_config, ConfigError,
+    apply_env_overrides, init_config, load_config, load_from_path, try_load_config, ConfigError,
     CONFIG_SEARCH_PATHS,
 };
 pub use logging::init_tracing;

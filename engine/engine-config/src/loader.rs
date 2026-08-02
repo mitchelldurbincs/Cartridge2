@@ -23,6 +23,15 @@ pub const CONFIG_SEARCH_PATHS: &[&str] = &[
 /// operator mistake.
 #[derive(Debug)]
 pub enum ConfigError {
+    /// `CARTRIDGE_CONFIG` named a file that does not exist.
+    ///
+    /// Distinct from "no config anywhere", which is fine: setting the variable
+    /// is an explicit statement that *this* file is the configuration. Falling
+    /// back to defaults in that case answers a request the operator did not
+    /// make -- typically a typo'd path or a volume that failed to mount, and
+    /// the result is a process silently running on none of its intended
+    /// settings.
+    ExplicitPathMissing { path: PathBuf },
     /// The file exists but could not be read.
     Read {
         path: PathBuf,
@@ -39,7 +48,9 @@ impl ConfigError {
     /// The config file the error refers to.
     pub fn path(&self) -> &Path {
         match self {
-            ConfigError::Read { path, .. } | ConfigError::Parse { path, .. } => path,
+            ConfigError::ExplicitPathMissing { path }
+            | ConfigError::Read { path, .. }
+            | ConfigError::Parse { path, .. } => path,
         }
     }
 }
@@ -47,6 +58,11 @@ impl ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ConfigError::ExplicitPathMissing { path } => write!(
+                f,
+                "CARTRIDGE_CONFIG points at {}, which does not exist",
+                path.display()
+            ),
             ConfigError::Read { path, source } => {
                 write!(f, "failed to read config file {}: {source}", path.display())
             }
@@ -62,8 +78,10 @@ impl fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {
+    #[allow(clippy::match_same_arms)]
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            ConfigError::ExplicitPathMissing { .. } => None,
             ConfigError::Read { source, .. } => Some(source),
             ConfigError::Parse { source, .. } => Some(source),
         }
@@ -77,28 +95,32 @@ impl std::error::Error for ConfigError {
 /// 2. Current directory (config.toml)
 /// 3. Parent directory (../config.toml)
 /// 4. Docker container path (/app/config.toml)
-fn find_config_file() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("CARTRIDGE_CONFIG") {
-        let path = PathBuf::from(&path);
-        if path.exists() {
+///
+/// A `CARTRIDGE_CONFIG` that names a missing file is an error, not a reason to
+/// keep searching: the variable is an explicit choice of configuration, so
+/// silently using a different one (or none) is never what was asked for.
+/// Finding nothing at all, by contrast, is normal and yields `Ok(None)`.
+fn find_config_file() -> Result<Option<PathBuf>, ConfigError> {
+    if let Ok(raw) = std::env::var("CARTRIDGE_CONFIG") {
+        if !raw.is_empty() {
+            let path = PathBuf::from(&raw);
+            if !path.exists() {
+                return Err(ConfigError::ExplicitPathMissing { path });
+            }
             info!("Loading config from CARTRIDGE_CONFIG: {}", path.display());
-            return Some(path);
+            return Ok(Some(path));
         }
-        warn!(
-            "CARTRIDGE_CONFIG={} not found, searching defaults",
-            path.display()
-        );
     }
 
     for path_str in CONFIG_SEARCH_PATHS {
         let path = PathBuf::from(path_str);
         if path.exists() {
             info!("Loading config from {}", path.display());
-            return Some(path);
+            return Ok(Some(path));
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// Load the central configuration, reporting a broken config file as an error.
@@ -114,7 +136,7 @@ fn find_config_file() -> Option<PathBuf> {
 /// (from the compile-time embed of `config.defaults.toml`) with environment
 /// overrides applied.
 pub fn try_load_config() -> Result<CentralConfig, ConfigError> {
-    match find_config_file() {
+    match find_config_file()? {
         Some(path) => load_from_path(&path),
         None => {
             debug!("No config.toml found, using built-in defaults");
@@ -123,14 +145,41 @@ pub fn try_load_config() -> Result<CentralConfig, ConfigError> {
     }
 }
 
+/// The configuration installed by [`init_config`], if it has run.
+static INSTALLED: std::sync::OnceLock<CentralConfig> = std::sync::OnceLock::new();
+
+/// Validate the configuration and install it process-wide.
+///
+/// Binaries should call this once at startup, at a point where they can still
+/// fail. Beyond validating, it *seeds* the value that later infallible
+/// [`load_config`] calls return, so the file is read exactly once.
+///
+/// That matters for more than efficiency. The actor's `Lazy<CentralConfig>` is
+/// forced later, from clap `default_value_t` expressions; without seeding, that
+/// is a second independent read of the same path. A config file replaced
+/// between the two reads -- an atomic rewrite, a remounted volume -- would pass
+/// validation and then be re-read as something else, or fail the second read
+/// and fall back to defaults silently. Reading once removes the window.
+pub fn init_config() -> Result<&'static CentralConfig, ConfigError> {
+    if let Some(config) = INSTALLED.get() {
+        return Ok(config);
+    }
+    let config = try_load_config()?;
+    Ok(INSTALLED.get_or_init(|| config))
+}
+
 /// Load the central configuration from config.toml, falling back to defaults.
 ///
 /// Retained for callers that cannot propagate an error -- notably the actor's
 /// `Lazy<CentralConfig>`, which is forced from clap `default_value_t`
-/// expressions. Those callers must run [`try_load_config`] first, at a point
-/// where they *can* fail, so a broken file has already aborted startup by the
-/// time this runs. Prefer [`try_load_config`] everywhere else.
+/// expressions. Those callers must run [`init_config`] first, at a point where
+/// they *can* fail: a broken file has then already aborted startup, and this
+/// returns the very value that was validated rather than re-reading it.
+/// Prefer [`init_config`] or [`try_load_config`] everywhere else.
 pub fn load_config() -> CentralConfig {
+    if let Some(config) = INSTALLED.get() {
+        return config.clone();
+    }
     match try_load_config() {
         Ok(config) => config,
         Err(e) => {

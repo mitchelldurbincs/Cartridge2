@@ -52,9 +52,11 @@ async fn main() -> Result<()> {
     // most damagingly resets env_id and fills the replay buffer with a
     // different game than the trainer expects.
     //
-    // The result is discarded: this call only decides whether to continue.
-    // Config::parse() re-reads the same (now known-good) file.
-    engine_config::try_load_config()?;
+    // init_config also *installs* what it validated, so the Lazy that
+    // Config::parse() forces returns this exact value instead of reading the
+    // file a second time -- closing the window where a config replaced between
+    // the two reads would be validated but not used.
+    engine_config::init_config()?;
 
     // Parse configuration
     let config = Config::parse();

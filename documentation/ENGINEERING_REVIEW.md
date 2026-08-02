@@ -131,6 +131,35 @@ actor/ (binary)                          web/ (binary)                          
 
 ---
 
+#### C0. Othello ends the game after a single forced pass
+
+- **Severity:** Critical
+- **Confidence:** Confirmed (reproduced — 80 of 200 random playouts)
+- **Location:** `engine/games-othello/src/lib.rs`, the pass handling in `make_move`
+- **Found by:** code review of PR #145, not by the original review pass. It predates that
+  PR; nothing in it caused or touched this.
+- **Current behavior:** when a move left the next player without legal moves, `make_move`
+  pre-set `pass_count = 1`. That player's only legal move is `PASS_ACTION`; executing it
+  incremented the counter to 2, which `make_move` reads as "two consecutive passes" and
+  ends the game — while the opponent still had moves. One measured case ended with 13
+  legal board moves remaining.
+- **Why it is a problem:** `pass_count` is meant to count passes that were *executed*.
+  Conflating "must pass" with "has passed" halves the number of passes needed to end a
+  game. 40% of random playouts terminated early, and every one of them scored the board at
+  an arbitrary midpoint. That score is the value target for **every transition in the
+  episode**, so the damage is not one bad label but a whole poisoned game.
+- **Realistic consequence:** any Othello model trained before this fix learned from a
+  replay buffer where roughly 40% of games ended early with a fabricated result.
+  **Existing Othello replay data and checkpoints should be regenerated.** The engine's own
+  test suite passed throughout — nothing asserted the terminal condition.
+- **Recommended change:** leave `pass_count` at zero until a pass is actually executed. The
+  "neither player can move" case already ends the game directly and needs no counter.
+- **Status: FIXED** — plus four regression tests, two of which fail on the old code: one
+  asserts the real Othello terminal condition (neither player has moves), the other that a
+  forced pass does not pre-increment the counter.
+
+---
+
 #### C1. `_ensure_schema()` silently skips every statement in `sql/schema.sql`
 
 - **Severity:** Critical

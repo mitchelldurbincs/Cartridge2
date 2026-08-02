@@ -626,3 +626,128 @@ fn test_state_encoding_roundtrip_pass_state() {
     let decoded = Othello::decode_state(&buf).unwrap();
     assert_eq!(terminal, decoded);
 }
+
+// ============================================================================
+// Pass handling
+//
+// `pass_count` counts passes that were actually *executed*. Two consecutive
+// ones end the game. It used to be pre-set to 1 the moment a player was left
+// without moves, so their explicit pass incremented it to 2 and ended the game
+// a move later -- while the opponent still had legal moves. 40% of random
+// playouts terminated early, each contributing a wrong final score as the
+// value target for every one of its transitions.
+// ============================================================================
+
+/// A game may only end when neither player can move (or the board is full).
+///
+/// This is the real Othello terminal condition, asserted directly rather than
+/// via `pass_count` bookkeeping, so it holds regardless of how passes are
+/// tracked internally.
+#[test]
+fn test_terminal_states_have_no_legal_moves_for_either_player() {
+    use rand::seq::SliceRandom;
+
+    for seed in 0..200u64 {
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
+        let mut state = State::new();
+
+        for _ in 0..200 {
+            if state.is_done() {
+                let board_moves = |player| {
+                    State {
+                        board: state.board,
+                        current_player: player,
+                        winner: 0,
+                        pass_count: 0,
+                    }
+                    .legal_moves()
+                    .iter()
+                    .filter(|&&m| m != PASS_ACTION)
+                    .count()
+                };
+
+                assert_eq!(
+                    (board_moves(1), board_moves(2)),
+                    (0, 0),
+                    "seed {seed}: game ended while a player still had moves \
+                     (p1={}, p2={}, {} discs placed)",
+                    board_moves(1),
+                    board_moves(2),
+                    state.board.iter().filter(|&&c| c != 0).count(),
+                );
+                break;
+            }
+
+            let moves = state.legal_moves();
+            let Some(&action) = moves.choose(&mut rng) else {
+                break;
+            };
+            state = state.make_move(action);
+        }
+    }
+}
+
+/// Being *forced* to pass is not the same as having passed.
+#[test]
+fn test_a_forced_pass_does_not_pre_increment_pass_count() {
+    use rand::seq::SliceRandom;
+
+    let mut forced_passes_seen = 0;
+    for seed in 0..200u64 {
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
+        let mut state = State::new();
+
+        for _ in 0..200 {
+            if state.is_done() {
+                break;
+            }
+            let moves = state.legal_moves();
+            if moves == vec![PASS_ACTION] {
+                // Pass is the only legal move, but it has not been played yet.
+                assert_eq!(
+                    state.pass_count, 0,
+                    "seed {seed}: pass_count incremented before the pass was executed"
+                );
+                forced_passes_seen += 1;
+            }
+            let Some(&action) = moves.choose(&mut rng) else {
+                break;
+            };
+            state = state.make_move(action);
+        }
+    }
+
+    assert!(
+        forced_passes_seen > 0,
+        "no forced pass occurred in 200 playouts, so the invariant went untested"
+    );
+}
+
+/// The two-consecutive-passes ending must still work.
+#[test]
+fn test_two_executed_passes_end_the_game() {
+    let after_one = State::new().make_move(PASS_ACTION);
+    assert_eq!(after_one.pass_count, 1);
+    assert!(!after_one.is_done(), "one pass must not end the game");
+
+    let after_two = after_one.make_move(PASS_ACTION);
+    assert_eq!(after_two.pass_count, 2);
+    assert!(
+        after_two.is_done(),
+        "two consecutive passes must end the game"
+    );
+}
+
+/// A board move resets the counter, so passes must be *consecutive*.
+#[test]
+fn test_a_board_move_resets_the_pass_counter() {
+    let passed = State::new().make_move(PASS_ACTION);
+    assert_eq!(passed.pass_count, 1);
+
+    let board_move = passed.legal_moves()[0];
+    assert_ne!(board_move, PASS_ACTION);
+    let after = passed.make_move(board_move);
+
+    assert_eq!(after.pass_count, 0);
+    assert!(!after.is_done());
+}

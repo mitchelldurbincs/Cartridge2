@@ -134,6 +134,16 @@ jobs:
     #
     # Delete an entry the moment its upgrade lands. Do not add one without a
     # justification here, and do not reach for continue-on-error again.
+    #
+    # KNOWN LIMITATION: --ignore suppresses an advisory ID globally, for all
+    # three lockfiles. If one of these four IDs later appears via a *different*
+    # dependency path, or in a lockfile it does not affect today, that new
+    # occurrence is silently covered too. A genuinely new advisory (any other
+    # ID) still fails the job, so the exposure is limited to re-occurrences of
+    # exactly these four. Closing it properly means parsing an unignored JSON
+    # report and asserting the exact expected set of
+    # (lockfile, advisory, package, version) tuples, failing on anything extra.
+    # Tracked as follow-up rather than done here.
     env:
       AUDIT_IGNORES: >-
         --ignore RUSTSEC-2024-0437

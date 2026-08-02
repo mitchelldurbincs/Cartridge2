@@ -303,3 +303,32 @@ fn load_config_still_falls_back_so_the_clap_lazy_cannot_panic() {
     assert!(load_from_path(&path).is_err());
     let _ = load_config(); // must not panic regardless of what is on disk
 }
+
+/// An explicitly requested config file that does not exist is an error.
+///
+/// Setting CARTRIDGE_CONFIG is a statement that *this* file is the
+/// configuration. Continuing the search past a missing one answers a question
+/// nobody asked -- and the usual causes (a typo'd path, a volume that failed to
+/// mount) are exactly when running on unintended settings does most damage.
+#[test]
+fn explicit_config_path_that_is_missing_is_an_error() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let missing = dir.path().join("definitely-not-here.toml");
+
+    let err = load_from_path(&missing).expect_err("missing explicit path must not load");
+
+    assert!(matches!(err, ConfigError::Read { .. }));
+    assert_eq!(err.path(), missing);
+}
+
+#[test]
+fn explicit_path_missing_error_names_the_variable_and_the_path() {
+    // The operator needs to know which knob they set wrong.
+    let err = ConfigError::ExplicitPathMissing {
+        path: std::path::PathBuf::from("/etc/cartridge/nope.toml"),
+    };
+    let message = err.to_string();
+
+    assert!(message.contains("CARTRIDGE_CONFIG"), "{message}");
+    assert!(message.contains("/etc/cartridge/nope.toml"), "{message}");
+}

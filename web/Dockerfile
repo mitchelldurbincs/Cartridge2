@@ -104,6 +104,25 @@ RUN find /app/engine /app/web -path '*/target' -prune -o -name '*.rs' -exec touc
         cargo build --release --locked --features "$CARGO_FEATURES"; \
     fi
 
+# Postcondition: prove the binary is the real server, not one built from the
+# placeholders.
+#
+# The touch above is what makes cargo rebuild first-party crates, and it relies
+# on cargo's mtime-based fingerprinting. If that assumption ever stops holding --
+# a cargo change, a filesystem with coarse timestamps, an incomplete touch set --
+# the failure is silent: `fn main() {}` compiles, links, and produces a
+# perfectly valid executable that does nothing. Docker and CI would both go
+# green.
+#
+# Checked by symbol rather than by running it: the web binary's entry point
+# binds a port and starts background tasks, which is more than a build layer
+# should be doing. These strings are emitted by the real startup path and are
+# absent from a placeholder build.
+RUN for marker in 'Registered all games' 'Starting web server'; do \
+        grep -qa "$marker" /app/web/target/release/web \
+        || { echo "FATAL: web binary is missing '$marker' -- it was probably built from placeholder sources"; exit 1; }; \
+    done
+
 # ============================================
 # Stage 2: Runtime
 # ============================================

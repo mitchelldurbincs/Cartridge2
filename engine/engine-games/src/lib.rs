@@ -157,20 +157,29 @@ mod tests {
         }
     }
 
-    /// A terminal step's info bits must report the true winner.
+    /// A terminal step's info bits must report the true winning seat.
     ///
     /// This is the invariant that makes `info_bits::outcome_from_info` safe.
-    /// The legal-move mask shares the same `u64` starting at bit 0, so for a
-    /// game with more than 16 actions it overlaps the winner field at bits
-    /// 20-23 *during play* — Othello (65 actions) documents exactly that on
-    /// its own `compute_info_bits`. What rescues the terminal step is that a
-    /// finished position has no legal moves, so the mask is zero and the
-    /// winner field is clean.
+    /// The legal-move mask shares the same `u64` starting at bit 0, so a game
+    /// with more than 16 actions can overlap the winner field at bits 20-23
+    /// *during play* — Othello (65 actions) documents exactly that on its own
+    /// `compute_info_bits`.
     ///
-    /// That is a property of the games, not of the decoder, so assert it here
-    /// for every registered game. A game that reported legal moves in a
-    /// terminal state would silently corrupt self-play win/loss attribution;
-    /// this is what catches it.
+    /// The requirement at a terminal step is precisely: **whatever mask the
+    /// game packs must not reach the winner bits.** Games satisfy that in two
+    /// different ways, and it is worth being exact about which, because the
+    /// looser phrasing "terminal positions have no legal moves" is not true:
+    ///
+    /// - Othello zeroes its mask once `is_done()`, so nothing collides.
+    /// - Generals always packs a zero mask (257 actions could never fit), so
+    ///   its terminal observations may well still contain legal moves.
+    ///
+    /// Either way the decode is exact, and that is what this asserts.
+    ///
+    /// The seat is checked against an **independently derived** expectation —
+    /// ply parity for who moved last, plus the sign of the terminal reward —
+    /// rather than against the same bits being tested. Without that, a decoder
+    /// hardcoded to return `Player1Win` for every decisive game would pass.
     #[test]
     fn test_terminal_info_bits_report_the_true_winner() {
         use engine_core::{EngineContext, GameOutcome};
@@ -183,16 +192,23 @@ mod tests {
             let mut ctx = EngineContext::new(&env_id).expect("registered game");
             let meta = ctx.metadata();
 
-            // A few seeds per game: different playouts reach different
-            // terminal shapes (wins for either seat, draws, adjudication).
+            // Enough seeds to reach terminals of every shape: wins for either
+            // seat, and draws. Asserted below, not assumed -- a seed set that
+            // only ever produced one seat's win would leave the interesting
+            // half of the decode untested.
             let mut reached_terminal = 0;
-            for seed in 0..8u64 {
+            let mut saw: Vec<GameOutcome> = Vec::new();
+
+            for seed in 0..24u64 {
                 let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
                 let reset = ctx.reset(seed, &[]).expect("reset");
                 let mut state = reset.state;
                 let mut obs = reset.obs;
 
-                for _ in 0..meta.num_actions * 64 {
+                // Every bundled game declares alternating turns (asserted by
+                // the test above), so the seat that moves at ply N is
+                // determined by parity: player 1 on even plies.
+                for ply in 0..meta.num_actions * 64 {
                     let legal = meta.extract_legal_moves(&obs);
                     let Some(&action) = legal.choose(&mut rng) else {
                         break;
@@ -203,30 +219,41 @@ mod tests {
                         .expect("step");
 
                     if step.done {
-                        // The decoded outcome must match the winner byte the
-                        // game itself recorded in its terminal state.
                         let decoded =
                             engine_core::game_utils::info_bits::outcome_from_info(step.info);
-                        assert!(
-                            decoded.is_some(),
-                            "{env_id}: terminal step decoded no outcome \
-                             (info=0x{:x}); the legal mask is probably still \
-                             set and is colliding with the winner field",
+
+                        // Derive the expected outcome WITHOUT touching the info
+                        // bits: who moved last (ply parity) plus whether the
+                        // reward says that mover won, lost, or drew. The reward
+                        // is relative to the mover, so it identifies the seat
+                        // only in combination with the parity.
+                        let mover_was_player1 = ply % 2 == 0;
+                        let expected = if step.reward == 0.0 {
+                            GameOutcome::Draw
+                        } else {
+                            let mover_won = step.reward > 0.0;
+                            if mover_won == mover_was_player1 {
+                                GameOutcome::Player1Win
+                            } else {
+                                GameOutcome::Player2Win
+                            }
+                        };
+
+                        assert_eq!(
+                            decoded,
+                            Some(expected),
+                            "{env_id} seed {seed}: info bits decoded {decoded:?} \
+                             but ply {ply} (mover = player {}) with terminal \
+                             reward {} means {expected:?}. info=0x{:x} -- if the \
+                             mask is reaching bits 20-23 this is where it shows.",
+                            if mover_was_player1 { 1 } else { 2 },
+                            step.reward,
                             step.info,
                         );
 
-                        // Cross-check against the reward, which is relative to
-                        // the mover: a decisive game must not decode as a draw
-                        // and vice versa.
-                        let is_draw = decoded == Some(GameOutcome::Draw);
-                        assert_eq!(
-                            is_draw,
-                            step.reward == 0.0,
-                            "{env_id}: outcome {decoded:?} disagrees with \
-                             terminal reward {}",
-                            step.reward,
-                        );
-
+                        if !saw.contains(&expected) {
+                            saw.push(expected);
+                        }
                         reached_terminal += 1;
                         break;
                     }
@@ -240,6 +267,15 @@ mod tests {
                 reached_terminal > 0,
                 "{env_id}: no random playout reached a terminal state, so the \
                  invariant was never exercised"
+            );
+
+            // Both seats must actually have been observed winning, or the
+            // seat-specific half of the decode is untested for this game.
+            assert!(
+                saw.contains(&GameOutcome::Player1Win) && saw.contains(&GameOutcome::Player2Win),
+                "{env_id}: {reached_terminal} terminals reached but only saw \
+                 {saw:?}; both seats must win at least once or a decoder \
+                 hardcoded to one seat would pass this test"
             );
         }
     }
