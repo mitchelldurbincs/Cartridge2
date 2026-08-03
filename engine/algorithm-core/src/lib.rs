@@ -863,6 +863,44 @@ mod tests {
     }
 
     #[test]
+    fn dqn_compatibility_issue_order_and_messages_are_stable() {
+        let (mut capabilities, metadata) = dqn_compatible_contract();
+        capabilities.contract_version = 0;
+        capabilities.encoding.schema_version = WIRE_ENCODING_SCHEMA_VERSION + 1;
+        capabilities.semantics.turn_model = TurnModel::Simultaneous;
+        capabilities.max_horizon = None;
+
+        let report = BuiltinAlgorithm::DqnV1.compatibility_for(&capabilities, &metadata);
+        let actual = report
+            .issues
+            .iter()
+            .map(|issue| (issue.code, issue.message.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual,
+            vec![
+                (
+                    "identity.contract_version",
+                    "requires a non-zero immutable environment contract version",
+                ),
+                (
+                    "encoding.schema_version",
+                    "requires wire encoding schema version 1, got 2",
+                ),
+                (
+                    "semantics.turn_model",
+                    "requires single-agent turns, got Simultaneous",
+                ),
+                (
+                    "episode.max_horizon",
+                    "requires a finite non-zero maximum horizon",
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn model_artifact_contract_is_derived_from_the_algorithm_descriptor() {
         let descriptor = resolve_algorithm(ALPHAZERO_BOARD_V1_ID)
             .unwrap()

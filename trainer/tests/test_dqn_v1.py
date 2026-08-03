@@ -285,6 +285,45 @@ def test_dqn_owns_a_clean_collect_and_train_cli_surface():
     assert not hasattr(loop, "stats_path")
 
 
+def test_dqn_cli_defaults_are_stable():
+    parser = cli.build_parser(get_algorithm(ALGORITHM_ID))
+    collect = parser.parse_args(
+        [
+            "--algorithm",
+            ALGORITHM_ID,
+            "collect",
+            "--episodes",
+            "1",
+            "--collection-scope-id",
+            "a" * 64,
+            "--source-root",
+        ]
+    )
+    assert collect.env_id == "counter"
+    assert collect.epsilon == 1.0
+    assert collect.seed == 0
+    assert collect.onnx_intra_threads == 1
+    assert collect.actor_id == "dqn-collector"
+    assert collect.episode_timeout_secs == 30
+    assert collect.log_level == "INFO"
+
+    evaluate = parser.parse_args(
+        ["--algorithm", ALGORITHM_ID, "evaluate", "--random"]
+    )
+    assert evaluate.env_id == "counter"
+    assert evaluate.episodes == 100
+    assert evaluate.seed == 42
+    assert evaluate.onnx_intra_threads == 1
+
+    loop = parser.parse_args(
+        ["--algorithm", ALGORITHM_ID, "loop", "--iterations", "1"]
+    )
+    assert loop.env_id == "counter"
+    assert loop.episodes_per_iteration == 100
+    assert loop.evaluation_episodes == 100
+    assert loop.log_level == "INFO"
+
+
 def test_dqn_evaluation_result_is_a_single_agent_return_contract():
     result = DqnEvaluationResults.from_json(
         {
