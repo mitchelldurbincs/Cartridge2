@@ -35,7 +35,7 @@ use startup::{resolve_startup_profile, shutdown_signal};
 // Re-export the server plumbing used by handlers and route tests.
 #[cfg(test)]
 pub use startup::create_test_state;
-pub use startup::{create_app, create_app_with_cors, AppState, ModelInfo, OnnxEvaluator};
+pub use startup::{create_app, create_app_with_cors, AppState, ModelInfo, SharedOnnxEvaluator};
 
 #[cfg(feature = "onnx")]
 async fn initialize_model_watcher(
@@ -43,7 +43,7 @@ async fn initialize_model_watcher(
     profile: &RuntimeProfile,
     data_root: &str,
     startup_profile: &startup::StartupProfile,
-    evaluator: Arc<StdRwLock<Option<OnnxEvaluator>>>,
+    evaluator: Arc<StdRwLock<Option<SharedOnnxEvaluator>>>,
 ) -> anyhow::Result<Arc<StdRwLock<ModelInfo>>> {
     let obs_size = startup_profile.obs_size;
     let num_actions = startup_profile.num_actions;
@@ -175,7 +175,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Set up shared evaluator for model hot-reloading
     // Uses std::sync::RwLock because it's shared with model_watcher crate
-    let evaluator: Arc<StdRwLock<Option<OnnxEvaluator>>> = Arc::new(StdRwLock::new(None));
+    let evaluator: Arc<StdRwLock<Option<SharedOnnxEvaluator>>> = Arc::new(StdRwLock::new(None));
 
     #[cfg(feature = "onnx")]
     let model_info = initialize_model_watcher(
@@ -194,7 +194,7 @@ async fn main() -> anyhow::Result<()> {
     let session = GameSession::with_evaluator(&default_game, Arc::clone(&evaluator))?;
 
     let state = Arc::new(AppState {
-        session: Mutex::new(session),
+        session: Arc::new(Mutex::new(session)),
         current_game: RwLock::new(default_game),
         data_dir,
         evaluator,

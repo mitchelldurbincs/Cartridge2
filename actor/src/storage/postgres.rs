@@ -11,6 +11,12 @@ use super::{ReplayRecord, ReplaySelection, ReplayStore};
 
 const SCHEMA_SQL: &str = include_str!("../../../sql/schema.sql");
 const COLS_PER_RECORD: usize = 10;
+/// PostgreSQL's extended protocol carries the bind-parameter count as a u16,
+/// so one statement can never carry more than 65535 parameters. Long episodes
+/// (e.g. Generals) can exceed that as one giant multi-row INSERT, so batches
+/// are chunked below the ceiling and committed in a single transaction.
+const MAX_PARAMETERS_PER_STATEMENT: usize = u16::MAX as usize;
+const MAX_RECORDS_PER_INSERT: usize = MAX_PARAMETERS_PER_STATEMENT / COLS_PER_RECORD;
 const SELECTION_PREDICATE: &str = "env_id = $1 AND env_contract_version = $2
      AND algorithm_id = $3 AND experience_schema = $4
      AND collection_scope_id = $5
@@ -435,9 +441,6 @@ impl ReplayStore for PostgresReplayStore {
             );
         }
 
-        let sql = build_batch_insert_sql(records.len());
-        let client = self.client().await?;
-
         let step_numbers = records
             .iter()
             .map(|record| i64::from(record.step_number))
@@ -446,26 +449,47 @@ impl ReplayStore for PostgresReplayStore {
             .iter()
             .map(|record| i64::from(record.env_contract_version))
             .collect::<Vec<_>>();
-        let mut parameters: Vec<&(dyn ToSql + Sync)> =
-            Vec::with_capacity(records.len() * COLS_PER_RECORD);
 
-        for (index, record) in records.iter().enumerate() {
-            parameters.push(&record.id);
-            parameters.push(&record.env_id);
-            parameters.push(&contract_versions[index]);
-            parameters.push(&record.algorithm_id);
-            parameters.push(&record.experience_schema);
-            parameters.push(&record.collection_scope_id);
-            parameters.push(&record.source_checkpoint_id);
-            parameters.push(&record.episode_id);
-            parameters.push(&step_numbers[index]);
-            parameters.push(&record.payload);
-        }
-
-        client
-            .execute(&sql, &parameters)
+        // All chunks commit atomically: either the whole batch is stored or
+        // none of it is, so a failure can never leave a partial episode.
+        let mut client = self.client().await?;
+        let transaction = client
+            .transaction()
             .await
-            .with_context(|| format!("failed to insert {} replay records", records.len()))?;
+            .context("failed to start replay insert transaction")?;
+        for (chunk_index, chunk) in records.chunks(MAX_RECORDS_PER_INSERT).enumerate() {
+            let offset = chunk_index * MAX_RECORDS_PER_INSERT;
+            let sql = build_batch_insert_sql(chunk.len());
+            let mut parameters: Vec<&(dyn ToSql + Sync)> =
+                Vec::with_capacity(chunk.len() * COLS_PER_RECORD);
+            for (index, record) in chunk.iter().enumerate() {
+                parameters.push(&record.id);
+                parameters.push(&record.env_id);
+                parameters.push(&contract_versions[offset + index]);
+                parameters.push(&record.algorithm_id);
+                parameters.push(&record.experience_schema);
+                parameters.push(&record.collection_scope_id);
+                parameters.push(&record.source_checkpoint_id);
+                parameters.push(&record.episode_id);
+                parameters.push(&step_numbers[offset + index]);
+                parameters.push(&record.payload);
+            }
+            transaction
+                .execute(&sql, &parameters)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to insert replay records {}..{} of {}",
+                        offset,
+                        offset + chunk.len(),
+                        records.len()
+                    )
+                })?;
+        }
+        transaction
+            .commit()
+            .await
+            .with_context(|| format!("failed to commit {} replay records", records.len()))?;
         Ok(())
     }
 
@@ -641,6 +665,18 @@ mod tests {
         assert!(sql.contains("$20"));
         assert!(!sql.contains("ON CONFLICT"));
         assert!(!sql.contains("UPDATE"));
+    }
+
+    #[test]
+    fn insert_chunks_stay_below_the_protocol_parameter_ceiling() {
+        assert_eq!(MAX_RECORDS_PER_INSERT, 6553);
+        assert_eq!(MAX_RECORDS_PER_INSERT * COLS_PER_RECORD, 65530);
+
+        // The largest permitted chunk must end on its exact final placeholder
+        // and never reach the u16 bind-parameter limit.
+        let sql = build_batch_insert_sql(MAX_RECORDS_PER_INSERT);
+        assert!(sql.ends_with(&format!("${})", MAX_RECORDS_PER_INSERT * COLS_PER_RECORD)));
+        assert!(!sql.contains("$65536"));
     }
 
     #[test]

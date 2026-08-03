@@ -20,9 +20,11 @@ lazy_static! {
         Opts::new("web_games_created_total", "Total game sessions created")
     ).unwrap();
 
-    /// Currently active game sessions
+    /// Whether the single game-session slot currently holds an unfinished
+    /// game (0/1). Set from session state after every mutation, so replaced
+    /// or abandoned games can never leave the gauge drifted.
     pub static ref GAMES_ACTIVE: IntGauge = IntGauge::with_opts(
-        Opts::new("web_games_active", "Currently active game sessions")
+        Opts::new("web_games_active", "Whether the game session slot holds an unfinished game (0/1)")
     ).unwrap();
 
     /// Total moves played across all games

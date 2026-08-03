@@ -2,7 +2,7 @@
 
 use algorithm_core::ModelArtifactContract;
 use anyhow::{anyhow, Result};
-use mcts::OnnxEvaluator;
+use mcts::SharedOnnxEvaluator;
 use std::path::Path;
 
 /// Validated environment/model shape needed to load and independently verify
@@ -41,8 +41,8 @@ impl ModelLoadSpec {
         })
     }
 
-    pub(crate) fn load(&self, path: &Path) -> Result<OnnxEvaluator> {
-        OnnxEvaluator::load_from_file(
+    pub(crate) fn load(&self, path: &Path) -> Result<SharedOnnxEvaluator> {
+        SharedOnnxEvaluator::load_from_file(
             path,
             self.obs_size,
             self.num_actions,

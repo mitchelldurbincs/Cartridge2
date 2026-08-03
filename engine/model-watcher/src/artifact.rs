@@ -1405,6 +1405,28 @@ mod tests {
     }
 
     #[test]
+    fn canonical_json_unicode_is_raw_utf8_cross_language_golden() {
+        // The Python publisher (trainer.storage.publisher.canonical_json_bytes)
+        // asserts these exact golden bytes; both sides must agree
+        // byte-for-byte or content-addressed IDs diverge across the boundary.
+        let golden = "{\"name\":\"café\",\"piece\":\"♟\",\"z\":1}".as_bytes();
+        assert_eq!(
+            sha256_hex(golden),
+            "2e4360a215d64b8654fc51e28743d8761b5816bef04a30ceefa3314a1f151189"
+        );
+        let value: serde_json::Value = parse_canonical_json("unicode value", golden).unwrap();
+        assert_eq!(value["name"], "café");
+
+        // Python's default ASCII-escaped spelling of the same object is NOT
+        // canonical here and must be rejected.
+        let escaped = br#"{"name":"caf\u00e9","piece":"\u265f","z":1}"#;
+        let error = parse_canonical_json::<serde_json::Value>("unicode value", escaped)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not canonical JSON"), "{error}");
+    }
+
+    #[test]
     fn manifest_is_bound_to_exact_runtime_profile() {
         validate_manifest(&manifest(), &identity()).unwrap();
         let other = resolve_algorithm(ALPHAZERO_BOARD_V1_ID)

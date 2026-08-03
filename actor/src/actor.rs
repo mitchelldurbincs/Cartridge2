@@ -109,28 +109,34 @@ impl EpisodeStats {
     }
 }
 
+/// Build the episode-ID prefix for one bounded collection process.
+///
+/// Episode IDs must never collide inside a replay selection: record IDs are
+/// `{episode_id}-step-{n}` under a primary key that already includes the
+/// collection scope. Seconds-plus-counter IDs collide when actors restart or
+/// run in parallel under one actor ID, so the prefix binds the scope and a
+/// per-process random token instead of wall-clock time.
+fn episode_id_prefix(actor_id: &str, collection_scope_id: &str, process_token: u64) -> String {
+    let scope = collection_scope_id.get(..8).unwrap_or(collection_scope_id);
+    format!("{actor_id}-{scope}-{process_token:016x}")
+}
+
 impl EpisodeContext {
     /// Create a new episode context with generated ID and timing.
-    fn new(
-        actor_id: &str,
-        episode_count: u32,
-        timeout_secs: u64,
-        max_horizon: u32,
-    ) -> Result<Self> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let id = format!("{}-ep-{}-{}", actor_id, episode_count, now.as_secs());
+    fn new(episode_prefix: &str, episode_count: u32, timeout_secs: u64, max_horizon: u32) -> Self {
+        let id = format!("{episode_prefix}-ep-{episode_count}");
         // This value is part of the authenticated RunRecipe and is therefore
         // the exact terminal bound, never an input to a hidden derived floor.
         let timeout = Duration::from_secs(timeout_secs);
         // Use 10x max_horizon as generous upper bound to protect against infinite loops
         let max_steps = max_horizon.saturating_mul(10).max(1000);
 
-        Ok(Self {
+        Self {
             id,
             start_time: Instant::now(),
             timeout,
             max_steps,
-        })
+        }
     }
 
     /// Check if the episode has exceeded its timeout.
@@ -221,6 +227,8 @@ pub struct AlphaZeroCollector {
     episode_count: AtomicU32,
     shutdown_signal: AtomicBool,
     stats: ActorStats,
+    /// Collision-proof prefix for this process's episode IDs.
+    episode_prefix: String,
 }
 
 /// One transition retained in memory until a terminal outcome is available.
@@ -649,6 +657,12 @@ impl AlphaZeroCollector {
         // Initialize stats tracking
         let stats = ActorStats::new(&config.env_id);
 
+        let episode_prefix = episode_id_prefix(
+            &config.actor_id,
+            &config.collection_scope_id,
+            rand::random::<u64>(),
+        );
+
         Ok(Self {
             config,
             replay_selection,
@@ -659,6 +673,7 @@ impl AlphaZeroCollector {
             episode_count: AtomicU32::new(0),
             shutdown_signal: AtomicBool::new(false),
             stats,
+            episode_prefix,
         })
     }
 
@@ -720,23 +735,21 @@ impl AlphaZeroCollector {
                     discarded,
                     timeout_secs,
                 }) => {
-                    let abandoned = self.stats.record_abandoned_episode(discarded);
-                    // Report the running rate, not just this one episode: a
-                    // stray drop is noise, a steady stream means the replay
-                    // buffer is quietly losing its longest games.
+                    // One abandoned episode fails the whole bounded collection
+                    // immediately: tolerating it would bias AlphaZero data by
+                    // silently dropping the longest games. There is no running
+                    // abandonment rate to report — at most one abandonment can
+                    // ever occur per collection process.
+                    self.stats.record_abandoned_episode(discarded);
                     let completed = self.episode_count.load(Ordering::Relaxed);
-                    let attempted = completed + abandoned;
                     warn!(
                         reason = reason.as_str(),
                         steps,
                         discarded,
                         timeout_secs,
-                        abandoned_total = abandoned,
-                        attempted,
+                        completed_before_abandonment = completed,
                         guidance = reason.guidance(),
-                        abandoned_pct =
-                            format!("{:.1}", 100.0 * abandoned as f64 / attempted.max(1) as f64),
-                        "Episode abandoned before terminal state; its replay records were discarded"
+                        "Episode abandoned before terminal state; discarding its replay records and failing this bounded collection"
                     );
                     return Err(anyhow!(
                         "bounded collection abandoned episode after {steps} steps ({})",
@@ -925,11 +938,11 @@ impl AlphaZeroCollector {
 
         // Create episode context with timing and limits
         let ctx = EpisodeContext::new(
-            &self.config.actor_id,
+            &self.episode_prefix,
             episode_count,
             self.config.episode_timeout_secs,
             max_horizon,
-        )?;
+        );
 
         debug!(
             episode = episode_count + 1,
@@ -945,7 +958,6 @@ impl AlphaZeroCollector {
         let mut current_timestep = reset_result.timestep;
         let (mut current_agent, reset_observation) = require_reset_timestep(&current_timestep)?;
         let mut current_obs = reset_observation.to_vec();
-        let mut current_legal_mask = self.board_metadata.legal_mask_from_obs(&current_obs)?;
         let mut step_number = 0u32;
         let mut steps_taken = 0u32;
         let mut pending_experiences: Vec<PendingExperience> = Vec::with_capacity(12);
@@ -964,12 +976,7 @@ impl AlphaZeroCollector {
             // Select action using MCTS policy
             let policy_result = {
                 let mut policy = self.lock_mcts_policy()?;
-                policy.select_action(
-                    &current_state,
-                    &current_timestep,
-                    &current_legal_mask,
-                    step_number,
-                )?
+                policy.select_action(&current_state, &current_timestep, step_number)?
             };
 
             // Accumulate MCTS performance stats
@@ -1025,8 +1032,6 @@ impl AlphaZeroCollector {
             let (next_agent, observation) = require_active_position(&current_timestep)?;
             current_agent = next_agent;
             current_obs = observation.to_vec();
-            // Read the next legal-action mask from its authoritative observation.
-            current_legal_mask = self.board_metadata.legal_mask_from_obs(&current_obs)?;
             step_number += 1;
         }
     }
@@ -1092,26 +1097,26 @@ mod tests {
 
     #[test]
     fn test_episode_timeout_is_exact_for_long_horizon() {
-        let ctx = EpisodeContext::new("a", 0, 180, 402).unwrap();
+        let ctx = EpisodeContext::new("a", 0, 180, 402);
         assert_eq!(ctx.timeout, Duration::from_secs(180));
     }
 
     #[test]
     fn test_episode_timeout_is_exact_for_short_horizon() {
-        let ctx = EpisodeContext::new("a", 0, 180, 42).unwrap();
+        let ctx = EpisodeContext::new("a", 0, 180, 42);
         assert_eq!(ctx.timeout, Duration::from_secs(180));
     }
 
     #[test]
     fn test_limit_exceeded_reports_no_reason_within_budget() {
-        let ctx = EpisodeContext::new("a", 0, 300, 42).unwrap();
+        let ctx = EpisodeContext::new("a", 0, 300, 42);
         assert_eq!(ctx.limit_exceeded(0), None);
         assert_eq!(ctx.limit_exceeded(ctx.max_steps - 1), None);
     }
 
     #[test]
     fn test_limit_exceeded_reports_max_steps() {
-        let ctx = EpisodeContext::new("a", 0, 300, 42).unwrap();
+        let ctx = EpisodeContext::new("a", 0, 300, 42);
         assert_eq!(
             ctx.limit_exceeded(ctx.max_steps),
             Some(AbandonReason::MaxSteps)
@@ -1122,9 +1127,27 @@ mod tests {
     fn test_limit_exceeded_reports_timeout() {
         // Config validation rejects zero, but the internal context still obeys
         // the exact value and reports timeout before the step guard.
-        let ctx = EpisodeContext::new("a", 0, 0, 1).unwrap();
+        let ctx = EpisodeContext::new("a", 0, 0, 1);
         assert_eq!(ctx.timeout, Duration::ZERO);
         assert_eq!(ctx.limit_exceeded(0), Some(AbandonReason::Timeout));
+    }
+
+    #[test]
+    fn episode_ids_bind_scope_and_process_token() {
+        let scope = "f".repeat(64);
+        let prefix_one = episode_id_prefix("actor-1", &scope, 0x0123456789abcdef);
+        assert_eq!(prefix_one, "actor-1-ffffffff-0123456789abcdef");
+
+        // The same actor ID, scope, and episode counter still produce distinct
+        // episode IDs across processes because the token differs.
+        let prefix_two = episode_id_prefix("actor-1", &scope, 0xfedcba9876543210);
+        let id_one = EpisodeContext::new(&prefix_one, 3, 30, 9).id;
+        let id_two = EpisodeContext::new(&prefix_two, 3, 30, 9).id;
+        assert_ne!(id_one, id_two);
+        assert!(id_one.ends_with("-ep-3"));
+
+        // Short scopes are used verbatim instead of panicking.
+        assert_eq!(episode_id_prefix("a", "abc", 1), "a-abc-0000000000000001");
     }
 
     #[test]

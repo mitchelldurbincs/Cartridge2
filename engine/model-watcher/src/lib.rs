@@ -5,7 +5,7 @@
 //! exact runtime profile, blob size, blob SHA-256, and ONNX contract all pass.
 
 use anyhow::{anyhow, Result};
-use mcts::OnnxEvaluator;
+use mcts::SharedOnnxEvaluator;
 use notify::{recommended_watcher, Event, EventKind, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -55,7 +55,7 @@ pub struct ModelWatcher {
     model_root: PathBuf,
     model_spec: ModelLoadSpec,
     selection: ModelSelection,
-    evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,
+    evaluator: Arc<RwLock<Option<SharedOnnxEvaluator>>>,
     accepted_head: Arc<RwLock<Option<AcceptedHead>>>,
     poll_interval: Duration,
     model_info: Arc<RwLock<ModelInfo>>,
@@ -66,7 +66,7 @@ impl ModelWatcher {
         model_root: impl AsRef<Path>,
         model_spec: ModelLoadSpec,
         selection: ModelSelection,
-        evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,
+        evaluator: Arc<RwLock<Option<SharedOnnxEvaluator>>>,
     ) -> Self {
         Self {
             model_root: model_root.as_ref().to_path_buf(),
@@ -118,9 +118,9 @@ impl ModelWatcher {
 
     fn commit_candidate(
         candidate: ResolvedCheckpoint,
-        new_evaluator: Option<OnnxEvaluator>,
+        new_evaluator: Option<SharedOnnxEvaluator>,
         expected_accepted_head: Option<AcceptedHead>,
-        evaluator: &Arc<RwLock<Option<OnnxEvaluator>>>,
+        evaluator: &Arc<RwLock<Option<SharedOnnxEvaluator>>>,
         accepted_head: &Arc<RwLock<Option<AcceptedHead>>>,
         model_info: &Arc<RwLock<ModelInfo>>,
     ) -> Result<LoadOutcome> {
@@ -201,7 +201,7 @@ impl ModelWatcher {
         model_root: &Path,
         model_spec: &ModelLoadSpec,
         selection: ModelSelection,
-        evaluator: &Arc<RwLock<Option<OnnxEvaluator>>>,
+        evaluator: &Arc<RwLock<Option<SharedOnnxEvaluator>>>,
         accepted_head: &Arc<RwLock<Option<AcceptedHead>>>,
         model_info: &Arc<RwLock<ModelInfo>>,
     ) -> Result<LoadOutcome> {

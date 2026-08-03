@@ -9,6 +9,7 @@ use axum::{
 use engine_core::EngineContext;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::OwnedMutexGuard;
 
 use crate::game::GameSession;
 use crate::metrics;
@@ -26,14 +27,28 @@ fn internal_error(context: &str, e: impl std::fmt::Display) -> (StatusCode, Stri
     )
 }
 
-/// Run the bot's move, recording its latency and converting errors to a 500.
-fn timed_bot_move(session: &mut GameSession) -> Result<u32, (StatusCode, String)> {
-    let bot_start = Instant::now();
-    let pos = session
-        .bot_move()
-        .map_err(|e| internal_error("Bot move failed", e))?;
-    metrics::BOT_MOVE_SECONDS.observe(bot_start.elapsed().as_secs_f64());
-    Ok(pos)
+/// Run the bot's synchronous MCTS on a blocking worker thread so it never
+/// stalls the async runtime, recording its latency and converting errors to
+/// a 500. Takes and returns the owned session guard because the guard must
+/// move onto the worker thread with the search.
+async fn timed_bot_move(
+    mut session: OwnedMutexGuard<GameSession>,
+) -> Result<(OwnedMutexGuard<GameSession>, u32), (StatusCode, String)> {
+    tokio::task::spawn_blocking(move || {
+        let bot_start = Instant::now();
+        let pos = session
+            .bot_move()
+            .map_err(|e| internal_error("Bot move failed", e))?;
+        metrics::BOT_MOVE_SECONDS.observe(bot_start.elapsed().as_secs_f64());
+        Ok((session, pos))
+    })
+    .await
+    .map_err(|e| internal_error("Bot move task failed", e))?
+}
+
+/// Reconcile the active-session gauge with the single session slot.
+fn record_session_activity(session: &GameSession) {
+    metrics::GAMES_ACTIVE.set(i64::from(!session.is_game_over()));
 }
 
 /// List available games.
@@ -112,16 +127,11 @@ pub async fn new_game(
     State(state): State<Arc<AppState>>,
     Json(req): Json<NewGameRequest>,
 ) -> Result<Json<GameStateResponse>, (StatusCode, String)> {
-    let mut session = state.session.lock().await;
-
-    // Record metrics for new game
-    metrics::GAMES_CREATED.inc();
-    metrics::GAMES_ACTIVE.inc();
-
     // Get the current configured game
     let current_game = state.current_game.read().await.clone();
 
-    // Reject requests trying to switch to a different game
+    // Reject requests trying to switch to a different game before touching
+    // the session or any metric
     if let Some(ref requested_game) = req.game {
         if requested_game != &current_game {
             return Err((
@@ -137,9 +147,12 @@ pub async fn new_game(
     // Use the current game (cannot be changed)
     let game_id = current_game;
 
+    let mut session = Arc::clone(&state.session).lock_owned().await;
+
     // Reset the game with shared evaluator (for hot-reloading)
     *session = GameSession::with_evaluator(&game_id, Arc::clone(&state.evaluator))
         .map_err(|e| internal_error(&format!("Failed to create game '{}'", game_id), e))?;
+    metrics::GAMES_CREATED.inc();
 
     // If bot goes first, bot is player 1, human is player 2
     // If player goes first, human is player 1, bot is player 2
@@ -147,12 +160,13 @@ pub async fn new_game(
         session
             .set_human_player(2)
             .map_err(|e| internal_error("Invalid human board seat", e))?; // Human plays as O (player 2)
-        timed_bot_move(&mut session)?;
+        (session, _) = timed_bot_move(session).await?;
     } else {
         session
             .set_human_player(1)
             .map_err(|e| internal_error("Invalid human board seat", e))?; // Human plays as X (player 1) - default
     }
+    record_session_activity(&session);
 
     Ok(Json(session.to_response().map_err(|error| {
         internal_error("Invalid game observation", error)
@@ -164,7 +178,7 @@ pub async fn make_move(
     State(state): State<Arc<AppState>>,
     Json(req): Json<MoveRequest>,
 ) -> Result<Json<MoveResponse>, (StatusCode, String)> {
-    let mut session = state.session.lock().await;
+    let mut session = Arc::clone(&state.session).lock_owned().await;
 
     // Check if game is over
     if session.is_game_over() {
@@ -198,21 +212,20 @@ pub async fn make_move(
 
     // If game is not over, bot makes a move
     let bot_move = if !session.is_game_over() {
-        let pos = timed_bot_move(&mut session)?;
+        let pos;
+        (session, pos) = timed_bot_move(session).await?;
         metrics::MOVES_PLAYED.inc(); // Count bot move too
         Some(pos)
     } else {
-        // Game ended - record completion
-        metrics::GAMES_COMPLETED.inc();
-        metrics::GAMES_ACTIVE.dec();
         None
     };
 
-    // Check if game is now over after bot move
-    if bot_move.is_some() && session.is_game_over() {
+    // The game was running when this request started, so reaching a terminal
+    // state now is exactly one completion regardless of who ended it.
+    if session.is_game_over() {
         metrics::GAMES_COMPLETED.inc();
-        metrics::GAMES_ACTIVE.dec();
     }
+    record_session_activity(&session);
 
     Ok(Json(MoveResponse {
         state: session

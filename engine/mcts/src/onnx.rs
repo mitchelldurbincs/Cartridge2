@@ -726,6 +726,12 @@ impl SharedOnnxEvaluator {
         }
     }
 
+    /// Stable identity of the shared underlying evaluator. Two clones of the
+    /// same loaded model return the same pointer.
+    pub fn instance_ptr(&self) -> *const OnnxEvaluator {
+        Arc::as_ptr(&self.inner)
+    }
+
     /// Load a shared ONNX model file and require its artifact identity.
     pub fn load_from_file<P: AsRef<Path>>(
         model_path: P,
