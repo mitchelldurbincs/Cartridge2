@@ -12,6 +12,7 @@ import pytest
 import torch
 from torch.optim import Adam
 
+from trainer.algorithms.alphazero_board_v1 import policy_value_artifact_contract
 from trainer.checkpoint import (
     LearnerStateContract,
     export_onnx_artifact,
@@ -32,10 +33,9 @@ from trainer.storage.evaluation import (
 )
 from trainer.storage.publisher import (
     FilesystemCheckpointPublisher,
-    OnnxArtifactContract,
 )
 
-CONTRACT = OnnxArtifactContract(
+CONTRACT = policy_value_artifact_contract(
     algorithm_id="alphazero_board_v1",
     env_id="tictactoe",
     env_contract_version=1,
@@ -56,7 +56,6 @@ def staged_blobs(tmp_path_factory):
     return (
         export_onnx_artifact(
             network,
-            29,
             root / "model.onnx",
             torch.device("cpu"),
             CONTRACT,
@@ -211,9 +210,7 @@ def test_solver_record_is_absent_without_solver_evidence(tmp_path, staged_blobs)
         config_sha256=CONFIG_SHA256,
         learner_state_contract=learner_contract,
     )
-    reference = evaluations.publish_evidence(
-        solver_artifact(candidate.checkpoint_id, solver=None)
-    )
+    reference = evaluations.publish_evidence(solver_artifact(candidate.checkpoint_id, solver=None))
     reporter = _Reporter(checkpoints, evaluations)
 
     assert reporter._build_solver_record(reference) is None

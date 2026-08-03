@@ -10,6 +10,7 @@ import torch
 from torch.optim import Adam
 
 from trainer.algorithms import get_algorithm
+from trainer.algorithms.alphazero_board_v1 import policy_value_artifact_contract
 from trainer.checkpoint import (
     LearnerStateContract,
     export_onnx_artifact,
@@ -23,8 +24,8 @@ from trainer.orchestrator.eval_runner import PreparedEvaluation
 from trainer.orchestrator.orchestrator import Orchestrator, _run_recipe
 from trainer.orchestrator.run_journal import PreparedRunV1, RunJournal
 from trainer.stats import (
-    EvalStats,
-    PreparedStatsSnapshotV2,
+    EvaluationStats,
+    PreparedStatsSnapshotV3,
     StatsBindingV1,
     TrainerStats,
     decode_stats_snapshot,
@@ -43,7 +44,6 @@ from trainer.storage.evaluation import (
 from trainer.storage.publisher import (
     ArtifactValidationError,
     FilesystemCheckpointPublisher,
-    OnnxArtifactContract,
 )
 from trainer.storage.run_commit import (
     LearnerRecipeV1,
@@ -52,13 +52,13 @@ from trainer.storage.run_commit import (
     RunCommitV1,
 )
 
-CONTRACT = OnnxArtifactContract(
+CONTRACT = policy_value_artifact_contract(
     algorithm_id="alphazero_board_v1",
     env_id="tictactoe",
-    env_contract_version=1,
+    env_contract_version=2,
     model_artifact_schema_version=1,
     model_contract="onnx_policy_value_v1",
-    obs_size=29,
+    obs_size=18,
     num_actions=9,
 )
 
@@ -103,12 +103,11 @@ class FakeReplayStore:
 @pytest.fixture(scope="module")
 def staged_blobs(tmp_path_factory):
     root = tmp_path_factory.mktemp("run-commit-recovery-v2")
-    network = PolicyValueNetwork(obs_size=29, action_size=9)
+    network = PolicyValueNetwork(obs_size=18, action_size=9)
     optimizer = Adam(network.parameters(), lr=0.001)
     return (
         export_onnx_artifact(
             network,
-            29,
             root / "model.onnx",
             torch.device("cpu"),
             CONTRACT,
@@ -189,9 +188,7 @@ def evaluation_for(
         profile=CONTRACT.profile,
         iteration=iteration,
         candidate_checkpoint_id=candidate.checkpoint_id,
-        previous_evaluation_id=(
-            parent.evaluation_head_id if parent is not None else None
-        ),
+        previous_evaluation_id=(parent.evaluation_head_id if parent is not None else None),
         champion_before=champion,
         recipe=EvaluationRecipeV1(
             simulations=run_recipe.evaluation_simulations,
@@ -269,16 +266,20 @@ def commit_for(
             completed = datetime.fromisoformat(
                 evaluation.artifact.completed_at.replace("Z", "+00:00")
             )
-            stats.append_eval(
-                EvalStats(
+            stats.append_evaluation(
+                EvaluationStats(
                     step=candidate.manifest.step,
-                    win_rate=random_result.candidate_win_rate,
-                    draw_rate=random_result.draw_rate,
-                    loss_rate=(
-                        1.0 - random_result.candidate_win_rate - random_result.draw_rate
-                    ),
-                    games_played=random_result.games_played,
-                    avg_game_length=random_result.average_game_length,
+                    metrics={
+                        "outcome/win_rate": random_result.candidate_win_rate,
+                        "outcome/draw_rate": random_result.draw_rate,
+                        "outcome/loss_rate": (
+                            1.0
+                            - random_result.candidate_win_rate
+                            - random_result.draw_rate
+                        ),
+                    },
+                    episodes=random_result.games_played,
+                    mean_episode_length=random_result.average_game_length,
                     timestamp=completed.timestamp(),
                 )
             )
@@ -291,9 +292,7 @@ def commit_for(
         training_steps=config.steps_per_iteration,
         actor_time_seconds=0.1,
         trainer_time_seconds=0.2,
-        eval_time_seconds=(
-            evaluation.elapsed_seconds if evaluation is not None else 0.0
-        ),
+        eval_time_seconds=(evaluation.elapsed_seconds if evaluation is not None else 0.0),
         total_time_seconds=1.0,
         eval_win_rate=result.candidate_win_rate if result is not None else None,
         eval_draw_rate=result.draw_rate if result is not None else None,
@@ -301,9 +300,7 @@ def commit_for(
         evaluation_id=(evaluation.evaluation_id if evaluation is not None else None),
         collector_simulations=run_recipe.simulations_for(iteration),
         collector_seed=None,
-        evaluation_seed=(
-            run_recipe.evaluation_seed if evaluation is not None else None
-        ),
+        evaluation_seed=(run_recipe.evaluation_seed if evaluation is not None else None),
         collection_scope_id=f"{iteration + 1000:064x}",
         source_checkpoint_id=(parent.checkpoint_id if parent is not None else None),
     )
@@ -470,9 +467,7 @@ def test_run_commit_rejects_unreachable_temperature_schedule(tmp_path, staged_bl
         commits.publish(invalid_commit)
 
 
-def test_missing_evaluation_fails_before_runcommit_or_head_materialization(
-    tmp_path, staged_blobs
-):
+def test_missing_evaluation_fails_before_runcommit_or_head_materialization(tmp_path, staged_blobs):
     config = loop_config(tmp_path)
     checkpoints, _, commits, _, prepared = build_root(config, staged_blobs)
 
@@ -483,9 +478,7 @@ def test_missing_evaluation_fails_before_runcommit_or_head_materialization(
     assert not (config.models_dir / "run-commits" / "sha256").exists()
 
 
-def test_invalid_preparation_cannot_poison_immutable_parent_journal(
-    tmp_path, staged_blobs
-):
+def test_invalid_preparation_cannot_poison_immutable_parent_journal(tmp_path, staged_blobs):
     config = loop_config(tmp_path)
     checkpoints, _, commits, _, prepared = build_root(config, staged_blobs)
     invalid = PreparedRunV1(
@@ -502,9 +495,7 @@ def test_invalid_preparation_cannot_poison_immutable_parent_journal(
     assert not (config.models_dir / "run-preparations" / "by-parent").exists()
 
 
-def test_mismatched_snapshot_wrapper_is_rejected_before_journal_write(
-    tmp_path, staged_blobs
-):
+def test_mismatched_snapshot_wrapper_is_rejected_before_journal_write(tmp_path, staged_blobs):
     config = loop_config(tmp_path)
     checkpoints, _, commits, _, prepared = build_root(config, staged_blobs)
     snapshot = prepared.run_commit.stats_snapshot
@@ -514,7 +505,7 @@ def test_mismatched_snapshot_wrapper_is_rejected_before_journal_write(
         checkpoint_id=snapshot.binding.checkpoint_id,
         step=snapshot.binding.step + 1,
     )
-    bad_snapshot = PreparedStatsSnapshotV2(
+    bad_snapshot = PreparedStatsSnapshotV3(
         stats_id=snapshot.stats_id,
         binding=bad_binding,
         data=snapshot.data,
@@ -525,22 +516,18 @@ def test_mismatched_snapshot_wrapper_is_rejected_before_journal_write(
     )
 
     with pytest.raises(Exception, match="snapshot"):
-        RunJournal(checkpoints, commits).publish(
-            PreparedRunV1(invalid_commit, prepared.evaluation)
-        )
+        RunJournal(checkpoints, commits).publish(PreparedRunV1(invalid_commit, prepared.evaluation))
 
     assert not (config.models_dir / "run-preparations" / "by-parent").exists()
 
 
-def test_model_contract_mismatch_is_rejected_before_journal_write(
-    tmp_path, staged_blobs
-):
+def test_model_contract_mismatch_is_rejected_before_journal_write(tmp_path, staged_blobs):
     config = loop_config(tmp_path, eval_interval=0)
     checkpoints, _, commits = repositories(config)
     original = recipe_for(config)
     learner_data = original.learner_recipe.to_dict()
     model = dict(learner_data["model_architecture"])
-    model["action_count"] = CONTRACT.num_actions + 1
+    model["action_count"] = CONTRACT.output("policy_logits").shape[1] + 1
     learner_data["model_architecture"] = model
     learner = LearnerRecipeV1(learner_data)
     recipe = replace(
@@ -611,9 +598,7 @@ def test_replay_provenance_violation_is_rejected_before_child_materialization(
     tmp_path, staged_blobs, violation
 ):
     config = loop_config(tmp_path, eval_interval=0)
-    checkpoints, _, commits, _, prepared = build_root(
-        config, staged_blobs, with_evaluation=False
-    )
+    checkpoints, _, commits, _, prepared = build_root(config, staged_blobs, with_evaluation=False)
     parent = commits.publish(prepared.run_commit).commit
     candidate = stage_checkpoint(
         checkpoints,
@@ -657,9 +642,7 @@ def test_replay_provenance_violation_is_rejected_before_child_materialization(
     ).exists()
 
 
-def test_run_modes_are_disjoint_and_same_checkpoint_children_are_rejected(
-    tmp_path, staged_blobs
-):
+def test_run_modes_are_disjoint_and_same_checkpoint_children_are_rejected(tmp_path, staged_blobs):
     config = loop_config(tmp_path, eval_interval=0)
     checkpoints, evaluations, commits = repositories(config)
     run_recipe = recipe_for(config)
@@ -714,13 +697,9 @@ def test_run_modes_are_disjoint_and_same_checkpoint_children_are_rejected(
         commits.validate_prepared(no_op)
 
 
-def test_changed_recipe_fails_before_replay_is_opened(
-    tmp_path, staged_blobs, monkeypatch
-):
+def test_changed_recipe_fails_before_replay_is_opened(tmp_path, staged_blobs, monkeypatch):
     config = loop_config(tmp_path, eval_interval=0)
-    checkpoints, _, commits, _, prepared = build_root(
-        config, staged_blobs, with_evaluation=False
-    )
+    checkpoints, _, commits, _, prepared = build_root(config, staged_blobs, with_evaluation=False)
     commits.publish(prepared.run_commit)
     checkpoints.commit_run_head(
         checkpoint_id=prepared.run_commit.checkpoint_id,

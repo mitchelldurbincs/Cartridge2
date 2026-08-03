@@ -4,9 +4,10 @@ Rust experience-collection host for Cartridge2. The binary resolves an
 algorithm cartridge, validates its environment compatibility profile, builds
 that cartridge's collector, and writes experience to PostgreSQL.
 
-The only installed collector today is `alphazero_board_v1`, which dispatches
-to `AlphaZeroCollector`. The generic actor host does not imply that every game
-is an AlphaZero board game.
+Installed collectors are `alphazero_board_v1` (`AlphaZeroCollector`) and
+`dqn_v1` (`DqnCollector`). The DQN collector emits immediate-reward transition
+records and uses the shared `dqn_greedy_v1` Q-policy adapter after root random
+collection.
 
 ## Quick start
 
@@ -55,8 +56,10 @@ For `alphazero_board_v1`, compatibility currently requires two fixed
 alternating players, discrete actions, perfect-information deterministic
 planning state, fixed spatial `f32` observations, an observation-embedded legal
 mask and player indicator, and terminal zero-sum outcomes. The generated
-schema-v4 manifest verifies these requirements against per-agent action spaces,
+schema-v5 manifest verifies these requirements against per-agent action spaces,
 explicit environment semantics, wire codecs, and the optional board profile.
+`dqn_v1` instead validates the single-agent discrete profile and never requests
+board metadata.
 
 Unknown IDs and incompatible pairs fail before model or database side effects.
 
@@ -66,6 +69,7 @@ Unknown IDs and incompatible pairs fail before model or database side effects.
 - `src/algorithms.rs`: algorithm ID to `CollectorAlgorithm` dispatch.
 - `src/actor.rs`: `AlphaZeroCollector` episode generation and terminal-target encoding.
 - `src/mcts_policy.rs`: AlphaZero MCTS action selection and policy targets.
+- `src/dqn_actor.rs`: DQN epsilon-greedy collection and transition encoding.
 - `src/storage/postgres.rs`: pooled PostgreSQL persistence.
 - `src/stats.rs`: final structured collection, abandonment, and RSS telemetry.
 
@@ -73,6 +77,8 @@ The AlphaZero collector requires `EnvironmentMetadata.board` and derives its
 dimensions and observation layout from that optional profile. Replay storage
 does not know about boards, observations, actions, rewards, policies, or value
 targets; those details remain owned by the selected algorithm cartridge.
+The DQN payload is observation, action, immediate reward, next observation,
+termination/truncation flags, and next-action availability.
 
 ## Model artifacts
 

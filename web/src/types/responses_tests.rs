@@ -2,16 +2,39 @@
 
 use super::*;
 use engine_core::board_profile::{BoardGameMetadata, BoardPlayerMetadata, BoardView};
+use engine_core::{
+    ActionSpace, AgentId, AgentModel, Capabilities, Encoding, EngineId, EnvironmentSemantics,
+    TensorSpec,
+};
+use std::collections::BTreeMap;
 
-fn test_board_metadata() -> EnvironmentMetadata {
-    EnvironmentMetadata::new("test_game", "Test Game Display").with_board(
-        BoardGameMetadata::new(5, 5, 25)
-            .with_observation(52, 1, 25, false)
-            .with_players(vec![
-                BoardPlayerMetadata::new("Player A", "A"),
-                BoardPlayerMetadata::new("Player B", "B"),
-            ]),
-    )
+fn test_board_contract() -> (EnvironmentMetadata, Capabilities) {
+    let metadata = EnvironmentMetadata::new("test_game", "Test Game Display").with_board(
+        BoardGameMetadata::new(5, 5).with_players(vec![
+            BoardPlayerMetadata::new("Player A", "A"),
+            BoardPlayerMetadata::new("Player B", "B"),
+        ]),
+    );
+    let capabilities = Capabilities {
+        id: EngineId {
+            env_id: "test_game".into(),
+            build_id: "test".into(),
+        },
+        contract_version: 1,
+        encoding: Encoding::discrete_u32_le(
+            "test:v1",
+            TensorSpec::f32_fixed([("channel", 2), ("row", 5), ("column", 5)]),
+        ),
+        semantics:
+            EnvironmentSemantics::deterministic_alternating_perfect_information_terminal_zero_sum(),
+        max_horizon: Some(25),
+        agents: AgentModel::fixed_homogeneous_masked(
+            [AgentId(1), AgentId(2)],
+            ActionSpace::discrete(25),
+        ),
+        preferred_batch: 1,
+    };
+    (metadata, capabilities)
 }
 
 // ========================================
@@ -84,17 +107,15 @@ fn test_games_list_response_deserialization() {
 
 #[test]
 fn test_game_info_response_from_environment_metadata() {
-    let metadata = test_board_metadata();
+    let (metadata, capabilities) = test_board_contract();
 
-    let response = GameInfoResponse::try_from(metadata).unwrap();
+    let response = GameInfoResponse::from_environment(metadata, &capabilities).unwrap();
 
     assert_eq!(response.env_id, "test_game");
     assert_eq!(response.display_name, "Test Game Display");
     assert_eq!(response.board_width, 5);
     assert_eq!(response.board_height, 5);
     assert_eq!(response.num_actions, 25);
-    assert_eq!(response.obs_size, 52);
-    assert_eq!(response.legal_mask_offset, 25);
     assert_eq!(response.player_count, 2);
     assert_eq!(response.player_names, vec!["Player A", "Player B"]);
     assert_eq!(response.player_symbols, vec!["A", "B"]);
@@ -103,7 +124,8 @@ fn test_game_info_response_from_environment_metadata() {
 #[test]
 fn test_game_info_rejects_environment_without_board_profile() {
     let metadata = EnvironmentMetadata::new("counter", "Counter");
-    let error = GameInfoResponse::try_from(metadata)
+    let (_, capabilities) = test_board_contract();
+    let error = GameInfoResponse::from_environment(metadata, &capabilities)
         .unwrap_err()
         .to_string();
     assert!(error.contains("no board presentation profile"));
@@ -117,8 +139,6 @@ fn test_game_info_response_serialization() {
         board_width: 3,
         board_height: 3,
         num_actions: 9,
-        obs_size: 29,
-        legal_mask_offset: 18,
         player_count: 2,
         player_names: vec!["X".to_string(), "O".to_string()],
         player_symbols: vec!["X".to_string(), "O".to_string()],
@@ -230,9 +250,11 @@ fn test_move_response_deserialization() {
 fn test_history_entry_serialization() {
     let entry = HistoryEntry {
         step: 100,
-        total_loss: 0.5,
-        value_loss: 0.2,
-        policy_loss: 0.3,
+        metrics: BTreeMap::from([
+            ("loss/total".to_string(), 0.5),
+            ("loss/value".to_string(), 0.2),
+            ("loss/policy".to_string(), 0.3),
+        ]),
         learning_rate: 0.001,
         grad_norm: Some(1.5),
     };
@@ -240,7 +262,7 @@ fn test_history_entry_serialization() {
     let json = serde_json::to_string(&entry).unwrap();
     assert!(json.contains("step"));
     assert!(json.contains("100"));
-    assert!(json.contains("total_loss"));
+    assert!(json.contains("loss/total"));
     assert!(json.contains("0.5"));
 }
 
@@ -249,55 +271,51 @@ fn test_history_entry_rejects_partial_legacy_shape() {
     let json = r#"{"step": 50}"#;
     let error = serde_json::from_str::<HistoryEntry>(json).unwrap_err();
 
-    assert!(error.to_string().contains("total_loss"));
+    assert!(error.to_string().contains("metrics"));
 }
 
 // ========================================
-// EvalStats Tests
+// EvaluationStats Tests
 // ========================================
 
 #[test]
 fn test_eval_stats_serialization() {
-    let eval = EvalStats {
+    let eval = EvaluationStats {
         step: 200,
-        win_rate: 0.6,
-        draw_rate: 0.2,
-        loss_rate: 0.2,
-        games_played: 100,
-        avg_game_length: 15.5,
+        metrics: BTreeMap::from([("return/mean".to_string(), 0.6)]),
+        episodes: 100,
+        mean_episode_length: 15.5,
         timestamp: 1234567890.0,
     };
 
     let json = serde_json::to_string(&eval).unwrap();
-    assert!(json.contains("win_rate"));
+    assert!(json.contains("return/mean"));
     assert!(json.contains("0.6"));
-    assert!(json.contains("games_played"));
+    assert!(json.contains("episodes"));
     assert!(json.contains("100"));
 }
 
 #[test]
 fn test_eval_stats_rejects_partial_legacy_shape() {
-    let json = r#"{"step": 150, "win_rate": 0.55}"#;
-    let error = serde_json::from_str::<EvalStats>(json).unwrap_err();
+    let json = r#"{"step": 150, "metrics": {"return/mean": 0.55}}"#;
+    let error = serde_json::from_str::<EvaluationStats>(json).unwrap_err();
 
-    assert!(error.to_string().contains("draw_rate"));
+    assert!(error.to_string().contains("episodes"));
 }
 
 #[test]
 fn test_eval_stats_accepts_u64_game_counts_from_the_authoritative_stats_schema() {
-    let games_played = u64::from(u32::MAX) + 1;
-    let stats: EvalStats = serde_json::from_value(serde_json::json!({
+    let episodes = u64::from(u32::MAX) + 1;
+    let stats: EvaluationStats = serde_json::from_value(serde_json::json!({
         "step": 1,
-        "win_rate": 0.5,
-        "draw_rate": 0.25,
-        "loss_rate": 0.25,
-        "games_played": games_played,
-        "avg_game_length": 8.0,
+        "metrics": {"return/mean": 0.5},
+        "episodes": episodes,
+        "mean_episode_length": 8.0,
         "timestamp": 1.0
     }))
     .unwrap();
 
-    assert_eq!(stats.games_played, games_played);
+    assert_eq!(stats.episodes, episodes);
 }
 
 // ========================================
@@ -309,17 +327,15 @@ fn test_training_stats_serialization() {
     let stats = TrainingStats {
         step: 500,
         total_steps: 10000,
-        total_loss: 0.4,
-        policy_loss: 0.25,
-        value_loss: 0.15,
+        metrics: BTreeMap::from([("loss/td".to_string(), 0.4)]),
         samples_seen: 32000,
         replay_record_count: 50000,
         last_checkpoint: "checkpoint-id".to_string(),
         learning_rate: 0.0005,
         timestamp: 1234567890.0,
         env_id: "tictactoe".to_string(),
-        last_eval: None,
-        eval_history: vec![],
+        last_evaluation: None,
+        evaluation_history: vec![],
         history: vec![],
     };
 
@@ -336,9 +352,7 @@ fn test_training_stats_accepts_u64_steps_from_the_authoritative_stats_schema() {
     let json = serde_json::json!({
         "step": step,
         "total_steps": step,
-        "total_loss": 0.4,
-        "value_loss": 0.15,
-        "policy_loss": 0.25,
+        "metrics": {"loss/total": 0.4, "loss/value": 0.15, "loss/policy": 0.25},
         "learning_rate": 0.0005,
         "samples_seen": step,
         "replay_record_count": 50_000,
@@ -346,15 +360,13 @@ fn test_training_stats_accepts_u64_steps_from_the_authoritative_stats_schema() {
         "timestamp": 1_234_567_890.0,
         "history": [{
             "step": step,
-            "total_loss": 0.4,
-            "value_loss": 0.15,
-            "policy_loss": 0.25,
+            "metrics": {"loss/total": 0.4, "loss/value": 0.15, "loss/policy": 0.25},
             "learning_rate": 0.0005,
             "grad_norm": null
         }],
         "env_id": "tictactoe",
-        "last_eval": null,
-        "eval_history": []
+        "last_evaluation": null,
+        "evaluation_history": []
     });
 
     let stats: TrainingStats = serde_json::from_value(json).unwrap();
@@ -372,44 +384,42 @@ fn test_training_stats_rejects_partial_legacy_shape() {
 
 #[test]
 fn test_training_stats_with_nested_eval() {
-    let eval = EvalStats {
+    let eval = EvaluationStats {
         step: 500,
-        win_rate: 0.7,
-        draw_rate: 0.2,
-        loss_rate: 0.1,
-        games_played: 50,
-        avg_game_length: 12.0,
+        metrics: BTreeMap::from([
+            ("outcome/win_rate".to_string(), 0.7),
+            ("outcome/draw_rate".to_string(), 0.2),
+            ("outcome/loss_rate".to_string(), 0.1),
+        ]),
+        episodes: 50,
+        mean_episode_length: 12.0,
         timestamp: 1234567890.0,
     };
 
     let stats = TrainingStats {
         step: 500,
         total_steps: 1000,
-        total_loss: 0.3,
-        policy_loss: 0.2,
-        value_loss: 0.1,
+        metrics: BTreeMap::from([("loss/total".to_string(), 0.3)]),
         samples_seen: 32000,
         replay_record_count: 10000,
         last_checkpoint: "checkpoint-id".to_string(),
         learning_rate: 0.001,
         timestamp: 1234567890.0,
         env_id: "connect4".to_string(),
-        last_eval: Some(eval.clone()),
-        eval_history: vec![eval.clone()],
+        last_evaluation: Some(eval.clone()),
+        evaluation_history: vec![eval.clone()],
         history: vec![HistoryEntry {
             step: 500,
-            total_loss: 0.3,
-            value_loss: 0.1,
-            policy_loss: 0.2,
+            metrics: BTreeMap::from([("loss/total".to_string(), 0.3)]),
             learning_rate: 0.001,
             grad_norm: None,
         }],
     };
 
     let json = serde_json::to_string(&stats).unwrap();
-    assert!(json.contains("last_eval"));
-    assert!(json.contains("eval_history"));
-    assert!(json.contains("win_rate"));
+    assert!(json.contains("last_evaluation"));
+    assert!(json.contains("evaluation_history"));
+    assert!(json.contains("outcome/win_rate"));
 }
 
 // ========================================

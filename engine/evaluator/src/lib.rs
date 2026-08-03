@@ -24,8 +24,8 @@ use rand_chacha::ChaCha20Rng;
 
 use player::AlphaZeroPosition;
 
-pub use player::Player;
-pub use results::{EvalSummary, PositionRecord};
+pub use player::{DqnPlayer, Player};
+pub use results::{DqnEvalSummary, EvalSummary, PositionRecord};
 
 /// Validate and canonicalize the play temperature stored by a model player.
 ///
@@ -74,7 +74,6 @@ fn resolve_compatible_algorithm(algorithm_id: &str, env_id: &str) -> Result<Buil
     engine_games::register_all_environments();
     let context = EngineContext::new(env_id)
         .map_err(|error| anyhow!("Environment '{env_id}' is unavailable: {error}"))?;
-    context.metadata().require_board()?;
     algorithm.compatibility(&context).require_compatible()?;
     Ok(algorithm)
 }
@@ -103,7 +102,134 @@ pub fn run_evaluation(
         BuiltinAlgorithm::AlphaZeroBoardV1 => {
             run_alphazero_evaluation(env_id, player1, player2, games, seed, positions)
         }
+        BuiltinAlgorithm::DqnV1 => Err(anyhow!(
+            "DQN uses the single-agent return suite, not the two-player evaluation API"
+        )),
     }
+}
+
+/// Evaluate a DQN policy by episode return through the environment contract.
+pub fn run_dqn_evaluation(
+    algorithm_id: &str,
+    env_id: &str,
+    player: &mut DqnPlayer,
+    episodes: u32,
+    seed: u64,
+) -> Result<DqnEvalSummary> {
+    validate_evaluation_schedule(episodes, seed)?;
+    let algorithm = resolve_compatible_algorithm(algorithm_id, env_id)?;
+    if algorithm != BuiltinAlgorithm::DqnV1 {
+        return Err(anyhow!(
+            "Algorithm '{}' does not own the single-agent return suite",
+            algorithm.descriptor().id
+        ));
+    }
+    let mut ctx = EngineContext::new(env_id)
+        .map_err(|error| anyhow!("Environment '{env_id}' is unavailable: {error}"))?;
+    let capabilities = ctx.capabilities();
+    let max_horizon = capabilities
+        .max_horizon
+        .filter(|horizon| *horizon > 0)
+        .ok_or_else(|| anyhow!("DQN evaluation requires a finite non-zero horizon"))?;
+    let agents = capabilities
+        .agents
+        .fixed_agents()
+        .ok_or_else(|| anyhow!("DQN evaluation requires one fixed agent"))?;
+    let [agent] = agents else {
+        return Err(anyhow!(
+            "DQN evaluation requires one fixed agent, got {}",
+            agents.len()
+        ));
+    };
+    let action_count = match agent.action_space {
+        engine_core::ActionSpace::Discrete { size } => usize::try_from(size)?,
+        ref other => return Err(anyhow!("DQN requires discrete actions, got {other:?}")),
+    };
+    player.require_environment_profile(env_id, capabilities.contract_version)?;
+
+    let mut total_return = 0.0f64;
+    let mut min_return = f64::INFINITY;
+    let mut max_return = f64::NEG_INFINITY;
+    let mut total_steps = 0u64;
+    let mut terminated_episodes = 0u32;
+    let mut truncated_episodes = 0u32;
+
+    for episode in 0..episodes {
+        let episode_seed = seed + u64::from(episode);
+        let mut rng = ChaCha20Rng::seed_from_u64(episode_seed);
+        let reset = ctx.reset(episode_seed, &[])?;
+        if reset.timestep.episode != EpisodeStatus::Running
+            || reset.timestep.source != engine_core::TransitionSource::Reset
+        {
+            return Err(anyhow!(
+                "DQN environment reset must produce a running reset timestep"
+            ));
+        }
+        let mut state = reset.state;
+        let mut timestep = reset.timestep;
+        let mut episode_return = 0.0f64;
+
+        for step in 0..max_horizon {
+            let action = player.select_action(&timestep, action_count, &mut rng)?;
+            let transition = ctx.step(&state, &action.to_le_bytes())?;
+            let outcome = transition
+                .timestep
+                .outcomes
+                .iter()
+                .find(|outcome| outcome.agent_id == agent.id)
+                .ok_or_else(|| anyhow!("DQN transition omitted its fixed-agent outcome"))?;
+            if !outcome.reward.is_finite() {
+                return Err(anyhow!("DQN evaluation observed a non-finite reward"));
+            }
+            episode_return += f64::from(outcome.reward);
+            total_steps += 1;
+            match transition.timestep.episode {
+                EpisodeStatus::Running => {
+                    if outcome.terminated || outcome.truncated {
+                        return Err(anyhow!("running DQN timestep contains a completed outcome"));
+                    }
+                    state = transition.state;
+                    timestep = transition.timestep;
+                }
+                EpisodeStatus::Terminated => {
+                    if !outcome.terminated || outcome.truncated {
+                        return Err(anyhow!(
+                            "DQN termination flags disagree with episode status"
+                        ));
+                    }
+                    terminated_episodes += 1;
+                    break;
+                }
+                EpisodeStatus::Truncated => {
+                    if outcome.terminated || !outcome.truncated {
+                        return Err(anyhow!("DQN truncation flags disagree with episode status"));
+                    }
+                    truncated_episodes += 1;
+                    break;
+                }
+            }
+            if step + 1 == max_horizon {
+                return Err(anyhow!(
+                    "DQN environment remained running beyond its declared horizon"
+                ));
+            }
+        }
+        total_return += episode_return;
+        min_return = min_return.min(episode_return);
+        max_return = max_return.max(episode_return);
+    }
+
+    Ok(DqnEvalSummary {
+        env_id: env_id.to_string(),
+        player_name: player.name(),
+        episodes_played: episodes,
+        terminated_episodes,
+        truncated_episodes,
+        mean_return: total_return / f64::from(episodes),
+        min_return,
+        max_return,
+        avg_episode_length: total_steps as f64 / f64::from(episodes),
+    })
 }
 
 /// Play `games` matches between two players and summarize the result.
@@ -126,7 +252,16 @@ fn run_alphazero_evaluation(
         .map_err(|error| anyhow!("Environment '{env_id}' is unavailable: {error}"))?;
     let metadata = ctx.metadata();
     let board = metadata.require_board()?;
-    let env_contract_version = ctx.capabilities().contract_version;
+    let capabilities = ctx.capabilities();
+    let env_contract_version = capabilities.contract_version;
+    let action_count = match capabilities.action_space(AgentId(1)) {
+        Some(engine_core::ActionSpace::Discrete { size }) => *size as usize,
+        other => {
+            return Err(anyhow!(
+                "AlphaZero requires discrete actions, got {other:?}"
+            ))
+        }
+    };
     player1.require_environment_profile(env_id, env_contract_version)?;
     player2.require_environment_profile(env_id, env_contract_version)?;
 
@@ -164,7 +299,7 @@ fn run_alphazero_evaluation(
                         ));
                     }
 
-                    let position = AlphaZeroPosition::new(&state, &timestep, board)?;
+                    let position = AlphaZeroPosition::new(&state, &timestep, action_count)?;
                     validate_running_outcomes(&timestep)?;
                     let seat = require_board_seat(position.agent_id)?;
                     if view.current_player != seat {
@@ -434,6 +569,19 @@ mod tests {
         .expect("random-vs-random evaluation")
     }
 
+    fn dqn_eval(episodes: u32, seed: u64) -> DqnEvalSummary {
+        engine_games::register_all_environments();
+        let mut player = DqnPlayer::Random;
+        run_dqn_evaluation(
+            algorithm_core::DQN_V1_ID,
+            "counter",
+            &mut player,
+            episodes,
+            seed,
+        )
+        .expect("random counter evaluation")
+    }
+
     #[test]
     fn winner_translation_follows_player_ones_seat() {
         assert_eq!(winner_from_player1(1, true), Some(1));
@@ -490,6 +638,23 @@ mod tests {
     #[test]
     fn runs_are_reproducible_for_a_given_seed() {
         assert_eq!(eval("connect4", 6), eval("connect4", 6));
+    }
+
+    #[test]
+    fn dqn_return_suite_runs_without_board_or_second_player_assumptions() {
+        let summary = dqn_eval(12, 9);
+        assert_eq!(summary.env_id, "counter");
+        assert_eq!(summary.player_name, "Random");
+        assert_eq!(summary.episodes_played, 12);
+        assert_eq!(
+            summary.terminated_episodes + summary.truncated_episodes,
+            summary.episodes_played
+        );
+        assert!(summary.mean_return.is_finite());
+        assert!(summary.min_return <= summary.mean_return);
+        assert!(summary.mean_return <= summary.max_return);
+        assert!(summary.avg_episode_length > 0.0);
+        assert_eq!(summary, dqn_eval(12, 9));
     }
 
     #[test]

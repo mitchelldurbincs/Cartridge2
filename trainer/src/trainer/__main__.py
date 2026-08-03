@@ -34,9 +34,7 @@ def _select_algorithm(argv: Sequence[str]) -> Algorithm:
     return get_algorithm(selected.algorithm)
 
 
-def _install_command(
-    subparsers: argparse._SubParsersAction, command: AlgorithmCommand
-) -> None:
+def _install_command(subparsers: argparse._SubParsersAction, command: AlgorithmCommand) -> None:
     parser = subparsers.add_parser(
         command.name,
         help=command.help,
@@ -69,9 +67,7 @@ def build_parser(algorithm: Algorithm) -> argparse.ArgumentParser:
     commands = algorithm.commands()
     names = [command.name for command in commands]
     if len(names) != len(set(names)):
-        raise RuntimeError(
-            f"Algorithm '{algorithm.descriptor.id}' exports duplicate CLI commands"
-        )
+        raise RuntimeError(f"Algorithm '{algorithm.descriptor.id}' exports duplicate CLI commands")
     for command in commands:
         _install_command(subparsers, command)
     return parser

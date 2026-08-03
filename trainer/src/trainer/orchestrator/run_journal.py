@@ -16,9 +16,7 @@ from ..storage.publisher import (
 from ..storage.run_commit import RunCommitRepository, RunCommitV1
 from .eval_runner import PreparedEvaluation
 
-_PREPARATION_FIELDS = frozenset(
-    {"schema_version", "run_commit_id", "run_commit", "evaluation"}
-)
+_PREPARATION_FIELDS = frozenset({"schema_version", "run_commit_id", "run_commit", "evaluation"})
 _PREPARED_EVALUATION_FIELDS = frozenset(
     {
         "evaluation_id",
@@ -52,15 +50,11 @@ class PreparedRunV1:
 
     def __post_init__(self) -> None:
         if self.schema_version != 1 or isinstance(self.schema_version, bool):
-            raise ArtifactValidationError(
-                "run_preparation.schema_version must be exactly 1"
-            )
+            raise ArtifactValidationError("run_preparation.schema_version must be exactly 1")
         if not isinstance(self.run_commit, RunCommitV1):
             raise ArtifactValidationError("run_preparation.run_commit is invalid")
         orchestration = self.run_commit.orchestration
-        evaluation_id = (
-            orchestration.evaluation_id if orchestration is not None else None
-        )
+        evaluation_id = orchestration.evaluation_id if orchestration is not None else None
         if (evaluation_id is None) != (self.evaluation is None):
             raise ArtifactValidationError(
                 "Run preparation evaluation presence disagrees with its RunCommit"
@@ -72,9 +66,7 @@ class PreparedRunV1:
                 raise ArtifactValidationError(
                     "Run preparation evaluation ID disagrees with its RunCommit"
                 )
-            if self.evaluation.artifact.candidate_checkpoint_id != (
-                self.run_commit.checkpoint_id
-            ):
+            if self.evaluation.artifact.candidate_checkpoint_id != (self.run_commit.checkpoint_id):
                 raise ArtifactValidationError(
                     "Run preparation candidate disagrees with its RunCommit"
                 )
@@ -125,9 +117,7 @@ class PreparedRunV1:
         if frozenset(value) != _PREPARATION_FIELDS:
             raise ArtifactValidationError("Run preparation fields must be exact")
         if value["schema_version"] != 1 or isinstance(value["schema_version"], bool):
-            raise ArtifactValidationError(
-                "run_preparation.schema_version must be exactly 1"
-            )
+            raise ArtifactValidationError("run_preparation.schema_version must be exactly 1")
         run_commit = RunCommitV1.from_bytes(canonical_json_bytes(value["run_commit"]))
         run_commit_id = validate_sha256_digest(
             value["run_commit_id"], field="run_preparation.run_commit_id"
@@ -143,9 +133,7 @@ class PreparedRunV1:
                 not isinstance(prepared_evaluation, dict)
                 or frozenset(prepared_evaluation) != _PREPARED_EVALUATION_FIELDS
             ):
-                raise ArtifactValidationError(
-                    "Prepared evaluation fields must be exact"
-                )
+                raise ArtifactValidationError("Prepared evaluation fields must be exact")
             artifact = EvaluationArtifactV2.from_bytes(
                 canonical_json_bytes(prepared_evaluation["artifact"])
             )
@@ -161,9 +149,7 @@ class PreparedRunV1:
             )
         prepared = cls(run_commit=run_commit, evaluation=evaluation)
         if prepared.to_bytes() != data:
-            raise ArtifactValidationError(
-                "Run preparation is not normalized canonical JSON"
-            )
+            raise ArtifactValidationError("Run preparation is not normalized canonical JSON")
         return prepared
 
 
@@ -172,9 +158,7 @@ class _PreparationStorage(Protocol):
         self, parent_run_commit_id: str | None, data: bytes
     ) -> None: ...
 
-    def read_run_preparation_bytes(
-        self, parent_run_commit_id: str | None
-    ) -> bytes | None: ...
+    def read_run_preparation_bytes(self, parent_run_commit_id: str | None) -> bytes | None: ...
 
 
 class RunJournal:
@@ -197,9 +181,7 @@ class RunJournal:
         )
         prepared = PreparedRunV1(canonical, prepared.evaluation)
         storage: _PreparationStorage = self.checkpoints  # type: ignore[assignment]
-        storage.publish_run_preparation_bytes(
-            prepared.parent_run_commit_id, prepared.to_bytes()
-        )
+        storage.publish_run_preparation_bytes(prepared.parent_run_commit_id, prepared.to_bytes())
 
     def resolve(self, parent_run_commit_id: str | None) -> PreparedRunV1 | None:
         storage: _PreparationStorage = self.checkpoints  # type: ignore[assignment]
@@ -208,9 +190,7 @@ class RunJournal:
             return None
         prepared = PreparedRunV1.from_bytes(data)
         if prepared.parent_run_commit_id != parent_run_commit_id:
-            raise ArtifactValidationError(
-                "Run preparation is stored under the wrong parent"
-            )
+            raise ArtifactValidationError("Run preparation is stored under the wrong parent")
         self.run_commits.validate_prepared(
             prepared.run_commit,
             prepared.evaluation.artifact if prepared.evaluation is not None else None,

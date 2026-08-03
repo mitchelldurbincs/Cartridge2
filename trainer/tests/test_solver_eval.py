@@ -141,9 +141,7 @@ def stub_eval_binary(monkeypatch, tmp_path):
         out = Path(command[command.index("--output") + 1])
         dump = Path(command[command.index("--dump-positions") + 1])
         out.write_text(json.dumps(fake_summary(games)))
-        dump.write_text(
-            "\n".join(json.dumps(record) for record in fake_dump(games)) + "\n"
-        )
+        dump.write_text("\n".join(json.dumps(record) for record in fake_dump(games)) + "\n")
 
     monkeypatch.setattr(scorer_module, "run_eval_binary", fake_run)
     return calls
@@ -456,9 +454,7 @@ class TestSolverEvaluateDriver:
                 num_games=4,
                 seed=seed,
             )
-            return {
-                k: v for k, v in results.to_dict().items() if k not in volatile_keys
-            }
+            return {k: v for k, v in results.to_dict().items() if k not in volatile_keys}
 
         assert run(42) == run(42)
 
@@ -468,9 +464,7 @@ class TestSolverEvaluateDriver:
         # namespace is sufficient.
         assert run_solver_evaluation(args) == 1
 
-    def test_default_model_resolves_the_current_checkpoint_channel(
-        self, tmp_path, monkeypatch
-    ):
+    def test_default_model_resolves_the_current_checkpoint_channel(self, tmp_path, monkeypatch):
         from trainer.solver_eval import cli as solver_cli
 
         checkpoint = SimpleNamespace(
@@ -492,9 +486,7 @@ class TestSolverEvaluateDriver:
             def to_dict():
                 return {"checkpoint_id": checkpoint.checkpoint_id, "step": 123}
 
-        monkeypatch.setattr(
-            solver_cli, "create_checkpoint_publisher", lambda *_: repository
-        )
+        monkeypatch.setattr(solver_cli, "create_checkpoint_publisher", lambda *_: repository)
         monkeypatch.setattr(solver_cli, "SolverScorer", object)
         monkeypatch.setattr(
             solver_cli,
@@ -695,8 +687,6 @@ class TestSolverAgainstRealEngineGames:
                 game = record["game"]
                 scorer.reset()
             # Raises on any disagreement with the engine's board.
-            scores = scorer.scores_for(
-                record["board"], record["player"], record["legal"]
-            )
+            scores = scorer.scores_for(record["board"], record["player"], record["legal"])
             assert sorted(scores) == sorted(record["legal"])
             scorer.mirror_move(record["action"])

@@ -100,7 +100,8 @@ pub async fn get_model_info(State(state): State<Arc<AppState>>) -> StatsResult<M
 
 #[cfg(test)]
 mod tests {
-    use crate::types::{EvalStats, HistoryEntry, ModelInfoResponse, TrainingStats};
+    use crate::types::{EvaluationStats, HistoryEntry, ModelInfoResponse, TrainingStats};
+    use std::collections::BTreeMap;
 
     #[test]
     fn test_model_info_response_default() {
@@ -145,46 +146,52 @@ mod tests {
 
         assert_eq!(stats.step, 0);
         assert_eq!(stats.total_steps, 0);
-        assert_eq!(stats.total_loss, 0.0);
+        assert!(stats.metrics.is_empty());
         assert_eq!(stats.samples_seen, 0);
         assert_eq!(stats.replay_record_count, 0);
         assert!(stats.last_checkpoint.is_empty());
-        assert!(stats.last_eval.is_none());
-        assert!(stats.eval_history.is_empty());
+        assert!(stats.last_evaluation.is_none());
+        assert!(stats.evaluation_history.is_empty());
         assert!(stats.history.is_empty());
     }
 
     #[test]
     fn test_training_stats_with_eval() {
-        let eval = EvalStats {
+        let eval = EvaluationStats {
             step: 100,
-            win_rate: 0.6,
-            draw_rate: 0.3,
-            loss_rate: 0.1,
-            games_played: 50,
-            avg_game_length: 15.5,
+            metrics: BTreeMap::from([
+                ("outcome/win_rate".to_string(), 0.6),
+                ("outcome/draw_rate".to_string(), 0.3),
+                ("outcome/loss_rate".to_string(), 0.1),
+            ]),
+            episodes: 50,
+            mean_episode_length: 15.5,
             timestamp: 1234567890.0,
         };
 
         let stats = TrainingStats {
             step: 100,
             total_steps: 1000,
-            total_loss: 0.5,
-            policy_loss: 0.3,
-            value_loss: 0.2,
+            metrics: BTreeMap::from([
+                ("loss/total".to_string(), 0.5),
+                ("loss/policy".to_string(), 0.3),
+                ("loss/value".to_string(), 0.2),
+            ]),
             samples_seen: 6400,
             replay_record_count: 10000,
             last_checkpoint: "checkpoint-id".to_string(),
             learning_rate: 0.001,
             timestamp: 1234567890.0,
             env_id: "tictactoe".to_string(),
-            last_eval: Some(eval.clone()),
-            eval_history: vec![eval],
+            last_evaluation: Some(eval.clone()),
+            evaluation_history: vec![eval],
             history: vec![HistoryEntry {
                 step: 100,
-                total_loss: 0.5,
-                value_loss: 0.2,
-                policy_loss: 0.3,
+                metrics: BTreeMap::from([
+                    ("loss/total".to_string(), 0.5),
+                    ("loss/value".to_string(), 0.2),
+                    ("loss/policy".to_string(), 0.3),
+                ]),
                 learning_rate: 0.001,
                 grad_norm: None,
             }],
@@ -192,11 +199,11 @@ mod tests {
 
         assert_eq!(stats.step, 100);
         assert_eq!(stats.total_steps, 1000);
-        assert!((stats.total_loss - 0.5).abs() < f64::EPSILON);
-        assert!(stats.last_eval.is_some());
+        assert!((stats.metrics["loss/total"] - 0.5).abs() < f64::EPSILON);
+        assert!(stats.last_evaluation.is_some());
 
-        let last_eval = stats.last_eval.unwrap();
-        assert!((last_eval.win_rate - 0.6).abs() < f64::EPSILON);
+        let last_evaluation = stats.last_evaluation.unwrap();
+        assert!((last_evaluation.metrics["outcome/win_rate"] - 0.6).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -204,38 +211,36 @@ mod tests {
         let entry = HistoryEntry::default();
 
         assert_eq!(entry.step, 0);
-        assert_eq!(entry.total_loss, 0.0);
-        assert_eq!(entry.value_loss, 0.0);
-        assert_eq!(entry.policy_loss, 0.0);
+        assert!(entry.metrics.is_empty());
         assert_eq!(entry.learning_rate, 0.0);
     }
 
     #[test]
     fn test_eval_stats_default() {
-        let eval = EvalStats::default();
+        let eval = EvaluationStats::default();
 
         assert_eq!(eval.step, 0);
-        assert_eq!(eval.win_rate, 0.0);
-        assert_eq!(eval.draw_rate, 0.0);
-        assert_eq!(eval.loss_rate, 0.0);
-        assert_eq!(eval.games_played, 0);
-        assert_eq!(eval.avg_game_length, 0.0);
+        assert!(eval.metrics.is_empty());
+        assert_eq!(eval.episodes, 0);
+        assert_eq!(eval.mean_episode_length, 0.0);
     }
 
     #[test]
     fn test_eval_stats_rates_sum_to_one() {
         // Test that rates can be set and sum to 1.0
-        let eval = EvalStats {
+        let eval = EvaluationStats {
             step: 100,
-            win_rate: 0.5,
-            draw_rate: 0.3,
-            loss_rate: 0.2,
-            games_played: 100,
-            avg_game_length: 20.0,
+            metrics: BTreeMap::from([
+                ("outcome/win_rate".to_string(), 0.5),
+                ("outcome/draw_rate".to_string(), 0.3),
+                ("outcome/loss_rate".to_string(), 0.2),
+            ]),
+            episodes: 100,
+            mean_episode_length: 20.0,
             timestamp: 1234567890.0,
         };
 
-        let sum = eval.win_rate + eval.draw_rate + eval.loss_rate;
+        let sum = eval.metrics.values().sum::<f64>();
         assert!((sum - 1.0).abs() < f64::EPSILON);
     }
 }

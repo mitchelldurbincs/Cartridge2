@@ -75,6 +75,10 @@ pub struct Config {
     #[arg(long)]
     pub source_checkpoint_id: Option<String>,
 
+    /// Algorithm-owned, versioned JSON configuration for the selected collector.
+    #[arg(long = "collector-config")]
+    pub collector_config: String,
+
     #[arg(long)]
     pub episode_timeout_secs: u64,
 
@@ -86,34 +90,6 @@ pub struct Config {
 
     #[arg(long, default_value_t = default_data_dir())]
     pub data_dir: String,
-
-    /// Exact positive search budget supplied by the synchronized orchestrator.
-    #[arg(long)]
-    pub num_simulations: u32,
-
-    #[arg(long)]
-    pub c_puct: f32,
-
-    #[arg(long)]
-    pub temperature: f32,
-
-    #[arg(long)]
-    pub late_temperature: f32,
-
-    #[arg(long)]
-    pub temp_threshold: u32,
-
-    #[arg(long)]
-    pub dirichlet_alpha: f32,
-
-    #[arg(long)]
-    pub dirichlet_weight: f32,
-
-    #[arg(long)]
-    pub eval_batch_size: u32,
-
-    #[arg(long)]
-    pub onnx_intra_threads: u32,
 
     #[arg(long, default_value_t = default_postgres_url())]
     pub postgres_url: String,
@@ -135,47 +111,13 @@ impl Config {
         if let Some(source_checkpoint_id) = &self.source_checkpoint_id {
             crate::storage::validate_replay_digest(source_checkpoint_id, "source_checkpoint_id")?;
         }
+        let recipe: serde_json::Value = serde_json::from_str(&self.collector_config)
+            .map_err(|error| anyhow!("collector_config must be valid JSON: {error}"))?;
+        if !recipe.is_object() {
+            return Err(anyhow!("collector_config must be a JSON object"));
+        }
         if self.episode_timeout_secs == 0 {
             return Err(anyhow!("episode_timeout_secs must be greater than 0"));
-        }
-        if self.num_simulations == 0 {
-            return Err(anyhow!("num_simulations must be greater than 0"));
-        }
-        if self.eval_batch_size == 0 {
-            return Err(anyhow!("eval_batch_size must be greater than 0"));
-        }
-        if self.onnx_intra_threads == 0 {
-            return Err(anyhow!("onnx_intra_threads must be greater than 0"));
-        }
-        for (name, value) in [
-            ("c_puct", self.c_puct),
-            ("temperature", self.temperature),
-            ("late_temperature", self.late_temperature),
-            ("dirichlet_alpha", self.dirichlet_alpha),
-            ("dirichlet_weight", self.dirichlet_weight),
-        ] {
-            if !value.is_finite() || value < 0.0 {
-                return Err(anyhow!("{name} must be finite and nonnegative"));
-            }
-        }
-        if self.dirichlet_weight > 1.0 {
-            return Err(anyhow!("dirichlet_weight must be in [0, 1]"));
-        }
-        if (self.dirichlet_alpha == 0.0) != (self.dirichlet_weight == 0.0) {
-            return Err(anyhow!(
-                "dirichlet_alpha and dirichlet_weight must both be zero to disable noise"
-            ));
-        }
-        if self.temp_threshold == 0 {
-            if self.late_temperature != self.temperature {
-                return Err(anyhow!(
-                    "late_temperature must equal temperature when temp_threshold is zero"
-                ));
-            }
-        } else if self.late_temperature == self.temperature {
-            return Err(anyhow!(
-                "late_temperature must differ from temperature when the schedule is enabled"
-            ));
         }
         if self.log_level.parse::<LevelFilter>().is_err() {
             return Err(anyhow!(
@@ -217,19 +159,11 @@ mod tests {
             max_episodes: 1,
             collection_scope_id: "a".repeat(64),
             source_checkpoint_id: Some("b".repeat(64)),
+            collector_config: r#"{"schema_version":1}"#.into(),
             episode_timeout_secs: 30,
             log_level: "info".into(),
             log_interval: 10,
             data_dir: "../data".into(),
-            num_simulations: 100,
-            c_puct: 1.4,
-            temperature: 1.0,
-            late_temperature: 1.0,
-            temp_threshold: 0,
-            dirichlet_alpha: 0.3,
-            dirichlet_weight: 0.25,
-            eval_batch_size: 32,
-            onnx_intra_threads: 1,
             postgres_url: "postgresql://test:test@localhost:5432/test".into(),
         }
     }
@@ -307,15 +241,7 @@ mod tests {
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ),
             ("--episode-timeout-secs", "30"),
-            ("--num-simulations", "10"),
-            ("--c-puct", "1.4"),
-            ("--temperature", "1.0"),
-            ("--late-temperature", "1.0"),
-            ("--temp-threshold", "0"),
-            ("--dirichlet-alpha", "0.3"),
-            ("--dirichlet-weight", "0.25"),
-            ("--eval-batch-size", "32"),
-            ("--onnx-intra-threads", "1"),
+            ("--collector-config", r#"{"schema_version":1}"#),
         ];
         let complete = || {
             std::iter::once("actor".to_string())
@@ -360,55 +286,21 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_zero_mcts_budgets() {
+    fn validate_rejects_malformed_collector_config() {
         let mut cfg = base_config();
-        cfg.num_simulations = 0;
+        cfg.collector_config = "[]".into();
         assert!(cfg
             .validate()
             .unwrap_err()
             .to_string()
-            .contains("num_simulations"));
+            .contains("JSON object"));
 
-        let mut cfg = base_config();
-        cfg.eval_batch_size = 0;
+        cfg.collector_config = "{".into();
         assert!(cfg
             .validate()
             .unwrap_err()
             .to_string()
-            .contains("eval_batch_size"));
-
-        let mut cfg = base_config();
-        cfg.onnx_intra_threads = 0;
-        assert!(cfg
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("onnx_intra_threads"));
-    }
-
-    #[test]
-    fn validate_rejects_invalid_search_floats_and_inactive_noise_values() {
-        for (field, mutate) in [
-            (
-                "c_puct",
-                (|cfg: &mut Config| cfg.c_puct = f32::NAN) as fn(&mut Config),
-            ),
-            ("temperature", |cfg: &mut Config| {
-                cfg.temperature = f32::INFINITY
-            }),
-            ("late_temperature", |cfg: &mut Config| {
-                cfg.late_temperature = -0.1
-            }),
-            ("dirichlet_weight", |cfg: &mut Config| {
-                cfg.dirichlet_weight = 1.1
-            }),
-            ("both be zero", |cfg: &mut Config| cfg.dirichlet_alpha = 0.0),
-            ("must differ", |cfg: &mut Config| cfg.temp_threshold = 1),
-        ] {
-            let mut cfg = base_config();
-            mutate(&mut cfg);
-            assert!(cfg.validate().unwrap_err().to_string().contains(field));
-        }
+            .contains("valid JSON"));
     }
 
     #[test]

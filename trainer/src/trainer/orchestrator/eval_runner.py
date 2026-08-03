@@ -10,7 +10,6 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from ..algorithms import get_algorithm
-from ..algorithms.alphazero_board_v1 import get_game_config
 from ..environment_catalog import get_environment
 from ..evaluator import evaluate as run_eval
 from ..players import ModelPlayer, RandomPlayer
@@ -31,7 +30,6 @@ from ..storage.publisher import (
     ArtifactValidationError,
     CheckpointPublisher,
     CheckpointRef,
-    OnnxArtifactContract,
     create_checkpoint_publisher,
 )
 from ..storage.run_commit import RunCommitV1
@@ -60,8 +58,7 @@ def _should_promote(
     if promotion_metric == "solver_optimal":
         if candidate_solver_rate is None or champion_solver_rate is None:
             raise RuntimeError(
-                "solver_optimal promotion requires complete candidate and "
-                "champion solver results"
+                "solver_optimal promotion requires complete candidate and champion solver results"
             )
         if candidate_solver_rate > champion_solver_rate + margin:
             return True, (
@@ -74,12 +71,8 @@ def _should_promote(
         )
 
     if vs_champion_win_rate > win_threshold:
-        return True, (
-            f"win_rate: {vs_champion_win_rate:.1%} > threshold " f"{win_threshold:.1%}"
-        )
-    return False, (
-        f"win_rate: {vs_champion_win_rate:.1%} <= threshold " f"{win_threshold:.1%}"
-    )
+        return True, (f"win_rate: {vs_champion_win_rate:.1%} > threshold {win_threshold:.1%}")
+    return False, (f"win_rate: {vs_champion_win_rate:.1%} <= threshold {win_threshold:.1%}")
 
 
 def _model_player(model_path: str, temperature: float, simulations: int) -> ModelPlayer:
@@ -131,9 +124,7 @@ class PreparedEvaluation:
         ):
             raise ValueError("elapsed_seconds must be finite and nonnegative")
         normalized = float(self.elapsed_seconds)
-        object.__setattr__(
-            self, "elapsed_seconds", 0.0 if normalized == 0.0 else normalized
-        )
+        object.__setattr__(self, "elapsed_seconds", 0.0 if normalized == 0.0 else normalized)
 
 
 class EvalRunner(EvalReportingMixin):
@@ -153,30 +144,16 @@ class EvalRunner(EvalReportingMixin):
         algorithm = get_algorithm(config.algorithm_id)
         environment = get_environment(config.env_id)
         algorithm.compatibility(environment).require_compatible()
-        game_config = get_game_config(config.env_id)
-        descriptor = algorithm.descriptor
-        contract = OnnxArtifactContract(
-            algorithm_id=descriptor.id,
-            env_id=environment.env_id,
-            env_contract_version=environment.contract_version,
-            model_artifact_schema_version=descriptor.model_artifact_schema_version,
-            model_contract=descriptor.components.model_contract,
-            obs_size=game_config.obs_size,
-            num_actions=game_config.num_actions,
-        )
+        contract = algorithm.artifact_contract(environment)
         self.checkpoints = checkpoint_repository or create_checkpoint_publisher(
             contract, config.models_dir
         )
-        self.evaluations = evaluation_repository or create_evaluation_repository(
-            self.checkpoints
-        )
+        self.evaluations = evaluation_repository or create_evaluation_repository(self.checkpoints)
         self._policy_loader = lambda path, temperature: _model_player(
             path, temperature, config.eval_simulations
         )
         self._baseline_policy_factory = RandomPlayer
-        self._run_eval = lambda **kwargs: run_eval(
-            algorithm_id=config.algorithm_id, **kwargs
-        )
+        self._run_eval = lambda **kwargs: run_eval(algorithm_id=config.algorithm_id, **kwargs)
         self._solver_scorer_factory = SolverScorer
         self._run_solver = lambda **kwargs: solver_evaluate(
             algorithm_id=config.algorithm_id, **kwargs
@@ -230,9 +207,7 @@ class EvalRunner(EvalReportingMixin):
         if self.config.promotion_metric == "solver_optimal" and (
             self.config.env_id != "connect4" or self.config.solver_games <= 0
         ):
-            raise ValueError(
-                "solver_optimal promotion requires connect4 with solver_games > 0"
-            )
+            raise ValueError("solver_optimal promotion requires connect4 with solver_games > 0")
         if (
             self.config.eval_interval > 0
             and not self.config.eval_vs_random
@@ -304,11 +279,7 @@ class EvalRunner(EvalReportingMixin):
         parent: RunCommitV1 | None,
     ) -> PreparedEvaluation:
         """Run games and return canonical evidence without writing any artifact."""
-        if (
-            isinstance(iteration, bool)
-            or not isinstance(iteration, int)
-            or iteration <= 0
-        ):
+        if isinstance(iteration, bool) or not isinstance(iteration, int) or iteration <= 0:
             raise ValueError("iteration must be a positive integer")
         if not isinstance(candidate, CheckpointRef):
             raise TypeError("candidate must be CheckpointRef")
@@ -318,9 +289,7 @@ class EvalRunner(EvalReportingMixin):
             raise TypeError("parent must be RunCommitV1 or None")
 
         expected_parent_id = parent.run_commit_id if parent is not None else None
-        expected_checkpoint_parent = (
-            parent.checkpoint_id if parent is not None else None
-        )
+        expected_checkpoint_parent = parent.checkpoint_id if parent is not None else None
         if candidate.manifest.parent_checkpoint_id != expected_checkpoint_parent:
             raise ArtifactValidationError(
                 "Evaluation candidate must be a direct child of the RunHead checkpoint"
@@ -337,12 +306,8 @@ class EvalRunner(EvalReportingMixin):
         head = self.checkpoints.resolve_run_head()
         actual_parent_id = head.run_commit_id if head is not None else None
         if actual_parent_id != expected_parent_id:
-            raise ArtifactValidationError(
-                "RunHead changed before evaluation preparation"
-            )
-        previous_evaluation_id = (
-            parent.evaluation_head_id if parent is not None else None
-        )
+            raise ArtifactValidationError("RunHead changed before evaluation preparation")
+        previous_evaluation_id = parent.evaluation_head_id if parent is not None else None
         previous_evaluation = (
             self.evaluations.resolve_evaluation(previous_evaluation_id)
             if previous_evaluation_id is not None
@@ -351,9 +316,7 @@ class EvalRunner(EvalReportingMixin):
         champion_reference, champion_checkpoint = self._resolve_champion(parent)
         started_clock = time.perf_counter()
         started_at = _utc_strictly_after(
-            previous_evaluation.artifact.completed_at
-            if previous_evaluation is not None
-            else None
+            previous_evaluation.artifact.completed_at if previous_evaluation is not None else None
         )
         candidate_policy = self._policy_loader(
             str(candidate.onnx_path), self.config.eval_temperature
@@ -410,9 +373,7 @@ class EvalRunner(EvalReportingMixin):
                 self._baseline_policy_factory(),
             )
         latest_head = self.checkpoints.resolve_run_head()
-        latest_parent_id = (
-            latest_head.run_commit_id if latest_head is not None else None
-        )
+        latest_parent_id = latest_head.run_commit_id if latest_head is not None else None
         if latest_parent_id != expected_parent_id:
             raise ArtifactValidationError("RunHead changed during evaluation")
 
@@ -431,15 +392,9 @@ class EvalRunner(EvalReportingMixin):
                 win_threshold=self.config.eval_win_threshold,
                 seed=self.config.evaluation_seed,
                 requested_games=RequestedGamesV1(
-                    vs_champion=(
-                        self.config.eval_games if champion_reference is not None else 0
-                    ),
-                    vs_random=(
-                        self.config.eval_games if self.config.eval_vs_random else 0
-                    ),
-                    candidate_solver=(
-                        self.config.solver_games if self._solver_enabled() else 0
-                    ),
+                    vs_champion=(self.config.eval_games if champion_reference is not None else 0),
+                    vs_random=(self.config.eval_games if self.config.eval_vs_random else 0),
+                    candidate_solver=(self.config.solver_games if self._solver_enabled() else 0),
                     champion_solver=champion_solver_games,
                 ),
             ),

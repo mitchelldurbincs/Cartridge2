@@ -5,9 +5,10 @@ use std::collections::BTreeSet;
 use crate::erased::{ErasedEnvironmentError, ErasedTimestep};
 use crate::metadata::{BoardGameMetadata, EnvironmentMetadata};
 use crate::typed::{
-    ActionEncoding, ActionSpace, AgentId, AgentModel, AgentOutcome, Capabilities, ChanceModel,
-    Decision, EngineId, EnvironmentSemantics, EpisodeStatus, ObservationEncoding, RewardModel,
-    Timestep, TransitionDynamics, TransitionSource, TurnModel, WIRE_ENCODING_SCHEMA_VERSION,
+    ActionAvailability, ActionAvailabilityContract, ActionEncoding, ActionSpace, AgentId,
+    AgentModel, AgentOutcome, Capabilities, ChanceModel, Decision, EngineId, EpisodeStatus,
+    ObservationEncoding, RewardModel, TensorDType, Timestep, TransitionDynamics, TransitionSource,
+    TurnModel, WIRE_ENCODING_SCHEMA_VERSION,
 };
 
 fn valid_runtime_segment(value: &str) -> bool {
@@ -46,6 +47,29 @@ pub(crate) fn validate_action_space(space: &ActionSpace) -> Result<(), ErasedEnv
     Ok(())
 }
 
+fn validate_availability_contract(
+    space: &ActionSpace,
+    contract: &ActionAvailabilityContract,
+) -> Result<(), ErasedEnvironmentError> {
+    match contract {
+        ActionAvailabilityContract::All => Ok(()),
+        ActionAvailabilityContract::DiscreteMask
+            if matches!(space, ActionSpace::Discrete { .. }) =>
+        {
+            Ok(())
+        }
+        ActionAvailabilityContract::DiscreteMask => Err(ErasedEnvironmentError::ContractViolation(
+            "discrete-mask availability requires a discrete action space".to_string(),
+        )),
+        ActionAvailabilityContract::Custom { id } if id.trim().is_empty() => {
+            Err(ErasedEnvironmentError::ContractViolation(
+                "custom action-availability contract ID must be non-empty".to_string(),
+            ))
+        }
+        ActionAvailabilityContract::Custom { .. } => Ok(()),
+    }
+}
+
 pub(crate) fn validate_encoding(capabilities: &Capabilities) -> Result<(), ErasedEnvironmentError> {
     let encoding = &capabilities.encoding;
     if encoding.state.trim().is_empty() {
@@ -58,7 +82,7 @@ pub(crate) fn validate_encoding(capabilities: &Capabilities) -> Result<(), Erase
             .iter()
             .map(|agent| &agent.action_space)
             .collect::<Vec<_>>(),
-        AgentModel::Dynamic { action_space } => vec![action_space],
+        AgentModel::Dynamic { action_space, .. } => vec![action_space],
     };
     match &encoding.action {
         ActionEncoding::DiscreteU32LittleEndian
@@ -97,10 +121,32 @@ pub(crate) fn validate_encoding(capabilities: &Capabilities) -> Result<(), Erase
         _ => {}
     }
     match &encoding.observation {
-        ObservationEncoding::F32LittleEndian { elements } if *elements == 0 => {
-            Err(ErasedEnvironmentError::ContractViolation(
-                "f32 observation encoding must declare at least one element".to_string(),
-            ))
+        ObservationEncoding::Tensor { spec } => {
+            if spec.dimensions.is_empty() {
+                return Err(ErasedEnvironmentError::ContractViolation(
+                    "tensor observation must declare at least one dimension".to_string(),
+                ));
+            }
+            let mut names = BTreeSet::new();
+            for dimension in &spec.dimensions {
+                if !valid_runtime_segment(&dimension.name) || !names.insert(&dimension.name) {
+                    return Err(ErasedEnvironmentError::ContractViolation(
+                        "tensor observation dimensions require unique runtime-segment names"
+                            .to_string(),
+                    ));
+                }
+                if dimension.size == Some(0) {
+                    return Err(ErasedEnvironmentError::ContractViolation(
+                        "fixed tensor observation dimensions must be positive".to_string(),
+                    ));
+                }
+            }
+            if spec.fixed_elements() == Some(0) {
+                return Err(ErasedEnvironmentError::ContractViolation(
+                    "tensor observation must contain at least one element".to_string(),
+                ));
+            }
+            Ok(())
         }
         ObservationEncoding::Custom { id } if id.trim().is_empty() => {
             Err(ErasedEnvironmentError::ContractViolation(
@@ -111,16 +157,13 @@ pub(crate) fn validate_encoding(capabilities: &Capabilities) -> Result<(), Erase
     }
 }
 
-fn validate_board_profile(
-    capabilities: &Capabilities,
-    board: &BoardGameMetadata,
-) -> Result<(), ErasedEnvironmentError> {
-    if board.width == 0 || board.height == 0 || board.action_count == 0 {
+fn validate_board_profile(board: &BoardGameMetadata) -> Result<(), ErasedEnvironmentError> {
+    if board.width == 0 || board.height == 0 {
         return Err(ErasedEnvironmentError::ContractViolation(
-            "board profile dimensions and action count must be positive".to_string(),
+            "board profile dimensions must be positive".to_string(),
         ));
     }
-    let board_size = board.board_size().map_err(|error| {
+    board.board_size().map_err(|error| {
         ErasedEnvironmentError::ContractViolation(format!("invalid board profile: {error}"))
     })?;
     if board.players.len() != 2
@@ -131,88 +174,6 @@ fn validate_board_profile(
     {
         return Err(ErasedEnvironmentError::ContractViolation(
             "board profile requires exactly two players with non-empty names and symbols"
-                .to_string(),
-        ));
-    }
-    if board.observation.spatial_channels == 0 {
-        return Err(ErasedEnvironmentError::ContractViolation(
-            "board profile requires at least one spatial observation channel".to_string(),
-        ));
-    }
-    let expected_legal_offset = board
-        .observation
-        .spatial_channels
-        .checked_mul(board_size)
-        .ok_or_else(|| {
-            ErasedEnvironmentError::ContractViolation(
-                "board spatial observation layout overflows usize".to_string(),
-            )
-        })?;
-    if board.observation.legal_actions_offset != expected_legal_offset {
-        return Err(ErasedEnvironmentError::ContractViolation(format!(
-            "board legal-action mask offset must be {expected_legal_offset}, got {}",
-            board.observation.legal_actions_offset
-        )));
-    }
-    let expected_elements = expected_legal_offset
-        .checked_add(board.action_count)
-        .and_then(|elements| elements.checked_add(2))
-        .ok_or_else(|| {
-            ErasedEnvironmentError::ContractViolation(
-                "board observation element count overflows usize".to_string(),
-            )
-        })?;
-    if board.observation.elements != expected_elements {
-        return Err(ErasedEnvironmentError::ContractViolation(format!(
-            "board observation must contain {expected_elements} elements, got {}",
-            board.observation.elements
-        )));
-    }
-
-    let action_count = u32::try_from(board.action_count).map_err(|_| {
-        ErasedEnvironmentError::ContractViolation(
-            "board action count exceeds the canonical discrete u32 range".to_string(),
-        )
-    })?;
-    let AgentModel::Fixed { agents } = &capabilities.agents else {
-        return Err(ErasedEnvironmentError::ContractViolation(
-            "board profile requires fixed agents [1, 2]".to_string(),
-        ));
-    };
-    if agents.len() != 2 || agents[0].id != AgentId(1) || agents[1].id != AgentId(2) {
-        return Err(ErasedEnvironmentError::ContractViolation(
-            "board profile requires fixed agents [1, 2] in seat order".to_string(),
-        ));
-    }
-    if agents.iter().any(|agent| {
-        !matches!(
-            agent.action_space,
-            ActionSpace::Discrete { size } if size == action_count
-        )
-    }) {
-        return Err(ErasedEnvironmentError::ContractViolation(format!(
-            "board profile requires Discrete({action_count}) actions for both agents"
-        )));
-    }
-    if capabilities.encoding.action != ActionEncoding::DiscreteU32LittleEndian {
-        return Err(ErasedEnvironmentError::ContractViolation(
-            "board profile requires discrete_u32_little_endian action encoding".to_string(),
-        ));
-    }
-    if capabilities.encoding.observation
-        != (ObservationEncoding::F32LittleEndian {
-            elements: expected_elements,
-        })
-    {
-        return Err(ErasedEnvironmentError::ContractViolation(format!(
-            "board profile requires f32_little_endian observations with {expected_elements} elements"
-        )));
-    }
-    if capabilities.semantics
-        != EnvironmentSemantics::deterministic_alternating_perfect_information_terminal_zero_sum()
-    {
-        return Err(ErasedEnvironmentError::ContractViolation(
-            "board profile requires deterministic alternating perfect-information complete-snapshot terminal-zero-sum semantics"
                 .to_string(),
         ));
     }
@@ -322,6 +283,7 @@ pub(crate) fn validate_descriptors(
                     )));
                 }
                 validate_action_space(&agent.action_space)?;
+                validate_availability_contract(&agent.action_space, &agent.action_availability)?;
             }
             if capabilities.semantics.turn_model == TurnModel::SingleAgent && agents.len() != 1 {
                 return Err(ErasedEnvironmentError::ContractViolation(format!(
@@ -330,10 +292,16 @@ pub(crate) fn validate_descriptors(
                 )));
             }
         }
-        AgentModel::Dynamic { action_space } => validate_action_space(action_space)?,
+        AgentModel::Dynamic {
+            action_space,
+            action_availability,
+        } => {
+            validate_action_space(action_space)?;
+            validate_availability_contract(action_space, action_availability)?;
+        }
     }
     if let Some(board) = &metadata.board {
-        validate_board_profile(capabilities, board)?;
+        validate_board_profile(board)?;
     }
     Ok(())
 }
@@ -342,6 +310,59 @@ fn known_agent(capabilities: &Capabilities, roster: &BTreeSet<AgentId>, id: Agen
     match &capabilities.agents {
         AgentModel::Fixed { agents } => agents.iter().any(|agent| agent.id == id),
         AgentModel::Dynamic { .. } => roster.contains(&id),
+    }
+}
+
+fn validate_action_availability(
+    capabilities: &Capabilities,
+    agent_id: AgentId,
+    availability: &ActionAvailability,
+) -> Result<(), ErasedEnvironmentError> {
+    let action_space = capabilities.action_space(agent_id).ok_or_else(|| {
+        ErasedEnvironmentError::ContractViolation(format!(
+            "decision agent {} has no declared action space",
+            agent_id.0
+        ))
+    })?;
+    let contract = capabilities
+        .agents
+        .action_availability(agent_id)
+        .ok_or_else(|| {
+            ErasedEnvironmentError::ContractViolation(format!(
+                "decision agent {} has no availability contract",
+                agent_id.0
+            ))
+        })?;
+    match (contract, availability) {
+        (ActionAvailabilityContract::All, ActionAvailability::All) => Ok(()),
+        (ActionAvailabilityContract::DiscreteMask, ActionAvailability::DiscreteMask { mask }) => {
+            let ActionSpace::Discrete { size } = action_space else {
+                unreachable!("descriptor validation binds discrete masks to discrete spaces")
+            };
+            if mask.num_actions() != *size as usize {
+                return Err(ErasedEnvironmentError::ContractViolation(format!(
+                    "decision agent {} legal mask has width {}, expected {}",
+                    agent_id.0,
+                    mask.num_actions(),
+                    size
+                )));
+            }
+            if mask.is_empty() {
+                return Err(ErasedEnvironmentError::ContractViolation(format!(
+                    "running decision agent {} has no available action",
+                    agent_id.0
+                )));
+            }
+            Ok(())
+        }
+        (
+            ActionAvailabilityContract::Custom { id },
+            ActionAvailability::Custom { contract, .. },
+        ) if id == contract => Ok(()),
+        _ => Err(ErasedEnvironmentError::ContractViolation(format!(
+            "decision agent {} availability does not match its declared contract",
+            agent_id.0
+        ))),
     }
 }
 
@@ -474,23 +495,27 @@ fn validate_timestep_fields(
                 "decision=chance requires chance_model=explicit".to_string(),
             ));
         }
-        (_, Decision::Agents { agent_ids }) => {
-            let unique = agent_ids.iter().copied().collect::<BTreeSet<_>>();
-            if agent_ids.is_empty() || unique.len() != agent_ids.len() {
+        (_, Decision::Agents { decisions }) => {
+            let unique = decisions
+                .iter()
+                .map(|decision| decision.agent_id)
+                .collect::<BTreeSet<_>>();
+            if decisions.is_empty() || unique.len() != decisions.len() {
                 return Err(ErasedEnvironmentError::ContractViolation(
                     "agent decision must contain unique agent IDs".to_string(),
                 ));
             }
-            if agent_ids
+            if decisions
                 .iter()
-                .any(|agent_id| !known_agent(capabilities, &roster, *agent_id))
+                .any(|decision| !known_agent(capabilities, &roster, decision.agent_id))
             {
                 return Err(ErasedEnvironmentError::ContractViolation(
                     "decision contains an unknown agent".to_string(),
                 ));
             }
-            for agent_id in agent_ids {
-                if !observation_ids.contains(agent_id) {
+            for decision in decisions {
+                let agent_id = decision.agent_id;
+                if !observation_ids.contains(&agent_id) {
                     return Err(ErasedEnvironmentError::ContractViolation(format!(
                         "decision agent {} has no observation",
                         agent_id.0
@@ -498,7 +523,7 @@ fn validate_timestep_fields(
                 }
                 let outcome = outcomes
                     .iter()
-                    .find(|outcome| outcome.agent_id == *agent_id)
+                    .find(|outcome| outcome.agent_id == agent_id)
                     .ok_or_else(|| {
                         ErasedEnvironmentError::ContractViolation(format!(
                             "decision agent {} has no outcome",
@@ -511,9 +536,10 @@ fn validate_timestep_fields(
                         agent_id.0
                     )));
                 }
+                validate_action_availability(capabilities, agent_id, &decision.availability)?;
             }
             if !matches!(capabilities.semantics.turn_model, TurnModel::Simultaneous)
-                && agent_ids.len() != 1
+                && decisions.len() != 1
             {
                 return Err(ErasedEnvironmentError::ContractViolation(
                     "non-simultaneous environment must request exactly one agent".to_string(),
@@ -591,33 +617,44 @@ pub(crate) fn validate_encoded_observation(
     agent_id: AgentId,
     data: &[u8],
 ) -> Result<(), ErasedEnvironmentError> {
-    let ObservationEncoding::F32LittleEndian { elements } = &capabilities.encoding.observation
-    else {
+    let ObservationEncoding::Tensor { spec } = &capabilities.encoding.observation else {
         return Ok(());
     };
-    let expected = elements
-        .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| {
-            ErasedEnvironmentError::ContractViolation(
-                "f32 observation byte length overflows usize".to_string(),
-            )
-        })?;
-    if data.len() != expected {
+    if let Some(expected) = spec.fixed_bytes() {
+        if data.len() != expected {
+            return Err(ErasedEnvironmentError::ContractViolation(format!(
+                "observation for agent {} encoded {} bytes, expected {}",
+                agent_id.0,
+                data.len(),
+                expected
+            )));
+        }
+    } else if !data.len().is_multiple_of(spec.dtype.element_size()) {
         return Err(ErasedEnvironmentError::ContractViolation(format!(
-            "observation for agent {} encoded {} bytes, expected {}",
-            agent_id.0,
-            data.len(),
-            expected
+            "dynamic observation for agent {} has a partial tensor element",
+            agent_id.0
         )));
     }
-    for chunk in data.chunks_exact(std::mem::size_of::<f32>()) {
-        let value = f32::from_le_bytes(chunk.try_into().expect("four-byte chunk"));
-        if !value.is_finite() {
+
+    match spec.dtype {
+        TensorDType::F32LittleEndian => {
+            for chunk in data.chunks_exact(std::mem::size_of::<f32>()) {
+                let value = f32::from_le_bytes(chunk.try_into().expect("four-byte chunk"));
+                if !value.is_finite() {
+                    return Err(ErasedEnvironmentError::ContractViolation(format!(
+                        "observation for agent {} contains a non-finite f32",
+                        agent_id.0
+                    )));
+                }
+            }
+        }
+        TensorDType::Bool if data.iter().any(|value| !matches!(value, 0 | 1)) => {
             return Err(ErasedEnvironmentError::ContractViolation(format!(
-                "observation for agent {} contains a non-finite f32",
+                "observation for agent {} contains a non-boolean byte",
                 agent_id.0
             )));
         }
+        TensorDType::U8 | TensorDType::I64LittleEndian | TensorDType::Bool => {}
     }
     Ok(())
 }

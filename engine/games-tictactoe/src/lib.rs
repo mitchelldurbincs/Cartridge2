@@ -24,13 +24,13 @@ use engine_core::board_profile::{
 };
 use engine_core::typed::{
     ActionSpace, AgentId, AgentModel, Capabilities, DecodeError, EncodeError, Encoding, EngineId,
-    EnvironmentSemantics,
+    EnvironmentSemantics, TensorSpec,
 };
-use engine_core::{EnvironmentError, EnvironmentMetadata};
+use engine_core::{EnvironmentError, EnvironmentMetadata, LegalMask};
 use rand_chacha::ChaCha20Rng;
 
 /// Immutable environment contract revision for wire formats and semantics.
-pub const ENV_CONTRACT_VERSION: u32 = 1;
+pub const ENV_CONTRACT_VERSION: u32 = 2;
 
 /// Register TicTacToe with the global game registry
 ///
@@ -160,16 +160,12 @@ impl Default for State {
 /// TicTacToe action - position to place a piece (0-8)
 pub type Action = u8;
 
-/// TicTacToe observation (18 board view + 9 legal moves + 2 current player = 29 floats)
-pub type Observation = TwoPlayerObs<18, 9>;
+/// Player-relative TicTacToe observation: two 3x3 occupancy planes.
+pub type Observation = TwoPlayerObs<18>;
 
 /// Create observation from game state
 pub fn observation_from_state(state: &State) -> Result<Observation, TwoPlayerObsError> {
-    TwoPlayerObs::from_board_with_legal_actions(
-        &state.board,
-        state.legal_moves().into_iter().map(usize::from),
-        state.current_player,
-    )
+    TwoPlayerObs::from_board(&state.board, state.current_player)
 }
 
 /// TicTacToe game implementation
@@ -205,11 +201,14 @@ impl BoardGame for TicTacToe {
         Capabilities {
             id: self.engine_id(),
             contract_version: ENV_CONTRACT_VERSION,
-            encoding: Encoding::discrete_u32_le_f32_le("tictactoe_state:v1", 29),
+            encoding: Encoding::discrete_u32_le(
+                "tictactoe_state:v1",
+                TensorSpec::f32_fixed([("channel", 2), ("row", 3), ("column", 3)]),
+            ),
             semantics:
                 EnvironmentSemantics::deterministic_alternating_perfect_information_terminal_zero_sum(),
             max_horizon: Some(9),
-            agents: AgentModel::fixed_homogeneous(
+            agents: AgentModel::fixed_homogeneous_masked(
                 [AgentId(1), AgentId(2)],
                 ActionSpace::discrete(9),
             ),
@@ -220,14 +219,10 @@ impl BoardGame for TicTacToe {
     fn metadata(&self) -> EnvironmentMetadata {
         EnvironmentMetadata::new("tictactoe", "Tic-Tac-Toe")
             .with_description("Get three in a row to win!")
-            .with_board(
-                BoardGameMetadata::new(3, 3, 9)
-                    .with_observation(29, 2, 18, false)
-                    .with_players(vec![
-                        BoardPlayerMetadata::new("X", "X"),
-                        BoardPlayerMetadata::new("O", "O"),
-                    ]),
-            )
+            .with_board(BoardGameMetadata::new(3, 3).with_players(vec![
+                BoardPlayerMetadata::new("X", "X"),
+                BoardPlayerMetadata::new("O", "O"),
+            ]))
     }
 
     // reset/step mirror games-connect4 and games-othello; shared reward and
@@ -328,6 +323,10 @@ impl BoardGame for TicTacToe {
     fn encode_observation(obs: &Self::Observation, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         obs.encode(out);
         Ok(())
+    }
+
+    fn legal_actions(state: &Self::State) -> Result<LegalMask, EnvironmentError> {
+        Ok(LegalMask::from_u64(state.legal_moves_mask() as u64, 9))
     }
 
     fn view(state: &Self::State) -> BoardView {

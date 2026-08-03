@@ -84,9 +84,7 @@ def _exact_dict(value: object, fields: frozenset[str], *, context: str) -> dict:
 def _integer(value: object, *, field: str, positive: bool = False) -> int:
     minimum = 1 if positive else 0
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-        raise ValueError(
-            f"{field} must be a {'positive' if positive else 'nonnegative'} integer"
-        )
+        raise ValueError(f"{field} must be a {'positive' if positive else 'nonnegative'} integer")
     return value
 
 
@@ -122,8 +120,7 @@ def _require_equal_rate(actual: object, expected: float, *, field: str) -> None:
 def _validate_solver_bucket(value: object, *, field: str) -> dict[str, int]:
     bucket = _exact_dict(value, _SOLVER_BUCKET_FIELDS, context=field)
     counts = {
-        name: _integer(bucket[name], field=f"{field}.{name}")
-        for name in _SOLVER_COUNT_FIELDS
+        name: _integer(bucket[name], field=f"{field}.{name}") for name in _SOLVER_COUNT_FIELDS
     }
     positions = counts["positions"]
     if any(count > positions for name, count in counts.items() if name != "positions"):
@@ -207,12 +204,8 @@ def _validate_solver_entry(value: object, index: int | str) -> dict:
         minimum=0.0,
     )
 
-    by_ply = _exact_dict(
-        entry["by_ply"], frozenset(_PLY_BUCKETS), context=f"{field}.by_ply"
-    )
-    by_seat = _exact_dict(
-        entry["by_seat"], frozenset(_SEAT_BUCKETS), context=f"{field}.by_seat"
-    )
+    by_ply = _exact_dict(entry["by_ply"], frozenset(_PLY_BUCKETS), context=f"{field}.by_ply")
+    by_seat = _exact_dict(entry["by_seat"], frozenset(_SEAT_BUCKETS), context=f"{field}.by_seat")
     ply_counts = {
         name: _validate_solver_bucket(by_ply[name], field=f"{field}.by_ply.{name}")
         for name in _PLY_BUCKETS
@@ -230,15 +223,9 @@ def _validate_solver_entry(value: object, index: int | str) -> dict:
         overall[count_field] = from_ply
 
     positions = overall["positions"]
-    if (
-        _integer(entry["positions_scored"], field=f"{field}.positions_scored")
-        != positions
-    ):
+    if _integer(entry["positions_scored"], field=f"{field}.positions_scored") != positions:
         raise ValueError(f"{field}.positions_scored does not match solver slices")
-    if (
-        _integer(entry["forced_moves"], field=f"{field}.forced_moves")
-        != overall["forced"]
-    ):
+    if _integer(entry["forced_moves"], field=f"{field}.forced_moves") != overall["forced"]:
         raise ValueError(f"{field}.forced_moves does not match solver slices")
     for name in (
         "blunders_win_to_draw",
@@ -310,16 +297,12 @@ def _validate_solver_entry(value: object, index: int | str) -> dict:
 def _validate_solver_history(value: object) -> list[dict]:
     if not isinstance(value, list):
         raise ValueError("solver_evaluations must be a list")
-    entries = [
-        _validate_solver_entry(entry, index) for index, entry in enumerate(value)
-    ]
+    entries = [_validate_solver_entry(entry, index) for index, entry in enumerate(value)]
     evaluation_ids = [entry["evaluation_id"] for entry in entries]
     if len(evaluation_ids) != len(set(evaluation_ids)):
         raise ValueError("Solver evaluation identifiers must be unique")
     iterations = [entry["iteration"] for entry in entries]
-    if any(
-        current <= previous for previous, current in zip(iterations, iterations[1:])
-    ):
+    if any(current <= previous for previous, current in zip(iterations, iterations[1:])):
         raise ValueError("Solver evaluation iterations must be strictly increasing")
     return entries
 
@@ -354,37 +337,25 @@ class EvalReportingMixin:
             "candidate_checkpoint_id": artifact.candidate_checkpoint_id,
             "evaluation_id": evaluation.evaluation_id,
             "vs_champion_checkpoint_id": (
-                champion_reference.checkpoint_id
-                if champion_reference is not None
-                else None
+                champion_reference.checkpoint_id if champion_reference is not None else None
             ),
             "vs_champion_evaluation_id": (
-                champion_reference.evaluation_id
-                if champion_reference is not None
-                else None
+                champion_reference.evaluation_id if champion_reference is not None else None
             ),
             "vs_champion_win_rate": (
                 vs_champion.candidate_win_rate if vs_champion is not None else None
             ),
-            "vs_champion_draw_rate": (
-                vs_champion.draw_rate if vs_champion is not None else None
-            ),
+            "vs_champion_draw_rate": (vs_champion.draw_rate if vs_champion is not None else None),
             "vs_champion_average_game_length": (
                 vs_champion.average_game_length if vs_champion is not None else None
             ),
             "vs_champion_iteration": (
-                champion_evaluation.artifact.iteration
-                if champion_evaluation is not None
-                else None
+                champion_evaluation.artifact.iteration if champion_evaluation is not None else None
             ),
             "promoted": artifact.decision.promoted,
             "promotion_reason": artifact.decision.reason,
-            "vs_random_win_rate": (
-                vs_random.candidate_win_rate if vs_random is not None else None
-            ),
-            "vs_random_draw_rate": (
-                vs_random.draw_rate if vs_random is not None else None
-            ),
+            "vs_random_win_rate": (vs_random.candidate_win_rate if vs_random is not None else None),
+            "vs_random_draw_rate": (vs_random.draw_rate if vs_random is not None else None),
             "vs_random_average_game_length": (
                 vs_random.average_game_length if vs_random is not None else None
             ),
@@ -406,13 +377,9 @@ class EvalReportingMixin:
                 if solver is not None and solver.overall.positions
                 else (0.0 if solver is not None else None)
             ),
-            "solver_positions": (
-                solver.overall.positions if solver is not None else None
-            ),
+            "solver_positions": (solver.overall.positions if solver is not None else None),
             "promotion_metric": artifact.recipe.promotion_metric,
-            "requested_vs_champion_games": (
-                artifact.recipe.requested_games.vs_champion
-            ),
+            "requested_vs_champion_games": (artifact.recipe.requested_games.vs_champion),
             "requested_vs_random_games": artifact.recipe.requested_games.vs_random,
             "timestamp": artifact.completed_at,
         }
@@ -421,9 +388,7 @@ class EvalReportingMixin:
     def _solver_bucket_projection(bucket: SolverBucketV1) -> dict[str, int | float]:
         positions = bucket.positions
         blunders = (
-            bucket.blunders_win_to_draw
-            + bucket.blunders_win_to_loss
-            + bucket.blunders_draw_to_loss
+            bucket.blunders_win_to_draw + bucket.blunders_win_to_loss + bucket.blunders_draw_to_loss
         )
 
         def rate(count: int) -> float:
@@ -479,19 +444,15 @@ class EvalReportingMixin:
             "blunders_win_to_loss": overall.blunders_win_to_loss,
             "blunders_draw_to_loss": overall.blunders_draw_to_loss,
             "by_ply": {
-                name: self._solver_bucket_projection(solver.by_ply[name])
-                for name in _PLY_BUCKETS
+                name: self._solver_bucket_projection(solver.by_ply[name]) for name in _PLY_BUCKETS
             },
             "by_seat": {
-                name: self._solver_bucket_projection(solver.by_seat[name])
-                for name in _SEAT_BUCKETS
+                name: self._solver_bucket_projection(solver.by_seat[name]) for name in _SEAT_BUCKETS
             },
             "solver_queries": solver.solver_queries,
             "solver_cache_hits": solver.solver_cache_hits,
             "solver_cache_hit_rate": (
-                solver.solver_cache_hits / solver.solver_queries
-                if solver.solver_queries
-                else 0.0
+                solver.solver_cache_hits / solver.solver_queries if solver.solver_queries else 0.0
             ),
             "solver_time_seconds": solver.solver_time_seconds,
             "wall_time_seconds": solver.wall_time_seconds,

@@ -64,12 +64,30 @@ pub fn resolve_startup_profile(algorithm_id: &str, env_id: &str) -> Result<Start
         .filter(|value| *value > 0)
         .ok_or_else(|| anyhow!("Serving environment '{env_id}' must declare max_horizon"))?;
     let metadata = context.metadata();
-    let board = metadata.require_board()?;
+    metadata.require_board()?;
+    let obs_size = match &capabilities.encoding.observation {
+        engine_core::ObservationEncoding::Tensor { spec } => spec
+            .fixed_elements()
+            .ok_or_else(|| anyhow!("AlphaZero serving requires a fixed observation tensor"))?,
+        other => {
+            return Err(anyhow!(
+                "AlphaZero serving requires tensor observations, got {other:?}"
+            ))
+        }
+    };
+    let num_actions = match capabilities.action_space(engine_core::AgentId(1)) {
+        Some(engine_core::ActionSpace::Discrete { size }) => *size as usize,
+        other => {
+            return Err(anyhow!(
+                "AlphaZero serving requires discrete actions, got {other:?}"
+            ))
+        }
+    };
 
     Ok(StartupProfile {
         algorithm,
-        obs_size: board.observation.elements,
-        num_actions: board.action_count,
+        obs_size,
+        num_actions,
         max_horizon,
         env_contract_version: capabilities.contract_version,
         model_contract: descriptor.model_artifact_contract(env_id, capabilities.contract_version),
@@ -240,10 +258,10 @@ mod startup_profile_tests {
             profile.model_contract.model_contract,
             "onnx_policy_value_v1"
         );
-        assert_eq!(profile.obs_size, 93);
+        assert_eq!(profile.obs_size, 84);
         assert_eq!(profile.num_actions, 7);
-        assert_eq!(profile.env_contract_version, 1);
-        assert_eq!(profile.model_contract.env_contract_version, 1);
+        assert_eq!(profile.env_contract_version, 2);
+        assert_eq!(profile.model_contract.env_contract_version, 2);
     }
 
     #[test]

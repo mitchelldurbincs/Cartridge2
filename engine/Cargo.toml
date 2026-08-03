@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "algorithm-core",
+    "dqn-runtime",
     "engine-core",
     "engine-config",
     "engine-games",

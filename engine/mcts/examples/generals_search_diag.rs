@@ -11,19 +11,22 @@
 //!
 //! Run: cargo run -p mcts --example generals_search_diag --release
 
-use engine_core::{Decision, EngineContext, EpisodeStatus, ErasedTimestep};
+use engine_core::{ActionAvailability, EngineContext, EpisodeStatus, ErasedTimestep};
 use mcts::{run_mcts, MctsConfig, UniformEvaluator};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
 const CAP_PLIES: u32 = 400; // 2 * MAX_TURNS
 
-fn active_observation(timestep: &ErasedTimestep) -> &[u8] {
-    let agent = match &timestep.decision {
-        Decision::Agents { agent_ids } if agent_ids.len() == 1 => agent_ids[0],
-        decision => panic!("expected one active agent, got {decision:?}"),
+fn active_legal_mask(timestep: &ErasedTimestep) -> &engine_core::LegalMask {
+    let active = timestep
+        .decision
+        .sole_agent()
+        .expect("expected one active agent");
+    let ActionAvailability::DiscreteMask { mask } = &active.availability else {
+        panic!("expected a discrete legal-action mask");
     };
-    timestep.observation_for(agent).unwrap()
+    mask
 }
 
 fn terminal_winner(timestep: &ErasedTimestep) -> usize {
@@ -76,9 +79,6 @@ fn normalize(visits: &[f64]) -> Vec<f64> {
 fn main() {
     engine_games::register_all_environments();
     let mut ctx = EngineContext::new("generals_8x8").unwrap();
-    let meta = ctx.metadata().clone();
-    let board = meta.require_board().unwrap();
-
     // ---------------- Part A: game shape under random play ----------------
     let games = 200u64;
     let mut plies_per_game: Vec<u32> = Vec::new();
@@ -96,9 +96,7 @@ fn main() {
         let mut plies = 0u32;
 
         loop {
-            let mask = board
-                .legal_mask_from_obs(active_observation(&timestep))
-                .unwrap();
+            let mask = active_legal_mask(&timestep);
             let legal: Vec<usize> = mask.iter_ones().collect();
             legal_counts.push(legal.len() as u32);
             if legal.len() == 1 {
@@ -174,9 +172,7 @@ fn main() {
         let mut rng = ChaCha20Rng::seed_from_u64(7);
         let mut reached = true;
         for _ in 0..probe {
-            let mask = board
-                .legal_mask_from_obs(active_observation(&timestep))
-                .unwrap();
+            let mask = active_legal_mask(&timestep);
             let legal: Vec<usize> = mask.iter_ones().collect();
             let action = legal[rng.gen_range(0..legal.len())] as u32;
             let step = ctx.step(&state, &action.to_le_bytes()).unwrap();
@@ -191,9 +187,7 @@ fn main() {
             continue;
         }
 
-        let mask = board
-            .legal_mask_from_obs(active_observation(&timestep))
-            .unwrap();
+        let mask = active_legal_mask(&timestep);
         let n_legal = mask.count_ones();
 
         for &sims in &sim_budgets {

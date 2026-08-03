@@ -28,9 +28,7 @@ impl MockEnvironment {
             decision: if value >= 1 {
                 Decision::None
             } else {
-                Decision::Agents {
-                    agent_ids: vec![AgentId(3)],
-                }
+                Decision::agents([AgentId(3)])
             },
             episode: if value >= 1 {
                 EpisodeStatus::Terminated
@@ -110,12 +108,7 @@ impl ErasedEnvironment for MockEnvironment {
 fn context_returns_full_timesteps_without_scalar_shortcuts() {
     let mut context = EngineContext::from_erased(Box::new(MockEnvironment)).unwrap();
     let reset = context.reset(42, &[]).unwrap();
-    assert_eq!(
-        reset.timestep.decision,
-        Decision::Agents {
-            agent_ids: vec![AgentId(3)]
-        }
-    );
+    assert_eq!(reset.timestep.decision, Decision::agents([AgentId(3)]));
     assert_eq!(
         reset.timestep.observation_for(AgentId(3)),
         Some(&0u32.to_le_bytes()[..])

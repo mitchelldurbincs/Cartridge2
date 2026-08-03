@@ -84,10 +84,8 @@ fn test_observation_encoding() {
 
     // All board positions should be 0 initially
     assert_eq!(obs.board_view, [0.0; 18]);
-    // All moves should be legal
-    assert_eq!(obs.legal_moves, [1.0; 9]);
-    // X should be current player
-    assert_eq!(obs.current_player, [1.0, 0.0]);
+    let legal = TicTacToe::legal_actions(&state).unwrap();
+    assert_eq!(legal.count_ones(), 9);
 }
 
 #[test]
@@ -106,8 +104,9 @@ fn test_game_trait_implementation() {
     // Reward should be 0 for ongoing game
     assert_eq!(transition.actor_reward, 0.0);
 
-    assert_eq!(transition.observation.legal_moves[4], 0.0);
-    assert_eq!(transition.observation.current_player, [0.0, 1.0]);
+    assert_eq!(transition.observation.board_view[9 + 4], 1.0);
+    let legal = TicTacToe::legal_actions(&state.make_move(4)).unwrap();
+    assert!(!legal.is_legal(4));
 }
 
 #[test]
@@ -148,8 +147,8 @@ fn test_observation_byte_encoding() {
     let mut buf = Vec::new();
     TicTacToe::encode_observation(&obs, &mut buf).unwrap();
 
-    // Should be 29 * 4 = 116 bytes (29 f32 values)
-    assert_eq!(buf.len(), 116);
+    // Two 3x3 player-relative planes.
+    assert_eq!(buf.len(), 18 * 4);
 }
 
 #[test]
@@ -301,7 +300,7 @@ fn test_observation_legal_mask_exactly_matches_step_acceptance() {
     ];
 
     for state in states {
-        let observation = observation_from_state(&state).unwrap();
+        let legal = TicTacToe::legal_actions(&state).unwrap();
         for action in 0..9u8 {
             let mut candidate = state;
             let before = candidate;
@@ -310,8 +309,8 @@ fn test_observation_legal_mask_exactly_matches_step_acceptance() {
                 .is_ok();
             assert_eq!(
                 accepted,
-                observation.legal_moves[action as usize] == 1.0,
-                "action {action} disagrees with the observation mask for {state:?}"
+                legal.is_legal(action as usize),
+                "action {action} disagrees with the decision mask for {state:?}"
             );
             if !accepted {
                 assert_eq!(candidate, before, "rejected action mutated the state");
@@ -475,8 +474,8 @@ fn test_observation_encoding_roundtrip() {
         TicTacToe::encode_observation(&obs, &mut buf).expect("encode should succeed");
         assert_eq!(
             buf.len(),
-            116,
-            "Observation should encode to 116 bytes (29 * 4)"
+            72,
+            "Observation should encode to 72 bytes (18 * 4)"
         );
 
         // Decode manually and verify
@@ -484,24 +483,12 @@ fn test_observation_encoding_roundtrip() {
             .chunks(4)
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
-        assert_eq!(decoded_floats.len(), 29);
+        assert_eq!(decoded_floats.len(), 18);
 
         // Verify board_view
         for (i, &decoded_val) in decoded_floats.iter().enumerate().take(18) {
             assert_eq!(decoded_val, obs.board_view[i], "board_view[{}] mismatch", i);
         }
-        // Verify legal_moves
-        for i in 0..9 {
-            assert_eq!(
-                decoded_floats[18 + i],
-                obs.legal_moves[i],
-                "legal_moves[{}] mismatch",
-                i
-            );
-        }
-        // Verify current_player
-        assert_eq!(decoded_floats[27], obs.current_player[0]);
-        assert_eq!(decoded_floats[28], obs.current_player[1]);
     }
 }
 
@@ -575,17 +562,14 @@ fn test_random_games_invariants() {
                 );
             }
 
+            let legal = TicTacToe::legal_actions(&state).unwrap();
+            let encoded = legal
+                .iter_ones()
+                .fold(0u16, |mask, index| mask | (1u16 << index));
             assert_eq!(
-                transition
-                    .observation
-                    .legal_moves
-                    .iter()
-                    .enumerate()
-                    .fold(0u16, |mask, (index, value)| {
-                        mask | (u16::from(*value == 1.0) << index)
-                    }),
+                encoded,
                 state.legal_moves_mask(),
-                "Observation mask should match state (seed={})",
+                "Decision mask should match state (seed={})",
                 seed
             );
         }

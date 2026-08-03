@@ -9,7 +9,9 @@ use rand_chacha::ChaCha20Rng;
 use super::*;
 use crate::action::{encode_move, move_target};
 use crate::board::{idx, new_board};
+use crate::obs::OBS_SIZE;
 use crate::params::{CITY_RATIO, CITY_START_ARMY, GENERAL_START_ARMY, HEIGHT, WAIT_ACTION, WIDTH};
+use engine_core::ObservationEncoding;
 
 fn rng(seed: u64) -> ChaCha20Rng {
     ChaCha20Rng::seed_from_u64(seed)
@@ -183,11 +185,12 @@ fn test_general_capture_transfers_all_tiles() {
 fn test_legal_mask_matches_brute_force() {
     let mut game = Generals::new();
     let mut r = rng(7);
-    let (state, obs) = game.reset(&mut r, &[]).unwrap();
+    let (state, _) = game.reset(&mut r, &[]).unwrap();
+    let mask = Generals::legal_actions(&state).unwrap();
 
     for action in 0..NUM_ACTIONS as u32 {
         let expected = rules::is_action_legal(&state.tiles, state.current_player, action);
-        let in_mask = obs.legal_moves[action as usize] > 0.5;
+        let in_mask = mask.is_legal(action as usize);
         assert_eq!(
             in_mask, expected,
             "action {} mask disagreement (mask={}, brute={})",
@@ -411,11 +414,18 @@ fn test_obs_shape_and_metadata_agree() {
     let meta = game.metadata();
     let board = meta.require_board().unwrap();
     assert_eq!(capabilities.contract_version, ENV_CONTRACT_VERSION);
-    assert_eq!(ENV_CONTRACT_VERSION, 2);
+    assert_eq!(ENV_CONTRACT_VERSION, 3);
     assert_eq!(capabilities.max_horizon, Some(MAX_TURNS * 2));
-    assert_eq!(board.action_count, NUM_ACTIONS);
-    assert_eq!(board.observation.elements, OBS_SIZE);
-    assert_eq!(board.observation.legal_actions_offset, LEGAL_MASK_OFFSET);
+    assert_eq!(board.width, WIDTH);
+    assert_eq!(board.height, HEIGHT);
+    assert!(matches!(
+        capabilities.action_space(AgentId(1)),
+        Some(ActionSpace::Discrete { size }) if *size == NUM_ACTIONS as u32
+    ));
+    let ObservationEncoding::Tensor { spec } = &capabilities.encoding.observation else {
+        panic!("Generals observations must be tensors");
+    };
+    assert_eq!(spec.fixed_elements(), Some(OBS_SIZE));
 
     let mut g = Generals::new();
     let (_state, obs) = g.reset(&mut rng(5), &[]).unwrap();
@@ -423,12 +433,8 @@ fn test_obs_shape_and_metadata_agree() {
     Generals::encode_observation(&obs, &mut buf).unwrap();
     assert_eq!(buf.len(), OBS_SIZE * 4);
 
-    // The advertised legal_mask_offset must point at the legal plane
-    let mask = board.legal_mask_from_obs(&buf).unwrap();
+    let mask = Generals::legal_actions(&_state).unwrap();
     assert!(mask.is_legal(WAIT_ACTION as usize));
-    for a in mask.iter_ones() {
-        assert!(obs.legal_moves[a] > 0.5);
-    }
 }
 
 #[test]
@@ -653,19 +659,19 @@ fn test_random_playout_terminates_cleanly() {
     for seed in 0..10 {
         let mut game = Generals::new();
         let mut r = rng(seed);
-        let (mut state, mut obs) = game.reset(&mut r, &[]).unwrap();
+        let (mut state, _) = game.reset(&mut r, &[]).unwrap();
         let mut plies = 0u32;
 
         loop {
-            // Pick a uniformly random legal action from the obs mask
-            let legal: Vec<u32> = (0..NUM_ACTIONS as u32)
-                .filter(|&a| obs.legal_moves[a as usize] > 0.5)
+            let legal: Vec<u32> = Generals::legal_actions(&state)
+                .unwrap()
+                .iter_ones()
+                .map(|action| action as u32)
                 .collect();
             assert!(!legal.is_empty(), "seed {}: no legal actions", seed);
             let action = legal[r.gen_range(0..legal.len())];
 
             let transition = game.step(&mut state, action, &mut r).unwrap();
-            obs = transition.observation;
             plies += 1;
             assert!(
                 plies <= MAX_TURNS * 2,
@@ -712,5 +718,8 @@ fn test_register_and_play_via_context() {
     // Metadata round-trip through the erased layer
     let meta = ctx.metadata();
     assert_eq!(meta.id, "generals_8x8");
-    assert_eq!(meta.require_board().unwrap().action_count, NUM_ACTIONS);
+    assert_eq!(
+        meta.require_board().unwrap().board_size().unwrap(),
+        BOARD_SIZE
+    );
 }

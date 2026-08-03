@@ -51,7 +51,7 @@ fn test_observation_legal_mask_exactly_matches_step_acceptance() {
     let mut state = State::new();
 
     for ply in 0..32 {
-        let observation = observation_from_state(&state).unwrap();
+        let legal = Othello::legal_actions(&state).unwrap();
         for action in 0..NUM_ACTIONS as u32 {
             let mut candidate = state.clone();
             let before = candidate.clone();
@@ -60,8 +60,8 @@ fn test_observation_legal_mask_exactly_matches_step_acceptance() {
                 .is_ok();
             assert_eq!(
                 accepted,
-                observation.legal_moves[action as usize] == 1.0,
-                "ply {ply}, action {action} disagrees with the observation mask"
+                legal.is_legal(action as usize),
+                "ply {ply}, action {action} disagrees with the decision mask"
             );
             if !accepted {
                 assert_eq!(candidate, before, "rejected action mutated the state");
@@ -80,10 +80,10 @@ fn test_observation_legal_mask_exactly_matches_step_acceptance() {
     // A terminal marker closes the action set even if the underlying board
     // shape would otherwise admit flips.
     state.winner = 1;
-    let observation = observation_from_state(&state).unwrap();
+    let legal = Othello::legal_actions(&state).unwrap();
     for action in 0..NUM_ACTIONS as u32 {
         let mut candidate = state.clone();
-        assert_eq!(observation.legal_moves[action as usize], 0.0);
+        assert!(!legal.is_legal(action as usize));
         assert!(Othello::new()
             .step(&mut candidate, action, &mut ChaCha20Rng::seed_from_u64(3),)
             .is_err());
@@ -438,9 +438,6 @@ fn test_game_metadata() {
     let board = metadata.require_board().unwrap();
     assert_eq!(board.width, 8);
     assert_eq!(board.height, 8);
-    assert_eq!(board.action_count, 65);
-    assert_eq!(board.observation.elements, 195); // 128 + 65 + 2
-    assert_eq!(board.observation.legal_actions_offset, 128); // After board views
     assert_eq!(board.players.len(), 2);
     assert_eq!(
         board.renderer,
@@ -486,8 +483,10 @@ fn test_reset_and_step() {
 
     let transition = game.step(&mut state, action, &mut rng).unwrap();
 
-    // The position we moved to should now show as occupied (not legal)
-    assert!(transition.observation.legal_moves[action as usize] == 0.0);
+    // The position we moved to should now show as occupied (not legal).
+    assert!(!Othello::legal_actions(&state)
+        .unwrap()
+        .is_legal(action as usize));
     assert_eq!(transition.actor_reward, 0.0); // No winner yet
     assert!(!transition.terminated);
     assert_eq!(state.current_player, 2); // Turn switched
@@ -534,8 +533,8 @@ fn test_observation_encoding() {
     let mut encoded = Vec::new();
     Othello::encode_observation(&obs, &mut encoded).unwrap();
 
-    // Observation should be 195 * 4 bytes (f32)
-    assert_eq!(encoded.len(), 195 * 4);
+    // Two player-relative 8x8 planes.
+    assert_eq!(encoded.len(), 128 * 4);
 }
 
 #[test]

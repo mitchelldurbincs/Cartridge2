@@ -133,9 +133,7 @@ def test_register_command_persists_the_selected_profile(tmp_path, monkeypatch):
     ]
 
 
-def test_tournament_command_passes_the_selected_algorithm(
-    tmp_path, monkeypatch, capsys
-):
+def test_tournament_command_passes_the_selected_algorithm(tmp_path, monkeypatch, capsys):
     registry_path = tmp_path / "players.json"
     PlayerRegistry().save(registry_path)
     output_path = tmp_path / "tournament.json"

@@ -288,10 +288,7 @@ class TestDeterministicWarning:
 
     def test_random_baseline_is_never_flagged(self):
         assert (
-            warn_about_deterministic_players(
-                [make_random_player("connect4", ALGORITHM_ID)]
-            )
-            == []
+            warn_about_deterministic_players([make_random_player("connect4", ALGORITHM_ID)]) == []
         )
 
 
@@ -411,9 +408,7 @@ class TestRunTournament:
         for rating in results.ratings:
             assert rating.games == 20
             assert rating.wins + rating.losses + rating.draws == 20
-        assert sum(r.wins for r in results.ratings) == sum(
-            r.losses for r in results.ratings
-        )
+        assert sum(r.wins for r in results.ratings) == sum(r.losses for r in results.ratings)
 
     def test_ratings_are_anchored_to_versioned_random_baseline(self, tmp_path):
         weak_record = model_record(tmp_path / "weak.onnx")
@@ -480,10 +475,7 @@ class TestRunTournament:
         assert payload["env_contract_version"] == profile().env_contract_version
         assert payload["algorithm_id"] == ALGORITHM_ID
         assert payload["model_contract"] == profile().model_contract
-        assert (
-            payload["model_artifact_schema_version"]
-            == profile().model_artifact_schema_version
-        )
+        assert payload["model_artifact_schema_version"] == profile().model_artifact_schema_version
         assert len(payload["matches"]) == 1
         assert len(payload["ratings"]) == 2
 

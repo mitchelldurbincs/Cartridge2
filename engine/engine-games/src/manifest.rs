@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::register_all_environments;
 
 /// Bumped only when this document's shape changes.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 4;
+pub const MANIFEST_SCHEMA_VERSION: u32 = 5;
 pub const REGENERATE_COMMAND: &str = "make environment-manifest";
 
 #[derive(Serialize)]
@@ -71,7 +71,7 @@ mod tests {
         let rendered = manifest_json();
         assert_eq!(rendered, manifest_json());
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(value["schema_version"], 4);
+        assert_eq!(value["schema_version"], 5);
         assert!(value.get("games").is_none());
         let environments = value["environments"].as_array().unwrap();
         let ids = environments
@@ -95,7 +95,10 @@ mod tests {
             if profile["compatible"].as_bool().unwrap() {
                 let board = &metadata["board"];
                 assert!(board["width"].as_u64().unwrap() > 0);
-                assert!(board["observation"]["spatial_channels"].as_u64().unwrap() > 0);
+                let observation = &environment["capabilities"]["encoding"]["observation"];
+                assert_eq!(observation["kind"], "tensor");
+                assert_eq!(observation["spec"]["dtype"], "f32_little_endian");
+                assert_eq!(observation["spec"]["dimensions"][0]["name"], "channel");
             } else if metadata["board"].is_null() {
                 saw_non_board = true;
             }

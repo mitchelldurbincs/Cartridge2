@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch.optim import Adam
 
+from trainer.algorithms.alphazero_board_v1 import policy_value_artifact_contract
 from trainer.checkpoint import (
     LearnerStateContract,
     export_onnx_artifact,
@@ -30,11 +31,10 @@ from trainer.storage.evaluation import (
 from trainer.storage.publisher import (
     ArtifactValidationError,
     FilesystemCheckpointPublisher,
-    OnnxArtifactContract,
     canonical_json_bytes,
 )
 
-CONTRACT = OnnxArtifactContract(
+CONTRACT = policy_value_artifact_contract(
     algorithm_id="alphazero_board_v1",
     env_id="tictactoe",
     env_contract_version=1,
@@ -54,7 +54,6 @@ def staged_blobs(tmp_path_factory):
     return (
         export_onnx_artifact(
             network,
-            29,
             root / "model.onnx",
             torch.device("cpu"),
             CONTRACT,
@@ -153,9 +152,7 @@ def repositories(tmp_path):
     return checkpoints, FilesystemEvaluationRepository(checkpoints)
 
 
-def test_v2_evidence_is_canonical_immutable_and_has_no_champion_channel(
-    tmp_path, staged_blobs
-):
+def test_v2_evidence_is_canonical_immutable_and_has_no_champion_channel(tmp_path, staged_blobs):
     checkpoints, evaluations = repositories(tmp_path)
     candidate = stage_checkpoint(checkpoints, staged_blobs, 1)
     evidence = artifact(candidate.checkpoint_id, vs_random=result())
@@ -170,14 +167,10 @@ def test_v2_evidence_is_canonical_immutable_and_has_no_champion_channel(
     assert json.loads(reference.path.read_text())["schema_version"] == 2
 
 
-def test_rejected_evidence_advances_chain_without_changing_champion_lineage(
-    tmp_path, staged_blobs
-):
+def test_rejected_evidence_advances_chain_without_changing_champion_lineage(tmp_path, staged_blobs):
     checkpoints, evaluations = repositories(tmp_path)
     first = stage_checkpoint(checkpoints, staged_blobs, 1)
-    first_ref = evaluations.publish_evidence(
-        artifact(first.checkpoint_id, vs_random=result())
-    )
+    first_ref = evaluations.publish_evidence(artifact(first.checkpoint_id, vs_random=result()))
     champion = ChampionReferenceV1(first.checkpoint_id, first_ref.evaluation_id)
     second = stage_checkpoint(checkpoints, staged_blobs, 2, parent=first.checkpoint_id)
     rejected = artifact(
@@ -194,8 +187,7 @@ def test_rejected_evidence_advances_chain_without_changing_champion_lineage(
     rejected_ref = evaluations.publish_evidence(rejected)
 
     assert [
-        item.evaluation_id
-        for item in evaluations.list_evaluations(rejected_ref.evaluation_id)
+        item.evaluation_id for item in evaluations.list_evaluations(rejected_ref.evaluation_id)
     ] == [first_ref.evaluation_id, rejected_ref.evaluation_id]
     assert rejected_ref.artifact.champion_before == champion
 
@@ -218,9 +210,7 @@ def test_publication_rejects_nonincreasing_iteration_or_time_before_write(
 ):
     checkpoints, evaluations = repositories(tmp_path)
     first = stage_checkpoint(checkpoints, staged_blobs, 1)
-    first_ref = evaluations.publish_evidence(
-        artifact(first.checkpoint_id, vs_random=result())
-    )
+    first_ref = evaluations.publish_evidence(artifact(first.checkpoint_id, vs_random=result()))
     second = stage_checkpoint(checkpoints, staged_blobs, 2, parent=first.checkpoint_id)
     values = {
         "iteration": 2,
@@ -307,9 +297,7 @@ def test_v1_or_noncanonical_artifact_is_rejected(tmp_path, staged_blobs):
         EvaluationArtifactV2.from_bytes(canonical_json_bytes(raw))
 
     with pytest.raises(ArtifactValidationError, match="canonical"):
-        EvaluationArtifactV2.from_bytes(
-            json.dumps(evidence.to_dict(), indent=2).encode()
-        )
+        EvaluationArtifactV2.from_bytes(json.dumps(evidence.to_dict(), indent=2).encode())
 
 
 def test_promotion_margin_is_a_rate():

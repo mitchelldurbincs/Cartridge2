@@ -9,9 +9,10 @@ game mechanics and capabilities; algorithm cartridges bind collection,
 experience, learning, model, and evaluation implementations to compatible
 environments.
 
-The first installed cartridge is `alphazero_board_v1`. It packages the
-project's AlphaZero board-game behavior as one explicit implementation instead
-of treating its assumptions as properties of every game.
+Two cartridges are installed. `alphazero_board_v1` packages the project's
+board-game policy/value system. `dqn_v1` is the first non-board vertical slice:
+single-agent discrete collection, transition replay, Q-learning, greedy ONNX
+inference, return evaluation, and bounded off-policy orchestration on `counter`.
 
 **Games:** TicTacToe, Connect 4, Othello (complete), and Generals 8x8
 (engine/trainer/web complete; training has not yet beaten random at local
@@ -41,7 +42,7 @@ The same selection can be supplied with `--algorithm alphazero_board_v1` or
 resolve the selected ID through their local algorithm registry and reject an
 unknown or incompatible algorithm/environment pair at startup.
 
-The engine-generated `environment_manifest.json` catalog uses schema version 4.
+The engine-generated `environment_manifest.json` catalog uses schema version 5.
 Its top-level `environments` entries contain exactly `metadata`, `capabilities`,
 and `algorithm_profiles`. Generic metadata is display-only and its nested
 `board` profile may be null. Capabilities carry the immutable contract version,
@@ -59,6 +60,12 @@ settings.
 - finite indexed discrete actions with an observation-embedded legal mask;
 - fixed-size spatial `f32` observations with a two-element player indicator; and
 - terminal-only, zero-sum rewards.
+
+`dqn_v1` instead requires one fixed agent, discrete actions, fixed `f32`
+observations, Markov information, general per-step rewards, a finite horizon,
+and no explicit chance decision. It does not require a board, alternating
+turns, a legal-mask observation channel, zero-sum rewards, or terminal-only
+rewards.
 
 The generic ABI represents fixed or dynamic agents, single-agent, sequential,
 and simultaneous decisions, explicit or environment-sampled chance, perfect or
@@ -106,7 +113,9 @@ evaluator.
 Old mutable checkpoint filenames and ONNX files without schema-v1 identity are
 not loaded; there is no legacy inference or implicit identity fallback.
 
-Training statistics are authoritative only as the exact canonical snapshot
+Training statistics schema v3 is algorithm-neutral: current and historical
+metrics are finite named maps, and evaluation history stores arbitrary metrics,
+episode counts, and mean episode length. Statistics are authoritative only as the exact canonical snapshot
 embedded in the selected `RunCommitV1`; `stats_id` hashes those embedded bytes.
 The profile-root `stats.json` is an atomically refreshed web projection, not
 learner continuity state. Existing malformed or incomplete authority fails

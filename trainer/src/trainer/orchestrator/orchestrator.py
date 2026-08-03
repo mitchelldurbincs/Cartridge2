@@ -18,11 +18,10 @@ from crucible.orchestrator.orchestrator import (
 )
 
 from ..algorithms import get_algorithm
-from ..algorithms.alphazero_board_v1 import get_game_config
 from ..environment_catalog import get_environment
 from ..stats import (
-    EvalStats,
-    PreparedStatsSnapshotV2,
+    EvaluationStats,
+    PreparedStatsSnapshotV3,
     decode_stats_snapshot,
     prepare_stats_snapshot,
 )
@@ -34,7 +33,6 @@ from ..storage.evaluation import (
 from ..storage.publisher import (
     ArtifactValidationError,
     CheckpointRef,
-    OnnxArtifactContract,
     create_checkpoint_publisher,
 )
 from ..storage.run_commit import (
@@ -171,20 +169,8 @@ class Orchestrator(_CoreOrchestrator):
             )
         self.algorithm = algorithm
         self.run_recipe = _run_recipe(config, algorithm)
-        game_config = get_game_config(config.env_id)
-        descriptor = algorithm.descriptor
         checkpoint_repository = create_checkpoint_publisher(
-            OnnxArtifactContract(
-                algorithm_id=descriptor.id,
-                env_id=environment.env_id,
-                env_contract_version=environment.contract_version,
-                model_artifact_schema_version=(
-                    descriptor.model_artifact_schema_version
-                ),
-                model_contract=descriptor.components.model_contract,
-                obs_size=game_config.obs_size,
-                num_actions=game_config.num_actions,
-            ),
+            algorithm.artifact_contract(environment),
             config.models_dir,
         )
         evaluation_repository = create_evaluation_repository(checkpoint_repository)
@@ -196,9 +182,7 @@ class Orchestrator(_CoreOrchestrator):
         preflight_chain = preflight_commits.resolve_chain(
             preflight_head.run_commit_id if preflight_head is not None else None
         )
-        preflight_parent_id = (
-            preflight_chain[-1].run_commit_id if preflight_chain else None
-        )
+        preflight_parent_id = preflight_chain[-1].run_commit_id if preflight_chain else None
         if preflight_chain:
             selected = preflight_chain[-1].commit
             if selected.config_sha256 != self.run_recipe.learner_config_sha256:
@@ -214,8 +198,7 @@ class Orchestrator(_CoreOrchestrator):
         recovered_before_logger: RunCommitV1 | None = None
         if pending is not None:
             if (
-                pending.run_commit.config_sha256
-                != self.run_recipe.learner_config_sha256
+                pending.run_commit.config_sha256 != self.run_recipe.learner_config_sha256
                 or pending.run_commit.run_recipe != self.run_recipe
             ):
                 raise ArtifactValidationError(
@@ -241,26 +224,20 @@ class Orchestrator(_CoreOrchestrator):
                 )
             recovered_before_logger = pending.run_commit
             preflight_head = checkpoint_repository.resolve_run_head()
-            preflight_chain = preflight_commits.resolve_chain(
-                preflight_head.run_commit_id
-            )
+            preflight_chain = preflight_commits.resolve_chain(preflight_head.run_commit_id)
         previous_iterations = [
             reference.commit.orchestration.iteration
             for reference in preflight_chain
             if reference.commit.orchestration is not None
         ]
-        config._set_start_iteration(
-            previous_iterations[-1] + 1 if previous_iterations else 1
-        )
+        config._set_start_iteration(previous_iterations[-1] + 1 if previous_iterations else 1)
         replay_profile = ReplayProfile(
             env_id=config.env_id,
             env_contract_version=environment.contract_version,
             algorithm_id=algorithm.descriptor.id,
             experience_schema=algorithm.descriptor.components.experience_schema,
         )
-        initial_source = (
-            preflight_chain[-1].commit.checkpoint_id if preflight_chain else None
-        )
+        initial_source = preflight_chain[-1].commit.checkpoint_id if preflight_chain else None
         self.replay_profile = replay_profile
         self._active_replay_selection = ReplaySelection(
             profile=replay_profile,
@@ -269,9 +246,7 @@ class Orchestrator(_CoreOrchestrator):
         )
         super().__init__(
             config,
-            replay_buffer_factory=lambda: create_replay_store(
-                self._active_replay_selection
-            ),
+            replay_buffer_factory=lambda: create_replay_store(self._active_replay_selection),
             trainer_factory=lambda spec: algorithm.build_loop_learner(spec, config),
             actor_runner_factory=algorithm.build_collector_runner,
             eval_runner_factory=lambda loop_config, wandb_logger=None: EvalRunner(
@@ -323,9 +298,7 @@ class Orchestrator(_CoreOrchestrator):
         self._active_replay_selection = selection
         previous.close()
         if self._replay_buffer.count() != 0:
-            raise ArtifactValidationError(
-                "Fresh replay collection scope is unexpectedly nonempty"
-            )
+            raise ArtifactValidationError("Fresh replay collection scope is unexpectedly nonempty")
         return selection
 
     def _get_transition_count(self) -> int:
@@ -333,9 +306,7 @@ class Orchestrator(_CoreOrchestrator):
 
     def _head_chain(self) -> list[RunCommitRef]:
         head = self.eval_runner.checkpoints.resolve_run_head()
-        return self.run_commits.resolve_chain(
-            head.run_commit_id if head is not None else None
-        )
+        return self.run_commits.resolve_chain(head.run_commit_id if head is not None else None)
 
     @staticmethod
     def _iteration_stats(commit: RunCommitV1) -> IterationStats | None:
@@ -366,9 +337,7 @@ class Orchestrator(_CoreOrchestrator):
         if actual_parent != prepared.parent_run_commit_id:
             if head is not None and head.run_commit_id == prepared.run_commit_id:
                 return self.run_commits.resolve(prepared.run_commit_id)
-            raise ArtifactValidationError(
-                "RunHead no longer matches the prepared run parent"
-            )
+            raise ArtifactValidationError("RunHead no longer matches the prepared run parent")
         if prepared.evaluation is not None:
             self.eval_runner.commit(prepared.evaluation)
         reference = self.run_commits.publish(prepared.run_commit)
@@ -399,8 +368,7 @@ class Orchestrator(_CoreOrchestrator):
             and reference.commit.orchestration.evaluation_id is not None
         ]
         self.eval_history = [
-            self.eval_runner._build_eval_record(evaluation)
-            for evaluation in evaluations
+            self.eval_runner._build_eval_record(evaluation) for evaluation in evaluations
         ]
         solver_history = self.eval_runner._build_solver_history(evaluations)
         latest = chain[-1].commit if chain else None
@@ -451,7 +419,7 @@ class Orchestrator(_CoreOrchestrator):
         num_steps: int,
         start_step: int,
         replay_selection: ReplaySelection,
-    ) -> tuple[bool, float, CheckpointRef | None, PreparedStatsSnapshotV2 | None]:
+    ) -> tuple[bool, float, CheckpointRef | None, PreparedStatsSnapshotV3 | None]:
         spec = _loop_train_spec(
             self.config,
             num_steps=num_steps,
@@ -467,7 +435,7 @@ class Orchestrator(_CoreOrchestrator):
             checkpoint = getattr(learner, "last_checkpoint_ref", None)
             snapshot = getattr(learner, "last_prepared_stats", None)
             if not isinstance(checkpoint, CheckpointRef) or not isinstance(
-                snapshot, PreparedStatsSnapshotV2
+                snapshot, PreparedStatsSnapshotV3
             ):
                 raise ArtifactValidationError(
                     "Deferred learner did not return its exact checkpoint/stats handoff"
@@ -479,10 +447,10 @@ class Orchestrator(_CoreOrchestrator):
 
     @staticmethod
     def _snapshot_with_evaluation(
-        snapshot: PreparedStatsSnapshotV2,
+        snapshot: PreparedStatsSnapshotV3,
         candidate: CheckpointRef,
         evaluation: PreparedEvaluation | None,
-    ) -> PreparedStatsSnapshotV2:
+    ) -> PreparedStatsSnapshotV3:
         if evaluation is None or evaluation.artifact.results.vs_random is None:
             return snapshot
         loaded = decode_stats_snapshot(
@@ -491,17 +459,19 @@ class Orchestrator(_CoreOrchestrator):
             expected_binding=snapshot.binding,
         )
         result = evaluation.artifact.results.vs_random
-        completed = datetime.fromisoformat(
-            evaluation.artifact.completed_at.replace("Z", "+00:00")
-        )
-        loaded.stats.append_eval(
-            EvalStats(
+        completed = datetime.fromisoformat(evaluation.artifact.completed_at.replace("Z", "+00:00"))
+        loaded.stats.append_evaluation(
+            EvaluationStats(
                 step=candidate.manifest.step,
-                win_rate=result.candidate_win_rate,
-                draw_rate=result.draw_rate,
-                loss_rate=(1.0 - result.candidate_win_rate - result.draw_rate),
-                games_played=result.games_played,
-                avg_game_length=result.average_game_length,
+                metrics={
+                    "outcome/win_rate": result.candidate_win_rate,
+                    "outcome/draw_rate": result.draw_rate,
+                    "outcome/loss_rate": (
+                        1.0 - result.candidate_win_rate - result.draw_rate
+                    ),
+                },
+                episodes=result.games_played,
+                mean_episode_length=result.average_game_length,
                 timestamp=completed.timestamp(),
             )
         )
@@ -515,7 +485,7 @@ class Orchestrator(_CoreOrchestrator):
         replay_selection: ReplaySelection,
         episodes: int,
         candidate: CheckpointRef,
-        snapshot: PreparedStatsSnapshotV2,
+        snapshot: PreparedStatsSnapshotV3,
         actor_time: float,
         trainer_time: float,
         transitions: int,
@@ -527,9 +497,7 @@ class Orchestrator(_CoreOrchestrator):
             if reference.commit.orchestration is not None:
                 previous_timestamp = reference.commit.orchestration.timestamp
                 break
-        evaluation_completed = (
-            evaluation.artifact.completed_at if evaluation is not None else None
-        )
+        evaluation_completed = evaluation.artifact.completed_at if evaluation is not None else None
         timestamp = _utc_after(previous_timestamp, evaluation_completed)
         orchestration = OrchestrationCommitV1(
             iteration=iteration,
@@ -538,21 +506,15 @@ class Orchestrator(_CoreOrchestrator):
             training_steps=self.config.steps_per_iteration,
             actor_time_seconds=actor_time,
             trainer_time_seconds=trainer_time,
-            eval_time_seconds=(
-                evaluation.elapsed_seconds if evaluation is not None else 0.0
-            ),
+            eval_time_seconds=(evaluation.elapsed_seconds if evaluation is not None else 0.0),
             total_time_seconds=total_time,
             eval_win_rate=evaluation.win_rate if evaluation is not None else None,
             eval_draw_rate=evaluation.draw_rate if evaluation is not None else None,
             timestamp=timestamp,
-            evaluation_id=(
-                evaluation.evaluation_id if evaluation is not None else None
-            ),
+            evaluation_id=(evaluation.evaluation_id if evaluation is not None else None),
             collector_simulations=self.run_recipe.simulations_for(iteration),
             collector_seed=None,
-            evaluation_seed=(
-                evaluation.artifact.recipe.seed if evaluation is not None else None
-            ),
+            evaluation_seed=(evaluation.artifact.recipe.seed if evaluation is not None else None),
             collection_scope_id=replay_selection.collection_scope_id,
             source_checkpoint_id=replay_selection.source_checkpoint_id,
         )
@@ -591,9 +553,7 @@ class Orchestrator(_CoreOrchestrator):
             "loop/total_seconds": orchestration.total_time_seconds,
             "loop/episodes": orchestration.episodes_generated,
             "loop/transitions": orchestration.transitions_generated,
-            "loop/mcts_simulations": self.run_recipe.simulations_for(
-                orchestration.iteration
-            ),
+            "loop/mcts_simulations": self.run_recipe.simulations_for(orchestration.iteration),
         }
         self.wandb_logger.log(
             metrics,
@@ -603,9 +563,7 @@ class Orchestrator(_CoreOrchestrator):
             evaluation = self.eval_runner.evaluations.resolve_evaluation(
                 orchestration.evaluation_id
             )
-            self.eval_runner._log_eval_to_wandb(
-                self.eval_runner._build_eval_record(evaluation)
-            )
+            self.eval_runner._log_eval_to_wandb(self.eval_runner._build_eval_record(evaluation))
 
     def run_iteration(self, iteration: int) -> IterationStats | None:
         self._require_execution_matches_recipe()
@@ -647,11 +605,7 @@ class Orchestrator(_CoreOrchestrator):
             return None
         should_eval = self.run_recipe.evaluation_scheduled(iteration)
         self._require_execution_matches_recipe()
-        evaluation = (
-            self.eval_runner.prepare(iteration, candidate, parent)
-            if should_eval
-            else None
-        )
+        evaluation = self.eval_runner.prepare(iteration, candidate, parent) if should_eval else None
         snapshot = self._snapshot_with_evaluation(snapshot, candidate, evaluation)
         total_time = time.perf_counter() - iter_started
         commit = self._build_run_commit(

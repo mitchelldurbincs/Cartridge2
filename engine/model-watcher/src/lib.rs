@@ -4,6 +4,7 @@
 //! update is accepted only after its canonical identity, immutable manifest,
 //! exact runtime profile, blob size, blob SHA-256, and ONNX contract all pass.
 
+use algorithm_core::ModelArtifactContract;
 use anyhow::{anyhow, Result};
 use mcts::SharedOnnxEvaluator;
 use notify::{recommended_watcher, Event, EventKind, RecursiveMode, Watcher};
@@ -25,6 +26,46 @@ pub mod s3;
 mod tests;
 
 pub use load::{ModelInfo, ModelLoadSpec};
+
+/// One immutable model selected from a fully validated filesystem RunHead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModel {
+    pub checkpoint_id: String,
+    pub run_commit_id: String,
+    pub model_sha256: String,
+    pub path: PathBuf,
+    pub training_step: u64,
+}
+
+/// Resolve and hash-verify a model without imposing an inference interface.
+///
+/// The selected cartridge remains responsible for validating and loading the
+/// exact ONNX tensor interface declared by its model contract.
+pub fn resolve_current_filesystem_model(
+    model_root: impl AsRef<Path>,
+    identity: &ModelArtifactContract,
+    environment_max_horizon: u32,
+    selection: ModelSelection,
+) -> Result<Option<ResolvedModel>> {
+    let model_root = model_root.as_ref();
+    let Some(head) = read_filesystem_head(model_root)? else {
+        return Ok(None);
+    };
+    let resolved = resolve_filesystem_head(
+        model_root,
+        head,
+        identity,
+        environment_max_horizon,
+        selection,
+    )?;
+    Ok(Some(ResolvedModel {
+        checkpoint_id: resolved.checkpoint_id,
+        run_commit_id: resolved.run_commit_id,
+        model_sha256: resolved.manifest.onnx.sha256,
+        path: resolved.model_path,
+        training_step: resolved.manifest.step,
+    }))
+}
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 

@@ -10,6 +10,7 @@ import torch
 from torch.optim import Adam
 
 from trainer.algorithms import get_algorithm
+from trainer.algorithms.alphazero_board_v1 import policy_value_artifact_contract
 from trainer.checkpoint import (
     LearnerStateContract,
     export_onnx_artifact,
@@ -20,7 +21,7 @@ from trainer.network import PolicyValueNetwork
 from trainer.orchestrator.config import LoopConfig
 from trainer.orchestrator.eval_runner import EvalRunner, PreparedEvaluation
 from trainer.orchestrator.orchestrator import _run_recipe
-from trainer.stats import EvalStats, TrainerStats, prepare_stats_snapshot
+from trainer.stats import EvaluationStats, TrainerStats, prepare_stats_snapshot
 from trainer.storage.evaluation import (
     ChampionReferenceV1,
     FilesystemEvaluationRepository,
@@ -42,22 +43,22 @@ from trainer.storage.run_commit import (
     RunCommitV1,
 )
 
-CONTRACT = OnnxArtifactContract(
+CONTRACT = policy_value_artifact_contract(
     algorithm_id="alphazero_board_v1",
     env_id="tictactoe",
-    env_contract_version=1,
+    env_contract_version=2,
     model_artifact_schema_version=1,
     model_contract="onnx_policy_value_v1",
-    obs_size=29,
+    obs_size=18,
     num_actions=9,
 )
-CONNECT4_CONTRACT = OnnxArtifactContract(
+CONNECT4_CONTRACT = policy_value_artifact_contract(
     algorithm_id="alphazero_board_v1",
     env_id="connect4",
-    env_contract_version=1,
+    env_contract_version=2,
     model_artifact_schema_version=1,
     model_contract="onnx_policy_value_v1",
-    obs_size=93,
+    obs_size=84,
     num_actions=7,
 )
 BASE_CONFIG = LoopConfig(
@@ -77,12 +78,11 @@ CONFIG_SHA256 = RUN_RECIPE.learner_config_sha256
 @pytest.fixture(scope="module")
 def staged_blobs(tmp_path_factory):
     root = tmp_path_factory.mktemp("evaluation-flow-v2")
-    network = PolicyValueNetwork(obs_size=29, action_size=9)
+    network = PolicyValueNetwork(obs_size=18, action_size=9)
     optimizer = Adam(network.parameters(), lr=0.001)
     return (
         export_onnx_artifact(
             network,
-            29,
             root / "model.onnx",
             torch.device("cpu"),
             CONTRACT,
@@ -219,9 +219,7 @@ def outcome(*, candidate_wins, opponent_wins, draws):
 
 
 def repositories(tmp_path):
-    checkpoints = FilesystemCheckpointPublisher(
-        model_root=tmp_path / "models", contract=CONTRACT
-    )
+    checkpoints = FilesystemCheckpointPublisher(model_root=tmp_path / "models", contract=CONTRACT)
     evaluations = FilesystemEvaluationRepository(checkpoints)
     return checkpoints, evaluations
 
@@ -239,17 +237,19 @@ def establish_first_run(checkpoints, evaluations, runner, candidate):
     )
     vs_random = prepared.artifact.results.vs_random
     assert vs_random is not None
-    completed = datetime.fromisoformat(
-        prepared.artifact.completed_at.replace("Z", "+00:00")
-    )
-    stats.append_eval(
-        EvalStats(
+    completed = datetime.fromisoformat(prepared.artifact.completed_at.replace("Z", "+00:00"))
+    stats.append_evaluation(
+        EvaluationStats(
             step=1,
-            win_rate=vs_random.candidate_win_rate,
-            draw_rate=vs_random.draw_rate,
-            loss_rate=(1.0 - vs_random.candidate_win_rate - vs_random.draw_rate),
-            games_played=vs_random.games_played,
-            avg_game_length=vs_random.average_game_length,
+            metrics={
+                "outcome/win_rate": vs_random.candidate_win_rate,
+                "outcome/draw_rate": vs_random.draw_rate,
+                "outcome/loss_rate": (
+                    1.0 - vs_random.candidate_win_rate - vs_random.draw_rate
+                ),
+            },
+            episodes=vs_random.games_played,
+            mean_episode_length=vs_random.average_game_length,
             timestamp=completed.timestamp(),
         )
     )
@@ -291,9 +291,7 @@ def establish_first_run(checkpoints, evaluations, runner, candidate):
     return commit, prepared
 
 
-def test_prepare_runs_games_without_writing_evidence_or_mutating_authority(
-    tmp_path, staged_blobs
-):
+def test_prepare_runs_games_without_writing_evidence_or_mutating_authority(tmp_path, staged_blobs):
     checkpoints, evaluations = repositories(tmp_path)
     candidate = stage_checkpoint(checkpoints, staged_blobs, 1)
     runner = make_runner(tmp_path, checkpoints, evaluations)
@@ -310,9 +308,7 @@ def test_prepare_runs_games_without_writing_evidence_or_mutating_authority(
     assert not (checkpoints.model_root / "channels" / "champion.json").exists()
 
 
-def test_commit_materializes_evidence_but_never_advances_run_head(
-    tmp_path, staged_blobs
-):
+def test_commit_materializes_evidence_but_never_advances_run_head(tmp_path, staged_blobs):
     checkpoints, evaluations = repositories(tmp_path)
     candidate = stage_checkpoint(checkpoints, staged_blobs, 1)
     runner = make_runner(tmp_path, checkpoints, evaluations)
@@ -341,9 +337,7 @@ def test_backend_failure_leaves_no_evidence(tmp_path, staged_blobs):
     assert not (checkpoints.model_root / "evaluations").exists()
 
 
-def test_candidate_lineage_is_preflighted_before_expensive_games(
-    tmp_path, staged_blobs
-):
+def test_candidate_lineage_is_preflighted_before_expensive_games(tmp_path, staged_blobs):
     checkpoints, evaluations = repositories(tmp_path)
     first = stage_checkpoint(checkpoints, staged_blobs, 1)
     runner = make_runner(tmp_path, checkpoints, evaluations)
@@ -361,9 +355,7 @@ def test_second_candidate_uses_runcommit_champion_and_rejection_is_evidence_only
     checkpoints, evaluations = repositories(tmp_path)
     first = stage_checkpoint(checkpoints, staged_blobs, 1)
     runner = make_runner(tmp_path, checkpoints, evaluations)
-    parent, first_prepared = establish_first_run(
-        checkpoints, evaluations, runner, first
-    )
+    parent, first_prepared = establish_first_run(checkpoints, evaluations, runner, first)
     second = stage_checkpoint(checkpoints, staged_blobs, 2, parent=first.checkpoint_id)
     calls = []
 

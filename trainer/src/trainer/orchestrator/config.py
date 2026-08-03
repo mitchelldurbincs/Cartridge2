@@ -18,12 +18,7 @@ _MAX_F32 = float.fromhex("0x1.fffffep+127")
 
 def _u32(value: object, *, field_name: str, positive: bool = False) -> int:
     minimum = 1 if positive else 0
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or value < minimum
-        or value > _MAX_U32
-    ):
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum or value > _MAX_U32:
         qualifier = "positive" if positive else "nonnegative"
         raise ValueError(f"{field_name} must be a {qualifier} u32 integer")
     return value
@@ -31,12 +26,7 @@ def _u32(value: object, *, field_name: str, positive: bool = False) -> int:
 
 def _u64(value: object, *, field_name: str, positive: bool = False) -> int:
     minimum = 1 if positive else 0
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or value < minimum
-        or value > _MAX_U64
-    ):
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum or value > _MAX_U64:
         qualifier = "positive" if positive else "nonnegative"
         raise ValueError(f"{field_name} must be a {qualifier} u64 integer")
     return value
@@ -69,14 +59,11 @@ def _finite_number(
     return 0.0 if normalized == 0.0 else normalized
 
 
-def _validate_simulation_schedule(
-    *, iterations: int, start: int, maximum: int, ramp: int
-) -> None:
+def _validate_simulation_schedule(*, iterations: int, start: int, maximum: int, ramp: int) -> None:
     if start == maximum:
         if ramp != 0:
             raise ValueError(
-                "mcts_sim_ramp_rate must be zero when mcts_start_sims equals "
-                "mcts_max_sims"
+                "mcts_sim_ramp_rate must be zero when mcts_start_sims equals mcts_max_sims"
             )
         return
     delta = maximum - start
@@ -87,9 +74,7 @@ def _validate_simulation_schedule(
         )
     steps_to_cap = (delta + ramp - 1) // ramp
     if iterations - 1 < steps_to_cap:
-        raise ValueError(
-            "MCTS simulation schedule must reach mcts_max_sims within iterations"
-        )
+        raise ValueError("MCTS simulation schedule must reach mcts_max_sims within iterations")
 
 
 @dataclass
@@ -154,9 +139,7 @@ class LoopConfig:
 
     def __setattr__(self, name: str, value: object) -> None:
         if getattr(self, "_sealed", False) and name != "_next_iteration":
-            raise FrozenInstanceError(
-                f"cannot mutate authenticated LoopConfig field {name!r}"
-            )
+            raise FrozenInstanceError(f"cannot mutate authenticated LoopConfig field {name!r}")
         object.__setattr__(self, name, value)
 
     def __post_init__(self) -> None:
@@ -233,8 +216,7 @@ class LoopConfig:
             raise ValueError("dirichlet_weight must be a rate in [0, 1]")
         if (self.dirichlet_alpha == 0.0) != (self.dirichlet_weight == 0.0):
             raise ValueError(
-                "dirichlet_alpha and dirichlet_weight must both be zero to "
-                "disable noise"
+                "dirichlet_alpha and dirichlet_weight must both be zero to disable noise"
             )
         if self.temp_threshold == 0:
             if self.late_temperature != self.temperature:
@@ -244,13 +226,11 @@ class LoopConfig:
         else:
             if self.late_temperature == self.temperature:
                 raise ValueError(
-                    "late_temperature must differ from temperature when the schedule "
-                    "is enabled"
+                    "late_temperature must differ from temperature when the schedule is enabled"
                 )
             if self.temp_threshold >= max_horizon:
                 raise ValueError(
-                    "temp_threshold must be less than the selected environment "
-                    "max_horizon"
+                    "temp_threshold must be less than the selected environment max_horizon"
                 )
         _u64(self.batch_size, field_name="batch_size", positive=True)
         for field_name, positive in (
@@ -288,14 +268,11 @@ class LoopConfig:
                 raise ValueError(f"{field_name} must be a finite rate in [0, 1]")
         if self.promotion_metric == "win_rate":
             if self.promotion_margin != 0.0:
-                raise ValueError(
-                    "promotion_margin must be zero when promotion_metric is win_rate"
-                )
+                raise ValueError("promotion_margin must be zero when promotion_metric is win_rate")
         elif self.promotion_metric == "solver_optimal":
             if self.eval_win_threshold != 0.0:
                 raise ValueError(
-                    "eval_win_threshold must be zero when promotion_metric is "
-                    "solver_optimal"
+                    "eval_win_threshold must be zero when promotion_metric is solver_optimal"
                 )
         else:
             raise ValueError("promotion_metric must be win_rate or solver_optimal")
@@ -304,15 +281,9 @@ class LoopConfig:
         if self.promotion_metric == "solver_optimal" and (
             self.env_id != "connect4" or self.solver_games == 0
         ):
-            raise ValueError(
-                "solver_optimal promotion requires connect4 with solver_games > 0"
-            )
+            raise ValueError("solver_optimal promotion requires connect4 with solver_games > 0")
         solver_evidence_enabled = self.env_id == "connect4" and solver_games > 0
-        if (
-            eval_interval > 0
-            and not self.eval_vs_random
-            and not solver_evidence_enabled
-        ):
+        if eval_interval > 0 and not self.eval_vs_random and not solver_evidence_enabled:
             raise ValueError(
                 "scheduled evaluation requires first-candidate evidence: enable "
                 "eval_vs_random or use connect4 with solver_games > 0"
@@ -323,9 +294,7 @@ class LoopConfig:
             raise ValueError("log_level must be DEBUG, INFO, WARNING, or ERROR")
         if not isinstance(self.wandb, WandbConfig):
             raise TypeError("wandb must be a WandbConfig")
-        if not isinstance(self.wandb.enabled, bool) or not isinstance(
-            self.wandb.required, bool
-        ):
+        if not isinstance(self.wandb.enabled, bool) or not isinstance(self.wandb.required, bool):
             raise ValueError("wandb enabled/required flags must be boolean")
         _finite_number(
             self.wandb.init_timeout_seconds,
@@ -396,9 +365,7 @@ class LoopConfig:
         if self.mcts_sim_ramp_rate == 0:
             return self.mcts_start_sims
         remaining = self.mcts_max_sims - self.mcts_start_sims
-        steps_to_cap = (
-            remaining + self.mcts_sim_ramp_rate - 1
-        ) // self.mcts_sim_ramp_rate
+        steps_to_cap = (remaining + self.mcts_sim_ramp_rate - 1) // self.mcts_sim_ramp_rate
         if iteration - 1 >= steps_to_cap:
             return self.mcts_max_sims
         return self.mcts_start_sims + (iteration - 1) * self.mcts_sim_ramp_rate

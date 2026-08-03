@@ -15,9 +15,9 @@
 //!   ch8 turn progress        (constant plane: round / MAX_TURNS)
 //!   ch9 plies remaining      (constant plane: remaining / (2 * MAX_TURNS),
 //!                              zero after termination)
-//! [ legal-move mask: 257 ]   legal_mask_offset = 640
-//! [ current-player one-hot: 2 ]
-//! obs_size = 640 + 257 + 2 = 899
+//! Action availability and the observing agent are carried by the generic
+//! timestep decision envelope, not duplicated in this tensor.
+//! obs_size = 640
 //! ```
 //!
 //! "Own"/"enemy" are relative to the player to act (`current_player`), so
@@ -28,8 +28,7 @@
 use engine_core::board_profile::encode_f32_slices;
 
 use crate::board::TileKind;
-use crate::params::{BOARD_SIZE, MAX_ARMY_NORM, MAX_TURNS, NUM_ACTIONS};
-use crate::rules::fill_legal_moves;
+use crate::params::{BOARD_SIZE, MAX_ARMY_NORM, MAX_TURNS};
 use crate::State;
 
 /// Number of spatial channels.
@@ -37,16 +36,12 @@ pub const NUM_CHANNELS: usize = 10;
 /// Flattened spatial section length.
 pub const CHANNELS_LEN: usize = NUM_CHANNELS * BOARD_SIZE;
 /// Total observation length in floats.
-pub const OBS_SIZE: usize = CHANNELS_LEN + NUM_ACTIONS + 2;
-/// Float index where the legal-move plane starts.
-pub const LEGAL_MASK_OFFSET: usize = CHANNELS_LEN;
+pub const OBS_SIZE: usize = CHANNELS_LEN;
 
 /// Generals observation.
 #[derive(Debug, Clone)]
 pub struct GeneralsObs {
     pub channels: [f32; CHANNELS_LEN],
-    pub legal_moves: [f32; NUM_ACTIONS],
-    pub current_player: [f32; 2],
 }
 
 impl GeneralsObs {
@@ -92,34 +87,11 @@ impl GeneralsObs {
             }
         }
 
-        let mut legal_moves = [0.0f32; NUM_ACTIONS];
-        let player_alive = state.alive[state.current_player as usize - 1];
-        fill_legal_moves(
-            &state.tiles,
-            state.current_player,
-            player_alive,
-            &mut legal_moves,
-        );
-
-        let mut current_player = [0.0f32; 2];
-        current_player[state.current_player as usize - 1] = 1.0;
-
-        Self {
-            channels,
-            legal_moves,
-            current_player,
-        }
+        Self { channels }
     }
 
     /// Encode as little-endian f32 bytes for the neural network.
     pub fn encode(&self, out: &mut Vec<u8>) {
-        encode_f32_slices(
-            out,
-            [
-                &self.channels[..],
-                &self.legal_moves[..],
-                &self.current_player[..],
-            ],
-        );
+        encode_f32_slices(out, [&self.channels[..]]);
     }
 }

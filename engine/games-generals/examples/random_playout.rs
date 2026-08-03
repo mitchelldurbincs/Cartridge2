@@ -4,7 +4,7 @@
 //! Run: cargo run -p games-generals --example random_playout --release
 
 use engine_core::board_profile::BoardGame;
-use games_generals::params::{MAX_TURNS, NUM_ACTIONS};
+use games_generals::params::MAX_TURNS;
 use games_generals::Generals;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
@@ -18,16 +18,17 @@ fn main() {
     for seed in 0..games {
         let mut game = Generals::new();
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
-        let (mut state, mut obs) = game.reset(&mut rng, &[]).unwrap();
+        let (mut state, _) = game.reset(&mut rng, &[]).unwrap();
         let mut plies = 0u32;
 
         loop {
-            let legal: Vec<u32> = (0..NUM_ACTIONS as u32)
-                .filter(|&a| obs.legal_moves[a as usize] > 0.5)
+            let legal: Vec<u32> = Generals::legal_actions(&state)
+                .unwrap()
+                .iter_ones()
+                .map(|action| action as u32)
                 .collect();
             let action = legal[rng.gen_range(0..legal.len())];
             let transition = game.step(&mut state, action, &mut rng).unwrap();
-            obs = transition.observation;
             plies += 1;
             if transition.terminated {
                 break;

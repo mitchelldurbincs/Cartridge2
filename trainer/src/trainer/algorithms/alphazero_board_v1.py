@@ -18,6 +18,8 @@ from ..environment_catalog import (
     get_environment,
 )
 from ..storage.base import ReplayRecord, ReplaySelection
+from ..storage.publisher import OnnxArtifactContract, OnnxTensorSpec
+from .alphazero_config import AlphaZeroLearnerConfig
 from .base import AlgorithmCommand
 
 logger = logging.getLogger(__name__)
@@ -71,9 +73,7 @@ class AlphaZeroGameConfig:
     board_height: int
     num_actions: int
     obs_size: int
-    legal_mask_offset: int
     obs_channels: int
-    player_relative_obs: bool
     hidden_size: int = 128
     network_type: str = "mlp"
     num_res_blocks: int = 4
@@ -82,21 +82,6 @@ class AlphaZeroGameConfig:
     @property
     def board_size(self) -> int:
         return self.board_width * self.board_height
-
-    @property
-    def legal_mask_end(self) -> int:
-        return self.legal_mask_offset + self.num_actions
-
-    @property
-    def player_indicator_offset(self) -> int:
-        return self.legal_mask_end
-
-    def extract_legal_mask(self, obs):
-        return obs[:, self.legal_mask_offset : self.legal_mask_end]
-
-    def extract_player_indicator(self, obs):
-        offset = self.player_indicator_offset
-        return obs[:, offset : offset + 2]
 
 
 def compatibility(env_id: str) -> CompatibilityReport:
@@ -107,6 +92,19 @@ def get_game_config(env_id: str) -> AlphaZeroGameConfig:
     environment = get_environment(env_id)
     environment.compatibility(ALGORITHM_ID).require_compatible()
     board = environment.require_board()
+    capabilities = environment.capabilities
+    agents = capabilities.agents.agents
+    if not agents or agents[0].action_space.discrete_size is None:
+        raise ValueError(f"Environment '{env_id}' has no discrete AlphaZero action space")
+    num_actions = agents[0].action_space.discrete_size
+    tensor = capabilities.encoding.observation_tensor
+    if tensor is None or tensor.dtype != "f32_little_endian":
+        raise ValueError(f"Environment '{env_id}' has no fixed f32 observation tensor")
+    dimensions = {dimension.name: dimension.size for dimension in tensor.dimensions}
+    obs_channels = dimensions.get("channel")
+    obs_size = tensor.fixed_elements
+    if obs_channels is None or obs_size is None:
+        raise ValueError(f"Environment '{env_id}' has no fixed channel dimension")
     network = NETWORK_OVERRIDES.get(env_id, {})
 
     return AlphaZeroGameConfig(
@@ -114,11 +112,9 @@ def get_game_config(env_id: str) -> AlphaZeroGameConfig:
         display_name=environment.display_name,
         board_width=board.width,
         board_height=board.height,
-        num_actions=board.action_count,
-        obs_size=board.observation.elements,
-        legal_mask_offset=board.observation.legal_actions_offset,
-        obs_channels=board.observation.spatial_channels,
-        player_relative_obs=board.observation.player_relative,
+        num_actions=num_actions,
+        obs_size=obs_size,
+        obs_channels=obs_channels,
         **network,
     )
 
@@ -128,6 +124,45 @@ def list_compatible_environments() -> list[str]:
         env_id
         for env_id in ENVIRONMENTS
         if get_environment(env_id).compatibility(ALGORITHM_ID).compatible
+    )
+
+
+def policy_value_artifact_contract(
+    *,
+    algorithm_id: str,
+    env_id: str,
+    env_contract_version: int,
+    model_artifact_schema_version: int,
+    model_contract: str,
+    obs_size: int,
+    num_actions: int,
+) -> OnnxArtifactContract:
+    """Build AlphaZero's exact policy/value artifact boundary."""
+    return OnnxArtifactContract(
+        algorithm_id=algorithm_id,
+        env_id=env_id,
+        env_contract_version=env_contract_version,
+        model_artifact_schema_version=model_artifact_schema_version,
+        model_contract=model_contract,
+        inputs=(
+            OnnxTensorSpec(
+                name="observation",
+                dtype="float32",
+                shape=("batch_size", obs_size),
+            ),
+        ),
+        outputs=(
+            OnnxTensorSpec(
+                name="policy_logits",
+                dtype="float32",
+                shape=("batch_size", num_actions),
+            ),
+            OnnxTensorSpec(
+                name="value",
+                dtype="float32",
+                shape=("batch_size", 1),
+            ),
+        ),
     )
 
 
@@ -184,8 +219,7 @@ def decode_replay_batch(
             )
             actual += (record.collection_scope_id, record.source_checkpoint_id)
             raise ValueError(
-                f"Replay record {record.id!r} belongs to selection {actual}, "
-                f"expected {expected}"
+                f"Replay record {record.id!r} belongs to selection {actual}, expected {expected}"
             )
         if len(record.payload) != expected_bytes:
             raise ValueError(
@@ -215,9 +249,7 @@ def decode_replay_batch(
             )
         policy_sum = float(policy.sum(dtype=np.float32))
         if abs(policy_sum - 1.0) > POLICY_SUM_TOLERANCE:
-            raise ValueError(
-                f"Replay record {record.id!r} policy sums to {policy_sum}, expected 1"
-            )
+            raise ValueError(f"Replay record {record.id!r} policy sums to {policy_sum}, expected 1")
         if not -1.0 <= value <= 1.0:
             raise ValueError(
                 f"Replay record {record.id!r} value target is {value}, expected [-1, 1]"
@@ -244,10 +276,7 @@ class AlphaZeroBoardV1:
             actual = getattr(self.descriptor.components, component)
             if actual != expected:
                 mismatches.append(f"{component}={actual!r} (expected {expected!r})")
-        if (
-            self.descriptor.model_artifact_schema_version
-            != MODEL_ARTIFACT_SCHEMA_VERSION
-        ):
+        if self.descriptor.model_artifact_schema_version != MODEL_ARTIFACT_SCHEMA_VERSION:
             mismatches.append(
                 "model_artifact_schema_version="
                 f"{self.descriptor.model_artifact_schema_version!r} "
@@ -273,9 +302,21 @@ class AlphaZeroBoardV1:
         self.compatibility(environment).require_compatible()
         return environment
 
-    def _apply_runtime_path_defaults(
-        self, args: argparse.Namespace, paths: dict[str, str]
-    ) -> None:
+    def artifact_contract(self, environment: EnvironmentDescriptor) -> OnnxArtifactContract:
+        """Declare the exact ONNX policy/value boundary owned by AlphaZero."""
+        self.compatibility(environment).require_compatible()
+        game = get_game_config(environment.env_id)
+        return policy_value_artifact_contract(
+            algorithm_id=self.descriptor.id,
+            env_id=environment.env_id,
+            env_contract_version=environment.contract_version,
+            model_artifact_schema_version=(self.descriptor.model_artifact_schema_version),
+            model_contract=self.descriptor.components.model_contract,
+            obs_size=game.obs_size,
+            num_actions=game.num_actions,
+        )
+
+    def _apply_runtime_path_defaults(self, args: argparse.Namespace, paths: dict[str, str]) -> None:
         """Fill omitted paths from the parsed environment's profile namespace."""
         from ..central_config import get_config
         from ..runtime_profile import resolve_runtime_profile
@@ -354,8 +395,6 @@ class AlphaZeroBoardV1:
 
     def _build_loop_learner_config(self, spec: Any, loop_config: Any):
         """Build the one exact learner config used for hashing and execution."""
-        from ..config import AlphaZeroLearnerConfig
-
         return AlphaZeroLearnerConfig(
             model_dir=spec.model_dir,
             stats_path=spec.stats_path,
@@ -396,14 +435,33 @@ class AlphaZeroBoardV1:
         self._require_environment(config.env_id)
         return learner_config_recipe(config)
 
-    def build_collector_runner(
-        self, config: Any, shutdown_check: Callable[[], bool] | None = None
-    ):
+    def build_collector_runner(self, config: Any, shutdown_check: Callable[[], bool] | None = None):
         from ..orchestrator.actor_runner import ActorRunner
 
         self._require_component("collector")
         self._require_environment(config.env_id)
-        return ActorRunner(config, shutdown_check=shutdown_check)
+        return ActorRunner(
+            config,
+            collector_config_builder=self.collector_config,
+            shutdown_check=shutdown_check,
+        )
+
+    def collector_config(self, config: Any, num_simulations: int) -> dict:
+        """Return the exact Rust collector configuration for this cartridge."""
+        if type(num_simulations) is not int or num_simulations <= 0:
+            raise ValueError("num_simulations must be a positive integer")
+        return {
+            "schema_version": 1,
+            "num_simulations": num_simulations,
+            "c_puct": config.c_puct,
+            "temperature": config.temperature,
+            "late_temperature": config.late_temperature,
+            "temp_threshold": config.temp_threshold,
+            "dirichlet_alpha": config.dirichlet_alpha,
+            "dirichlet_weight": config.dirichlet_weight,
+            "eval_batch_size": config.actor_eval_batch_size,
+            "onnx_intra_threads": config.actor_onnx_intra_threads,
+        }
 
     def build_evaluation_runner(self, config: Any, wandb_logger: Any = None):
         from ..orchestrator.eval_runner import EvalRunner
@@ -414,7 +472,6 @@ class AlphaZeroBoardV1:
 
     def _configure_train_parser(self, parser: argparse.ArgumentParser) -> None:
         from ..central_config import get_config
-        from ..config import AlphaZeroLearnerConfig
 
         cfg = get_config()
         AlphaZeroLearnerConfig.configure_parser(
@@ -479,9 +536,7 @@ class AlphaZeroBoardV1:
 
         add_solver_eval_arguments(parser)
 
-    def _configure_register_players_parser(
-        self, parser: argparse.ArgumentParser
-    ) -> None:
+    def _configure_register_players_parser(self, parser: argparse.ArgumentParser) -> None:
         from ..tournament_cli import add_register_players_arguments
 
         add_register_players_arguments(parser)
@@ -495,7 +550,6 @@ class AlphaZeroBoardV1:
         from crucible.backoff import WaitTimeout
 
         from .. import metrics as prom_metrics
-        from ..config import AlphaZeroLearnerConfig
 
         try:
             self._require_component("learner")
@@ -525,7 +579,7 @@ class AlphaZeroBoardV1:
             )
             learner = self.build_learner(learner_config)
             stats = learner.train()
-            logger.info(f"Training complete; final loss: {stats.total_loss:.4f}")
+            logger.info(f"Training complete; final loss: {stats.metrics['loss/total']:.4f}")
             logger.info(f"Last checkpoint: {stats.last_checkpoint}")
             return 0
         except KeyboardInterrupt:
@@ -548,27 +602,13 @@ class AlphaZeroBoardV1:
             if getattr(args, "model", None) is None:
                 from ..central_config import get_config
                 from ..runtime_profile import resolve_runtime_profile
-                from ..storage.publisher import (
-                    OnnxArtifactContract,
-                    create_checkpoint_publisher,
-                )
+                from ..storage.publisher import create_checkpoint_publisher
 
-                game = get_game_config(args.env_id)
-                profile_dir = resolve_runtime_profile(
-                    self.descriptor.id, args.env_id
-                ).data_dir(get_config().data_root)
+                profile_dir = resolve_runtime_profile(self.descriptor.id, args.env_id).data_dir(
+                    get_config().data_root
+                )
                 repository = create_checkpoint_publisher(
-                    OnnxArtifactContract(
-                        algorithm_id=self.descriptor.id,
-                        env_id=args.env_id,
-                        env_contract_version=environment.contract_version,
-                        model_artifact_schema_version=(
-                            self.descriptor.model_artifact_schema_version
-                        ),
-                        model_contract=self.descriptor.components.model_contract,
-                        obs_size=game.obs_size,
-                        num_actions=game.num_actions,
-                    ),
+                    self.artifact_contract(environment),
                     profile_dir / "models",
                 )
                 current = repository.resolve_head()

@@ -8,6 +8,8 @@ import pytest
 import torch
 from torch.optim import Adam
 
+from trainer.algorithms.alphazero_board_v1 import policy_value_artifact_contract
+from trainer.algorithms.alphazero_config import AlphaZeroLearnerConfig
 from trainer.checkpoint import (
     _validate_onnx_runtime_equivalence,
     export_onnx_artifact,
@@ -16,17 +18,15 @@ from trainer.checkpoint import (
     restore_learner_state,
     write_learner_state_artifact,
 )
-from trainer.config import AlphaZeroLearnerConfig
 from trainer.lr_scheduler import LRConfig, WarmupCosineScheduler
 from trainer.network import PolicyValueNetwork
 from trainer.storage.publisher import (
     ArtifactValidationError,
     BlobDescriptorV1,
     CheckpointManifestV1,
-    OnnxArtifactContract,
 )
 
-CONTRACT = OnnxArtifactContract(
+CONTRACT = policy_value_artifact_contract(
     algorithm_id="alphazero_board_v1",
     env_id="tictactoe",
     env_contract_version=1,
@@ -67,7 +67,6 @@ def test_export_onnx_artifact_writes_only_requested_staging_path(tmp_path, monke
 
     result = export_onnx_artifact(
         network,
-        29,
         output,
         torch.device("cpu"),
         CONTRACT,
@@ -94,7 +93,6 @@ def test_export_has_exact_runtime_metadata(tmp_path):
     onnx = pytest.importorskip("onnx")
     path = export_onnx_artifact(
         PolicyValueNetwork(obs_size=29, action_size=9),
-        29,
         tmp_path / "model.onnx",
         torch.device("cpu"),
         CONTRACT,
@@ -119,9 +117,7 @@ def test_export_has_exact_runtime_metadata(tmp_path):
     assert not list(tmp_path.glob("*.data"))
 
 
-def test_export_failure_preserves_existing_artifact_and_module_modes(
-    tmp_path, monkeypatch
-):
+def test_export_failure_preserves_existing_artifact_and_module_modes(tmp_path, monkeypatch):
     output = tmp_path / "model.onnx"
     output.write_bytes(b"previous artifact")
     network = PolicyValueNetwork(obs_size=29, action_size=9)
@@ -136,7 +132,6 @@ def test_export_failure_preserves_existing_artifact_and_module_modes(
     with pytest.raises(RuntimeError, match="dynamo export failed"):
         export_onnx_artifact(
             network,
-            29,
             output,
             torch.device("cpu"),
             CONTRACT,
@@ -182,14 +177,12 @@ def test_runtime_equivalence_rejects_shape_and_nonfinite_outputs(tmp_path, monke
             _validate_onnx_runtime_equivalence(
                 network,
                 tmp_path / "model.onnx",
-                obs_size=29,
+                artifact_contract=CONTRACT,
                 device=torch.device("cpu"),
             )
 
 
-def test_runtime_equivalence_rejects_meaningful_numeric_corruption(
-    tmp_path, monkeypatch
-):
+def test_runtime_equivalence_rejects_meaningful_numeric_corruption(tmp_path, monkeypatch):
     network = PolicyValueNetwork(obs_size=29, action_size=9)
     network.eval()
 
@@ -209,7 +202,7 @@ def test_runtime_equivalence_rejects_meaningful_numeric_corruption(
         _validate_onnx_runtime_equivalence(
             network,
             tmp_path / "model.onnx",
-            obs_size=29,
+            artifact_contract=CONTRACT,
             device=torch.device("cpu"),
         )
 
@@ -223,14 +216,11 @@ def test_runtime_validation_failure_is_atomic(tmp_path, monkeypatch):
     def reject_runtime(*_args, **_kwargs):
         raise ArtifactValidationError("runtime equivalence failed")
 
-    monkeypatch.setattr(
-        "trainer.checkpoint._validate_onnx_runtime_equivalence", reject_runtime
-    )
+    monkeypatch.setattr("trainer.checkpoint._validate_onnx_runtime_equivalence", reject_runtime)
 
     with pytest.raises(ArtifactValidationError, match="runtime equivalence failed"):
         export_onnx_artifact(
             network,
-            29,
             output,
             torch.device("cpu"),
             CONTRACT,
@@ -242,13 +232,16 @@ def test_runtime_validation_failure_is_atomic(tmp_path, monkeypatch):
 
 
 def test_export_rejects_observation_contract_mismatch(tmp_path):
-    with pytest.raises(ValueError, match="obs_size"):
+    wrong_contract = replace(
+        CONTRACT,
+        inputs=(replace(CONTRACT.input("observation"), shape=("batch_size", 28)),),
+    )
+    with pytest.raises(ArtifactValidationError, match="artifact-contract validation"):
         export_onnx_artifact(
             PolicyValueNetwork(obs_size=29, action_size=9),
-            28,
             tmp_path / "model.onnx",
             torch.device("cpu"),
-            CONTRACT,
+            wrong_contract,
         )
 
 
@@ -275,12 +268,8 @@ def test_config_hash_is_deterministic_and_excludes_paths_and_callbacks(tmp_path)
     )
 
     assert learner_config_sha256(base) == learner_config_sha256(moved)
-    assert learner_config_sha256(base) != learner_config_sha256(
-        replace(base, learning_rate=0.25)
-    )
-    assert learner_config_sha256(base) != learner_config_sha256(
-        replace(base, env_id="connect4")
-    )
+    assert learner_config_sha256(base) != learner_config_sha256(replace(base, learning_rate=0.25))
+    assert learner_config_sha256(base) != learner_config_sha256(replace(base, env_id="connect4"))
 
 
 def test_config_recipe_returns_a_mutation_safe_semantic_copy():
@@ -321,9 +310,7 @@ def test_learner_state_round_trip_restores_model_optimizer_and_scheduler(tmp_pat
     config_hash = "a" * 64
     network = PolicyValueNetwork(obs_size=29, action_size=9, hidden_size=128)
     optimizer = Adam(network.parameters(), lr=0.001)
-    scheduler = WarmupCosineScheduler(
-        optimizer, LRConfig(target_lr=0.001, total_steps=100)
-    )
+    scheduler = WarmupCosineScheduler(optimizer, LRConfig(target_lr=0.001, total_steps=100))
     with torch.no_grad():
         network.policy_fc.weight.fill_(0.5)
     loss = network(torch.randn(1, 29))[1].sum()
@@ -332,7 +319,6 @@ def test_learner_state_round_trip_restores_model_optimizer_and_scheduler(tmp_pat
     scheduler.step()
     onnx_path = export_onnx_artifact(
         network,
-        29,
         tmp_path / "model.onnx",
         torch.device("cpu"),
         CONTRACT,
@@ -370,7 +356,6 @@ def test_restore_verifies_hash_before_torch_load(tmp_path, monkeypatch):
     optimizer = Adam(network.parameters(), lr=0.001)
     onnx_path = export_onnx_artifact(
         network,
-        29,
         tmp_path / "model.onnx",
         torch.device("cpu"),
         CONTRACT,
@@ -457,7 +442,6 @@ def test_restore_rejects_manifest_profile_mismatch(tmp_path):
     optimizer = Adam(network.parameters(), lr=0.001)
     onnx_path = export_onnx_artifact(
         network,
-        29,
         tmp_path / "model.onnx",
         torch.device("cpu"),
         CONTRACT,

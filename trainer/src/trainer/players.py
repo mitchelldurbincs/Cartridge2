@@ -53,16 +53,10 @@ class ModelPlayer:
     def __post_init__(self) -> None:
         if not isinstance(self.model_path, str) or not self.model_path.strip():
             raise ValueError("model_path must be a nonempty string")
-        if isinstance(self.temperature, bool) or not isinstance(
-            self.temperature, (int, float)
-        ):
+        if isinstance(self.temperature, bool) or not isinstance(self.temperature, (int, float)):
             raise ValueError("temperature must be a finite nonnegative f32")
         temperature = float(self.temperature)
-        if (
-            not math.isfinite(temperature)
-            or temperature < 0.0
-            or temperature > _MAX_F32
-        ):
+        if not math.isfinite(temperature) or temperature < 0.0 or temperature > _MAX_F32:
             raise ValueError("temperature must be a finite nonnegative f32")
         narrowed = float(struct.unpack("!f", struct.pack("!f", temperature))[0])
         object.__setattr__(self, "temperature", 0.0 if narrowed == 0.0 else narrowed)

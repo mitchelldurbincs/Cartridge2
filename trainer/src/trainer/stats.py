@@ -39,15 +39,13 @@ RECENT_RESOLUTION = 1  # Keep every entry in recent range
 MEDIUM_RESOLUTION = 100  # Keep every 100th step in medium range
 OLD_RESOLUTION = 500  # Keep every 500th step for older data
 
-STATS_ARTIFACT_SCHEMA_VERSION = 2
+STATS_ARTIFACT_SCHEMA_VERSION = 3
 _MAX_U64 = (1 << 64) - 1
 _STATS_FIELDS = frozenset(
     {
         "step",
         "total_steps",
-        "total_loss",
-        "value_loss",
-        "policy_loss",
+        "metrics",
         "learning_rate",
         "samples_seen",
         "replay_record_count",
@@ -55,8 +53,8 @@ _STATS_FIELDS = frozenset(
         "timestamp",
         "history",
         "env_id",
-        "last_eval",
-        "eval_history",
+        "last_evaluation",
+        "evaluation_history",
     }
 )
 _BINDING_FIELDS = frozenset({"profile", "config_sha256", "checkpoint_id", "step"})
@@ -73,20 +71,16 @@ _SNAPSHOT_FIELDS = frozenset(
 _EVAL_FIELDS = frozenset(
     {
         "step",
-        "win_rate",
-        "draw_rate",
-        "loss_rate",
-        "games_played",
-        "avg_game_length",
+        "metrics",
+        "episodes",
+        "mean_episode_length",
         "timestamp",
     }
 )
 _HISTORY_FIELDS = frozenset(
     {
         "step",
-        "total_loss",
-        "value_loss",
-        "policy_loss",
+        "metrics",
         "learning_rate",
         "grad_norm",
     }
@@ -124,9 +118,7 @@ def _decode_canonical_json(data: bytes, *, context: str) -> object:
     return value
 
 
-def _exact_object(
-    value: object, fields: frozenset[str], *, context: str
-) -> Mapping[str, Any]:
+def _exact_object(value: object, fields: frozenset[str], *, context: str) -> Mapping[str, Any]:
     if not isinstance(value, dict):
         raise StatsArtifactError(f"{context} must be a JSON object")
     actual = frozenset(value)
@@ -139,21 +131,12 @@ def _exact_object(
 
 
 def _require_nonnegative_integer(value: object, *, field_name: str) -> int:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or value < 0
-        or value > _MAX_U64
-    ):
-        raise StatsArtifactError(
-            f"{field_name} must be a nonnegative integer within u64"
-        )
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > _MAX_U64:
+        raise StatsArtifactError(f"{field_name} must be a nonnegative integer within u64")
     return value
 
 
-def _require_finite_number(
-    value: object, *, field_name: str, nonnegative: bool = False
-) -> float:
+def _require_finite_number(value: object, *, field_name: str, nonnegative: bool = False) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise StatsArtifactError(f"{field_name} must be a finite number")
     result = float(value)
@@ -163,17 +146,6 @@ def _require_finite_number(
     # JSON distinguishes -0.0 textually even though it has no semantic meaning
     # for these metrics. Collapse both signed zeros before content hashing.
     return 0.0 if result == 0.0 else result
-
-
-def _require_rate(value: object, *, field_name: str) -> float:
-    result = _require_finite_number(value, field_name=field_name)
-    if -1e-12 <= result <= 1e-12:
-        return 0.0
-    if 1.0 - 1e-12 <= result <= 1.0 + 1e-12:
-        return 1.0
-    if not 0.0 < result < 1.0:
-        raise StatsArtifactError(f"{field_name} must be in [0, 1]")
-    return result
 
 
 def _require_string(value: object, *, field_name: str) -> str:
@@ -196,6 +168,17 @@ def _require_digest(value: object, *, field_name: str) -> str:
         raise StatsArtifactError(str(exc)) from exc
 
 
+def _normalize_metrics(value: object, *, context: str) -> dict[str, float]:
+    if not isinstance(value, dict):
+        raise StatsArtifactError(f"{context} must be a JSON object")
+    result: dict[str, float] = {}
+    for name, metric in value.items():
+        if not isinstance(name, str) or not name.strip() or name != name.strip():
+            raise StatsArtifactError(f"{context} names must be nonempty trimmed strings")
+        result[name] = _require_finite_number(metric, field_name=f"{context}.{name}")
+    return result
+
+
 def _normalize_history_entry(value: object, *, context: str) -> dict[str, object]:
     fields = _exact_object(value, _HISTORY_FIELDS, context=context)
     grad_norm = fields["grad_norm"]
@@ -204,24 +187,8 @@ def _normalize_history_entry(value: object, *, context: str) -> dict[str, object
             grad_norm, field_name=f"{context}.grad_norm", nonnegative=True
         )
     return {
-        "step": _require_nonnegative_integer(
-            fields["step"], field_name=f"{context}.step"
-        ),
-        "total_loss": _require_finite_number(
-            fields["total_loss"],
-            field_name=f"{context}.total_loss",
-            nonnegative=True,
-        ),
-        "value_loss": _require_finite_number(
-            fields["value_loss"],
-            field_name=f"{context}.value_loss",
-            nonnegative=True,
-        ),
-        "policy_loss": _require_finite_number(
-            fields["policy_loss"],
-            field_name=f"{context}.policy_loss",
-            nonnegative=True,
-        ),
+        "step": _require_nonnegative_integer(fields["step"], field_name=f"{context}.step"),
+        "metrics": _normalize_metrics(fields["metrics"], context=f"{context}.metrics"),
         "learning_rate": _require_finite_number(
             fields["learning_rate"],
             field_name=f"{context}.learning_rate",
@@ -278,9 +245,7 @@ class StatsBindingV1:
             checkpoint_id=_require_digest(
                 fields["checkpoint_id"], field_name="stats binding checkpoint_id"
             ),
-            step=_require_nonnegative_integer(
-                fields["step"], field_name="stats binding step"
-            ),
+            step=_require_nonnegative_integer(fields["step"], field_name="stats binding step"),
         )
 
 
@@ -342,84 +307,67 @@ def retain_training_history(history: list[dict], current_step: int) -> list[dict
 
 
 @dataclass
-class EvalStats:
-    """Web-facing summary of one learner checkpoint evaluation."""
+class EvaluationStats:
+    """Algorithm-neutral metrics from one checkpoint evaluation."""
 
     step: int = 0
-    win_rate: float = 0.0
-    draw_rate: float = 0.0
-    loss_rate: float = 0.0
-    games_played: int = 0
-    avg_game_length: float = 0.0
+    metrics: dict[str, float] = field(default_factory=dict)
+    episodes: int = 0
+    mean_episode_length: float = 0.0
     timestamp: float = field(default_factory=time.time)
 
     def __post_init__(self) -> None:
-        self.step = _require_nonnegative_integer(self.step, field_name="eval.step")
-        self.win_rate = _require_rate(self.win_rate, field_name="eval.win_rate")
-        self.draw_rate = _require_rate(self.draw_rate, field_name="eval.draw_rate")
-        self.loss_rate = _require_rate(self.loss_rate, field_name="eval.loss_rate")
-        self.games_played = _require_nonnegative_integer(
-            self.games_played, field_name="eval.games_played"
+        self.step = _require_nonnegative_integer(self.step, field_name="evaluation.step")
+        self.metrics = _normalize_metrics(self.metrics, context="evaluation.metrics")
+        self.episodes = _require_nonnegative_integer(
+            self.episodes, field_name="evaluation.episodes"
         )
-        self.avg_game_length = _require_finite_number(
-            self.avg_game_length,
-            field_name="eval.avg_game_length",
+        self.mean_episode_length = _require_finite_number(
+            self.mean_episode_length,
+            field_name="evaluation.mean_episode_length",
             nonnegative=True,
         )
         self.timestamp = _require_finite_number(
-            self.timestamp, field_name="eval.timestamp", nonnegative=True
+            self.timestamp, field_name="evaluation.timestamp", nonnegative=True
         )
-        rate_sum = self.win_rate + self.draw_rate + self.loss_rate
-        if self.games_played == 0:
-            if rate_sum != 0.0 or self.avg_game_length != 0.0:
+        if self.episodes == 0:
+            if self.metrics or self.mean_episode_length != 0.0:
                 raise StatsArtifactError(
-                    "zero-game evaluation stats must have zero rates and average length"
+                    "zero-episode evaluation stats must have no metrics and zero mean length"
                 )
-        else:
-            if self.avg_game_length == 0.0:
-                raise StatsArtifactError(
-                    "non-empty evaluation stats must have a positive average length"
-                )
-            if not math.isclose(rate_sum, 1.0, rel_tol=0.0, abs_tol=1e-12):
-                raise StatsArtifactError(
-                    "evaluation win/draw/loss rates must sum to one"
-                )
+        elif self.mean_episode_length == 0.0:
+            raise StatsArtifactError(
+                "non-empty evaluation stats must have a positive mean episode length"
+            )
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, object]:
         return {
             "step": self.step,
-            "win_rate": self.win_rate,
-            "draw_rate": self.draw_rate,
-            "loss_rate": self.loss_rate,
-            "games_played": self.games_played,
-            "avg_game_length": self.avg_game_length,
+            "metrics": self.metrics,
+            "episodes": self.episodes,
+            "mean_episode_length": self.mean_episode_length,
             "timestamp": self.timestamp,
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "EvalStats":
-        """Create EvalStats from its exact serialized contract."""
+    def from_dict(cls, data: dict) -> "EvaluationStats":
         fields = _exact_object(data, _EVAL_FIELDS, context="evaluation stats")
         return cls(
             step=fields["step"],
-            win_rate=fields["win_rate"],
-            draw_rate=fields["draw_rate"],
-            loss_rate=fields["loss_rate"],
-            games_played=fields["games_played"],
-            avg_game_length=fields["avg_game_length"],
+            metrics=fields["metrics"],
+            episodes=fields["episodes"],
+            mean_episode_length=fields["mean_episode_length"],
             timestamp=fields["timestamp"],
         )
 
 
 @dataclass
 class TrainerStats:
-    """Training statistics for web visualization."""
+    """Algorithm-neutral training statistics for immutable publication."""
 
     step: int = 0
     total_steps: int = 0
-    total_loss: float = 0.0
-    value_loss: float = 0.0
-    policy_loss: float = 0.0
+    metrics: dict[str, float] = field(default_factory=dict)
     learning_rate: float = 0.0
     samples_seen: int = 0
     replay_record_count: int = 0
@@ -427,13 +375,10 @@ class TrainerStats:
     timestamp: float = field(default_factory=time.time)
     history: list[dict] = field(default_factory=list)
 
-    # Environment being trained
     env_id: str = ""
-
-    # Evaluation metrics
-    last_eval: EvalStats | None = None
-    eval_history: list[dict] = field(default_factory=list)
-    _max_eval_history: int = DEFAULT_MAX_EVAL_HISTORY
+    last_evaluation: EvaluationStats | None = None
+    evaluation_history: list[dict] = field(default_factory=list)
+    _max_evaluation_history: int = DEFAULT_MAX_EVAL_HISTORY
     _binding: StatsBindingV1 | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -447,13 +392,7 @@ class TrainerStats:
                 getattr(self, field_name), field_name=f"stats.{field_name}"
             )
             setattr(self, field_name, normalized)
-        for field_name in ("total_loss", "value_loss", "policy_loss"):
-            normalized = _require_finite_number(
-                getattr(self, field_name),
-                field_name=f"stats.{field_name}",
-                nonnegative=True,
-            )
-            setattr(self, field_name, normalized)
+        self.metrics = _normalize_metrics(self.metrics, context="stats.metrics")
         self.learning_rate = _require_finite_number(
             self.learning_rate,
             field_name="stats.learning_rate",
@@ -468,18 +407,20 @@ class TrainerStats:
         self.env_id = _require_string(self.env_id, field_name="stats.env_id")
         if not isinstance(self.history, list):
             raise StatsArtifactError("stats.history must be an array")
-        if not isinstance(self.eval_history, list):
-            raise StatsArtifactError("stats.eval_history must be an array")
-        if self.last_eval is not None and not isinstance(self.last_eval, EvalStats):
-            raise StatsArtifactError("stats.last_eval must be evaluation stats or null")
+        if not isinstance(self.evaluation_history, list):
+            raise StatsArtifactError("stats.evaluation_history must be an array")
+        if self.last_evaluation is not None and not isinstance(
+            self.last_evaluation, EvaluationStats
+        ):
+            raise StatsArtifactError("stats.last_evaluation must be evaluation stats or null")
         if self._binding is not None and not isinstance(self._binding, StatsBindingV1):
             raise StatsArtifactError("stats binding is invalid")
         self.history = [
             _normalize_history_entry(entry, context=f"stats.history[{index}]")
             for index, entry in enumerate(self.history)
         ]
-        self.eval_history = [
-            EvalStats.from_dict(entry).to_dict() for entry in self.eval_history
+        self.evaluation_history = [
+            EvaluationStats.from_dict(entry).to_dict() for entry in self.evaluation_history
         ]
         self._validate_semantics()
 
@@ -487,56 +428,40 @@ class TrainerStats:
         if self.total_steps < self.step:
             raise StatsArtifactError("stats.total_steps cannot be less than stats.step")
         history_steps = [entry["step"] for entry in self.history]
-        if any(
-            current <= previous
-            for previous, current in zip(history_steps, history_steps[1:])
-        ):
+        if any(current <= previous for previous, current in zip(history_steps, history_steps[1:])):
             raise StatsArtifactError("stats.history steps must be strictly increasing")
         if history_steps and history_steps[-1] > self.step:
             raise StatsArtifactError("stats.history cannot extend beyond stats.step")
 
-        evaluations = [EvalStats.from_dict(entry) for entry in self.eval_history]
+        evaluations = [EvaluationStats.from_dict(entry) for entry in self.evaluation_history]
         eval_steps = [entry.step for entry in evaluations]
-        if any(
-            current <= previous for previous, current in zip(eval_steps, eval_steps[1:])
-        ):
-            raise StatsArtifactError(
-                "stats.eval_history steps must be strictly increasing"
-            )
+        if any(current <= previous for previous, current in zip(eval_steps, eval_steps[1:])):
+            raise StatsArtifactError("stats.evaluation_history steps must be strictly increasing")
         eval_timestamps = [entry.timestamp for entry in evaluations]
         if any(
-            current < previous
-            for previous, current in zip(eval_timestamps, eval_timestamps[1:])
+            current < previous for previous, current in zip(eval_timestamps, eval_timestamps[1:])
         ):
-            raise StatsArtifactError(
-                "stats.eval_history timestamps must be nondecreasing"
-            )
+            raise StatsArtifactError("stats.evaluation_history timestamps must be nondecreasing")
         if eval_steps and eval_steps[-1] > self.step:
-            raise StatsArtifactError(
-                "stats.eval_history cannot extend beyond stats.step"
-            )
+            raise StatsArtifactError("stats.evaluation_history cannot extend beyond stats.step")
         if not evaluations:
-            if self.last_eval is not None:
+            if self.last_evaluation is not None:
                 raise StatsArtifactError(
-                    "stats.last_eval must be null when eval_history is empty"
+                    "stats.last_evaluation must be null when evaluation_history is empty"
                 )
         elif (
-            self.last_eval is None
-            or self.last_eval.to_dict() != evaluations[-1].to_dict()
+            self.last_evaluation is None
+            or self.last_evaluation.to_dict() != evaluations[-1].to_dict()
         ):
             raise StatsArtifactError(
-                "stats.last_eval must equal the final eval_history record"
+                "stats.last_evaluation must equal the final evaluation_history record"
             )
 
         if self._binding is not None:
             if self.step != self._binding.step:
-                raise StatsArtifactError(
-                    "stats.step does not match its bound checkpoint step"
-                )
+                raise StatsArtifactError("stats.step does not match its bound checkpoint step")
             if self.env_id != self._binding.profile.env_id:
-                raise StatsArtifactError(
-                    "stats.env_id does not match its bound checkpoint profile"
-                )
+                raise StatsArtifactError("stats.env_id does not match its bound checkpoint profile")
             if self.last_checkpoint != self._binding.checkpoint_id:
                 raise StatsArtifactError(
                     "stats.last_checkpoint does not match its bound checkpoint"
@@ -562,30 +487,24 @@ class TrainerStats:
         current_step = normalized["step"]
         self.history = retain_training_history(self.history, current_step)
 
-    def append_eval(self, eval_stats: EvalStats) -> None:
+    def append_evaluation(self, evaluation: EvaluationStats) -> None:
         """Append evaluation result to history."""
-        if not isinstance(eval_stats, EvalStats):
-            raise StatsArtifactError("evaluation append requires EvalStats")
-        if eval_stats.step > self.step:
-            raise StatsArtifactError(
-                "stats.eval_history cannot extend beyond stats.step"
-            )
-        if self.eval_history and eval_stats.step <= self.eval_history[-1]["step"]:
-            raise StatsArtifactError(
-                "stats.eval_history steps must be strictly increasing"
-            )
-        self.last_eval = eval_stats
-        self.eval_history.append(eval_stats.to_dict())
-        if len(self.eval_history) > self._max_eval_history:
-            self.eval_history = self.eval_history[-self._max_eval_history :]
+        if not isinstance(evaluation, EvaluationStats):
+            raise StatsArtifactError("evaluation append requires EvaluationStats")
+        if evaluation.step > self.step:
+            raise StatsArtifactError("stats.evaluation_history cannot extend beyond stats.step")
+        if self.evaluation_history and evaluation.step <= self.evaluation_history[-1]["step"]:
+            raise StatsArtifactError("stats.evaluation_history steps must be strictly increasing")
+        self.last_evaluation = evaluation
+        self.evaluation_history.append(evaluation.to_dict())
+        if len(self.evaluation_history) > self._max_evaluation_history:
+            self.evaluation_history = self.evaluation_history[-self._max_evaluation_history :]
 
     def _payload_dict(self) -> dict[str, object]:
         return {
             "step": self.step,
             "total_steps": self.total_steps,
-            "total_loss": self.total_loss,
-            "value_loss": self.value_loss,
-            "policy_loss": self.policy_loss,
+            "metrics": self.metrics,
             "learning_rate": self.learning_rate,
             "samples_seen": self.samples_seen,
             "replay_record_count": self.replay_record_count,
@@ -593,8 +512,10 @@ class TrainerStats:
             "timestamp": self.timestamp,
             "history": self.history,  # Already bounded on append
             "env_id": self.env_id,
-            "last_eval": self.last_eval.to_dict() if self.last_eval else None,
-            "eval_history": self.eval_history,
+            "last_evaluation": (
+                self.last_evaluation.to_dict() if self.last_evaluation else None
+            ),
+            "evaluation_history": self.evaluation_history,
         }
 
     def to_dict(self) -> dict[str, object]:
@@ -606,23 +527,21 @@ class TrainerStats:
         """Create TrainerStats from its exact serialized contract."""
         fields = _exact_object(data, _STATS_FIELDS, context="training stats")
         history = fields["history"]
-        eval_history = fields["eval_history"]
-        if not isinstance(history, list) or not all(
-            isinstance(entry, dict) for entry in history
-        ):
+        evaluation_history = fields["evaluation_history"]
+        if not isinstance(history, list) or not all(isinstance(entry, dict) for entry in history):
             raise StatsArtifactError("stats.history must be an array of objects")
-        if not isinstance(eval_history, list):
-            raise StatsArtifactError("stats.eval_history must be an array")
-        parsed_eval_history = [EvalStats.from_dict(entry) for entry in eval_history]
-        last_eval = fields["last_eval"]
-        if last_eval is not None:
-            last_eval = EvalStats.from_dict(last_eval)
+        if not isinstance(evaluation_history, list):
+            raise StatsArtifactError("stats.evaluation_history must be an array")
+        parsed_evaluations = [
+            EvaluationStats.from_dict(entry) for entry in evaluation_history
+        ]
+        last_evaluation = fields["last_evaluation"]
+        if last_evaluation is not None:
+            last_evaluation = EvaluationStats.from_dict(last_evaluation)
         stats = cls(
             step=fields["step"],
             total_steps=fields["total_steps"],
-            total_loss=fields["total_loss"],
-            value_loss=fields["value_loss"],
-            policy_loss=fields["policy_loss"],
+            metrics=fields["metrics"],
             learning_rate=fields["learning_rate"],
             samples_seen=fields["samples_seen"],
             replay_record_count=fields["replay_record_count"],
@@ -630,14 +549,14 @@ class TrainerStats:
             timestamp=fields["timestamp"],
             history=history,
             env_id=fields["env_id"],
-            last_eval=last_eval,
-            eval_history=[entry.to_dict() for entry in parsed_eval_history],
+            last_evaluation=last_evaluation,
+            evaluation_history=[entry.to_dict() for entry in parsed_evaluations],
         )
         return stats
 
 
 @dataclass(frozen=True)
-class PreparedStatsSnapshotV2:
+class PreparedStatsSnapshotV3:
     """Canonical stats bytes ready to embed in one immutable RunCommitV1."""
 
     stats_id: str
@@ -653,8 +572,7 @@ class PreparedStatsSnapshotV2:
         actual_id = sha256_bytes(self.data)
         if actual_id != self.stats_id:
             raise StatsArtifactError(
-                f"Prepared stats SHA-256 mismatch: got {actual_id}, "
-                f"expected {self.stats_id}"
+                f"Prepared stats SHA-256 mismatch: got {actual_id}, expected {self.stats_id}"
             )
 
     def to_dict(self) -> dict[str, object]:
@@ -670,7 +588,7 @@ class PreparedStatsSnapshotV2:
 
 
 @dataclass(frozen=True)
-class LoadedStatsSnapshotV2:
+class LoadedStatsSnapshotV3:
     """A verified canonical stats snapshot reconstructed from a RunCommitV1."""
 
     stats_id: str
@@ -702,15 +620,13 @@ def _validate_rebinding(stats: TrainerStats, binding: StatsBindingV1) -> None:
     if stats.env_id != binding.profile.env_id:
         raise StatsArtifactError("stats.env_id does not match its checkpoint profile")
     if stats.last_checkpoint != binding.checkpoint_id:
-        raise StatsArtifactError(
-            "stats.last_checkpoint does not match its bound checkpoint"
-        )
+        raise StatsArtifactError("stats.last_checkpoint does not match its bound checkpoint")
 
 
 def prepare_stats_snapshot(
     stats: TrainerStats,
     checkpoint: CheckpointRef,
-) -> PreparedStatsSnapshotV2:
+) -> PreparedStatsSnapshotV3:
     """Normalize and bind mutable learner stats to one exact checkpoint.
 
     The returned bytes have no visibility by themselves. A ``RunCommitV1``
@@ -739,7 +655,7 @@ def prepare_stats_snapshot(
     }
     snapshot_bytes = canonical_json_bytes(payload)
     stats_id = sha256_bytes(snapshot_bytes)
-    return PreparedStatsSnapshotV2(
+    return PreparedStatsSnapshotV3(
         stats_id=stats_id,
         binding=binding,
         data=snapshot_bytes,
@@ -751,38 +667,31 @@ def decode_stats_snapshot(
     *,
     expected_stats_id: str | None = None,
     expected_binding: StatsBindingV1 | None = None,
-) -> LoadedStatsSnapshotV2:
+) -> LoadedStatsSnapshotV3:
     """Strictly reconstruct the stats snapshot embedded by a RunCommitV1."""
     if not isinstance(data, bytes):
         raise StatsArtifactError("stats snapshot data must be bytes")
     stats_id = sha256_bytes(data)
     if expected_stats_id is not None:
-        expected_stats_id = _require_digest(
-            expected_stats_id, field_name="expected stats_id"
-        )
+        expected_stats_id = _require_digest(expected_stats_id, field_name="expected stats_id")
         if stats_id != expected_stats_id:
             raise StatsArtifactError(
-                f"Stats snapshot SHA-256 mismatch: got {stats_id}, "
-                f"expected {expected_stats_id}"
+                f"Stats snapshot SHA-256 mismatch: got {stats_id}, expected {expected_stats_id}"
             )
-    if expected_binding is not None and not isinstance(
-        expected_binding, StatsBindingV1
-    ):
+    if expected_binding is not None and not isinstance(expected_binding, StatsBindingV1):
         raise TypeError("expected_binding must be StatsBindingV1 or None")
 
     raw = _decode_canonical_json(data, context="stats snapshot")
     fields = _exact_object(raw, _SNAPSHOT_FIELDS, context="stats snapshot")
     schema_version = fields["schema_version"]
-    if isinstance(schema_version, bool) or schema_version != 2:
-        raise StatsArtifactError("stats snapshot schema_version must be exactly 2")
+    if isinstance(schema_version, bool) or schema_version != STATS_ARTIFACT_SCHEMA_VERSION:
+        raise StatsArtifactError(
+            f"stats snapshot schema_version must be exactly {STATS_ARTIFACT_SCHEMA_VERSION}"
+        )
     binding = StatsBindingV1.from_fields(fields)
     if expected_binding is not None and binding != expected_binding:
-        raise StatsArtifactError(
-            "Stats snapshot binding does not match its RunCommit binding"
-        )
-    stats_fields = _exact_object(
-        fields["stats"], _STATS_FIELDS, context="stats snapshot stats"
-    )
+        raise StatsArtifactError("Stats snapshot binding does not match its RunCommit binding")
+    stats_fields = _exact_object(fields["stats"], _STATS_FIELDS, context="stats snapshot stats")
     stats = TrainerStats.from_dict(dict(stats_fields))
     stats._binding = binding
     stats._validate_semantics()
@@ -798,35 +707,33 @@ def decode_stats_snapshot(
             "Stats snapshot numbers are not in their canonical normalized form"
         )
     logger.info(
-        "Decoded immutable stats %s: %s eval records, %s training records",
+        "Decoded immutable stats %s: %s evaluation records, %s training records",
         stats_id,
-        len(stats.eval_history),
+        len(stats.evaluation_history),
         len(stats.history),
     )
-    return LoadedStatsSnapshotV2(stats_id, binding, stats, data)
+    return LoadedStatsSnapshotV3(stats_id, binding, stats, data)
 
 
 def write_stats_projection(
-    snapshot: PreparedStatsSnapshotV2 | LoadedStatsSnapshotV2,
+    snapshot: PreparedStatsSnapshotV3 | LoadedStatsSnapshotV3,
     path: str | Path,
 ) -> None:
     """Atomically rebuild non-authoritative ``stats.json`` from a run snapshot."""
-    if isinstance(snapshot, PreparedStatsSnapshotV2):
+    if isinstance(snapshot, PreparedStatsSnapshotV3):
         loaded = decode_stats_snapshot(
             snapshot.data,
             expected_stats_id=snapshot.stats_id,
             expected_binding=snapshot.binding,
         )
-    elif isinstance(snapshot, LoadedStatsSnapshotV2):
+    elif isinstance(snapshot, LoadedStatsSnapshotV3):
         loaded = decode_stats_snapshot(
             snapshot.data,
             expected_stats_id=snapshot.stats_id,
             expected_binding=snapshot.binding,
         )
     else:
-        raise TypeError(
-            "snapshot must be PreparedStatsSnapshotV2 or LoadedStatsSnapshotV2"
-        )
+        raise TypeError("snapshot must be PreparedStatsSnapshotV3 or LoadedStatsSnapshotV3")
     _atomic_replace(Path(path), canonical_json_bytes(loaded.stats.to_dict()))
 
 

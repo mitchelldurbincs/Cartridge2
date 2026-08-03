@@ -58,7 +58,7 @@ its seven replaceable components:
 | Serving | `alphazero_mcts_web_v1` |
 
 Rust dispatches the collector and evaluator through this catalog. Python reads
-the same descriptors from manifest schema version 4 and binds its concrete
+the same descriptors from manifest schema version 5 and binds its concrete
 implementations in `trainer/algorithms/registry.py`. `[algorithm].id`,
 `--algorithm`, and `CARTRIDGE_ALGORITHM_ID` all select the same canonical ID.
 
@@ -790,7 +790,7 @@ trainer/
     ├── tournament_cli.py  # register-players / tournament commands
     ├── solver_eval/       # Perfect-solver move scoring (Connect4)
     ├── config.py          # AlphaZeroLearnerConfig
-    ├── environment_manifest.json # GENERATED manifest schema v4
+    ├── environment_manifest.json # GENERATED manifest schema v5
     ├── checkpoint.py      # ONNX + PyTorch save/load
     ├── checkpoint_runner.py
     ├── replay_setup.py    # Exact ReplaySelection setup
@@ -1112,13 +1112,11 @@ or incomplete authority fails closed.
 class TrainerStats:
     step: int
     total_steps: int
-    total_loss: float
-    policy_loss: float
-    value_loss: float
+    metrics: Dict[str, float] # Algorithm-owned names such as loss/td
     learning_rate: float
     replay_record_count: int
-    history: List[Dict]      # Per-interval entries (downsampled)
-    eval_history: List[Dict] # Evaluation results
+    history: List[Dict]             # Step + metrics (downsampled)
+    evaluation_history: List[Dict]  # Episode counts + arbitrary metrics
 ```
 
 History downsampling:
@@ -1358,7 +1356,7 @@ AlphaZero board dimensions ──► alphazero_transition_v1 codec
 ```
 
 - **The manifest is generated, not written.** `make environment-manifest`
-  renders schema version 4 to
+  renders schema version 5 to
   `trainer/src/trainer/environment_manifest.json`. It ships inside the Python
   package and is loaded with `importlib.resources`. The `engine-games` golden
   test fails when the committed catalog drifts.

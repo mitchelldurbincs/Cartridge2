@@ -57,9 +57,7 @@ def checkpoint_ref(
         checkpoint_id=manifest.checkpoint_id,
         manifest=manifest,
         onnx_path=root / "blobs" / "sha256" / f"{manifest.onnx.sha256}.onnx",
-        learner_state_path=(
-            root / "blobs" / "sha256" / f"{manifest.learner_state.sha256}.pt"
-        ),
+        learner_state_path=(root / "blobs" / "sha256" / f"{manifest.learner_state.sha256}.pt"),
     )
     _REFERENCES[reference.checkpoint_id] = reference
     return reference
@@ -303,9 +301,7 @@ class TestPlayerRegistry:
     def test_round_trips_exact_v5_records(self, tmp_path):
         path = tmp_path / "players.json"
         reference = checkpoint_ref(tmp_path / "models", 100)
-        original = PlayerRegistry(
-            [random_record(), model_record(reference, simulations=50)]
-        )
+        original = PlayerRegistry([random_record(), model_record(reference, simulations=50)])
 
         original.save(path)
         loaded = PlayerRegistry.load(path)
@@ -390,8 +386,7 @@ class TestRegisterCheckpoints:
             second.checkpoint_id,
         }
         assert all(
-            record.kind == "random"
-            or f"checkpoint:{record.checkpoint_id}:adapter:" in record.id
+            record.kind == "random" or f"checkpoint:{record.checkpoint_id}:adapter:" in record.id
             for record in added
         )
 

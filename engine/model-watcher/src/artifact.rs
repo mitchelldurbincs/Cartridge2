@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -14,7 +14,7 @@ use crate::ModelSelection;
 pub(crate) const CHECKPOINT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub(crate) const RUN_HEAD_SCHEMA_VERSION: u32 = 2;
 pub(crate) const RUN_COMMIT_SCHEMA_VERSION: u32 = 1;
-pub(crate) const STATS_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+pub(crate) const STATS_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 pub(crate) const RUN_HEAD_CHANNEL: &str = "current";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,9 +137,7 @@ pub(crate) struct RunRecipeV1 {
 #[serde(deny_unknown_fields)]
 pub(crate) struct HistoryEntryV1 {
     pub step: u64,
-    pub total_loss: f64,
-    pub value_loss: f64,
-    pub policy_loss: f64,
+    pub metrics: BTreeMap<String, f64>,
     pub learning_rate: f64,
     pub grad_norm: Option<f64>,
 }
@@ -148,22 +146,18 @@ pub(crate) struct HistoryEntryV1 {
 #[serde(deny_unknown_fields)]
 pub(crate) struct EvaluationStatsV1 {
     pub step: u64,
-    pub win_rate: f64,
-    pub draw_rate: f64,
-    pub loss_rate: f64,
-    pub games_played: u64,
-    pub avg_game_length: f64,
+    pub metrics: BTreeMap<String, f64>,
+    pub episodes: u64,
+    pub mean_episode_length: f64,
     pub timestamp: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TrainingStatsV2 {
+pub(crate) struct TrainingStatsV3 {
     pub step: u64,
     pub total_steps: u64,
-    pub total_loss: f64,
-    pub value_loss: f64,
-    pub policy_loss: f64,
+    pub metrics: BTreeMap<String, f64>,
     pub learning_rate: f64,
     pub samples_seen: u64,
     pub replay_record_count: u64,
@@ -171,19 +165,19 @@ pub(crate) struct TrainingStatsV2 {
     pub timestamp: f64,
     pub history: Vec<HistoryEntryV1>,
     pub env_id: String,
-    pub last_eval: Option<EvaluationStatsV1>,
-    pub eval_history: Vec<EvaluationStatsV1>,
+    pub last_evaluation: Option<EvaluationStatsV1>,
+    pub evaluation_history: Vec<EvaluationStatsV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct StatsSnapshotV2 {
+pub(crate) struct StatsSnapshotV3 {
     pub schema_version: u32,
     pub profile: ArtifactProfile,
     pub config_sha256: String,
     pub checkpoint_id: String,
     pub step: u64,
-    pub stats: TrainingStatsV2,
+    pub stats: TrainingStatsV3,
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,7 +205,7 @@ pub(crate) struct RunCommitV1 {
     pub checkpoint_id: String,
     pub run_recipe_id: Option<String>,
     pub run_recipe: Option<RunRecipeV1>,
-    pub stats_snapshot: StatsSnapshotV2,
+    pub stats_snapshot: StatsSnapshotV3,
     pub champion: Option<ChampionReferenceV1>,
     pub evaluation_head_id: Option<String>,
     pub orchestration: Option<OrchestrationCommitV1>,
@@ -257,9 +251,7 @@ const STATS_SNAPSHOT_FIELDS: &[&str] = &[
 const TRAINING_STATS_FIELDS: &[&str] = &[
     "step",
     "total_steps",
-    "total_loss",
-    "value_loss",
-    "policy_loss",
+    "metrics",
     "learning_rate",
     "samples_seen",
     "replay_record_count",
@@ -267,24 +259,15 @@ const TRAINING_STATS_FIELDS: &[&str] = &[
     "timestamp",
     "history",
     "env_id",
-    "last_eval",
-    "eval_history",
+    "last_evaluation",
+    "evaluation_history",
 ];
-const HISTORY_FIELDS: &[&str] = &[
-    "step",
-    "total_loss",
-    "value_loss",
-    "policy_loss",
-    "learning_rate",
-    "grad_norm",
-];
+const HISTORY_FIELDS: &[&str] = &["step", "metrics", "learning_rate", "grad_norm"];
 const EVALUATION_STATS_FIELDS: &[&str] = &[
     "step",
-    "win_rate",
-    "draw_rate",
-    "loss_rate",
-    "games_played",
-    "avg_game_length",
+    "metrics",
+    "episodes",
+    "mean_episode_length",
     "timestamp",
 ];
 const CHAMPION_FIELDS: &[&str] = &["checkpoint_id", "evaluation_id"];
@@ -409,19 +392,19 @@ fn validate_stats_json_shape(value: &serde_json::Value) -> Result<()> {
     for (index, entry) in history.iter().enumerate() {
         validate_exact_fields(&format!("stats.history[{index}]"), entry, HISTORY_FIELDS)?;
     }
-    if !stats["last_eval"].is_null() {
+    if !stats["last_evaluation"].is_null() {
         validate_exact_fields(
-            "stats.last_eval",
-            &stats["last_eval"],
+            "stats.last_evaluation",
+            &stats["last_evaluation"],
             EVALUATION_STATS_FIELDS,
         )?;
     }
-    let evaluations = stats["eval_history"]
+    let evaluations = stats["evaluation_history"]
         .as_array()
-        .ok_or_else(|| anyhow!("stats.eval_history must be an array"))?;
+        .ok_or_else(|| anyhow!("stats.evaluation_history must be an array"))?;
     for (index, evaluation) in evaluations.iter().enumerate() {
         validate_exact_fields(
-            &format!("stats.eval_history[{index}]"),
+            &format!("stats.evaluation_history[{index}]"),
             evaluation,
             EVALUATION_STATS_FIELDS,
         )?;
@@ -525,32 +508,35 @@ fn validate_utc_timestamp(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_evaluation_stats(label: &str, stats: &EvaluationStatsV1) -> Result<()> {
-    for (field, value) in [
-        ("win_rate", stats.win_rate),
-        ("draw_rate", stats.draw_rate),
-        ("loss_rate", stats.loss_rate),
-    ] {
-        validate_rate(&format!("{label}.{field}"), value)?;
-    }
-    validate_finite(
-        &format!("{label}.avg_game_length"),
-        stats.avg_game_length,
-        true,
-    )?;
-    validate_finite(&format!("{label}.timestamp"), stats.timestamp, true)?;
-    let rate_sum = stats.win_rate + stats.draw_rate + stats.loss_rate;
-    if stats.games_played == 0 {
-        if rate_sum != 0.0 || stats.avg_game_length != 0.0 {
-            bail!("{label} with zero games must contain zero rates and length");
+fn validate_metrics(label: &str, metrics: &BTreeMap<String, f64>) -> Result<()> {
+    for (name, value) in metrics {
+        if name.is_empty() || name.trim() != name {
+            bail!("{label} names must be nonempty trimmed strings");
         }
-    } else if stats.avg_game_length <= 0.0 || (rate_sum - 1.0).abs() > 1e-12 {
-        bail!("{label} rates must sum to one and average length must be positive");
+        validate_finite(&format!("{label}.{name}"), *value, false)?;
     }
     Ok(())
 }
 
-fn validate_training_stats(snapshot: &StatsSnapshotV2) -> Result<()> {
+fn validate_evaluation_stats(label: &str, stats: &EvaluationStatsV1) -> Result<()> {
+    validate_metrics(&format!("{label}.metrics"), &stats.metrics)?;
+    validate_finite(
+        &format!("{label}.mean_episode_length"),
+        stats.mean_episode_length,
+        true,
+    )?;
+    validate_finite(&format!("{label}.timestamp"), stats.timestamp, true)?;
+    if stats.episodes == 0 {
+        if !stats.metrics.is_empty() || stats.mean_episode_length != 0.0 {
+            bail!("{label} with zero episodes must contain no metrics and zero length");
+        }
+    } else if stats.mean_episode_length <= 0.0 {
+        bail!("{label} mean episode length must be positive");
+    }
+    Ok(())
+}
+
+fn validate_training_stats(snapshot: &StatsSnapshotV3) -> Result<()> {
     let stats = &snapshot.stats;
     if stats.step != snapshot.step {
         bail!("stats.step does not match stats snapshot step");
@@ -564,10 +550,8 @@ fn validate_training_stats(snapshot: &StatsSnapshotV2) -> Result<()> {
     if stats.env_id != snapshot.profile.env_id {
         bail!("stats.env_id does not match stats snapshot profile");
     }
+    validate_metrics("stats.metrics", &stats.metrics)?;
     for (field, value) in [
-        ("total_loss", stats.total_loss),
-        ("value_loss", stats.value_loss),
-        ("policy_loss", stats.policy_loss),
         ("learning_rate", stats.learning_rate),
         ("timestamp", stats.timestamp),
     ] {
@@ -581,14 +565,12 @@ fn validate_training_stats(snapshot: &StatsSnapshotV2) -> Result<()> {
             bail!("stats.history steps must strictly increase within stats.step");
         }
         previous_history_step = Some(entry.step);
-        for (field, value) in [
-            ("total_loss", entry.total_loss),
-            ("value_loss", entry.value_loss),
-            ("policy_loss", entry.policy_loss),
-            ("learning_rate", entry.learning_rate),
-        ] {
-            validate_finite(&format!("stats.history[{index}].{field}"), value, true)?;
-        }
+        validate_metrics(&format!("stats.history[{index}].metrics"), &entry.metrics)?;
+        validate_finite(
+            &format!("stats.history[{index}].learning_rate"),
+            entry.learning_rate,
+            true,
+        )?;
         if let Some(grad_norm) = entry.grad_norm {
             validate_finite(
                 &format!("stats.history[{index}].grad_norm"),
@@ -599,23 +581,23 @@ fn validate_training_stats(snapshot: &StatsSnapshotV2) -> Result<()> {
     }
     let mut previous_eval_step = None;
     let mut previous_eval_timestamp = None;
-    for (index, evaluation) in stats.eval_history.iter().enumerate() {
-        validate_evaluation_stats(&format!("stats.eval_history[{index}]"), evaluation)?;
+    for (index, evaluation) in stats.evaluation_history.iter().enumerate() {
+        validate_evaluation_stats(&format!("stats.evaluation_history[{index}]"), evaluation)?;
         if evaluation.step > stats.step
             || previous_eval_step.is_some_and(|previous| evaluation.step <= previous)
             || previous_eval_timestamp.is_some_and(|previous| evaluation.timestamp < previous)
         {
-            bail!("stats.eval_history chronology is invalid");
+            bail!("stats.evaluation_history chronology is invalid");
         }
         previous_eval_step = Some(evaluation.step);
         previous_eval_timestamp = Some(evaluation.timestamp);
     }
-    match (&stats.last_eval, stats.eval_history.last()) {
+    match (&stats.last_evaluation, stats.evaluation_history.last()) {
         (None, None) => {}
         (Some(last), Some(expected)) if last == expected => {
-            validate_evaluation_stats("stats.last_eval", last)?;
+            validate_evaluation_stats("stats.last_evaluation", last)?;
         }
-        _ => bail!("stats.last_eval must equal the final eval_history record"),
+        _ => bail!("stats.last_evaluation must equal the final evaluation_history record"),
     }
     Ok(())
 }
@@ -928,7 +910,7 @@ pub(crate) fn parse_run_commit(
             wire.stats_id
         );
     }
-    let stats_snapshot: StatsSnapshotV2 = serde_json::from_str(wire.stats_snapshot.get())
+    let stats_snapshot: StatsSnapshotV3 = serde_json::from_str(wire.stats_snapshot.get())
         .context("invalid embedded stats snapshot contract")?;
     if stats_snapshot.schema_version != STATS_SNAPSHOT_SCHEMA_VERSION {
         bail!(

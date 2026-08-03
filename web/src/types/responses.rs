@@ -2,8 +2,9 @@
 
 use anyhow::{anyhow, Result};
 use engine_core::board_profile::{BoardRenderer, CellView};
-use engine_core::EnvironmentMetadata;
+use engine_core::{ActionSpace, AgentId, Capabilities, EnvironmentMetadata};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Health check response.
 #[derive(Serialize, Deserialize)]
@@ -26,8 +27,6 @@ pub struct GameInfoResponse {
     pub board_width: usize,
     pub board_height: usize,
     pub num_actions: usize,
-    pub obs_size: usize,
-    pub legal_mask_offset: usize,
     pub player_count: usize,
     pub player_names: Vec<String>,
     pub player_symbols: Vec<String>,
@@ -35,10 +34,11 @@ pub struct GameInfoResponse {
     pub board_type: String,
 }
 
-impl TryFrom<EnvironmentMetadata> for GameInfoResponse {
-    type Error = anyhow::Error;
-
-    fn try_from(meta: EnvironmentMetadata) -> Result<Self> {
+impl GameInfoResponse {
+    pub fn from_environment(
+        meta: EnvironmentMetadata,
+        capabilities: &Capabilities,
+    ) -> Result<Self> {
         let board = meta.board.ok_or_else(|| {
             anyhow!(
                 "environment '{}' has no board presentation profile",
@@ -57,15 +57,21 @@ impl TryFrom<EnvironmentMetadata> for GameInfoResponse {
             BoardRenderer::DropColumn => "drop_column",
             BoardRenderer::Generals => "generals",
         };
+        let num_actions = match capabilities.action_space(AgentId(1)) {
+            Some(ActionSpace::Discrete { size }) => *size as usize,
+            other => {
+                return Err(anyhow!(
+                    "board serving requires discrete actions, got {other:?}"
+                ))
+            }
+        };
 
         Ok(Self {
             env_id: meta.id,
             display_name: meta.display_name,
             board_width: board.width,
             board_height: board.height,
-            num_actions: board.action_count,
-            obs_size: board.observation.elements,
-            legal_mask_offset: board.observation.legal_actions_offset,
+            num_actions,
             player_count: board.players.len(),
             player_names: board
                 .players
@@ -114,14 +120,12 @@ pub struct MoveResponse {
     pub bot_move: Option<u32>,
 }
 
-/// Training history entry for loss visualization.
+/// One algorithm-neutral training-metric sample.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct HistoryEntry {
     pub step: u64,
-    pub total_loss: f64,
-    pub value_loss: f64,
-    pub policy_loss: f64,
+    pub metrics: BTreeMap<String, f64>,
     pub learning_rate: f64,
     pub grad_norm: Option<f64>,
 }
@@ -129,13 +133,11 @@ pub struct HistoryEntry {
 /// Evaluation stats from a single evaluation run.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
-pub struct EvalStats {
+pub struct EvaluationStats {
     pub step: u64,
-    pub win_rate: f64,
-    pub draw_rate: f64,
-    pub loss_rate: f64,
-    pub games_played: u64,
-    pub avg_game_length: f64,
+    pub metrics: BTreeMap<String, f64>,
+    pub episodes: u64,
+    pub mean_episode_length: f64,
     pub timestamp: f64,
 }
 
@@ -145,17 +147,15 @@ pub struct EvalStats {
 pub struct TrainingStats {
     pub step: u64,
     pub total_steps: u64,
-    pub total_loss: f64,
-    pub policy_loss: f64,
-    pub value_loss: f64,
+    pub metrics: BTreeMap<String, f64>,
     pub samples_seen: u64,
     pub replay_record_count: u64,
     pub last_checkpoint: String,
     pub learning_rate: f64,
     pub timestamp: f64,
     pub env_id: String,
-    pub last_eval: Option<EvalStats>,
-    pub eval_history: Vec<EvalStats>,
+    pub last_evaluation: Option<EvaluationStats>,
+    pub evaluation_history: Vec<EvaluationStats>,
     pub history: Vec<HistoryEntry>,
 }
 

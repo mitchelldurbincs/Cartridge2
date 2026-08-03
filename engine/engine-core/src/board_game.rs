@@ -8,8 +8,9 @@ use crate::board_view::{BoardView, Presentation};
 use crate::legal_mask::LegalMask;
 use crate::metadata::EnvironmentMetadata;
 use crate::typed::{
-    AgentId, AgentObservation, AgentOutcome, Capabilities, Decision, DecodeError, EncodeError,
-    EngineId, Environment, EnvironmentError, EpisodeStatus, Timestep, TransitionSource,
+    ActionAvailability, AgentId, AgentObservation, AgentOutcome, Capabilities, Decision,
+    DecodeError, EncodeError, EngineId, Environment, EnvironmentError, EpisodeStatus, Timestep,
+    TransitionSource,
 };
 use rand_chacha::ChaCha20Rng;
 
@@ -61,6 +62,8 @@ pub trait BoardGame: Send + Sync + std::fmt::Debug + 'static {
         observation: &Self::Observation,
         out: &mut Vec<u8>,
     ) -> Result<(), EncodeError>;
+    /// Exact actions accepted from `state` for its current decision agent.
+    fn legal_actions(state: &Self::State) -> Result<LegalMask, EnvironmentError>;
     fn view(state: &Self::State) -> BoardView;
 }
 
@@ -128,6 +131,13 @@ impl<G: BoardGame> Environment for BoardGameEnvironment<G> {
         let view = G::view(&state);
         let terminated = view.game_over();
         let current = AgentId::from(view.current_player);
+        let availability = if terminated {
+            None
+        } else {
+            Some(ActionAvailability::DiscreteMask {
+                mask: G::legal_actions(&state)?,
+            })
+        };
         Ok((
             state,
             Timestep {
@@ -143,9 +153,10 @@ impl<G: BoardGame> Environment for BoardGameEnvironment<G> {
                 decision: if terminated {
                     Decision::None
                 } else {
-                    Decision::Agents {
-                        agent_ids: vec![current],
-                    }
+                    Decision::single(
+                        current,
+                        availability.expect("running position availability"),
+                    )
                 },
                 episode: if terminated {
                     EpisodeStatus::Terminated
@@ -173,6 +184,13 @@ impl<G: BoardGame> Environment for BoardGameEnvironment<G> {
         } else {
             AgentId(1)
         };
+        let availability = if transition.terminated {
+            None
+        } else {
+            Some(ActionAvailability::DiscreteMask {
+                mask: G::legal_actions(state)?,
+            })
+        };
         Ok(Timestep {
             agents: vec![AgentId(1), AgentId(2)],
             observations: vec![AgentObservation {
@@ -196,9 +214,10 @@ impl<G: BoardGame> Environment for BoardGameEnvironment<G> {
             decision: if transition.terminated {
                 Decision::None
             } else {
-                Decision::Agents {
-                    agent_ids: vec![observer],
-                }
+                Decision::single(
+                    observer,
+                    availability.expect("running position availability"),
+                )
             },
             episode: if transition.terminated {
                 EpisodeStatus::Terminated
@@ -244,32 +263,22 @@ impl<G: BoardGame> Environment for BoardGameEnvironment<G> {
 
 /// Neural network observation for two-player board games.
 ///
-/// Generic over board view size and number of actions to support different board sizes.
-/// - `BOARD_VIEW_SIZE`: Total size of one-hot board encoding (board_size * 2 for two players)
-/// - `NUM_ACTIONS`: Number of possible actions (board positions or columns)
+/// Generic over board view size (`board_size * 2` for two players). Planes are
+/// relative to the observing player: the first plane is "own" and the second
+/// is "opponent". Action availability and observer identity live in the
+/// timestep envelope rather than being duplicated inside this tensor.
 #[derive(Debug, Clone, PartialEq)]
-pub struct TwoPlayerObs<const BOARD_VIEW_SIZE: usize, const NUM_ACTIONS: usize> {
-    /// One-hot encoding of board: [player1_positions, player2_positions]
+pub struct TwoPlayerObs<const BOARD_VIEW_SIZE: usize> {
+    /// One-hot encoding of board: [own_positions, opponent_positions]
     pub board_view: [f32; BOARD_VIEW_SIZE],
-    /// Legal moves mask (1.0 = legal, 0.0 = illegal)
-    pub legal_moves: [f32; NUM_ACTIONS],
-    /// Current player indicator: [is_player1, is_player2]
-    pub current_player: [f32; 2],
 }
 
-impl<const BOARD_VIEW_SIZE: usize, const NUM_ACTIONS: usize>
-    TwoPlayerObs<BOARD_VIEW_SIZE, NUM_ACTIONS>
-{
-    /// Create an observation from a board and a validated dynamic-width legal mask.
+impl<const BOARD_VIEW_SIZE: usize> TwoPlayerObs<BOARD_VIEW_SIZE> {
+    /// Create a player-relative observation from a board.
     ///
     /// - `board`: Slice of cell values (0=empty, 1=player1, 2=player2)
-    /// - `legal_mask`: One bit per action; its width must equal `NUM_ACTIONS`
-    /// - `current_player`: Current player (1 or 2)
-    pub fn from_board(
-        board: &[u8],
-        legal_mask: &LegalMask,
-        current_player: u8,
-    ) -> Result<Self, TwoPlayerObsError> {
+    /// - `observer`: Player whose perspective defines own/opponent planes
+    pub fn from_board(board: &[u8], observer: u8) -> Result<Self, TwoPlayerObsError> {
         if !BOARD_VIEW_SIZE.is_multiple_of(2) {
             return Err(TwoPlayerObsError::InvalidBoardViewSize {
                 board_view_size: BOARD_VIEW_SIZE,
@@ -282,88 +291,37 @@ impl<const BOARD_VIEW_SIZE: usize, const NUM_ACTIONS: usize>
                 actual: board.len(),
             });
         }
-        if legal_mask.num_actions() != NUM_ACTIONS {
-            return Err(TwoPlayerObsError::InvalidLegalMaskWidth {
-                expected: NUM_ACTIONS,
-                actual: legal_mask.num_actions(),
-            });
-        }
-        if !(1..=2).contains(&current_player) {
-            return Err(TwoPlayerObsError::InvalidCurrentPlayer { current_player });
+        if !(1..=2).contains(&observer) {
+            return Err(TwoPlayerObsError::InvalidObserver { observer });
         }
 
         let mut obs = Self {
             board_view: [0.0; BOARD_VIEW_SIZE],
-            legal_moves: [0.0; NUM_ACTIONS],
-            current_player: [0.0; 2],
         };
 
-        // Encode board state (one-hot for each player)
+        // Encode board state relative to the observer.
         for (i, &cell) in board.iter().enumerate() {
             match cell {
                 0 => {}
-                1 => obs.board_view[i] = 1.0,
-                2 => obs.board_view[i + board_size] = 1.0,
+                value if value == observer => obs.board_view[i] = 1.0,
+                1 | 2 => obs.board_view[i + board_size] = 1.0,
                 value => {
                     return Err(TwoPlayerObsError::InvalidBoardCell { index: i, value });
                 }
             }
         }
 
-        // Encode legal moves
-        for (pos, slot) in obs.legal_moves.iter_mut().enumerate() {
-            if legal_mask.is_legal(pos) {
-                *slot = 1.0;
-            }
-        }
-
-        // Encode current player
-        if current_player == 1 {
-            obs.current_player[0] = 1.0;
-        } else {
-            obs.current_player[1] = 1.0;
-        }
-
         Ok(obs)
-    }
-
-    /// Create an observation from an iterator of legal action indices.
-    ///
-    /// Every index is bounds-checked before the mask is mutated, so malformed
-    /// environment state is returned as an error rather than panicking.
-    pub fn from_board_with_legal_actions(
-        board: &[u8],
-        legal_actions: impl IntoIterator<Item = usize>,
-        current_player: u8,
-    ) -> Result<Self, TwoPlayerObsError> {
-        let mut legal_mask = LegalMask::new(NUM_ACTIONS);
-        for action in legal_actions {
-            if action >= NUM_ACTIONS {
-                return Err(TwoPlayerObsError::InvalidLegalAction {
-                    action,
-                    num_actions: NUM_ACTIONS,
-                });
-            }
-            legal_mask.set(action);
-        }
-        Self::from_board(board, &legal_mask, current_player)
     }
 
     /// Encode observation as bytes for neural network input.
     pub fn encode(&self, out: &mut Vec<u8>) {
-        encode_f32_slices(
-            out,
-            [
-                &self.board_view[..],
-                &self.legal_moves[..],
-                &self.current_player[..],
-            ],
-        );
+        encode_f32_slices(out, [&self.board_view[..]]);
     }
 
     /// Total observation size in floats.
     pub const fn obs_size() -> usize {
-        BOARD_VIEW_SIZE + NUM_ACTIONS + 2
+        BOARD_VIEW_SIZE
     }
 }
 
@@ -376,12 +334,8 @@ pub enum TwoPlayerObsError {
     InvalidBoardLength { expected: usize, actual: usize },
     #[error("board cell {index} must be 0, 1, or 2, got {value}")]
     InvalidBoardCell { index: usize, value: u8 },
-    #[error("legal mask width must be exactly {expected}, got {actual}")]
-    InvalidLegalMaskWidth { expected: usize, actual: usize },
-    #[error("legal action {action} is outside action space of size {num_actions}")]
-    InvalidLegalAction { action: usize, num_actions: usize },
-    #[error("current player must be 1 or 2, got {current_player}")]
-    InvalidCurrentPlayer { current_player: u8 },
+    #[error("observer must be player 1 or 2, got {observer}")]
+    InvalidObserver { observer: u8 },
 }
 
 #[cfg(test)]
@@ -391,95 +345,58 @@ mod tests {
     #[test]
     fn test_tictactoe_obs() {
         // TicTacToe: 9 positions * 2 players = 18, 9 actions
-        type TicTacToeObs = TwoPlayerObs<18, 9>;
+        type TicTacToeObs = TwoPlayerObs<18>;
 
         let board = [1, 0, 2, 0, 1, 0, 0, 0, 0u8];
-        let legal_mask = LegalMask::from_u64(0b111101010, 9); // positions 1, 3, 5, 6, 7, 8
-        let obs = TicTacToeObs::from_board(&board, &legal_mask, 2).unwrap();
+        let obs = TicTacToeObs::from_board(&board, 2).unwrap();
 
-        // Player 1 at positions 0, 4
-        assert_eq!(obs.board_view[0], 1.0);
-        assert_eq!(obs.board_view[4], 1.0);
-        // Player 2 at position 2
-        assert_eq!(obs.board_view[9 + 2], 1.0);
-        // Current player is 2
-        assert_eq!(obs.current_player, [0.0, 1.0]);
+        // Player 2 (observer) at position 2 in the own plane.
+        assert_eq!(obs.board_view[2], 1.0);
+        // Player 1 at positions 0, 4 in the opponent plane.
+        assert_eq!(obs.board_view[9], 1.0);
+        assert_eq!(obs.board_view[9 + 4], 1.0);
         // Check obs size
-        assert_eq!(TicTacToeObs::obs_size(), 29);
+        assert_eq!(TicTacToeObs::obs_size(), 18);
     }
 
     #[test]
     fn test_connect4_obs() {
         // Connect4: 42 positions * 2 players = 84, 7 actions
-        type Connect4Obs = TwoPlayerObs<84, 7>;
+        type Connect4Obs = TwoPlayerObs<84>;
 
         let mut board = [0u8; 42];
         board[3] = 1; // Red at column 3, row 0
-        let legal_mask = LegalMask::all_legal(7);
-        let obs = Connect4Obs::from_board(&board, &legal_mask, 1).unwrap();
+        let obs = Connect4Obs::from_board(&board, 1).unwrap();
 
         assert_eq!(obs.board_view[3], 1.0);
-        assert_eq!(obs.current_player, [1.0, 0.0]);
-        assert_eq!(obs.legal_moves, [1.0; 7]);
-        assert_eq!(Connect4Obs::obs_size(), 93);
-    }
-
-    #[test]
-    fn observation_supports_action_spaces_wider_than_u64() {
-        type WideObs = TwoPlayerObs<4, 130>;
-        let obs = WideObs::from_board_with_legal_actions(&[1, 2], [0, 64, 129], 1).unwrap();
-
-        assert_eq!(obs.legal_moves[0], 1.0);
-        assert_eq!(obs.legal_moves[64], 1.0);
-        assert_eq!(obs.legal_moves[129], 1.0);
-        assert_eq!(
-            obs.legal_moves
-                .iter()
-                .filter(|&&value| value == 1.0)
-                .count(),
-            3
-        );
+        assert_eq!(Connect4Obs::obs_size(), 84);
     }
 
     #[test]
     fn observation_rejects_malformed_inputs_without_panicking() {
-        type Obs = TwoPlayerObs<4, 3>;
+        type Obs = TwoPlayerObs<4>;
         assert_eq!(
-            Obs::from_board(&[0], &LegalMask::new(3), 1),
+            Obs::from_board(&[0], 1),
             Err(TwoPlayerObsError::InvalidBoardLength {
                 expected: 2,
                 actual: 1,
             })
         );
         assert_eq!(
-            Obs::from_board(&[0, 9], &LegalMask::new(3), 1),
+            Obs::from_board(&[0, 9], 1),
             Err(TwoPlayerObsError::InvalidBoardCell { index: 1, value: 9 })
         );
         assert_eq!(
-            Obs::from_board(&[0, 0], &LegalMask::new(2), 1),
-            Err(TwoPlayerObsError::InvalidLegalMaskWidth {
-                expected: 3,
-                actual: 2,
-            })
-        );
-        assert_eq!(
-            Obs::from_board(&[0, 0], &LegalMask::new(3), 3),
-            Err(TwoPlayerObsError::InvalidCurrentPlayer { current_player: 3 })
-        );
-        assert_eq!(
-            Obs::from_board_with_legal_actions(&[0, 0], [3], 1),
-            Err(TwoPlayerObsError::InvalidLegalAction {
-                action: 3,
-                num_actions: 3,
-            })
+            Obs::from_board(&[0, 0], 3),
+            Err(TwoPlayerObsError::InvalidObserver { observer: 3 })
         );
     }
 
     #[test]
     fn observation_rejects_odd_board_view_size() {
-        type Obs = TwoPlayerObs<3, 1>;
+        type Obs = TwoPlayerObs<3>;
         assert_eq!(
-            Obs::from_board(&[0], &LegalMask::new(1), 1),
+            Obs::from_board(&[0], 1),
             Err(TwoPlayerObsError::InvalidBoardViewSize { board_view_size: 3 })
         );
     }

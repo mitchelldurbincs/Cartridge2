@@ -277,9 +277,7 @@ class PostgresReplayStore(ReplayStore):
                 marker_rows = tuple((row[0], row[1]) for row in cur.fetchall())
                 _validate_schema_marker(marker_columns, marker_primary_key, marker_rows)
 
-                record_columns, record_primary_key = self._table_contract(
-                    cur, "replay_records"
-                )
+                record_columns, record_primary_key = self._table_contract(cur, "replay_records")
                 _validate_record_schema(record_columns, record_primary_key)
                 conn.commit()
                 logger.info("PostgreSQL replay schema v3 validated/created")
@@ -307,11 +305,7 @@ class PostgresReplayStore(ReplayStore):
                 return cur.fetchone()[0]
 
     def sample(self, batch_size: int) -> list[ReplayRecord]:
-        if (
-            isinstance(batch_size, bool)
-            or not isinstance(batch_size, int)
-            or batch_size <= 0
-        ):
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
         with self._connection() as conn:
             with conn.cursor() as cur:
@@ -356,9 +350,7 @@ class PostgresReplayStore(ReplayStore):
                     rows = cur.fetchall()
                 records = self._rows_to_records(rows)
         if not records:
-            raise EmptyReplaySelectionError(
-                "cannot sample from an empty exact replay selection"
-            )
+            raise EmptyReplaySelectionError("cannot sample from an empty exact replay selection")
         if len(records) < batch_size:
             records.extend(random.choices(records, k=batch_size - len(records)))
         return records
@@ -433,9 +425,7 @@ class PostgresReplayStore(ReplayStore):
             raise TypeError("Replay record batch must be a list")
         if any(not isinstance(record, ReplayRecord) for record in records):
             raise TypeError("Replay record batch must contain only ReplayRecord values")
-        mismatched = [
-            record.id for record in records if not self.selection.matches(record)
-        ]
+        mismatched = [record.id for record in records if not self.selection.matches(record)]
         if mismatched:
             raise ValueError(
                 f"Replay records do not match replay selection {self.selection}: "

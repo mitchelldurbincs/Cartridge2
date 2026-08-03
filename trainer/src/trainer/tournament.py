@@ -120,9 +120,7 @@ class TournamentResults:
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write(
             path,
-            lambda tmp: Path(tmp).write_text(
-                json.dumps(self.to_dict(), indent=2) + "\n"
-            ),
+            lambda tmp: Path(tmp).write_text(json.dumps(self.to_dict(), indent=2) + "\n"),
         )
 
     def table(self) -> str:
@@ -185,15 +183,12 @@ def fit_ratings(
 
     for match_number, match in enumerate(matches, start=1):
         unknown_players = {
-            player_id
-            for player_id in (match.player1, match.player2)
-            if player_id not in index
+            player_id for player_id in (match.player1, match.player2) if player_id not in index
         }
         if unknown_players:
             unknown = ", ".join(sorted(repr(player) for player in unknown_players))
             raise ValueError(
-                f"match {match_number} references players absent from player_ids: "
-                f"{unknown}"
+                f"match {match_number} references players absent from player_ids: {unknown}"
             )
         if match.player1 == match.player2:
             raise ValueError(f"match {match_number} must contain two distinct players")
@@ -207,8 +202,7 @@ def fit_ratings(
         recorded_games = match.player1_wins + match.player2_wins + match.draws
         if match.games != recorded_games:
             raise ValueError(
-                f"match {match_number} games must equal player1_wins + "
-                "player2_wins + draws"
+                f"match {match_number} games must equal player1_wins + player2_wins + draws"
             )
 
     if not player_ids:
@@ -288,9 +282,7 @@ def warn_about_deterministic_players(players: list[PlayerRecord]) -> list[str]:
     Returns the ids warned about, for testing.
     """
     deterministic = [
-        p.id
-        for p in players
-        if p.kind == "model" and p.temperature <= 0.0 and p.simulations == 0
+        p.id for p in players if p.kind == "model" and p.temperature <= 0.0 and p.simulations == 0
     ]
     if len(deterministic) > 1:
         logger.warning(

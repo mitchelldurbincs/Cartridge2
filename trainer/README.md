@@ -3,10 +3,12 @@
 Python algorithm host for Cartridge2 learning, evaluation, and synchronized
 orchestration. Environment facts and algorithm implementations are separate:
 
-- `environment_catalog.py` strictly parses engine-generated manifest schema v4.
+- `environment_catalog.py` strictly parses engine-generated manifest schema v5.
 - `algorithms/registry.py` resolves an installed algorithm ID.
 - `algorithms/alphazero_board_v1.py` owns the current AlphaZero learner,
   network recipes, collector runner, and evaluation runner.
+- `algorithms/dqn_v1.py` owns single-agent transition decoding, Q-learning,
+  greedy return evaluation, and bounded off-policy orchestration.
 
 There is no generic promise that every registered game can use AlphaZero. Each
 entry point validates the requested algorithm/environment profile before it
@@ -45,6 +47,22 @@ The CLI requires a subcommand. Available commands are:
 | `python -m trainer --algorithm ID solver-eval` | Score Connect 4 moves with the perfect solver |
 | `python -m trainer --algorithm ID register-players` | Register checkpoint players |
 | `python -m trainer --algorithm ID tournament` | Run a profile-scoped round robin and rate players |
+
+The command set is cartridge-owned. `dqn_v1` exposes `collect`, `train`,
+`evaluate`, and `loop`; it does not expose board tournaments or the Connect 4
+solver.
+
+```bash
+python -m trainer --algorithm dqn_v1 loop \
+  --env-id counter \
+  --iterations 10 \
+  --episodes-per-iteration 100 \
+  --steps-per-iteration 500
+```
+
+Each DQN iteration allocates a fresh replay scope bound to the current RunHead,
+collects epsilon-greedy transitions, trains a direct-child Q checkpoint, and
+evaluates the committed greedy policy by episode return.
 
 Pass `--algorithm alphazero_board_v1` explicitly in scripts. The checked-in
 `[algorithm].id` supplies the interactive default.

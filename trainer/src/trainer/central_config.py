@@ -50,12 +50,7 @@ _MAX_F32 = float.fromhex("0x1.fffffep+127")
 
 def _nonnegative_u32(value: object, *, field_name: str, positive: bool = False) -> int:
     minimum = 1 if positive else 0
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or value < minimum
-        or value > _MAX_U32
-    ):
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum or value > _MAX_U32:
         qualifier = "positive" if positive else "nonnegative"
         raise ValueError(f"{field_name} must be a {qualifier} u32 integer")
     return value
@@ -63,12 +58,7 @@ def _nonnegative_u32(value: object, *, field_name: str, positive: bool = False) 
 
 def _nonnegative_u64(value: object, *, field_name: str, positive: bool = False) -> int:
     minimum = 1 if positive else 0
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or value < minimum
-        or value > _MAX_U64
-    ):
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum or value > _MAX_U64:
         qualifier = "positive" if positive else "nonnegative"
         raise ValueError(f"{field_name} must be a {qualifier} u64 integer")
     return value
@@ -84,25 +74,18 @@ def _nonnegative_f32(value: object, *, field_name: str) -> float:
     return 0.0 if narrowed == 0.0 else narrowed
 
 
-def _validate_simulation_schedule(
-    *, iterations: int, start: int, maximum: int, ramp: int
-) -> None:
+def _validate_simulation_schedule(*, iterations: int, start: int, maximum: int, ramp: int) -> None:
     if start == maximum:
         if ramp != 0:
-            raise ValueError(
-                "mcts.sim_ramp_rate must be zero when start_sims equals max_sims"
-            )
+            raise ValueError("mcts.sim_ramp_rate must be zero when start_sims equals max_sims")
         return
     delta = maximum - start
     if ramp == 0 or ramp > delta:
-        raise ValueError(
-            "ramped MCTS requires mcts.sim_ramp_rate in " "[1, max_sims - start_sims]"
-        )
+        raise ValueError("ramped MCTS requires mcts.sim_ramp_rate in [1, max_sims - start_sims]")
     steps_to_cap = (delta + ramp - 1) // ramp
     if iterations - 1 < steps_to_cap:
         raise ValueError(
-            "MCTS simulation schedule must reach mcts.max_sims within "
-            "training.iterations"
+            "MCTS simulation schedule must reach mcts.max_sims within training.iterations"
         )
 
 
@@ -160,9 +143,7 @@ class TrainingConfig:
     num_actors: int = 1  # Number of parallel actor processes for self-play
 
     def __post_init__(self) -> None:
-        _nonnegative_u64(
-            self.iterations, field_name="training.iterations", positive=True
-        )
+        _nonnegative_u64(self.iterations, field_name="training.iterations", positive=True)
         episodes = _nonnegative_u32(
             self.episodes_per_iteration,
             field_name="training.episodes_per_iteration",
@@ -173,21 +154,15 @@ class TrainingConfig:
             field_name="training.steps_per_iteration",
             positive=True,
         )
-        _nonnegative_u64(
-            self.batch_size, field_name="training.batch_size", positive=True
-        )
+        _nonnegative_u64(self.batch_size, field_name="training.batch_size", positive=True)
         _nonnegative_u64(
             self.checkpoint_interval,
             field_name="training.checkpoint_interval",
             positive=True,
         )
-        actors = _nonnegative_u32(
-            self.num_actors, field_name="training.num_actors", positive=True
-        )
+        actors = _nonnegative_u32(self.num_actors, field_name="training.num_actors", positive=True)
         if actors > episodes:
-            raise ValueError(
-                "training.num_actors cannot exceed training.episodes_per_iteration"
-            )
+            raise ValueError("training.num_actors cannot exceed training.episodes_per_iteration")
 
 
 @dataclass
@@ -212,24 +187,16 @@ class EvaluationConfig:
 
     def __post_init__(self) -> None:
         interval = _nonnegative_u64(self.interval, field_name="evaluation.interval")
-        games = _nonnegative_u32(
-            self.games, field_name="evaluation.games", positive=True
-        )
+        games = _nonnegative_u32(self.games, field_name="evaluation.games", positive=True)
         if not isinstance(self.eval_vs_random, bool):
             raise ValueError("evaluation.eval_vs_random must be boolean")
         _nonnegative_u32(self.simulations, field_name="evaluation.simulations")
-        solver_games = _nonnegative_u32(
-            self.solver_games, field_name="evaluation.solver_games"
-        )
-        seed = _nonnegative_u64(
-            self.evaluation_seed, field_name="evaluation.evaluation_seed"
-        )
+        solver_games = _nonnegative_u32(self.solver_games, field_name="evaluation.solver_games")
+        seed = _nonnegative_u64(self.evaluation_seed, field_name="evaluation.evaluation_seed")
         largest_run = max(games, solver_games)
         if seed > _MAX_U64 - (largest_run - 1):
             raise ValueError("evaluation seed schedule exceeds u64")
-        self.temperature = _nonnegative_f32(
-            self.temperature, field_name="evaluation.temperature"
-        )
+        self.temperature = _nonnegative_f32(self.temperature, field_name="evaluation.temperature")
         for field_name in ("win_threshold", "promotion_margin"):
             value = getattr(self, field_name)
             if (
@@ -242,19 +209,15 @@ class EvaluationConfig:
         if self.promotion_metric == "win_rate":
             if self.promotion_margin != 0.0:
                 raise ValueError(
-                    "evaluation.promotion_margin must be zero when "
-                    "promotion_metric is win_rate"
+                    "evaluation.promotion_margin must be zero when promotion_metric is win_rate"
                 )
         elif self.promotion_metric == "solver_optimal":
             if self.win_threshold != 0.0:
                 raise ValueError(
-                    "evaluation.win_threshold must be zero when promotion_metric "
-                    "is solver_optimal"
+                    "evaluation.win_threshold must be zero when promotion_metric is solver_optimal"
                 )
         else:
-            raise ValueError(
-                "evaluation.promotion_metric must be win_rate or solver_optimal"
-            )
+            raise ValueError("evaluation.promotion_metric must be win_rate or solver_optimal")
         if interval > 0 and not self.eval_vs_random and solver_games == 0:
             raise ValueError(
                 "scheduled evaluation requires first-candidate evidence: enable "
@@ -296,9 +259,7 @@ class MctsConfig:
     c_puct: float = 1.4
     temperature: float = 1.0
     late_temperature: float = 1.0
-    temp_threshold: int = (
-        0  # Move number after which to reduce temperature (0 = disabled)
-    )
+    temp_threshold: int = 0  # Move number after which to reduce temperature (0 = disabled)
     dirichlet_alpha: float = 0.3
     dirichlet_weight: float = 0.25
     # Simulation ramping: start_sims + (iteration-1) * sim_ramp_rate, capped at max_sims
@@ -311,9 +272,7 @@ class MctsConfig:
 
     def __post_init__(self) -> None:
         self.c_puct = _nonnegative_f32(self.c_puct, field_name="mcts.c_puct")
-        self.temperature = _nonnegative_f32(
-            self.temperature, field_name="mcts.temperature"
-        )
+        self.temperature = _nonnegative_f32(self.temperature, field_name="mcts.temperature")
         self.late_temperature = _nonnegative_f32(
             self.late_temperature, field_name="mcts.late_temperature"
         )
@@ -327,8 +286,7 @@ class MctsConfig:
             raise ValueError("mcts.dirichlet_weight must be a rate in [0, 1]")
         if (self.dirichlet_alpha == 0.0) != (self.dirichlet_weight == 0.0):
             raise ValueError(
-                "mcts.dirichlet_alpha and mcts.dirichlet_weight must both be zero "
-                "to disable noise"
+                "mcts.dirichlet_alpha and mcts.dirichlet_weight must both be zero to disable noise"
             )
         if self.temp_threshold == 0:
             if self.late_temperature != self.temperature:
@@ -342,25 +300,16 @@ class MctsConfig:
                 "the schedule is enabled"
             )
         _nonnegative_u32(self.temp_threshold, field_name="mcts.temp_threshold")
-        start = _nonnegative_u32(
-            self.start_sims, field_name="mcts.start_sims", positive=True
-        )
-        maximum = _nonnegative_u32(
-            self.max_sims, field_name="mcts.max_sims", positive=True
-        )
+        start = _nonnegative_u32(self.start_sims, field_name="mcts.start_sims", positive=True)
+        maximum = _nonnegative_u32(self.max_sims, field_name="mcts.max_sims", positive=True)
         _nonnegative_u32(self.sim_ramp_rate, field_name="mcts.sim_ramp_rate")
         if start > maximum:
             raise ValueError("mcts.start_sims cannot exceed mcts.max_sims")
         if start == maximum and self.sim_ramp_rate != 0:
+            raise ValueError("mcts.sim_ramp_rate must be zero when start_sims equals max_sims")
+        if start < maximum and (self.sim_ramp_rate == 0 or self.sim_ramp_rate > maximum - start):
             raise ValueError(
-                "mcts.sim_ramp_rate must be zero when start_sims equals max_sims"
-            )
-        if start < maximum and (
-            self.sim_ramp_rate == 0 or self.sim_ramp_rate > maximum - start
-        ):
-            raise ValueError(
-                "ramped MCTS requires mcts.sim_ramp_rate in "
-                "[1, max_sims - start_sims]"
+                "ramped MCTS requires mcts.sim_ramp_rate in [1, max_sims - start_sims]"
             )
         _nonnegative_u32(
             self.eval_batch_size,
@@ -489,22 +438,16 @@ def _validate_canonical_defaults(data: object) -> None:
         if unknown_sections:
             details.append("unknown sections: " + ", ".join(unknown_sections))
         raise ValueError(
-            "Canonical config.defaults.toml schema mismatch ("
-            + "; ".join(details)
-            + ")"
+            "Canonical config.defaults.toml schema mismatch (" + "; ".join(details) + ")"
         )
 
     for section, expected_keys in _CONFIG_SECTIONS.items():
         values = data[section]
         if not isinstance(values, dict):
-            raise ValueError(
-                f"Canonical config.defaults.toml [{section}] must be a TOML table"
-            )
+            raise ValueError(f"Canonical config.defaults.toml [{section}] must be a TOML table")
         actual_keys = set(values)
         optional_none_keys = {
-            item.name
-            for item in fields(_CONFIG_SECTION_TYPES[section])
-            if item.default is None
+            item.name for item in fields(_CONFIG_SECTION_TYPES[section]) if item.default is None
         }
         missing_keys = sorted(expected_keys - optional_none_keys - actual_keys)
         unknown_keys = sorted(actual_keys - expected_keys)
@@ -535,8 +478,7 @@ def _find_defaults_file() -> Path | None:
     for mirror in existing[1:]:
         if mirror.read_bytes() != canonical_bytes:
             raise RuntimeError(
-                "Canonical config.defaults.toml copies diverge: "
-                f"{existing[0]} != {mirror}"
+                f"Canonical config.defaults.toml copies diverge: {existing[0]} != {mirror}"
             )
     return existing[0]
 
@@ -549,9 +491,7 @@ def _find_config_file() -> Path | None:
         path = Path(env_path)
         if path.is_file():
             return path.resolve()
-        raise FileNotFoundError(
-            f"CARTRIDGE_CONFIG points to missing file: {env_path!r}"
-        )
+        raise FileNotFoundError(f"CARTRIDGE_CONFIG points to missing file: {env_path!r}")
 
     # Search default locations
     project_config = _PROJECT_ROOT / "config.toml"
@@ -627,8 +567,7 @@ def _convert_value(value: str, section: str, key: str, data: dict) -> Any:
             if normalized in ("false", "0", "no"):
                 return False
             raise ValueError(
-                f"Invalid boolean value {value!r} for {section}.{key}; "
-                "expected true/false"
+                f"Invalid boolean value {value!r} for {section}.{key}; expected true/false"
             )
         elif isinstance(existing, int):
             return int(value)
@@ -664,9 +603,7 @@ def _dict_to_config(data: dict[str, Any]) -> Config:
 
     unknown_sections = sorted(set(data) - set(_CONFIG_SECTIONS))
     if unknown_sections:
-        raise ValueError(
-            "Unknown configuration sections: " + ", ".join(unknown_sections)
-        )
+        raise ValueError("Unknown configuration sections: " + ", ".join(unknown_sections))
 
     def build_section(cls: type, section_name: str) -> Any:
         section_data = data.get(section_name, {})
@@ -692,9 +629,7 @@ def _dict_to_config(data: dict[str, Any]) -> Config:
     )
 
     if config.training.iterations > _MAX_U64 // config.training.steps_per_iteration:
-        raise ValueError(
-            "training.iterations * training.steps_per_iteration exceeds u64"
-        )
+        raise ValueError("training.iterations * training.steps_per_iteration exceeds u64")
     _validate_simulation_schedule(
         iterations=config.training.iterations,
         start=config.mcts.start_sims,
@@ -738,15 +673,11 @@ def _dict_to_config(data: dict[str, Any]) -> Config:
             f"{config.storage.model_backend!r}"
         )
     if config.storage.model_backend == "s3" and (
-        not isinstance(config.storage.s3_bucket, str)
-        or not config.storage.s3_bucket.strip()
+        not isinstance(config.storage.s3_bucket, str) or not config.storage.s3_bucket.strip()
     ):
-        raise ValueError(
-            "storage.s3_bucket is required when storage.model_backend is 's3'"
-        )
+        raise ValueError("storage.s3_bucket is required when storage.model_backend is 's3'")
     if config.storage.s3_endpoint is not None and (
-        not isinstance(config.storage.s3_endpoint, str)
-        or not config.storage.s3_endpoint.strip()
+        not isinstance(config.storage.s3_endpoint, str) or not config.storage.s3_endpoint.strip()
     ):
         raise ValueError("storage.s3_endpoint must be a non-empty string when set")
     for value, path in (
@@ -759,13 +690,10 @@ def _dict_to_config(data: dict[str, Any]) -> Config:
     if config.logging.format not in {"text", "json"}:
         raise ValueError("logging.format must be 'text' or 'json'")
     if config.evaluation.promotion_metric not in {"win_rate", "solver_optimal"}:
-        raise ValueError(
-            "evaluation.promotion_metric must be 'win_rate' or 'solver_optimal'"
-        )
+        raise ValueError("evaluation.promotion_metric must be 'win_rate' or 'solver_optimal'")
     if config.evaluation.solver_games > 0 and config.common.env_id != "connect4":
         raise ValueError(
-            "evaluation.solver_games may be nonzero only when common.env_id is "
-            "'connect4'"
+            "evaluation.solver_games may be nonzero only when common.env_id is 'connect4'"
         )
     if config.evaluation.promotion_metric == "solver_optimal" and (
         config.common.env_id != "connect4" or config.evaluation.solver_games == 0

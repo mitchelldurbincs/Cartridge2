@@ -15,6 +15,7 @@ coreml = ["mcts/coreml"]
 
 [dependencies]
 algorithm-core = { path = "../algorithm-core" }
+dqn-runtime = { path = "../dqn-runtime" }
 engine-core = { path = "../engine-core" }
 engine-games = { path = "../engine-games" }
 # Not optional: an evaluator that cannot load a model has nothing to evaluate.

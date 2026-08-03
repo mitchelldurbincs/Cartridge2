@@ -257,7 +257,7 @@ env_id = "connect4"
 ```
 
 The actor, trainer, evaluator, and web host validate this pair against strict
-manifest schema v4 before starting collection, learning, serving, or
+manifest schema v5 before starting collection, learning, serving, or
 evaluation. A registered environment may still be incompatible with the
 selected cartridge.
 

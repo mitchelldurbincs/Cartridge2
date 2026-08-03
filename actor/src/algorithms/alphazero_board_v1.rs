@@ -8,6 +8,77 @@
 //! 3. terminal value target: one value
 
 use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
+
+pub const COLLECTOR_CONFIG_SCHEMA_VERSION: u32 = 1;
+
+/// Exact collector configuration owned by the AlphaZero cartridge.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AlphaZeroCollectorConfig {
+    pub schema_version: u32,
+    pub num_simulations: u32,
+    pub c_puct: f32,
+    pub temperature: f32,
+    pub late_temperature: f32,
+    pub temp_threshold: u32,
+    pub dirichlet_alpha: f32,
+    pub dirichlet_weight: f32,
+    pub eval_batch_size: u32,
+    pub onnx_intra_threads: u32,
+}
+
+impl AlphaZeroCollectorConfig {
+    pub fn parse(json: &str) -> Result<Self> {
+        let config: Self = serde_json::from_str(json)
+            .map_err(|error| anyhow::anyhow!("invalid AlphaZero collector config: {error}"))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != COLLECTOR_CONFIG_SCHEMA_VERSION {
+            bail!(
+                "AlphaZero collector config schema_version must be exactly {}",
+                COLLECTOR_CONFIG_SCHEMA_VERSION
+            );
+        }
+        for (name, value) in [
+            ("num_simulations", self.num_simulations),
+            ("eval_batch_size", self.eval_batch_size),
+            ("onnx_intra_threads", self.onnx_intra_threads),
+        ] {
+            if value == 0 {
+                bail!("{name} must be greater than 0");
+            }
+        }
+        for (name, value) in [
+            ("c_puct", self.c_puct),
+            ("temperature", self.temperature),
+            ("late_temperature", self.late_temperature),
+            ("dirichlet_alpha", self.dirichlet_alpha),
+            ("dirichlet_weight", self.dirichlet_weight),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                bail!("{name} must be finite and nonnegative");
+            }
+        }
+        if self.dirichlet_weight > 1.0 {
+            bail!("dirichlet_weight must be in [0, 1]");
+        }
+        if (self.dirichlet_alpha == 0.0) != (self.dirichlet_weight == 0.0) {
+            bail!("dirichlet_alpha and dirichlet_weight must both be zero to disable noise");
+        }
+        if self.temp_threshold == 0 {
+            if self.late_temperature != self.temperature {
+                bail!("late_temperature must equal temperature when temp_threshold is zero");
+            }
+        } else if self.late_temperature == self.temperature {
+            bail!("late_temperature must differ from temperature when the schedule is enabled");
+        }
+        Ok(())
+    }
+}
 
 fn decode_f32(bytes: &[u8]) -> f32 {
     f32::from_le_bytes(bytes.try_into().expect("exact f32 chunk"))
@@ -78,6 +149,63 @@ pub(crate) fn encode_experience(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn collector_config() -> AlphaZeroCollectorConfig {
+        AlphaZeroCollectorConfig {
+            schema_version: COLLECTOR_CONFIG_SCHEMA_VERSION,
+            num_simulations: 100,
+            c_puct: 1.4,
+            temperature: 1.0,
+            late_temperature: 1.0,
+            temp_threshold: 0,
+            dirichlet_alpha: 0.3,
+            dirichlet_weight: 0.25,
+            eval_batch_size: 32,
+            onnx_intra_threads: 1,
+        }
+    }
+
+    #[test]
+    fn collector_config_is_strict_and_versioned() {
+        let json = serde_json::to_string(&collector_config()).unwrap();
+        assert_eq!(
+            AlphaZeroCollectorConfig::parse(&json).unwrap(),
+            collector_config()
+        );
+        assert!(AlphaZeroCollectorConfig::parse(
+            r#"{"schema_version":1,"num_simulations":1,"c_puct":1.0,"temperature":1.0,"late_temperature":1.0,"temp_threshold":0,"dirichlet_alpha":0.0,"dirichlet_weight":0.0,"eval_batch_size":1,"onnx_intra_threads":1,"legacy":true}"#
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("unknown field"));
+    }
+
+    #[test]
+    fn collector_config_rejects_invalid_search_domains() {
+        let mut config = collector_config();
+        config.num_simulations = 0;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("num_simulations"));
+
+        let mut config = collector_config();
+        config.dirichlet_alpha = 0.0;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("both be zero"));
+
+        let mut config = collector_config();
+        config.temp_threshold = 1;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must differ"));
+    }
 
     fn observation(values: &[f32]) -> Vec<u8> {
         values

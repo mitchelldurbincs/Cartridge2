@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol
+
+if TYPE_CHECKING:
+    from ..storage.publisher import OnnxArtifactContract
 
 from ..environment_catalog import (
     AlgorithmDescriptor,
@@ -39,19 +42,23 @@ class AlgorithmCommand:
     configure_parser: Callable[[argparse.ArgumentParser], None]
     run: Callable[[argparse.Namespace], int]
     description: str | None = None
-    formatter_class: type[argparse.HelpFormatter] = (
-        argparse.ArgumentDefaultsHelpFormatter
-    )
+    formatter_class: type[argparse.HelpFormatter] = argparse.ArgumentDefaultsHelpFormatter
 
 
 class Algorithm(Protocol):
+    """The only capabilities every installed cartridge must provide."""
+
     descriptor: AlgorithmDescriptor
 
     def commands(self) -> tuple[AlgorithmCommand, ...]: ...
 
-    def compatibility(
-        self, environment: EnvironmentDescriptor
-    ) -> CompatibilityReport: ...
+    def compatibility(self, environment: EnvironmentDescriptor) -> CompatibilityReport: ...
+
+    def artifact_contract(self, environment: EnvironmentDescriptor) -> "OnnxArtifactContract": ...
+
+
+class SynchronizedLoopAlgorithm(Algorithm, Protocol):
+    """Composition hooks required by the synchronized AlphaZero loop recipe."""
 
     def build_learner(self, config: Any) -> Learner: ...
 
@@ -64,6 +71,8 @@ class Algorithm(Protocol):
     def build_collector_runner(
         self, config: Any, shutdown_check: Callable[[], bool] | None = None
     ) -> CollectorRunner: ...
+
+    def collector_config(self, config: Any, num_simulations: int) -> dict: ...
 
     def build_evaluation_runner(
         self, config: Any, wandb_logger: Any = None

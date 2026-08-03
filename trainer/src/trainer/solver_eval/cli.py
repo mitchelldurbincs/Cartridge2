@@ -69,9 +69,7 @@ def _validate_solver_eval_request(args: argparse.Namespace) -> None:
         raise ValueError("--seed must be a nonnegative u64 integer")
     if args.seed > _MAX_U64 - (args.games - 1):
         raise ValueError("--seed plus the game index exceeds u64")
-    if isinstance(args.temperature, bool) or not isinstance(
-        args.temperature, (int, float)
-    ):
+    if isinstance(args.temperature, bool) or not isinstance(args.temperature, (int, float)):
         raise ValueError("--temperature must be a finite nonnegative f32")
     temperature = float(args.temperature)
     if not math.isfinite(temperature) or temperature < 0.0 or temperature > _MAX_F32:
@@ -106,8 +104,7 @@ def add_solver_eval_arguments(parser: argparse.ArgumentParser) -> None:
         "--model",
         type=str,
         default=argparse.SUPPRESS,
-        help="One-off ONNX file. If omitted, resolve the latest checkpoint "
-        "selected by RunHead",
+        help="One-off ONNX file. If omitted, resolve the latest checkpoint selected by RunHead",
     )
     model_selection.add_argument(
         "--all-checkpoints",
@@ -193,9 +190,7 @@ def run_solver_evaluation(args: argparse.Namespace) -> int:
                     )
                     for checkpoint in checkpoints
                 ]
-                logger.info(
-                    f"Evaluating {len(model_jobs)} checkpoints from {model_root}"
-                )
+                logger.info(f"Evaluating {len(model_jobs)} checkpoints from {model_root}")
             else:
                 checkpoint = repository.resolve_head()
                 if checkpoint is None:

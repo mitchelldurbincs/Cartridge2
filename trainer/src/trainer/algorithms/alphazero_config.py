@@ -1,4 +1,4 @@
-"""AlphaZero learner configuration and CLI argument helpers.
+"""Learner configuration owned by the AlphaZero board cartridge.
 
 This module provides:
 - AlphaZeroLearnerConfig dataclass with AlphaZero training parameters
@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 from crucible.backoff import DEFAULT_MAX_WAIT, DEFAULT_WAIT_INTERVAL
 
-from .storage.base import ReplaySelection
+from ..storage.base import ReplaySelection
 
 __all__ = ["AlphaZeroLearnerConfig", "cli_field"]
 
@@ -144,12 +144,8 @@ class AlphaZeroLearnerConfig:
     checkpoint_interval: int = cli_field(
         100, cli="--checkpoint-interval", help="Steps between checkpoint saves"
     )
-    stats_interval: int = cli_field(
-        10, cli="--stats-interval", help="Steps between stats updates"
-    )
-    log_interval: int = cli_field(
-        10, cli="--log-interval", help="Steps between log messages"
-    )
+    stats_interval: int = cli_field(10, cli="--stats-interval", help="Steps between stats updates")
+    log_interval: int = cli_field(10, cli="--log-interval", help="Steps between log messages")
 
     # Wait/backoff settings
     wait_interval: float = cli_field(
@@ -179,8 +175,7 @@ class AlphaZeroLearnerConfig:
         0,
         cli="--replay-cleanup-interval",
         help=(
-            "Steps between replay cleanup when replay-window is set ("
-            "0 = align with stats-interval)"
+            "Steps between replay cleanup when replay-window is set (0 = align with stats-interval)"
         ),
     )
     # Operational fencing is intentionally excluded from the learner recipe.
@@ -253,9 +248,7 @@ class AlphaZeroLearnerConfig:
             )
 
         if self.value_loss_weight == 0.0 and self.policy_loss_weight == 0.0:
-            raise ValueError(
-                "value_loss_weight and policy_loss_weight cannot both be zero"
-            )
+            raise ValueError("value_loss_weight and policy_loss_weight cannot both be zero")
         if self.lr_total_steps and self.lr_total_steps < self.total_steps:
             raise ValueError("lr_total_steps cannot be less than total_steps")
         if self.replay_window == 0 and self.replay_cleanup_interval != 0:
@@ -286,17 +279,15 @@ class AlphaZeroLearnerConfig:
 
     def learner_recipe(self) -> dict[str, object]:
         """Return only settings that change AlphaZero learning semantics."""
-        from .algorithms.alphazero_board_v1 import get_game_config
+        from .alphazero_board_v1 import get_game_config
 
         game = get_game_config(self.env_id)
         lr_horizon = self.lr_total_steps or self.total_steps
         cleanup_cadence = (
-            (self.replay_cleanup_interval or self.stats_interval)
-            if self.replay_window > 0
-            else 0
+            (self.replay_cleanup_interval or self.stats_interval) if self.replay_window > 0 else 0
         )
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "batch_size": self.batch_size,
             "learning_rate": self.learning_rate,
             "weight_decay": self.weight_decay,
@@ -313,7 +304,7 @@ class AlphaZeroLearnerConfig:
             "replay_window": self.replay_window,
             "replay_cleanup_cadence": cleanup_cadence,
             "model_architecture": {
-                "schema_version": 1,
+                "schema_version": 2,
                 "implementation": "alphazero_policy_value_network_v1",
                 "network_type": game.network_type,
                 "observation_elements": game.obs_size,
@@ -322,8 +313,6 @@ class AlphaZeroLearnerConfig:
                 "board_width": game.board_width,
                 "board_height": game.board_height,
                 "observation_spatial_channels": game.obs_channels,
-                "legal_actions_offset": game.legal_mask_offset,
-                "player_relative_observation": game.player_relative_obs,
                 "residual_blocks": game.num_res_blocks,
                 "residual_filters": game.num_filters,
             },
@@ -345,9 +334,7 @@ class AlphaZeroLearnerConfig:
         return "cpu"
 
     @classmethod
-    def configure_parser(
-        cls, parser: Any, overrides: dict[str, Any] | None = None
-    ) -> None:
+    def configure_parser(cls, parser: Any, overrides: dict[str, Any] | None = None) -> None:
         """Add CLI arguments to parser based on field metadata.
 
         Args:

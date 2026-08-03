@@ -274,16 +274,16 @@ def test_train_paths_follow_the_cli_selected_environment(monkeypatch):
         algorithm,
         "build_learner",
         lambda config: SimpleNamespace(
-            train=lambda: SimpleNamespace(total_loss=0.5, last_checkpoint="checkpoint"),
+            train=lambda: SimpleNamespace(
+                metrics={"loss/total": 0.5}, last_checkpoint="checkpoint"
+            ),
             config=captured.append(config),
         ),
     )
 
     assert args._command_runner(args) == 0
 
-    profile_dir = resolve_runtime_profile(ALGORITHM_ID, "othello").data_dir(
-        get_config().data_root
-    )
+    profile_dir = resolve_runtime_profile(ALGORITHM_ID, "othello").data_dir(get_config().data_root)
     assert Path(args.model_dir) == profile_dir / "models"
     assert Path(args.stats_path) == profile_dir / "stats.json"
 
@@ -318,9 +318,7 @@ def test_artifact_commands_resolve_profile_defaults_after_env_parsing(
 ):
     algorithm = get_algorithm(ALGORITHM_ID)
     parser = cli.build_parser(algorithm)
-    args = parser.parse_args(
-        ["--algorithm", ALGORITHM_ID, command, "--env-id", "connect4"]
-    )
+    args = parser.parse_args(["--algorithm", ALGORITHM_ID, command, "--env-id", "connect4"])
     assert all(not hasattr(args, attribute) for attribute in expected_paths)
 
     calls = []
@@ -330,9 +328,7 @@ def test_artifact_commands_resolve_profile_defaults_after_env_parsing(
     assert args._command_runner(args) == 0
     assert calls == [args]
 
-    profile_dir = resolve_runtime_profile(ALGORITHM_ID, "connect4").data_dir(
-        get_config().data_root
-    )
+    profile_dir = resolve_runtime_profile(ALGORITHM_ID, "connect4").data_dir(get_config().data_root)
     for attribute, relative_path in expected_paths.items():
         assert Path(getattr(args, attribute)) == profile_dir / relative_path
 
@@ -340,13 +336,9 @@ def test_artifact_commands_resolve_profile_defaults_after_env_parsing(
 def test_evaluate_default_resolves_verified_current_checkpoint(monkeypatch):
     algorithm = get_algorithm(ALGORITHM_ID)
     parser = cli.build_parser(algorithm)
-    args = parser.parse_args(
-        ["--algorithm", ALGORITHM_ID, "evaluate", "--env-id", "connect4"]
-    )
+    args = parser.parse_args(["--algorithm", ALGORITHM_ID, "evaluate", "--env-id", "connect4"])
     assert not hasattr(args, "model")
-    profile_dir = resolve_runtime_profile(ALGORITHM_ID, "connect4").data_dir(
-        get_config().data_root
-    )
+    profile_dir = resolve_runtime_profile(ALGORITHM_ID, "connect4").data_dir(get_config().data_root)
     immutable = profile_dir / "models" / "blobs" / "sha256" / f"{'a' * 64}.onnx"
     from trainer import evaluator
     from trainer.storage import publisher
@@ -359,9 +351,7 @@ def test_evaluate_default_resolves_verified_current_checkpoint(monkeypatch):
         ),
     )
     calls = []
-    monkeypatch.setattr(
-        evaluator, "run_evaluation", lambda parsed: calls.append(parsed) or 0
-    )
+    monkeypatch.setattr(evaluator, "run_evaluation", lambda parsed: calls.append(parsed) or 0)
 
     assert args._command_runner(args) == 0
     assert calls == [args]

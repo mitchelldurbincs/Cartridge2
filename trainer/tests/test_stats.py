@@ -15,9 +15,9 @@ from trainer.stats import (
     MEDIUM_STEPS_THRESHOLD,
     OLD_RESOLUTION,
     RECENT_STEPS_THRESHOLD,
-    EvalStats,
-    LoadedStatsSnapshotV2,
-    PreparedStatsSnapshotV2,
+    EvaluationStats,
+    LoadedStatsSnapshotV3,
+    PreparedStatsSnapshotV3,
     StatsArtifactError,
     StatsBindingV1,
     TrainerStats,
@@ -72,22 +72,26 @@ def checkpoint_ref(
 def history_entry(step: int, loss: float | int = 0.0) -> dict[str, object]:
     return {
         "step": step,
-        "total_loss": loss,
-        "value_loss": float(loss) / 3.0,
-        "policy_loss": float(loss) * 2.0 / 3.0,
+        "metrics": {
+            "loss/total": loss,
+            "loss/value": float(loss) / 3.0,
+            "loss/policy": float(loss) * 2.0 / 3.0,
+        },
         "learning_rate": 0.001,
         "grad_norm": None,
     }
 
 
-def eval_stats(step: int, win_rate: float, *, timestamp: float = 1.0) -> EvalStats:
-    return EvalStats(
+def eval_stats(step: int, win_rate: float, *, timestamp: float = 1.0) -> EvaluationStats:
+    return EvaluationStats(
         step=step,
-        win_rate=win_rate,
-        draw_rate=0.0,
-        loss_rate=1.0 - win_rate,
-        games_played=10,
-        avg_game_length=1.0,
+        metrics={
+            "outcome/win_rate": win_rate,
+            "outcome/draw_rate": 0.0,
+            "outcome/loss_rate": 1.0 - win_rate,
+        },
+        episodes=10,
+        mean_episode_length=1.0,
         timestamp=timestamp,
     )
 
@@ -103,9 +107,7 @@ def bound_stats(
     stats = TrainerStats(
         step=step,
         total_steps=step + 10,
-        total_loss=total_loss,
-        value_loss=0.2,
-        policy_loss=0.3,
+        metrics={"loss/total": total_loss, "loss/value": 0.2, "loss/policy": 0.3},
         learning_rate=0.001,
         samples_seen=step * 4,
         replay_record_count=step * 8,
@@ -117,113 +119,88 @@ def bound_stats(
     return stats, checkpoint
 
 
-class TestEvalStatsContract:
-    def test_default_is_the_only_valid_zero_game_record(self):
-        stats = EvalStats(timestamp=0)
+class TestEvaluationStatsContract:
+    def test_default_is_the_only_valid_zero_episode_record(self):
+        stats = EvaluationStats(timestamp=0)
 
         assert stats.to_dict() == {
             "step": 0,
-            "win_rate": 0.0,
-            "draw_rate": 0.0,
-            "loss_rate": 0.0,
-            "games_played": 0,
-            "avg_game_length": 0.0,
+            "metrics": {},
+            "episodes": 0,
+            "mean_episode_length": 0.0,
             "timestamp": 0.0,
         }
 
     def test_exact_schema_round_trip(self):
         original = eval_stats(5, 0.7, timestamp=2.0)
 
-        assert EvalStats.from_dict(original.to_dict()) == original
+        assert EvaluationStats.from_dict(original.to_dict()) == original
         with pytest.raises(StatsArtifactError, match="fields must be exact"):
-            EvalStats.from_dict({**original.to_dict(), "extra": 1})
+            EvaluationStats.from_dict({**original.to_dict(), "extra": 1})
         missing = original.to_dict()
-        del missing["loss_rate"]
+        del missing["metrics"]
         with pytest.raises(StatsArtifactError, match="fields must be exact"):
-            EvalStats.from_dict(missing)
+            EvaluationStats.from_dict(missing)
 
     @pytest.mark.parametrize(
         ("overrides", "message"),
         [
-            ({"games_played": 0, "win_rate": 1.0}, "zero-game"),
+            ({"episodes": 0, "metrics": {"return/mean": 1.0}}, "zero-episode"),
             (
                 {
-                    "games_played": 2,
-                    "win_rate": 0.4,
-                    "draw_rate": 0.2,
-                    "loss_rate": 0.3,
-                    "avg_game_length": 2.0,
+                    "episodes": 2,
+                    "metrics": {"return/mean": 1.0},
+                    "mean_episode_length": 0.0,
                 },
-                "sum to one",
+                "positive mean episode length",
             ),
-            (
-                {
-                    "games_played": 2,
-                    "win_rate": 1.0,
-                    "avg_game_length": 0.0,
-                },
-                "positive average length",
-            ),
-            ({"win_rate": 1.1}, r"\[0, 1\]"),
-            ({"games_played": -1}, "nonnegative integer"),
+            ({"metrics": {"return/mean": float("nan")}}, "finite"),
+            ({"metrics": {" bad": 1.0}}, "trimmed"),
+            ({"episodes": -1}, "nonnegative integer"),
             ({"timestamp": -1.0}, "nonnegative"),
         ],
     )
     def test_semantic_invariants(self, overrides, message):
         values = {
             "step": 1,
-            "win_rate": 0.0,
-            "draw_rate": 0.0,
-            "loss_rate": 0.0,
-            "games_played": 0,
-            "avg_game_length": 0.0,
+            "metrics": {},
+            "episodes": 0,
+            "mean_episode_length": 0.0,
             "timestamp": 1.0,
         }
         values.update(overrides)
 
         with pytest.raises(StatsArtifactError, match=message):
-            EvalStats(**values)
+            EvaluationStats(**values)
 
     def test_numeric_normalization_collapses_signed_zero(self):
-        stats = EvalStats(
-            win_rate=-0.0,
-            draw_rate=0,
-            loss_rate=0,
-            games_played=0,
-            avg_game_length=-0.0,
+        stats = EvaluationStats(
+            metrics={},
+            episodes=0,
+            mean_episode_length=-0.0,
             timestamp=0,
         )
 
         assert canonical_json_bytes(stats.to_dict()).count(b"-0.0") == 0
-        assert all(
-            isinstance(stats.to_dict()[field], float)
-            for field in (
-                "win_rate",
-                "draw_rate",
-                "loss_rate",
-                "avg_game_length",
-                "timestamp",
-            )
-        )
+        assert isinstance(stats.to_dict()["mean_episode_length"], float)
+        assert isinstance(stats.to_dict()["timestamp"], float)
 
-    def test_rate_roundoff_at_probability_boundaries_is_normalized(self):
-        stats = EvalStats(
+    def test_metrics_support_negative_single_agent_returns(self):
+        stats = EvaluationStats(
             step=1,
-            win_rate=0.8,
-            draw_rate=0.2,
-            loss_rate=1.0 - 0.8 - 0.2,
-            games_played=10,
-            avg_game_length=1.0,
+            metrics={"return/mean": -0.08},
+            episodes=10,
+            mean_episode_length=8.0,
             timestamp=1.0,
         )
 
-        assert stats.loss_rate == 0.0
+        assert stats.metrics["return/mean"] == -0.08
 
 
 class TestTrainerStatsContract:
     def test_exact_schema_round_trip(self):
         stats, _ = bound_stats(10)
-        stats.append_eval(eval_stats(10, 0.7))
+        stats.append_evaluation(eval_stats(10, 0.7))
 
         restored = TrainerStats.from_dict(stats.to_dict())
 
@@ -251,16 +228,17 @@ class TestTrainerStatsContract:
         ("field_name", "value", "message"),
         [
             ("step", True, "nonnegative integer"),
-            ("total_loss", -0.1, "nonnegative"),
-            ("value_loss", float("nan"), "finite nonnegative"),
-            ("policy_loss", float("inf"), "finite nonnegative"),
+            ("metric", float("nan"), "finite"),
             ("learning_rate", -0.1, "nonnegative"),
             ("grad_norm", -0.1, "nonnegative"),
         ],
     )
     def test_history_numeric_contract(self, field_name, value, message):
         entry = history_entry(1, 0.3)
-        entry[field_name] = value
+        if field_name == "metric":
+            entry["metrics"]["loss/total"] = value
+        else:
+            entry[field_name] = value
         stats = TrainerStats(step=1, total_steps=1)
 
         with pytest.raises(StatsArtifactError, match=message):
@@ -283,51 +261,49 @@ class TestTrainerStatsContract:
             TrainerStats(
                 step=2,
                 total_steps=2,
-                last_eval=second,
-                eval_history=[first.to_dict(), second.to_dict()],
+                last_evaluation=second,
+                evaluation_history=[first.to_dict(), second.to_dict()],
             )
-        with pytest.raises(StatsArtifactError, match="last_eval must equal"):
+        with pytest.raises(StatsArtifactError, match="last_evaluation must equal"):
             TrainerStats(
                 step=2,
                 total_steps=2,
-                last_eval=first,
-                eval_history=[
+                last_evaluation=first,
+                evaluation_history=[
                     first.to_dict(),
                     eval_stats(2, 0.6, timestamp=3.0).to_dict(),
                 ],
             )
-        with pytest.raises(StatsArtifactError, match="last_eval must be null"):
-            TrainerStats(step=1, total_steps=1, last_eval=first)
+        with pytest.raises(StatsArtifactError, match="last_evaluation must be null"):
+            TrainerStats(step=1, total_steps=1, last_evaluation=first)
 
-    def test_top_level_counters_and_losses_are_bounded(self):
+    def test_top_level_counters_and_metrics_are_bounded(self):
         with pytest.raises(StatsArtifactError, match="total_steps"):
             TrainerStats(step=2, total_steps=1)
-        with pytest.raises(StatsArtifactError, match="nonnegative"):
-            TrainerStats(total_loss=-0.1)
+        with pytest.raises(StatsArtifactError, match="finite"):
+            TrainerStats(metrics={"loss/total": float("nan")})
         with pytest.raises(StatsArtifactError, match="within u64"):
             TrainerStats(samples_seen=2**64)
 
     def test_append_eval_and_history_require_current_stats_step(self):
         stats = TrainerStats(step=1, total_steps=2)
         stats.append_history(history_entry(1, 0.5))
-        stats.append_eval(eval_stats(1, 0.5))
+        stats.append_evaluation(eval_stats(1, 0.5))
 
         with pytest.raises(StatsArtifactError, match="beyond stats.step"):
             stats.append_history(history_entry(2, 0.4))
         with pytest.raises(StatsArtifactError, match="beyond stats.step"):
-            stats.append_eval(eval_stats(2, 0.6, timestamp=2.0))
+            stats.append_evaluation(eval_stats(2, 0.6, timestamp=2.0))
 
     def test_numeric_normalization_is_recursive(self):
         stats = TrainerStats(
-            total_loss=-0.0,
-            value_loss=0,
-            policy_loss=0,
+            metrics={"loss/total": -0.0, "return/mean": -1},
             learning_rate=-0.0,
             timestamp=0,
             history=[
                 {
                     **history_entry(0),
-                    "total_loss": -0.0,
+                    "metrics": {"loss/total": -0.0},
                     "learning_rate": -0.0,
                     "grad_norm": -0.0,
                 }
@@ -336,8 +312,9 @@ class TestTrainerStatsContract:
 
         encoded = canonical_json_bytes(stats.to_dict())
         assert b"-0.0" not in encoded
-        assert stats.value_loss == 0.0
-        assert isinstance(stats.value_loss, float)
+        assert stats.metrics["loss/total"] == 0.0
+        assert isinstance(stats.metrics["loss/total"], float)
+        assert stats.metrics["return/mean"] == -1.0
         assert stats.history[0]["grad_norm"] == 0.0
 
 
@@ -371,13 +348,13 @@ class TestHistoryRetention:
 
     def test_eval_history_enforces_absolute_bound(self):
         stats = TrainerStats(step=9, total_steps=9)
-        stats._max_eval_history = 3
+        stats._max_evaluation_history = 3
         for step in range(10):
-            stats.append_eval(eval_stats(step, step / 10, timestamp=float(step)))
+            stats.append_evaluation(eval_stats(step, step / 10, timestamp=float(step)))
 
-        assert [entry["step"] for entry in stats.eval_history] == [7, 8, 9]
-        assert stats.last_eval is not None
-        assert stats.last_eval.step == 9
+        assert [entry["step"] for entry in stats.evaluation_history] == [7, 8, 9]
+        assert stats.last_evaluation is not None
+        assert stats.last_evaluation.step == 9
 
 
 class TestPreparedStatsSnapshot:
@@ -391,8 +368,8 @@ class TestPreparedStatsSnapshot:
             expected_binding=StatsBindingV1.from_checkpoint(checkpoint),
         )
 
-        assert isinstance(prepared, PreparedStatsSnapshotV2)
-        assert isinstance(loaded, LoadedStatsSnapshotV2)
+        assert isinstance(prepared, PreparedStatsSnapshotV3)
+        assert isinstance(loaded, LoadedStatsSnapshotV3)
         assert prepared.stats_id == sha256_bytes(prepared.data)
         assert loaded.binding.profile == checkpoint.manifest.profile
         assert loaded.binding.config_sha256 == checkpoint.manifest.config_sha256
@@ -442,8 +419,8 @@ class TestPreparedStatsSnapshot:
     @pytest.mark.parametrize(
         "mutation",
         [
-            lambda raw: raw["stats"].__setitem__("total_loss", 1),
-            lambda raw: raw["stats"].__setitem__("total_loss", -0.0),
+            lambda raw: raw["stats"]["metrics"].__setitem__("loss/total", 1),
+            lambda raw: raw["stats"]["metrics"].__setitem__("loss/total", -0.0),
             lambda raw: raw["stats"]["history"][0].__setitem__("grad_norm", -0.0),
         ],
     )
@@ -486,9 +463,7 @@ class TestPreparedStatsSnapshot:
             stats.total_steps = 20
             stats.env_id = checkpoint.manifest.profile.env_id
             stats.last_checkpoint = checkpoint.checkpoint_id
-            with pytest.raises(
-                StatsArtifactError, match="different.*profile or config"
-            ):
+            with pytest.raises(StatsArtifactError, match="different.*profile or config"):
                 prepare_stats_snapshot(stats, checkpoint)
 
     def test_prepare_rejects_checkpoint_step_regression(self):
@@ -521,9 +496,7 @@ class TestPreparedStatsSnapshot:
             ("last_checkpoint", "", "bound checkpoint"),
         ],
     )
-    def test_prepare_rejects_stats_checkpoint_disagreement(
-        self, field_name, value, message
-    ):
+    def test_prepare_rejects_stats_checkpoint_disagreement(self, field_name, value, message):
         stats, checkpoint = bound_stats(10)
         setattr(stats, field_name, value)
 
@@ -547,9 +520,7 @@ class TestStatsProjection:
     def test_projection_accepts_verified_loaded_snapshot(self, tmp_path):
         stats, checkpoint = bound_stats(10)
         prepared = prepare_stats_snapshot(stats, checkpoint)
-        loaded = decode_stats_snapshot(
-            prepared.data, expected_stats_id=prepared.stats_id
-        )
+        loaded = decode_stats_snapshot(prepared.data, expected_stats_id=prepared.stats_id)
 
         write_stats_projection(loaded, tmp_path / "stats.json")
 
@@ -572,9 +543,7 @@ class TestStatsProjection:
     def test_concurrent_projection_reads_never_observe_partial_json(self, tmp_path):
         path = tmp_path / "stats.json"
         initial_stats, initial_checkpoint = bound_stats(0)
-        write_stats_projection(
-            prepare_stats_snapshot(initial_stats, initial_checkpoint), path
-        )
+        write_stats_projection(prepare_stats_snapshot(initial_stats, initial_checkpoint), path)
         errors: list[str] = []
         observed: list[int] = []
 

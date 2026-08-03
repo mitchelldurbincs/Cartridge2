@@ -12,9 +12,9 @@ from typing import Any, Mapping, Protocol
 
 from ..stats import (
     DEFAULT_MAX_EVAL_HISTORY,
-    EvalStats,
-    LoadedStatsSnapshotV2,
-    PreparedStatsSnapshotV2,
+    EvaluationStats,
+    LoadedStatsSnapshotV3,
+    PreparedStatsSnapshotV3,
     StatsBindingV1,
     decode_stats_snapshot,
     retain_training_history,
@@ -136,8 +136,6 @@ _MODEL_ARCHITECTURE_FIELDS = frozenset(
         "board_width",
         "board_height",
         "observation_spatial_channels",
-        "legal_actions_offset",
-        "player_relative_observation",
         "residual_blocks",
         "residual_filters",
     }
@@ -186,12 +184,7 @@ def _decode_canonical(data: bytes, *, context: str) -> Mapping[str, Any]:
 
 def _integer(value: object, *, field: str, positive: bool = False) -> int:
     minimum = 1 if positive else 0
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or value < minimum
-        or value > _MAX_U64
-    ):
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum or value > _MAX_U64:
         qualifier = "positive" if positive else "nonnegative"
         raise ArtifactValidationError(f"{field} must be a {qualifier} integer")
     return value
@@ -237,9 +230,7 @@ def _text(value: object, *, field: str) -> str:
 
 def _timestamp(value: object, *, field: str) -> str:
     if not isinstance(value, str) or _UTC_TIMESTAMP.fullmatch(value) is None:
-        raise ArtifactValidationError(
-            f"{field} must be a UTC timestamp with six fractional digits"
-        )
+        raise ArtifactValidationError(f"{field} must be a UTC timestamp with six fractional digits")
     try:
         datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
@@ -276,8 +267,8 @@ def _validate_alphazero_learner_recipe(
     replay_policy: str,
 ) -> None:
     fields = _exact(value, _LEARNER_RECIPE_FIELDS, context="AlphaZero learner recipe")
-    if fields["schema_version"] != 1 or isinstance(fields["schema_version"], bool):
-        raise ArtifactValidationError("learner_recipe.schema_version must be exactly 1")
+    if fields["schema_version"] != 2 or isinstance(fields["schema_version"], bool):
+        raise ArtifactValidationError("learner_recipe.schema_version must be exactly 2")
     _integer(fields["batch_size"], field="learner_recipe.batch_size", positive=True)
     for field in (
         "learning_rate",
@@ -299,9 +290,7 @@ def _validate_alphazero_learner_recipe(
         positive=True,
     )
     if training_steps != training_steps_per_iteration:
-        raise ArtifactValidationError(
-            "learner_recipe.training_steps disagrees with the run recipe"
-        )
+        raise ArtifactValidationError("learner_recipe.training_steps disagrees with the run recipe")
     if total_iterations > _MAX_U64 // training_steps_per_iteration:
         raise ArtifactValidationError("run recipe global LR horizon exceeds u64")
     horizon = _integer(
@@ -314,12 +303,8 @@ def _validate_alphazero_learner_recipe(
             "learner_recipe.lr_horizon_steps disagrees with the global run target"
         )
     if not isinstance(fields["clear_replay_on_start"], bool):
-        raise ArtifactValidationError(
-            "learner_recipe.clear_replay_on_start must be boolean"
-        )
-    replay_window = _integer(
-        fields["replay_window"], field="learner_recipe.replay_window"
-    )
+        raise ArtifactValidationError("learner_recipe.clear_replay_on_start must be boolean")
+    replay_window = _integer(fields["replay_window"], field="learner_recipe.replay_window")
     cleanup = _integer(
         fields["replay_cleanup_cadence"],
         field="learner_recipe.replay_cleanup_cadence",
@@ -331,23 +316,17 @@ def _validate_alphazero_learner_recipe(
             "scoped_fresh_iteration_v1 requires no learner-owned replay reset or window"
         )
     if replay_window == 0 and cleanup != 0:
-        raise ArtifactValidationError(
-            "learner replay cleanup requires a nonzero replay window"
-        )
+        raise ArtifactValidationError("learner replay cleanup requires a nonzero replay window")
 
     model = _exact(
         fields["model_architecture"],
         _MODEL_ARCHITECTURE_FIELDS,
         context="AlphaZero model architecture",
     )
-    if model["schema_version"] != 1 or isinstance(model["schema_version"], bool):
-        raise ArtifactValidationError(
-            "model_architecture.schema_version must be exactly 1"
-        )
+    if model["schema_version"] != 2 or isinstance(model["schema_version"], bool):
+        raise ArtifactValidationError("model_architecture.schema_version must be exactly 2")
     if model["implementation"] != "alphazero_policy_value_network_v1":
-        raise ArtifactValidationError(
-            "model_architecture implementation is unsupported"
-        )
+        raise ArtifactValidationError("model_architecture implementation is unsupported")
     if model["network_type"] not in {"mlp", "resnet"}:
         raise ArtifactValidationError("model_architecture.network_type is invalid")
     for field in (
@@ -361,14 +340,6 @@ def _validate_alphazero_learner_recipe(
         "residual_filters",
     ):
         _u32(model[field], field=f"model_architecture.{field}", positive=True)
-    _u32(
-        model["legal_actions_offset"],
-        field="model_architecture.legal_actions_offset",
-    )
-    if not isinstance(model["player_relative_observation"], bool):
-        raise ArtifactValidationError(
-            "model_architecture.player_relative_observation must be boolean"
-        )
 
 
 @dataclass(frozen=True)
@@ -417,12 +388,8 @@ class RunRecipeV1:
             field="run_recipe.learner_config_sha256",
         )
         if self.learner_config_sha256 != self.learner_recipe.config_sha256:
-            raise ArtifactValidationError(
-                "run_recipe learner digest disagrees with learner_recipe"
-            )
-        _integer(
-            self.total_iterations, field="run_recipe.total_iterations", positive=True
-        )
+            raise ArtifactValidationError("run_recipe learner digest disagrees with learner_recipe")
+        _integer(self.total_iterations, field="run_recipe.total_iterations", positive=True)
         _u32(
             self.episodes_per_iteration,
             field="run_recipe.episodes_per_iteration",
@@ -486,8 +453,7 @@ class RunRecipeV1:
         object.__setattr__(self, "collector_dirichlet_weight", dirichlet_weight)
         if (self.collector_dirichlet_alpha == 0.0) != (dirichlet_weight == 0.0):
             raise ArtifactValidationError(
-                "run_recipe collector Dirichlet alpha and weight must both be zero "
-                "to disable noise"
+                "run_recipe collector Dirichlet alpha and weight must both be zero to disable noise"
             )
         _u32(
             self.temperature_move_threshold,
@@ -505,9 +471,7 @@ class RunRecipeV1:
                 "temperature when its schedule is enabled"
             )
         if start > maximum:
-            raise ArtifactValidationError(
-                "run_recipe MCTS start simulations exceed its maximum"
-            )
+            raise ArtifactValidationError("run_recipe MCTS start simulations exceed its maximum")
         if start == maximum:
             if self.mcts_simulation_ramp != 0:
                 raise ArtifactValidationError(
@@ -519,17 +483,13 @@ class RunRecipeV1:
                 raise ArtifactValidationError(
                     "run_recipe ramped MCTS schedule has a noncanonical ramp"
                 )
-            steps_to_cap = (
-                delta + self.mcts_simulation_ramp - 1
-            ) // self.mcts_simulation_ramp
+            steps_to_cap = (delta + self.mcts_simulation_ramp - 1) // self.mcts_simulation_ramp
             if self.total_iterations - 1 < steps_to_cap:
                 raise ArtifactValidationError(
                     "run_recipe MCTS schedule does not reach its cap within the run"
                 )
         if self.collector_seed_strategy != "system_entropy_v1":
-            raise ArtifactValidationError(
-                "run_recipe.collector_seed_strategy is unsupported"
-            )
+            raise ArtifactValidationError("run_recipe.collector_seed_strategy is unsupported")
         if self.replay_policy != "scoped_fresh_iteration_v1":
             raise ArtifactValidationError("run_recipe.replay_policy is unsupported")
         _integer(
@@ -562,9 +522,7 @@ class RunRecipeV1:
         object.__setattr__(self, "evaluation_win_threshold", threshold)
         object.__setattr__(self, "promotion_margin", margin)
         if not isinstance(self.evaluation_vs_random, bool):
-            raise ArtifactValidationError(
-                "run_recipe.evaluation_vs_random must be boolean"
-            )
+            raise ArtifactValidationError("run_recipe.evaluation_vs_random must be boolean")
         solver_games = _u32(
             self.solver_games,
             field="run_recipe.solver_games",
@@ -575,27 +533,19 @@ class RunRecipeV1:
         )
         largest_run = max(games, solver_games)
         if seed > _MAX_U64 - (largest_run - 1):
-            raise ArtifactValidationError(
-                "run_recipe.evaluation_seed plus game index exceeds u64"
-            )
+            raise ArtifactValidationError("run_recipe.evaluation_seed plus game index exceeds u64")
         if self.promotion_metric not in {"win_rate", "solver_optimal"}:
             raise ArtifactValidationError("run_recipe.promotion_metric is invalid")
         if self.promotion_metric == "win_rate" and self.promotion_margin != 0.0:
             raise ArtifactValidationError(
                 "run_recipe.promotion_margin must be zero for win_rate promotion"
             )
-        if (
-            self.promotion_metric == "solver_optimal"
-            and self.evaluation_win_threshold != 0.0
-        ):
+        if self.promotion_metric == "solver_optimal" and self.evaluation_win_threshold != 0.0:
             raise ArtifactValidationError(
-                "run_recipe.evaluation_win_threshold must be zero for "
-                "solver_optimal promotion"
+                "run_recipe.evaluation_win_threshold must be zero for solver_optimal promotion"
             )
         if self.promotion_metric == "solver_optimal" and solver_games == 0:
-            raise ArtifactValidationError(
-                "solver_optimal promotion requires solver games"
-            )
+            raise ArtifactValidationError("solver_optimal promotion requires solver games")
         _validate_alphazero_learner_recipe(
             self.learner_recipe.to_dict(),
             total_iterations=self.total_iterations,
@@ -605,16 +555,12 @@ class RunRecipeV1:
 
     def simulations_for(self, iteration: int) -> int:
         _integer(iteration, field="iteration", positive=True)
-        ramped = (
-            self.mcts_start_simulations + (iteration - 1) * self.mcts_simulation_ramp
-        )
+        ramped = self.mcts_start_simulations + (iteration - 1) * self.mcts_simulation_ramp
         return min(ramped, self.mcts_max_simulations)
 
     def evaluation_scheduled(self, iteration: int) -> bool:
         _integer(iteration, field="iteration", positive=True)
-        return (
-            self.evaluation_interval > 0 and iteration % self.evaluation_interval == 0
-        )
+        return self.evaluation_interval > 0 and iteration % self.evaluation_interval == 0
 
     def to_dict(self) -> dict[str, object]:
         value = {field: getattr(self, field) for field in _RUN_RECIPE_FIELDS}
@@ -690,26 +636,18 @@ class OrchestrationCommitV1:
             normalized = _number(getattr(self, field), field=f"orchestration.{field}")
             object.__setattr__(self, field, normalized)
             phase_total += normalized
-        total = _number(
-            self.total_time_seconds, field="orchestration.total_time_seconds"
-        )
+        total = _number(self.total_time_seconds, field="orchestration.total_time_seconds")
         object.__setattr__(self, "total_time_seconds", total)
         if total + 1e-12 < phase_total:
             raise ArtifactValidationError(
                 "orchestration.total_time_seconds is shorter than its phases"
             )
-        win_rate = _optional_rate(
-            self.eval_win_rate, field="orchestration.eval_win_rate"
-        )
-        draw_rate = _optional_rate(
-            self.eval_draw_rate, field="orchestration.eval_draw_rate"
-        )
+        win_rate = _optional_rate(self.eval_win_rate, field="orchestration.eval_win_rate")
+        draw_rate = _optional_rate(self.eval_draw_rate, field="orchestration.eval_draw_rate")
         object.__setattr__(self, "eval_win_rate", win_rate)
         object.__setattr__(self, "eval_draw_rate", draw_rate)
         if (win_rate is None) != (draw_rate is None):
-            raise ArtifactValidationError(
-                "Orchestration evaluation rates are incomplete"
-            )
+            raise ArtifactValidationError("Orchestration evaluation rates are incomplete")
         if win_rate is not None and win_rate + draw_rate > 1.0:
             raise ArtifactValidationError("Orchestration evaluation rates exceed one")
         _timestamp(self.timestamp, field="orchestration.timestamp")
@@ -723,9 +661,7 @@ class OrchestrationCommitV1:
                     "A non-evaluation commit cannot contain evaluation metrics"
                 )
         else:
-            validate_sha256_digest(
-                self.evaluation_id, field="orchestration.evaluation_id"
-            )
+            validate_sha256_digest(self.evaluation_id, field="orchestration.evaluation_id")
             if self.evaluation_seed is None:
                 raise ArtifactValidationError(
                     "An evaluation commit requires evaluation_seed provenance"
@@ -740,7 +676,7 @@ class OrchestrationCommitV1:
         return cls(**dict(fields))
 
 
-StatsSnapshotV2 = PreparedStatsSnapshotV2 | LoadedStatsSnapshotV2
+StatsSnapshotV2 = PreparedStatsSnapshotV3 | LoadedStatsSnapshotV3
 
 
 @dataclass(frozen=True)
@@ -775,9 +711,7 @@ class RunCommitV1:
                 field="run_commit.parent_run_commit_id",
             )
         validate_sha256_digest(self.checkpoint_id, field="run_commit.checkpoint_id")
-        if not isinstance(
-            self.stats_snapshot, (PreparedStatsSnapshotV2, LoadedStatsSnapshotV2)
-        ):
+        if not isinstance(self.stats_snapshot, (PreparedStatsSnapshotV3, LoadedStatsSnapshotV3)):
             raise ArtifactValidationError("run_commit.stats_snapshot is invalid")
         binding = self.stats_snapshot.binding
         if (
@@ -789,13 +723,9 @@ class RunCommitV1:
                 "RunCommit fields do not match the embedded stats binding"
             )
         if self.evaluation_head_id is not None:
-            validate_sha256_digest(
-                self.evaluation_head_id, field="run_commit.evaluation_head_id"
-            )
+            validate_sha256_digest(self.evaluation_head_id, field="run_commit.evaluation_head_id")
         if self.champion is not None and self.evaluation_head_id is None:
-            raise ArtifactValidationError(
-                "A RunCommit champion requires an evaluation head"
-            )
+            raise ArtifactValidationError("A RunCommit champion requires an evaluation head")
         if self.orchestration is not None and not isinstance(
             self.orchestration, OrchestrationCommitV1
         ):
@@ -815,9 +745,7 @@ class RunCommitV1:
             "profile": self.profile.to_dict(),
             "config_sha256": self.config_sha256,
             "run_recipe_id": self.run_recipe_id,
-            "run_recipe": (
-                self.run_recipe.to_dict() if self.run_recipe is not None else None
-            ),
+            "run_recipe": (self.run_recipe.to_dict() if self.run_recipe is not None else None),
             "parent_run_commit_id": self.parent_run_commit_id,
             "checkpoint_id": self.checkpoint_id,
             "stats_id": self.stats_id,
@@ -847,18 +775,14 @@ class RunCommitV1:
         fields = _exact(raw, _RUN_COMMIT_FIELDS, context="run commit")
         if fields["schema_version"] != 1 or isinstance(fields["schema_version"], bool):
             raise ArtifactValidationError("run_commit.schema_version must be exactly 1")
-        profile_fields = _exact(
-            fields["profile"], _PROFILE_FIELDS, context="run commit profile"
-        )
+        profile_fields = _exact(fields["profile"], _PROFILE_FIELDS, context="run commit profile")
         profile = CheckpointProfileV1.from_dict(dict(profile_fields))
         config_sha256 = validate_sha256_digest(
             fields["config_sha256"], field="run_commit.config_sha256"
         )
         run_recipe_value = fields["run_recipe"]
         run_recipe = (
-            RunRecipeV1.from_dict(run_recipe_value)
-            if run_recipe_value is not None
-            else None
+            RunRecipeV1.from_dict(run_recipe_value) if run_recipe_value is not None else None
         )
         run_recipe_id = fields["run_recipe_id"]
         if (run_recipe is None) != (run_recipe_id is None):
@@ -866,9 +790,7 @@ class RunCommitV1:
                 "run_commit.run_recipe and run_recipe_id must both be null or present"
             )
         if run_recipe is not None:
-            run_recipe_id = validate_sha256_digest(
-                run_recipe_id, field="run_commit.run_recipe_id"
-            )
+            run_recipe_id = validate_sha256_digest(run_recipe_id, field="run_commit.run_recipe_id")
             if run_recipe_id != run_recipe.run_recipe_id:
                 raise ArtifactValidationError("RunCommit recipe SHA-256 mismatch")
         checkpoint_id = validate_sha256_digest(
@@ -891,9 +813,7 @@ class RunCommitV1:
         )
         parent = fields["parent_run_commit_id"]
         if parent is not None:
-            parent = validate_sha256_digest(
-                parent, field="run_commit.parent_run_commit_id"
-            )
+            parent = validate_sha256_digest(parent, field="run_commit.parent_run_commit_id")
         evaluation_head = fields["evaluation_head_id"]
         if evaluation_head is not None:
             evaluation_head = validate_sha256_digest(
@@ -977,26 +897,28 @@ def _validate_stats_continuity(
 
 
 def _validate_eval_stats_continuity(current, previous, artifact) -> None:
-    inherited = previous.eval_history if previous is not None else []
+    inherited = previous.evaluation_history if previous is not None else []
     result = artifact.results.vs_random if artifact is not None else None
     if result is None:
-        if current.eval_history != inherited:
+        if current.evaluation_history != inherited:
             raise ArtifactValidationError(
                 "RunCommit stats evaluation history changed without random evidence"
             )
         return
     completed = datetime.fromisoformat(artifact.completed_at.replace("Z", "+00:00"))
-    appended = EvalStats(
+    appended = EvaluationStats(
         step=current.step,
-        win_rate=result.candidate_win_rate,
-        draw_rate=result.draw_rate,
-        loss_rate=1.0 - result.candidate_win_rate - result.draw_rate,
-        games_played=result.games_played,
-        avg_game_length=result.average_game_length,
+        metrics={
+            "outcome/win_rate": result.candidate_win_rate,
+            "outcome/draw_rate": result.draw_rate,
+            "outcome/loss_rate": 1.0 - result.candidate_win_rate - result.draw_rate,
+        },
+        episodes=result.games_played,
+        mean_episode_length=result.average_game_length,
         timestamp=completed.timestamp(),
     ).to_dict()
     expected = [*inherited, appended][-DEFAULT_MAX_EVAL_HISTORY:]
-    if current.eval_history != expected or current.last_eval is None:
+    if current.evaluation_history != expected or current.last_evaluation is None:
         raise ArtifactValidationError(
             "RunCommit stats do not contain the exact random-evaluation projection"
         )
@@ -1030,9 +952,7 @@ def _validate_evaluation_recipe(
         or artifact.recipe.seed != recipe.evaluation_seed
         or actual_requested != expected_requested
     ):
-        raise ArtifactValidationError(
-            "Evaluation evidence disagrees with the immutable run recipe"
-        )
+        raise ArtifactValidationError("Evaluation evidence disagrees with the immutable run recipe")
 
 
 def validate_transition(
@@ -1059,16 +979,12 @@ def validate_transition(
             )
     elif parent.run_recipe is None:
         if commit.orchestration is not None or commit.run_recipe is not None:
-            raise ArtifactValidationError(
-                "Standalone and synchronized run modes cannot be mixed"
-            )
+            raise ArtifactValidationError("Standalone and synchronized run modes cannot be mixed")
     else:
         if commit.run_recipe != parent.run_recipe:
             raise ArtifactValidationError("RunCommit changed the immutable run recipe")
         if commit.orchestration is None:
-            raise ArtifactValidationError(
-                "A recipe-owned run cannot contain standalone commits"
-            )
+            raise ArtifactValidationError("A recipe-owned run cannot contain standalone commits")
 
     checkpoint = checkpoints.read_checkpoint_manifest_exact(commit.checkpoint_id)
     if (
@@ -1089,20 +1005,11 @@ def validate_transition(
                 "The first RunCommit checkpoint must start a checkpoint lineage"
             )
     else:
-        if (
-            commit.profile != parent.profile
-            or commit.config_sha256 != parent.config_sha256
-        ):
-            raise ArtifactValidationError(
-                "RunCommit profile/config changed within a run"
-            )
-        parent_checkpoint = checkpoints.read_checkpoint_manifest_exact(
-            parent.checkpoint_id
-        )
+        if commit.profile != parent.profile or commit.config_sha256 != parent.config_sha256:
+            raise ArtifactValidationError("RunCommit profile/config changed within a run")
+        parent_checkpoint = checkpoints.read_checkpoint_manifest_exact(parent.checkpoint_id)
         if commit.checkpoint_id == parent.checkpoint_id:
-            raise ArtifactValidationError(
-                "A RunCommit must select a new direct-child checkpoint"
-            )
+            raise ArtifactValidationError("A RunCommit must select a new direct-child checkpoint")
         if (
             checkpoint.parent_checkpoint_id != parent.checkpoint_id
             or checkpoint.step <= parent_checkpoint.step
@@ -1131,9 +1038,7 @@ def validate_transition(
 
     recipe = commit.run_recipe
     if recipe is None:
-        raise ArtifactValidationError(
-            "An orchestration RunCommit requires an immutable run recipe"
-        )
+        raise ArtifactValidationError("An orchestration RunCommit requires an immutable run recipe")
     if commit.profile.env_id != "connect4" and (
         recipe.solver_games > 0 or recipe.promotion_metric == "solver_optimal"
     ):
@@ -1147,10 +1052,7 @@ def validate_transition(
         raise ArtifactValidationError(
             "Synchronized RunCommit environment must declare a finite max_horizon"
         )
-    if (
-        recipe.temperature_move_threshold != 0
-        and recipe.temperature_move_threshold >= max_horizon
-    ):
+    if recipe.temperature_move_threshold != 0 and recipe.temperature_move_threshold >= max_horizon:
         raise ArtifactValidationError(
             "RunCommit temperature threshold is unreachable for its environment"
         )
@@ -1159,27 +1061,25 @@ def validate_transition(
         # RunRecipeV1 already rejects this shape. Keep the transition validator
         # total in case a non-canonical instance reaches this boundary.
         raise ArtifactValidationError("RunCommit learner model architecture is invalid")
-    if (
-        model_architecture["observation_elements"] != checkpoints.contract.obs_size
-        or model_architecture["action_count"] != checkpoints.contract.num_actions
+    if checkpoints.contract.input("observation").shape != (
+        "batch_size",
+        model_architecture["observation_elements"],
+    ) or checkpoints.contract.output("policy_logits").shape != (
+        "batch_size",
+        model_architecture["action_count"],
     ):
         raise ArtifactValidationError(
             "RunCommit learner model dimensions disagree with the checkpoint contract"
         )
     if orchestration.iteration > recipe.total_iterations:
-        raise ArtifactValidationError(
-            "Orchestration iteration exceeds the run's total target"
-        )
+        raise ArtifactValidationError("Orchestration iteration exceeds the run's total target")
     if (
         orchestration.episodes_generated != recipe.episodes_per_iteration
         or orchestration.training_steps != recipe.training_steps_per_iteration
-        or orchestration.collector_simulations
-        != recipe.simulations_for(orchestration.iteration)
+        or orchestration.collector_simulations != recipe.simulations_for(orchestration.iteration)
         or orchestration.collector_seed is not None
     ):
-        raise ArtifactValidationError(
-            "Orchestration facts disagree with the immutable run recipe"
-        )
+        raise ArtifactValidationError("Orchestration facts disagree with the immutable run recipe")
     learner_recipe = recipe.learner_recipe.to_dict()
     batch_size = learner_recipe.get("batch_size")
     if (
@@ -1192,14 +1092,9 @@ def validate_transition(
             "run_recipe learner batch_size must be a positive u64 integer"
         )
     if orchestration.training_steps > _MAX_U64 // batch_size:
-        raise ArtifactValidationError(
-            "orchestration training_steps times batch_size exceeds u64"
-        )
+        raise ArtifactValidationError("orchestration training_steps times batch_size exceeds u64")
     previous_samples = previous_stats.samples_seen if previous_stats is not None else 0
-    if (
-        current_stats.samples_seen - previous_samples
-        != orchestration.training_steps * batch_size
-    ):
+    if current_stats.samples_seen - previous_samples != orchestration.training_steps * batch_size:
         raise ArtifactValidationError(
             "RunCommit samples_seen delta disagrees with training_steps times batch_size"
         )
@@ -1244,9 +1139,7 @@ def validate_transition(
 
     if prepared_evaluation is not None:
         if prepared_evaluation.evaluation_id != orchestration.evaluation_id:
-            raise ArtifactValidationError(
-                "Prepared evaluation ID disagrees with its RunCommit"
-            )
+            raise ArtifactValidationError("Prepared evaluation ID disagrees with its RunCommit")
         evaluations.validate_evidence(prepared_evaluation)
         artifact = prepared_evaluation
         evaluation_id = artifact.evaluation_id
@@ -1268,26 +1161,17 @@ def validate_transition(
             "RunCommit evaluation does not match its authoritative transition"
         )
     if artifact.completed_at > orchestration.timestamp:
-        raise ArtifactValidationError(
-            "RunCommit timestamp precedes evaluation completion"
-        )
+        raise ArtifactValidationError("RunCommit timestamp precedes evaluation completion")
     observed_win = (
         artifact.results.vs_champion.candidate_win_rate
         if artifact.results.vs_champion is not None
         else None
     )
     observed_draw = (
-        artifact.results.vs_champion.draw_rate
-        if artifact.results.vs_champion is not None
-        else None
+        artifact.results.vs_champion.draw_rate if artifact.results.vs_champion is not None else None
     )
-    if (
-        orchestration.eval_win_rate != observed_win
-        or orchestration.eval_draw_rate != observed_draw
-    ):
-        raise ArtifactValidationError(
-            "RunCommit evaluation rates disagree with immutable evidence"
-        )
+    if orchestration.eval_win_rate != observed_win or orchestration.eval_draw_rate != observed_draw:
+        raise ArtifactValidationError("RunCommit evaluation rates disagree with immutable evidence")
     expected_champion = (
         ChampionReferenceV1(
             checkpoint_id=commit.checkpoint_id,
@@ -1297,9 +1181,7 @@ def validate_transition(
         else inherited_champion
     )
     if commit.champion != expected_champion:
-        raise ArtifactValidationError(
-            "RunCommit champion disagrees with the evaluation decision"
-        )
+        raise ArtifactValidationError("RunCommit champion disagrees with the evaluation decision")
     if prepared_evaluation is None:
         lineage = evaluations.list_evaluations(commit.evaluation_head_id)
         if not lineage or lineage[-1].evaluation_id != evaluation_id:
@@ -1370,10 +1252,7 @@ class RunCommitRepository:
                 raise ArtifactValidationError(
                     "Orchestration iterations must be contiguous from one"
                 )
-            if (
-                latest is not None
-                and canonical.orchestration.timestamp <= latest.timestamp
-            ):
+            if latest is not None and canonical.orchestration.timestamp <= latest.timestamp:
                 raise ArtifactValidationError(
                     "Orchestration timestamps must be strictly increasing"
                 )
@@ -1428,9 +1307,7 @@ class RunCommitRepository:
                     )
                 collection_scopes.add(orchestration.collection_scope_id)
                 expected_iteration = (
-                    latest_orchestration.iteration + 1
-                    if latest_orchestration is not None
-                    else 1
+                    latest_orchestration.iteration + 1 if latest_orchestration is not None else 1
                 )
                 if orchestration.iteration != expected_iteration:
                     raise ArtifactValidationError(

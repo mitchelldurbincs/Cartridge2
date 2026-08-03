@@ -127,7 +127,7 @@ fn publish_test_run_commit(
 ) -> String {
     let profile = ArtifactProfile::from(identity);
     let stats_snapshot = serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": profile,
         "config_sha256": config_sha256(),
         "checkpoint_id": checkpoint_id,
@@ -135,9 +135,7 @@ fn publish_test_run_commit(
         "stats": {
             "step": step,
             "total_steps": step,
-            "total_loss": 0.0,
-            "value_loss": 0.0,
-            "policy_loss": 0.0,
+            "metrics": {},
             "learning_rate": 0.0,
             "samples_seen": 0,
             "replay_record_count": 0,
@@ -145,8 +143,8 @@ fn publish_test_run_commit(
             "timestamp": 0.0,
             "history": [],
             "env_id": identity.env_id,
-            "last_eval": null,
-            "eval_history": [],
+            "last_evaluation": null,
+            "evaluation_history": [],
         },
     });
     let stats_bytes = canonical(&stats_snapshot);

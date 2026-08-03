@@ -1,11 +1,18 @@
 //! Runtime dispatch from an algorithm ID to its self-play collector.
 
 mod alphazero_board_v1;
+mod dqn_v1;
 
-pub(crate) use alphazero_board_v1::encode_experience;
+#[cfg(test)]
+pub(crate) use alphazero_board_v1::COLLECTOR_CONFIG_SCHEMA_VERSION;
+pub(crate) use alphazero_board_v1::{encode_experience, AlphaZeroCollectorConfig};
+pub(crate) use dqn_v1::{
+    encode_transition as encode_dqn_transition, DqnCollectorConfig, DqnTransition,
+};
 
 use crate::actor::AlphaZeroCollector;
 use crate::config::Config;
+use crate::dqn_actor::DqnCollector;
 use algorithm_core::{resolve_algorithm, BuiltinAlgorithm};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -28,9 +35,29 @@ impl CollectorAlgorithm for AlphaZeroCollector {
     }
 }
 
+#[async_trait]
+impl CollectorAlgorithm for DqnCollector {
+    async fn run(&self) -> Result<()> {
+        DqnCollector::run(self).await
+    }
+
+    fn shutdown(&self) {
+        DqnCollector::shutdown(self);
+    }
+}
+
 /// Build the collector selected by configuration.
 pub async fn build_collector(config: Config) -> Result<Box<dyn CollectorAlgorithm>> {
     match resolve_algorithm(&config.algorithm_id)? {
-        BuiltinAlgorithm::AlphaZeroBoardV1 => Ok(Box::new(AlphaZeroCollector::new(config).await?)),
+        BuiltinAlgorithm::AlphaZeroBoardV1 => {
+            let cartridge_config = AlphaZeroCollectorConfig::parse(&config.collector_config)?;
+            Ok(Box::new(
+                AlphaZeroCollector::new(config, cartridge_config).await?,
+            ))
+        }
+        BuiltinAlgorithm::DqnV1 => {
+            let cartridge_config = DqnCollectorConfig::parse(&config.collector_config)?;
+            Ok(Box::new(DqnCollector::new(config, cartridge_config).await?))
+        }
     }
 }

@@ -2,9 +2,9 @@
 
 use algorithm_core::{resolve_algorithm, RuntimeProfile};
 use anyhow::{anyhow, Result};
-use engine_core::board_profile::BoardGameMetadata;
 use engine_core::{
-    AgentId, Capabilities, Decision, EngineContext, EpisodeStatus, ErasedTimestep, TransitionSource,
+    ActionSpace, AgentId, Capabilities, Decision, EngineContext, EpisodeStatus, ErasedTimestep,
+    ObservationEncoding, TransitionSource,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use mcts::{MctsConfig, SearchStats};
@@ -18,7 +18,7 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
-use crate::algorithms::encode_experience;
+use crate::algorithms::{encode_experience, AlphaZeroCollectorConfig};
 use crate::config::Config;
 use crate::mcts_policy::MctsPolicy;
 use crate::resources::rss_mb;
@@ -220,7 +220,8 @@ pub(crate) enum EpisodeOutcome {
 pub struct AlphaZeroCollector {
     config: Config,
     replay_selection: ReplaySelection,
-    board_metadata: BoardGameMetadata,
+    obs_size: usize,
+    num_actions: usize,
     engine: Mutex<EngineContext>,
     mcts_policy: Mutex<MctsPolicy>,
     replay: Arc<dyn ReplayStore>,
@@ -335,14 +336,16 @@ fn require_active_position(timestep: &ErasedTimestep) -> Result<(AgentId, &[u8])
             timestep.episode
         ));
     }
-    let active_agent = match &timestep.decision {
-        Decision::Agents { agent_ids } if agent_ids.len() == 1 => agent_ids[0],
-        decision => {
-            return Err(anyhow!(
-                "AlphaZero requires exactly one acting agent, got {decision:?}"
-            ))
-        }
-    };
+    let active_agent = timestep
+        .decision
+        .sole_agent()
+        .ok_or_else(|| {
+            anyhow!(
+                "AlphaZero requires exactly one acting agent, got {:?}",
+                timestep.decision
+            )
+        })?
+        .agent_id;
     if !matches!(active_agent, AgentId(1) | AgentId(2)) {
         return Err(anyhow!(
             "AlphaZero active agent must be seat 1 or 2, got {}",
@@ -470,11 +473,12 @@ fn require_source_checkpoint(
 }
 
 impl AlphaZeroCollector {
-    pub async fn new(config: Config) -> Result<Self> {
+    pub async fn new(config: Config, cartridge_config: AlphaZeroCollectorConfig) -> Result<Self> {
         config.validate()?;
-        let eval_batch_size = usize::try_from(config.eval_batch_size)
+        cartridge_config.validate()?;
+        let eval_batch_size = usize::try_from(cartridge_config.eval_batch_size)
             .map_err(|_| anyhow!("eval_batch_size does not fit this platform's usize"))?;
-        let onnx_intra_threads = usize::try_from(config.onnx_intra_threads)
+        let onnx_intra_threads = usize::try_from(cartridge_config.onnx_intra_threads)
             .map_err(|_| anyhow!("onnx_intra_threads does not fit this platform's usize"))?;
 
         // Register all games
@@ -503,9 +507,8 @@ impl AlphaZeroCollector {
 
         let caps = engine.capabilities();
         let max_horizon = require_max_horizon(&caps)?;
-        require_reachable_temperature_threshold(config.temp_threshold, max_horizon)?;
-        let environment_metadata = engine.metadata();
-        let board_metadata = environment_metadata.require_board()?.clone();
+        require_reachable_temperature_threshold(cartridge_config.temp_threshold, max_horizon)?;
+        engine.metadata().require_board()?;
         info!(
             "Actor {} initialized for environment {}",
             config.actor_id, caps.id.env_id
@@ -515,19 +518,35 @@ impl AlphaZeroCollector {
             max_horizon, caps.preferred_batch
         );
 
-        let num_actions = board_metadata.action_count;
-        let obs_size = board_metadata.observation.elements;
+        let num_actions = match caps.action_space(AgentId(1)) {
+            Some(ActionSpace::Discrete { size }) => *size as usize,
+            other => {
+                return Err(anyhow!(
+                    "AlphaZero requires discrete actions, got {other:?}"
+                ))
+            }
+        };
+        let obs_size = match &caps.encoding.observation {
+            ObservationEncoding::Tensor { spec } => spec
+                .fixed_elements()
+                .ok_or_else(|| anyhow!("AlphaZero requires a fixed observation tensor"))?,
+            other => {
+                return Err(anyhow!(
+                    "AlphaZero requires tensor observations, got {other:?}"
+                ))
+            }
+        };
 
         // Virtual loss remains owned by the versioned MCTS component. Every
         // run-varying collector search setting is supplied by the authenticated
         // run recipe and reaches this exact configuration.
         let mut mcts_config = MctsConfig::for_training()
-            .with_simulations(config.num_simulations)
+            .with_simulations(cartridge_config.num_simulations)
             .with_eval_batch_size(eval_batch_size)
-            .with_c_puct(config.c_puct)
-            .with_temperature(config.temperature);
-        mcts_config.dirichlet_alpha = config.dirichlet_alpha;
-        mcts_config.dirichlet_epsilon = config.dirichlet_weight;
+            .with_c_puct(cartridge_config.c_puct)
+            .with_temperature(cartridge_config.temperature);
+        mcts_config.dirichlet_alpha = cartridge_config.dirichlet_alpha;
+        mcts_config.dirichlet_epsilon = cartridge_config.dirichlet_weight;
         mcts_config
             .validate()
             .map_err(|error| anyhow!("invalid authenticated MCTS configuration: {error}"))?;
@@ -535,17 +554,20 @@ impl AlphaZeroCollector {
 
         let mcts_policy = MctsPolicy::new(config.env_id.clone(), num_actions, obs_size)
             .with_config(mcts_config)
-            .with_temp_schedule(config.temp_threshold, config.late_temperature);
+            .with_temp_schedule(
+                cartridge_config.temp_threshold,
+                cartridge_config.late_temperature,
+            );
 
         info!(
-            num_simulations = config.num_simulations,
-            c_puct = config.c_puct,
-            temperature = config.temperature,
-            late_temperature = config.late_temperature,
-            temp_threshold = config.temp_threshold,
-            dirichlet_alpha = config.dirichlet_alpha,
-            dirichlet_weight = config.dirichlet_weight,
-            eval_batch_size = config.eval_batch_size,
+            num_simulations = cartridge_config.num_simulations,
+            c_puct = cartridge_config.c_puct,
+            temperature = cartridge_config.temperature,
+            late_temperature = cartridge_config.late_temperature,
+            temp_threshold = cartridge_config.temp_threshold,
+            dirichlet_alpha = cartridge_config.dirichlet_alpha,
+            dirichlet_weight = cartridge_config.dirichlet_weight,
+            eval_batch_size = cartridge_config.eval_batch_size,
             virtual_loss,
             "Authenticated collector MCTS configuration"
         );
@@ -666,7 +688,8 @@ impl AlphaZeroCollector {
         Ok(Self {
             config,
             replay_selection,
-            board_metadata,
+            obs_size,
+            num_actions,
             engine: Mutex::new(engine),
             mcts_policy: Mutex::new(mcts_policy),
             replay: Arc::from(replay),
@@ -885,9 +908,9 @@ impl AlphaZeroCollector {
                     })?;
                 let payload = encode_experience(
                     &pending.observation,
-                    self.board_metadata.observation.elements,
+                    self.obs_size,
                     &pending.policy_target,
-                    self.board_metadata.action_count,
+                    self.num_actions,
                     value_target,
                 )?;
                 Ok(self.replay_selection.record(
@@ -1169,12 +1192,10 @@ mod tests {
 
         let (agent, observation) = require_reset_timestep(&reset.timestep).unwrap();
         assert_eq!(agent, AgentId(1));
-        assert_eq!(observation.len(), 29 * std::mem::size_of::<f32>());
+        assert_eq!(observation.len(), 18 * std::mem::size_of::<f32>());
 
         let mut multiple_decisions = reset.timestep.clone();
-        multiple_decisions.decision = Decision::Agents {
-            agent_ids: vec![AgentId(1), AgentId(2)],
-        };
+        multiple_decisions.decision = Decision::agents([AgentId(1), AgentId(2)]);
         assert!(require_reset_timestep(&multiple_decisions)
             .unwrap_err()
             .to_string()
@@ -1242,22 +1263,29 @@ mod tests {
             max_episodes: 1,
             collection_scope_id: "a".repeat(64),
             source_checkpoint_id: None,
+            collector_config: serde_json::to_string(&alpha_config()).unwrap(),
             episode_timeout_secs: 30,
             log_level: "info".into(),
             log_interval: 10,
             data_dir: "./data".into(),
-            num_simulations: 50, // Fewer for tests
+            postgres_url: std::env::var("CARTRIDGE_STORAGE_POSTGRES_URL").unwrap_or_else(|_| {
+                "postgresql://cartridge:cartridge@localhost:5432/cartridge".into()
+            }),
+        }
+    }
+
+    fn alpha_config() -> AlphaZeroCollectorConfig {
+        AlphaZeroCollectorConfig {
+            schema_version: crate::algorithms::COLLECTOR_CONFIG_SCHEMA_VERSION,
+            num_simulations: 50,
             c_puct: 1.4,
             temperature: 1.0,
             late_temperature: 1.0,
-            temp_threshold: 0, // Disabled for tests
+            temp_threshold: 0,
             dirichlet_alpha: 0.3,
             dirichlet_weight: 0.25,
             eval_batch_size: 32,
             onnx_intra_threads: 1,
-            postgres_url: std::env::var("CARTRIDGE_STORAGE_POSTGRES_URL").unwrap_or_else(|_| {
-                "postgresql://cartridge:cartridge@localhost:5432/cartridge".into()
-            }),
         }
     }
 
@@ -1266,7 +1294,7 @@ mod tests {
     async fn test_actor_creation() {
         let config = test_config();
 
-        let actor = AlphaZeroCollector::new(config).await;
+        let actor = AlphaZeroCollector::new(config, alpha_config()).await;
         assert!(actor.is_ok());
     }
 
@@ -1275,7 +1303,9 @@ mod tests {
     async fn test_actor_run_single_episode() {
         let config = test_config();
 
-        let actor = AlphaZeroCollector::new(config).await.unwrap();
+        let actor = AlphaZeroCollector::new(config, alpha_config())
+            .await
+            .unwrap();
 
         // Run a single episode
         let result = actor.run_episode().await;
@@ -1303,7 +1333,7 @@ mod tests {
         let mut config = test_config();
         config.env_id = "nonexistent_game".into();
 
-        let result = AlphaZeroCollector::new(config).await;
+        let result = AlphaZeroCollector::new(config, alpha_config()).await;
         assert!(result.is_err());
         let err = result.err().unwrap();
         let err_msg = err.to_string();
@@ -1315,7 +1345,9 @@ mod tests {
     async fn test_actor_stores_replay_records() {
         let config = test_config();
 
-        let actor = AlphaZeroCollector::new(config).await.unwrap();
+        let actor = AlphaZeroCollector::new(config, alpha_config())
+            .await
+            .unwrap();
 
         // Run an episode
         actor.run_episode().await.unwrap();

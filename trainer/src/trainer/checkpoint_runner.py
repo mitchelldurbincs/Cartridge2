@@ -60,7 +60,6 @@ def save_checkpoint(trainer: "AlphaZeroLearner", step: int) -> CheckpointRef:
         )
         onnx_path = export_onnx_artifact(
             network=trainer.network,
-            obs_size=trainer.network.obs_size,
             output_path=staging_dir / "model.onnx",
             device=trainer.device,
             artifact_contract=trainer.artifact_contract,

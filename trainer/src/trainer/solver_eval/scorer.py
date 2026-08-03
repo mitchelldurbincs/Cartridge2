@@ -108,9 +108,7 @@ class SolverScorer:
             for col in range(_CONNECT4_WIDTH)
         ]
 
-    def scores_for(
-        self, board: list[int], current_player: int, legal: list[int]
-    ) -> dict[int, int]:
+    def scores_for(self, board: list[int], current_player: int, legal: list[int]) -> dict[int, int]:
         """Solver scores for every legal move in the given position.
 
         Args:
@@ -176,9 +174,7 @@ class SolverScorer:
                     f"vs col {6 - col}={scores[6 - col]}"
                 )
         if self._agent.best_move(board) != 3:
-            failures.append(
-                f"best_move should be 3, got {self._agent.best_move(board)}"
-            )
+            failures.append(f"best_move should be 3, got {self._agent.best_move(board)}")
 
         if failures:
             raise RuntimeError(
@@ -240,9 +236,7 @@ def solver_evaluate(
     hits_before = scorer.cache_hits
     solve_time_before = scorer.solve_time_seconds
 
-    summary, positions = _play_and_dump(
-        model, opponent, algorithm_id, env_id, num_games, seed
-    )
+    summary, positions = _play_and_dump(model, opponent, algorithm_id, env_id, num_games, seed)
 
     current_game: int | None = None
     for record in positions:
@@ -252,17 +246,13 @@ def solver_evaluate(
             scorer.reset()
 
         if record["by"] == "p1":
-            scores = scorer.scores_for(
-                record["board"], record["player"], record["legal"]
-            )
+            scores = scorer.scores_for(record["board"], record["player"], record["legal"])
             judgment = judge_move(scores, record["action"])
             results.overall.add(judgment)
             results.by_ply[ply_bucket(record["ply"] + 1)].add(judgment)
             # The model is player 1, so the seat it holds this game is simply
             # the seat to move on its own turns.
-            results.by_seat["first" if record["player"] == 1 else "second"].add(
-                judgment
-            )
+            results.by_seat["first" if record["player"] == 1 else "second"].add(judgment)
 
         scorer.mirror_move(record["action"])
 
@@ -314,7 +304,5 @@ def _play_and_dump(
             )
         )
         summary = json.loads(output_path.read_text())
-        positions = [
-            json.loads(line) for line in dump_path.read_text().splitlines() if line
-        ]
+        positions = [json.loads(line) for line in dump_path.read_text().splitlines() if line]
     return summary, positions

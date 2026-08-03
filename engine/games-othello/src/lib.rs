@@ -41,9 +41,9 @@ use engine_core::board_profile::{
 };
 use engine_core::typed::{
     ActionSpace, AgentId, AgentModel, Capabilities, DecodeError, EncodeError, Encoding, EngineId,
-    EnvironmentSemantics,
+    EnvironmentSemantics, TensorSpec,
 };
-use engine_core::{EnvironmentError, EnvironmentMetadata};
+use engine_core::{EnvironmentError, EnvironmentMetadata, LegalMask};
 use rand_chacha::ChaCha20Rng;
 
 /// Board dimensions
@@ -52,7 +52,7 @@ pub const ROWS: usize = 8;
 pub const BOARD_SIZE: usize = COLS * ROWS; // 64
 
 /// Immutable environment contract revision for wire formats and semantics.
-pub const ENV_CONTRACT_VERSION: u32 = 1;
+pub const ENV_CONTRACT_VERSION: u32 = 2;
 
 /// Number of actions: 64 board positions + 1 pass
 pub const NUM_ACTIONS: usize = 65;
@@ -353,20 +353,12 @@ impl Default for State {
 /// Othello action - board position (0-63) or pass (64)
 pub type Action = u32;
 
-/// Othello observation: 128 board features + 65 legal actions + 2 seat features.
-/// The dynamic-width legal mask includes action 64 (pass) without a u64 special case.
-pub type OthelloObs = TwoPlayerObs<128, 65>;
+/// Player-relative Othello observation: two 8x8 occupancy planes.
+pub type OthelloObs = TwoPlayerObs<128>;
 
 /// Create observation from game state
 pub fn observation_from_state(state: &State) -> Result<OthelloObs, TwoPlayerObsError> {
-    OthelloObs::from_board_with_legal_actions(
-        &state.board,
-        state
-            .legal_moves()
-            .into_iter()
-            .map(|action| action as usize),
-        state.current_player,
-    )
+    OthelloObs::from_board(&state.board, state.current_player)
 }
 
 /// Othello game implementation
@@ -386,9 +378,7 @@ impl Default for Othello {
     }
 }
 
-/// Observation size: 64 (Black) + 64 (White) + 65 (legal) + 2 (player) = 195
-const OBS_SIZE: usize = BOARD_SIZE * 2 + NUM_ACTIONS + 2;
-
+/// Observation size: two player-relative board planes.
 impl BoardGame for Othello {
     type State = State;
     type Action = Action;
@@ -405,11 +395,18 @@ impl BoardGame for Othello {
         Capabilities {
             id: self.engine_id(),
             contract_version: ENV_CONTRACT_VERSION,
-            encoding: Encoding::discrete_u32_le_f32_le("othello_state:v1", OBS_SIZE),
+            encoding: Encoding::discrete_u32_le(
+                "othello_state:v1",
+                TensorSpec::f32_fixed([
+                    ("channel", 2),
+                    ("row", ROWS as u32),
+                    ("column", COLS as u32),
+                ]),
+            ),
             semantics:
                 EnvironmentSemantics::deterministic_alternating_perfect_information_terminal_zero_sum(),
             max_horizon: Some(BOARD_SIZE as u32),
-            agents: AgentModel::fixed_homogeneous(
+            agents: AgentModel::fixed_homogeneous_masked(
                 [AgentId(1), AgentId(2)],
                 ActionSpace::discrete(NUM_ACTIONS as u32),
             ),
@@ -420,14 +417,10 @@ impl BoardGame for Othello {
     fn metadata(&self) -> EnvironmentMetadata {
         EnvironmentMetadata::new("othello", "Othello")
             .with_description("Flip opponent pieces to dominate the board!")
-            .with_board(
-                BoardGameMetadata::new(COLS, ROWS, NUM_ACTIONS)
-                    .with_observation(OBS_SIZE, 2, BOARD_SIZE * 2, false)
-                    .with_players(vec![
-                        BoardPlayerMetadata::new("Black", "⚫"),
-                        BoardPlayerMetadata::new("White", "⚪"),
-                    ]),
-            )
+            .with_board(BoardGameMetadata::new(COLS, ROWS).with_players(vec![
+                BoardPlayerMetadata::new("Black", "⚫"),
+                BoardPlayerMetadata::new("White", "⚪"),
+            ]))
     }
 
     // reset/step mirror games-tictactoe and games-connect4; shared reward and
@@ -551,6 +544,14 @@ impl BoardGame for Othello {
     fn encode_observation(obs: &Self::Observation, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         obs.encode(out);
         Ok(())
+    }
+
+    fn legal_actions(state: &Self::State) -> Result<LegalMask, EnvironmentError> {
+        let mut mask = LegalMask::new(NUM_ACTIONS);
+        for action in state.legal_moves() {
+            mask.set(action as usize);
+        }
+        Ok(mask)
     }
 
     fn view(state: &Self::State) -> BoardView {

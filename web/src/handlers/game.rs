@@ -47,8 +47,20 @@ async fn timed_bot_move(
 }
 
 /// Reconcile the active-session gauge with the single session slot.
-fn record_session_activity(session: &GameSession) {
-    metrics::GAMES_ACTIVE.set(i64::from(!session.is_game_over()));
+fn record_session_activity(session: &GameSession) -> i64 {
+    let active = i64::from(!session.is_game_over());
+    metrics::GAMES_ACTIVE.set(active);
+    active
+}
+
+/// Install a newly created session and immediately reconcile every metric
+/// derived from the single session slot. Later initialization work (including
+/// a bot-first search) may fail, but the slot already contains this session at
+/// that point and the gauge must continue to describe it accurately.
+fn install_session(slot: &mut GameSession, session: GameSession) -> i64 {
+    *slot = session;
+    metrics::GAMES_CREATED.inc();
+    record_session_activity(slot)
 }
 
 /// List available games.
@@ -99,14 +111,15 @@ pub async fn get_game_info(
         })?;
 
     let metadata = context.metadata();
-    Ok(Json(GameInfoResponse::try_from(metadata).map_err(
-        |error| {
+    let capabilities = context.capabilities();
+    Ok(Json(
+        GameInfoResponse::from_environment(metadata, &capabilities).map_err(|error| {
             internal_error(
                 "Environment is not compatible with AlphaZero board serving",
                 error,
             )
-        },
-    )?))
+        })?,
+    ))
 }
 
 /// Get current game state.
@@ -150,9 +163,9 @@ pub async fn new_game(
     let mut session = Arc::clone(&state.session).lock_owned().await;
 
     // Reset the game with shared evaluator (for hot-reloading)
-    *session = GameSession::with_evaluator(&game_id, Arc::clone(&state.evaluator))
+    let replacement = GameSession::with_evaluator(&game_id, Arc::clone(&state.evaluator))
         .map_err(|e| internal_error(&format!("Failed to create game '{}'", game_id), e))?;
-    metrics::GAMES_CREATED.inc();
+    install_session(&mut session, replacement);
 
     // If bot goes first, bot is player 1, human is player 2
     // If player goes first, human is player 1, bot is player 2
@@ -244,27 +257,53 @@ pub async fn make_move(
 // handlers above actually return.
 #[cfg(test)]
 mod tests {
+    use super::{install_session, record_session_activity};
+    use crate::game::GameSession;
     use crate::types::{
         FirstPlayer, GameInfoResponse, GameStateResponse, GamesListResponse, MoveRequest,
         MoveResponse, NewGameRequest,
     };
     use engine_core::board_profile::{BoardGameMetadata, BoardPlayerMetadata, BoardRenderer};
-    use engine_core::EnvironmentMetadata;
+    use engine_core::{
+        ActionSpace, AgentId, AgentModel, Capabilities, Encoding, EngineId, EnvironmentMetadata,
+        EnvironmentSemantics, TensorSpec,
+    };
+
+    #[test]
+    fn installing_session_reconciles_activity_before_later_work() {
+        engine_games::register_all_environments();
+        let mut slot = GameSession::new("tictactoe").unwrap();
+
+        let active = install_session(&mut slot, GameSession::new("tictactoe").unwrap());
+
+        assert_eq!(active, 1);
+    }
+
+    #[test]
+    fn session_activity_tracks_terminal_state() {
+        engine_games::register_all_environments();
+        let mut session = GameSession::new("tictactoe").unwrap();
+        assert_eq!(record_session_activity(&session), 1);
+
+        for action in [0, 3, 1, 4, 2] {
+            session.player_move(action).unwrap();
+        }
+        assert!(session.is_game_over());
+
+        assert_eq!(record_session_activity(&session), 0);
+    }
 
     fn board_metadata(
         id: &str,
         display_name: &str,
         dimensions: (usize, usize),
         action_count: usize,
-        observation: (usize, usize),
         players: [(&str, &str); 2],
         renderer: BoardRenderer,
-    ) -> EnvironmentMetadata {
+    ) -> (EnvironmentMetadata, Capabilities) {
         let (width, height) = dimensions;
-        let (elements, legal_actions_offset) = observation;
-        EnvironmentMetadata::new(id, display_name).with_board(
-            BoardGameMetadata::new(width, height, action_count)
-                .with_observation(elements, 2, legal_actions_offset, false)
+        let metadata = EnvironmentMetadata::new(id, display_name).with_board(
+            BoardGameMetadata::new(width, height)
                 .with_players(
                     players
                         .into_iter()
@@ -272,7 +311,31 @@ mod tests {
                         .collect(),
                 )
                 .with_renderer(renderer),
-        )
+        );
+        let capabilities = Capabilities {
+            id: EngineId {
+                env_id: id.into(),
+                build_id: "test".into(),
+            },
+            contract_version: 1,
+            encoding: Encoding::discrete_u32_le(
+                "test:v1",
+                TensorSpec::f32_fixed([
+                    ("channel", 2),
+                    ("row", height as u32),
+                    ("column", width as u32),
+                ]),
+            ),
+            semantics:
+                EnvironmentSemantics::deterministic_alternating_perfect_information_terminal_zero_sum(),
+            max_horizon: Some((width * height) as u32),
+            agents: AgentModel::fixed_homogeneous_masked(
+                [AgentId(1), AgentId(2)],
+                ActionSpace::discrete(action_count as u32),
+            ),
+            preferred_batch: 1,
+        };
+        (metadata, capabilities)
     }
 
     #[test]
@@ -294,25 +357,22 @@ mod tests {
 
     #[test]
     fn test_game_info_response_from_metadata() {
-        let metadata = board_metadata(
+        let (metadata, capabilities) = board_metadata(
             "tictactoe",
             "Tic-Tac-Toe",
             (3, 3),
             9,
-            (29, 18),
             [("X", "X"), ("O", "O")],
             BoardRenderer::Grid,
         );
 
-        let response = GameInfoResponse::try_from(metadata).unwrap();
+        let response = GameInfoResponse::from_environment(metadata, &capabilities).unwrap();
 
         assert_eq!(response.env_id, "tictactoe");
         assert_eq!(response.display_name, "Tic-Tac-Toe");
         assert_eq!(response.board_width, 3);
         assert_eq!(response.board_height, 3);
         assert_eq!(response.num_actions, 9);
-        assert_eq!(response.obs_size, 29);
-        assert_eq!(response.legal_mask_offset, 18);
         assert_eq!(response.player_count, 2);
         assert_eq!(response.player_names, vec!["X", "O"]);
         assert_eq!(response.player_symbols, vec!["X", "O"]);
@@ -320,17 +380,16 @@ mod tests {
 
     #[test]
     fn test_game_info_response_connect4() {
-        let metadata = board_metadata(
+        let (metadata, capabilities) = board_metadata(
             "connect4",
             "Connect Four",
             (7, 6),
             7,
-            (93, 84),
             [("Red", "🔴"), ("Yellow", "🟡")],
             BoardRenderer::DropColumn,
         );
 
-        let response = GameInfoResponse::try_from(metadata).unwrap();
+        let response = GameInfoResponse::from_environment(metadata, &capabilities).unwrap();
 
         assert_eq!(response.env_id, "connect4");
         assert_eq!(response.display_name, "Connect Four");

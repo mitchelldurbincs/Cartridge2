@@ -22,16 +22,19 @@ pub mod typed;
 pub use board_view::Presentation;
 pub use context::{EngineContext, EngineContextError, ResetResult, StepResult};
 pub use erased::{EncodedObservation, ErasedEnvironmentError, ErasedTimestep};
+pub use legal_mask::LegalMask;
 pub use metadata::EnvironmentMetadata;
 pub use registry::{
     is_registered, list_registered_environments, register_environment, RegistryError,
 };
 pub use typed::{
-    ActionEncoding, ActionSpace, AgentId, AgentModel, AgentObservation, AgentOutcome, AgentSpec,
-    Capabilities, ChanceModel, Decision, DecodeError, EncodeError, Encoding, EngineId, Environment,
-    EnvironmentError, EnvironmentSemantics, EpisodeStatus, InformationModel, ObservationEncoding,
-    PlanningStateModel, RewardModel, SequentialTurnOrder, Timestep, TimestepAccessError,
-    TransitionDynamics, TransitionSource, TurnModel, WIRE_ENCODING_SCHEMA_VERSION,
+    ActionAvailability, ActionAvailabilityContract, ActionEncoding, ActionSpace, AgentDecision,
+    AgentId, AgentModel, AgentObservation, AgentOutcome, AgentSpec, Capabilities, ChanceModel,
+    Decision, DecodeError, EncodeError, Encoding, EngineId, Environment, EnvironmentError,
+    EnvironmentSemantics, EpisodeStatus, InformationModel, ObservationEncoding, PlanningStateModel,
+    RewardModel, SequentialTurnOrder, TensorDType, TensorDimension, TensorSpec, Timestep,
+    TimestepAccessError, TransitionDynamics, TransitionSource, TurnModel,
+    WIRE_ENCODING_SCHEMA_VERSION,
 };
 
 /// Explicitly narrow types and helpers for the bundled two-seat board profile.
@@ -42,10 +45,9 @@ pub mod board_profile {
         validate_player_and_winner,
     };
     pub use crate::board_view::{BoardView, CellKind, CellView};
-    pub use crate::legal_mask::{LegalMask, LegalMaskError};
+    pub use crate::legal_mask::LegalMask;
     pub use crate::metadata::{
-        BoardGameMetadata, BoardObservationMetadata, BoardPlayerMetadata, BoardRenderer,
-        MetadataError,
+        BoardGameMetadata, BoardPlayerMetadata, BoardRenderer, MetadataError,
     };
     pub use crate::registry::register_board_game;
 }

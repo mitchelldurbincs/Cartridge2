@@ -43,9 +43,11 @@ def record_step_metrics(
     """
     # Update stats
     trainer.stats.step = global_step
-    trainer.stats.total_loss = metrics["loss/total"]
-    trainer.stats.value_loss = metrics["loss/value"]
-    trainer.stats.policy_loss = metrics["loss/policy"]
+    trainer.stats.metrics = {
+        "loss/total": metrics["loss/total"],
+        "loss/value": metrics["loss/value"],
+        "loss/policy": metrics["loss/policy"],
+    }
     trainer.stats.learning_rate = trainer.optimizer.param_groups[0]["lr"]
     trainer.stats.samples_seen = trainer.samples_seen
     # Wall clocks can move backwards across hosts or after NTP correction.
@@ -100,9 +102,11 @@ def record_step_metrics(
     if step % trainer.config.stats_interval == 0:
         history_entry = {
             "step": global_step,
-            "total_loss": metrics["loss/total"],
-            "value_loss": metrics["loss/value"],
-            "policy_loss": metrics["loss/policy"],
+            "metrics": {
+                "loss/total": metrics["loss/total"],
+                "loss/value": metrics["loss/value"],
+                "loss/policy": metrics["loss/policy"],
+            },
             "learning_rate": trainer.optimizer.param_groups[0]["lr"],
             "grad_norm": metrics.get("grad_norm"),
         }

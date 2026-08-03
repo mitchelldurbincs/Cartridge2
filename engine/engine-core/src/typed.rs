@@ -6,6 +6,7 @@
 //! they do not define it.
 
 use crate::board_view::Presentation;
+use crate::legal_mask::LegalMask;
 use crate::metadata::EnvironmentMetadata;
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
@@ -34,8 +35,85 @@ pub enum ActionEncoding {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ObservationEncoding {
-    F32LittleEndian { elements: usize },
+    Tensor { spec: TensorSpec },
     Custom { id: String },
+}
+
+/// Scalar representation used by a tensor observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TensorDType {
+    F32LittleEndian,
+    U8,
+    I64LittleEndian,
+    Bool,
+}
+
+impl TensorDType {
+    pub const fn element_size(self) -> usize {
+        match self {
+            Self::F32LittleEndian => std::mem::size_of::<f32>(),
+            Self::U8 | Self::Bool => 1,
+            Self::I64LittleEndian => std::mem::size_of::<i64>(),
+        }
+    }
+}
+
+/// One named tensor dimension. `size=None` declares a dynamic dimension.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TensorDimension {
+    pub name: String,
+    pub size: Option<u32>,
+}
+
+impl TensorDimension {
+    pub fn fixed(name: impl Into<String>, size: u32) -> Self {
+        Self {
+            name: name.into(),
+            size: Some(size),
+        }
+    }
+
+    pub fn dynamic(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            size: None,
+        }
+    }
+}
+
+/// Shape and scalar encoding for one agent observation tensor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TensorSpec {
+    pub dtype: TensorDType,
+    pub dimensions: Vec<TensorDimension>,
+}
+
+impl TensorSpec {
+    pub fn f32_fixed<const N: usize>(dimensions: [(&str, u32); N]) -> Self {
+        Self {
+            dtype: TensorDType::F32LittleEndian,
+            dimensions: dimensions
+                .into_iter()
+                .map(|(name, size)| TensorDimension::fixed(name, size))
+                .collect(),
+        }
+    }
+
+    /// Number of scalar elements when every dimension is fixed.
+    pub fn fixed_elements(&self) -> Option<usize> {
+        self.dimensions
+            .iter()
+            .try_fold(1usize, |elements, dimension| {
+                elements.checked_mul(usize::try_from(dimension.size?).ok()?)
+            })
+    }
+
+    /// Exact encoded byte count when every dimension is fixed.
+    pub fn fixed_bytes(&self) -> Option<usize> {
+        self.fixed_elements()?
+            .checked_mul(self.dtype.element_size())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,31 +126,26 @@ pub struct Encoding {
 }
 
 impl Encoding {
-    pub fn discrete_u32_le_f32_le(state: impl Into<String>, observation_elements: usize) -> Self {
+    pub fn discrete_u32_le(state: impl Into<String>, observation: TensorSpec) -> Self {
         Self {
             state: state.into(),
             action: ActionEncoding::DiscreteU32LittleEndian,
-            observation: ObservationEncoding::F32LittleEndian {
-                elements: observation_elements,
-            },
+            observation: ObservationEncoding::Tensor { spec: observation },
             schema_version: WIRE_ENCODING_SCHEMA_VERSION,
         }
     }
 
-    pub fn multi_discrete_u32_le_f32_le(
-        state: impl Into<String>,
-        observation_elements: usize,
-    ) -> Self {
+    pub fn multi_discrete_u32_le(state: impl Into<String>, observation: TensorSpec) -> Self {
         Self {
             action: ActionEncoding::MultiDiscreteU32LittleEndian,
-            ..Self::discrete_u32_le_f32_le(state, observation_elements)
+            ..Self::discrete_u32_le(state, observation)
         }
     }
 
-    pub fn continuous_f32_le_f32_le(state: impl Into<String>, observation_elements: usize) -> Self {
+    pub fn continuous_f32_le(state: impl Into<String>, observation: TensorSpec) -> Self {
         Self {
             action: ActionEncoding::ContinuousF32LittleEndian,
-            ..Self::discrete_u32_le_f32_le(state, observation_elements)
+            ..Self::discrete_u32_le(state, observation)
         }
     }
 
@@ -227,6 +300,16 @@ impl From<u8> for AgentId {
 pub struct AgentSpec {
     pub id: AgentId,
     pub action_space: ActionSpace,
+    pub action_availability: ActionAvailabilityContract,
+}
+
+/// Availability representation an environment promises for one agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ActionAvailabilityContract {
+    All,
+    DiscreteMask,
+    Custom { id: String },
 }
 
 /// Agent population and action spaces for an environment.
@@ -239,6 +322,7 @@ pub enum AgentModel {
     /// Dynamic agents share one action-space contract.
     Dynamic {
         action_space: ActionSpace,
+        action_availability: ActionAvailabilityContract,
     },
 }
 
@@ -253,6 +337,23 @@ impl AgentModel {
                 .map(|id| AgentSpec {
                     id,
                     action_space: action_space.clone(),
+                    action_availability: ActionAvailabilityContract::All,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn fixed_homogeneous_masked(
+        ids: impl IntoIterator<Item = AgentId>,
+        action_space: ActionSpace,
+    ) -> Self {
+        Self::Fixed {
+            agents: ids
+                .into_iter()
+                .map(|id| AgentSpec {
+                    id,
+                    action_space: action_space.clone(),
+                    action_availability: ActionAvailabilityContract::DiscreteMask,
                 })
                 .collect(),
         }
@@ -264,7 +365,20 @@ impl AgentModel {
                 .iter()
                 .find(|agent| agent.id == agent_id)
                 .map(|agent| &agent.action_space),
-            Self::Dynamic { action_space } => Some(action_space),
+            Self::Dynamic { action_space, .. } => Some(action_space),
+        }
+    }
+
+    pub fn action_availability(&self, agent_id: AgentId) -> Option<&ActionAvailabilityContract> {
+        match self {
+            Self::Fixed { agents } => agents
+                .iter()
+                .find(|agent| agent.id == agent_id)
+                .map(|agent| &agent.action_availability),
+            Self::Dynamic {
+                action_availability,
+                ..
+            } => Some(action_availability),
         }
     }
 
@@ -323,13 +437,58 @@ impl EpisodeStatus {
     }
 }
 
-/// Who must supply the next action. `Agents` may contain more than one ID.
+/// Concrete availability accompanying one requested agent action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ActionAvailability {
+    All,
+    DiscreteMask { mask: LegalMask },
+    Custom { contract: String, data: Vec<u8> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDecision {
+    pub agent_id: AgentId,
+    pub availability: ActionAvailability,
+}
+
+/// Who must supply the next action. `Agents` may contain more than one entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Decision {
-    Agents { agent_ids: Vec<AgentId> },
+    Agents { decisions: Vec<AgentDecision> },
     Chance,
     None,
+}
+
+impl Decision {
+    pub fn agents(agent_ids: impl IntoIterator<Item = AgentId>) -> Self {
+        Self::Agents {
+            decisions: agent_ids
+                .into_iter()
+                .map(|agent_id| AgentDecision {
+                    agent_id,
+                    availability: ActionAvailability::All,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn single(agent_id: AgentId, availability: ActionAvailability) -> Self {
+        Self::Agents {
+            decisions: vec![AgentDecision {
+                agent_id,
+                availability,
+            }],
+        }
+    }
+
+    pub fn sole_agent(&self) -> Option<&AgentDecision> {
+        match self {
+            Self::Agents { decisions } if decisions.len() == 1 => decisions.first(),
+            _ => None,
+        }
+    }
 }
 
 /// Provenance of the transition that produced a timestep.

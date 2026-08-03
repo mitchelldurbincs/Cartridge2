@@ -10,7 +10,7 @@ from importlib.resources import files
 from typing import Any, Callable, TypeVar
 
 MANIFEST_FILENAME = "environment_manifest.json"
-MANIFEST_SCHEMA_VERSION = 4
+MANIFEST_SCHEMA_VERSION = 5
 REGENERATE_HINT = f"Run `make environment-manifest` to regenerate {MANIFEST_FILENAME}."
 U32_MAX = 2**32 - 1
 USIZE_MAX = 2 ** (8 * struct.calcsize("P")) - 1
@@ -69,13 +69,35 @@ class EngineIdentity:
 
 
 @dataclass(frozen=True)
+class TensorDimensionDescriptor:
+    name: str
+    size: int | None
+
+
+@dataclass(frozen=True)
+class TensorSpecDescriptor:
+    dtype: str
+    dimensions: tuple[TensorDimensionDescriptor, ...]
+
+    @property
+    def fixed_elements(self) -> int | None:
+        if any(dimension.size is None for dimension in self.dimensions):
+            return None
+        return math.prod(
+            dimension.size
+            for dimension in self.dimensions
+            if dimension.size is not None
+        )
+
+
+@dataclass(frozen=True)
 class WireEncoding:
     schema_version: int
     state: str
     action_kind: str
     action_custom_id: str | None
     observation_kind: str
-    observation_elements: int | None
+    observation_tensor: TensorSpecDescriptor | None
     observation_custom_id: str | None
 
 
@@ -104,6 +126,8 @@ class ActionSpaceDescriptor:
 class AgentDescriptor:
     id: int
     action_space: ActionSpaceDescriptor
+    action_availability_kind: str
+    action_availability_custom_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +135,8 @@ class AgentModelDescriptor:
     kind: str
     agents: tuple[AgentDescriptor, ...] = ()
     shared_action_space: ActionSpaceDescriptor | None = None
+    shared_action_availability_kind: str | None = None
+    shared_action_availability_custom_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -125,14 +151,6 @@ class EnvironmentCapabilities:
 
 
 @dataclass(frozen=True)
-class BoardObservationDescriptor:
-    elements: int
-    spatial_channels: int
-    legal_actions_offset: int
-    player_relative: bool
-
-
-@dataclass(frozen=True)
 class BoardPlayerDescriptor:
     name: str
     symbol: str
@@ -142,8 +160,6 @@ class BoardPlayerDescriptor:
 class BoardDescriptor:
     width: int
     height: int
-    action_count: int
-    observation: BoardObservationDescriptor
     players: tuple[BoardPlayerDescriptor, ...]
     renderer: str
 
@@ -175,9 +191,7 @@ class EnvironmentDescriptor:
 
     def require_board(self) -> BoardDescriptor:
         if self.board is None:
-            raise ValueError(
-                f"Environment '{self.env_id}' does not expose the board-game profile"
-            )
+            raise ValueError(f"Environment '{self.env_id}' does not expose the board-game profile")
         return self.board
 
     def compatibility(self, algorithm_id: str) -> CompatibilityReport:
@@ -192,9 +206,7 @@ class EnvironmentDescriptor:
 
 
 def _error(path: str, message: str) -> RuntimeError:
-    return RuntimeError(
-        f"Invalid environment catalog field {path}: {message}. {REGENERATE_HINT}"
-    )
+    return RuntimeError(f"Invalid environment catalog field {path}: {message}. {REGENERATE_HINT}")
 
 
 def _mapping(value: Any, path: str) -> dict[str, Any]:
@@ -239,8 +251,7 @@ def _nonblank_string(value: Any, path: str) -> str:
 def _runtime_segment(value: Any, path: str) -> str:
     value = _string(value, path)
     if not all(
-        character.isascii()
-        and (character.islower() or character.isdigit() or character in "_-")
+        character.isascii() and (character.islower() or character.isdigit() or character in "_-")
         for character in value
     ):
         raise _error(
@@ -258,11 +269,7 @@ def _bounded_integer(
     rust_type: str,
     minimum: int = 1,
 ) -> int:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or not minimum <= value <= maximum
-    ):
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
         raise _error(
             path,
             f"expected a {rust_type} integer between {minimum} and {maximum}",
@@ -299,15 +306,6 @@ def _checked_usize_product(values: tuple[int, ...], path: str) -> int:
     return product
 
 
-def _checked_usize_sum(values: tuple[int, ...], path: str) -> int:
-    total = 0
-    for value in values:
-        if total > USIZE_MAX - value:
-            raise _error(path, "sum overflows usize")
-        total += value
-    return total
-
-
 def _boolean(value: Any, path: str) -> bool:
     if not isinstance(value, bool):
         raise _error(path, "expected a boolean")
@@ -329,10 +327,7 @@ def _list(value: Any, path: str) -> list[Any]:
 
 
 def _strings(value: Any, path: str) -> tuple[str, ...]:
-    return tuple(
-        _string(item, f"{path}[{index}]")
-        for index, item in enumerate(_list(value, path))
-    )
+    return tuple(_string(item, f"{path}[{index}]") for index, item in enumerate(_list(value, path)))
 
 
 def _f32_numbers(value: Any, path: str) -> tuple[float, ...]:
@@ -395,10 +390,7 @@ def _parse_algorithm(value: Any, path: str) -> AlgorithmDescriptor:
         ),
         display_name=_string(raw["display_name"], f"{path}.display_name"),
         components=AlgorithmComponents(
-            **{
-                field: _string(components[field], f"{component_path}.{field}")
-                for field in fields
-            }
+            **{field: _string(components[field], f"{component_path}.{field}") for field in fields}
         ),
         requirements=_strings(raw["requirements"], f"{path}.requirements"),
     )
@@ -455,29 +447,50 @@ def _parse_encoding(value: Any, path: str) -> WireEncoding:
     observation_path = f"{path}.observation"
     observation = _mapping(raw["observation"], observation_path)
     observation_kind = _string(observation.get("kind"), f"{observation_path}.kind")
-    if observation_kind == "f32_little_endian":
-        _keys(observation, {"kind", "elements"}, observation_path)
-        observation_elements = _usize(
-            observation["elements"], f"{observation_path}.elements"
+    if observation_kind == "tensor":
+        _keys(observation, {"kind", "spec"}, observation_path)
+        spec_path = f"{observation_path}.spec"
+        spec = _mapping(observation["spec"], spec_path)
+        _keys(spec, {"dtype", "dimensions"}, spec_path)
+        dtype = _enum(
+            spec["dtype"],
+            f"{spec_path}.dtype",
+            {"f32_little_endian", "u8", "i64_little_endian", "bool"},
         )
+        dimensions = []
+        for index, value in enumerate(_list(spec["dimensions"], f"{spec_path}.dimensions")):
+            dimension_path = f"{spec_path}.dimensions[{index}]"
+            dimension = _mapping(value, dimension_path)
+            _keys(dimension, {"name", "size"}, dimension_path)
+            size = dimension["size"]
+            if size is not None:
+                size = _u32(size, f"{dimension_path}.size")
+            dimensions.append(
+                TensorDimensionDescriptor(
+                    name=_nonblank_string(dimension["name"], f"{dimension_path}.name"),
+                    size=size,
+                )
+            )
+        if not dimensions or len({dimension.name for dimension in dimensions}) != len(dimensions):
+            raise _error(f"{spec_path}.dimensions", "must contain unique named dimensions")
+        fixed_sizes = [dimension.size for dimension in dimensions if dimension.size is not None]
+        if len(fixed_sizes) == len(dimensions):
+            _checked_usize_product(fixed_sizes, f"{spec_path}.dimensions")
+        observation_tensor = TensorSpecDescriptor(dtype, tuple(dimensions))
         observation_custom_id = None
     elif observation_kind == "custom":
         _keys(observation, {"kind", "id"}, observation_path)
-        observation_elements = None
-        observation_custom_id = _nonblank_string(
-            observation["id"], f"{observation_path}.id"
-        )
+        observation_tensor = None
+        observation_custom_id = _nonblank_string(observation["id"], f"{observation_path}.id")
     else:
-        raise _error(
-            f"{observation_path}.kind", f"unsupported encoding {observation_kind!r}"
-        )
+        raise _error(f"{observation_path}.kind", f"unsupported encoding {observation_kind!r}")
     return WireEncoding(
         schema_version=_u32(raw["schema_version"], f"{path}.schema_version"),
         state=_nonblank_string(raw["state"], f"{path}.state"),
         action_kind=action_kind,
         action_custom_id=action_custom_id,
         observation_kind=observation_kind,
-        observation_elements=observation_elements,
+        observation_tensor=observation_tensor,
         observation_custom_id=observation_custom_id,
     )
 
@@ -539,10 +552,7 @@ def _parse_semantics(value: Any, path: str) -> EnvironmentSemantics:
             path,
             "transition_dynamics and chance_model describe inconsistent stochasticity",
         )
-    if (
-        chance_model == "environment_sampled"
-        and planning_state_model == "complete_snapshot"
-    ):
+    if chance_model == "environment_sampled" and planning_state_model == "complete_snapshot":
         raise _error(
             path,
             "environment-sampled chance depends on runtime RNG state and requires external_state",
@@ -563,9 +573,7 @@ def _parse_action_space(value: Any, path: str) -> ActionSpaceDescriptor:
     kind = _string(raw.get("kind"), f"{path}.kind")
     if kind == "discrete":
         _keys(raw, {"kind", "size"}, path)
-        return ActionSpaceDescriptor(
-            kind=kind, discrete_size=_u32(raw["size"], f"{path}.size")
-        )
+        return ActionSpaceDescriptor(kind=kind, discrete_size=_u32(raw["size"], f"{path}.size"))
     if kind == "multi_discrete":
         _keys(raw, {"kind", "dimensions"}, path)
         dimensions = tuple(
@@ -590,11 +598,21 @@ def _parse_action_space(value: Any, path: str) -> ActionSpaceDescriptor:
                 "low/high lengths must equal the product of the non-empty shape",
             )
         if any(lower >= upper for lower, upper in zip(low, high)):
-            raise _error(
-                path, "every continuous lower bound must be below its upper bound"
-            )
+            raise _error(path, "every continuous lower bound must be below its upper bound")
         return ActionSpaceDescriptor(kind=kind, low=low, high=high, shape=shape)
     raise _error(f"{path}.kind", f"unsupported action space {kind!r}")
+
+
+def _parse_action_availability(value: Any, path: str) -> tuple[str, str | None]:
+    raw = _mapping(value, path)
+    kind = _string(raw.get("kind"), f"{path}.kind")
+    if kind in {"all", "discrete_mask"}:
+        _keys(raw, {"kind"}, path)
+        return kind, None
+    if kind == "custom":
+        _keys(raw, {"kind", "id"}, path)
+        return kind, _nonblank_string(raw["id"], f"{path}.id")
+    raise _error(f"{path}.kind", f"unsupported action availability {kind!r}")
 
 
 def _parse_agent_model(value: Any, path: str) -> AgentModelDescriptor:
@@ -606,25 +624,37 @@ def _parse_agent_model(value: Any, path: str) -> AgentModelDescriptor:
         for index, value in enumerate(_list(raw["agents"], f"{path}.agents")):
             agent_path = f"{path}.agents[{index}]"
             agent = _mapping(value, agent_path)
-            _keys(agent, {"id", "action_space"}, agent_path)
+            _keys(
+                agent,
+                {"id", "action_space", "action_availability"},
+                agent_path,
+            )
+            availability_kind, availability_custom_id = _parse_action_availability(
+                agent["action_availability"], f"{agent_path}.action_availability"
+            )
             agents.append(
                 AgentDescriptor(
                     id=_u32(agent["id"], f"{agent_path}.id", minimum=0),
                     action_space=_parse_action_space(
                         agent["action_space"], f"{agent_path}.action_space"
                     ),
+                    action_availability_kind=availability_kind,
+                    action_availability_custom_id=availability_custom_id,
                 )
             )
         if not agents or len({agent.id for agent in agents}) != len(agents):
             raise _error(f"{path}.agents", "must contain unique fixed agent IDs")
         return AgentModelDescriptor(kind=kind, agents=tuple(agents))
     if kind == "dynamic":
-        _keys(raw, {"kind", "action_space"}, path)
+        _keys(raw, {"kind", "action_space", "action_availability"}, path)
+        availability_kind, availability_custom_id = _parse_action_availability(
+            raw["action_availability"], f"{path}.action_availability"
+        )
         return AgentModelDescriptor(
             kind=kind,
-            shared_action_space=_parse_action_space(
-                raw["action_space"], f"{path}.action_space"
-            ),
+            shared_action_space=_parse_action_space(raw["action_space"], f"{path}.action_space"),
+            shared_action_availability_kind=availability_kind,
+            shared_action_availability_custom_id=availability_custom_id,
         )
     raise _error(f"{path}.kind", f"unsupported agent model {kind!r}")
 
@@ -653,9 +683,7 @@ def _parse_capabilities(value: Any, path: str) -> EnvironmentCapabilities:
     capabilities = EnvironmentCapabilities(
         identity=EngineIdentity(
             env_id=_runtime_segment(identity["env_id"], f"{identity_path}.env_id"),
-            build_id=_nonblank_string(
-                identity["build_id"], f"{identity_path}.build_id"
-            ),
+            build_id=_nonblank_string(identity["build_id"], f"{identity_path}.build_id"),
         ),
         contract_version=_u32(raw["contract_version"], f"{path}.contract_version"),
         encoding=_parse_encoding(raw["encoding"], f"{path}.encoding"),
@@ -716,18 +744,7 @@ def _parse_board(value: Any, path: str) -> BoardDescriptor | None:
     if value is None:
         return None
     raw = _mapping(value, path)
-    _keys(
-        raw,
-        {"width", "height", "action_count", "observation", "players", "renderer"},
-        path,
-    )
-    observation_path = f"{path}.observation"
-    observation = _mapping(raw["observation"], observation_path)
-    _keys(
-        observation,
-        {"elements", "spatial_channels", "legal_actions_offset", "player_relative"},
-        observation_path,
-    )
+    _keys(raw, {"width", "height", "players", "renderer"}, path)
     players = []
     for index, value in enumerate(_list(raw["players"], f"{path}.players")):
         player_path = f"{path}.players[{index}]"
@@ -744,21 +761,6 @@ def _parse_board(value: Any, path: str) -> BoardDescriptor | None:
     return BoardDescriptor(
         width=_usize(raw["width"], f"{path}.width"),
         height=_usize(raw["height"], f"{path}.height"),
-        action_count=_usize(raw["action_count"], f"{path}.action_count"),
-        observation=BoardObservationDescriptor(
-            elements=_usize(observation["elements"], f"{observation_path}.elements"),
-            spatial_channels=_usize(
-                observation["spatial_channels"], f"{observation_path}.spatial_channels"
-            ),
-            legal_actions_offset=_usize(
-                observation["legal_actions_offset"],
-                f"{observation_path}.legal_actions_offset",
-                minimum=0,
-            ),
-            player_relative=_boolean(
-                observation["player_relative"], f"{observation_path}.player_relative"
-            ),
-        ),
         players=tuple(players),
         renderer=_enum(
             raw["renderer"],
@@ -768,9 +770,7 @@ def _parse_board(value: Any, path: str) -> BoardDescriptor | None:
     )
 
 
-def _parse_environment(
-    value: Any, path: str, algorithm_ids: set[str]
-) -> EnvironmentDescriptor:
+def _parse_environment(value: Any, path: str, algorithm_ids: set[str]) -> EnvironmentDescriptor:
     raw = _mapping(value, path)
     _keys(raw, {"metadata", "capabilities", "algorithm_profiles"}, path)
     metadata_path = f"{path}.metadata"
@@ -791,9 +791,7 @@ def _parse_environment(
     }
     descriptor = EnvironmentDescriptor(
         env_id=env_id,
-        display_name=_nonblank_string(
-            metadata["display_name"], f"{metadata_path}.display_name"
-        ),
+        display_name=_nonblank_string(metadata["display_name"], f"{metadata_path}.display_name"),
         description=_text(metadata["description"], f"{metadata_path}.description"),
         board=board,
         capabilities=capabilities,
@@ -803,91 +801,7 @@ def _parse_environment(
         raise _error(f"{path}.capabilities.id.env_id", "does not match metadata.id")
     if board is not None:
         board_path = f"{metadata_path}.board"
-        if len(board.players) != 2:
-            raise _error(f"{board_path}.players", "board profile requires two players")
-        board_size = _checked_usize_product(
-            (board.width, board.height), f"{board_path}.width/height"
-        )
-        expected_offset = _checked_usize_product(
-            (board.observation.spatial_channels, board_size),
-            f"{board_path}.observation.spatial_channels",
-        )
-        if board.observation.legal_actions_offset != expected_offset:
-            raise _error(
-                f"{board_path}.observation.legal_actions_offset",
-                f"board profile requires spatial_channels * board size ({expected_offset})",
-            )
-        expected_elements = _checked_usize_sum(
-            (expected_offset, board.action_count, 2),
-            f"{board_path}.observation.elements",
-        )
-        if board.observation.elements != expected_elements:
-            raise _error(
-                f"{board_path}.observation.elements",
-                "board profile requires planes + legal mask + two player "
-                f"indicators ({expected_elements})",
-            )
-        if board.action_count > U32_MAX:
-            raise _error(
-                f"{board_path}.action_count",
-                "board profile action count must fit the canonical u32 encoding",
-            )
-        if capabilities.encoding.action_kind != "discrete_u32_little_endian":
-            raise _error(
-                f"{path}.capabilities.encoding.action",
-                "board profile requires discrete_u32_little_endian",
-            )
-        elements = capabilities.encoding.observation_elements
-        if capabilities.encoding.observation_kind != "f32_little_endian":
-            raise _error(
-                f"{path}.capabilities.encoding.observation",
-                "board profile requires f32_little_endian",
-            )
-        if elements != board.observation.elements:
-            raise _error(
-                f"{path}.capabilities.encoding.observation",
-                "does not match board observation elements",
-            )
-        agents = capabilities.agents
-        if agents.kind != "fixed" or [agent.id for agent in agents.agents] != [1, 2]:
-            raise _error(
-                f"{path}.capabilities.agents",
-                "board profile requires fixed agents [1, 2] in seat order",
-            )
-        if any(
-            agent.action_space.kind != "discrete"
-            or agent.action_space.discrete_size != board.action_count
-            for agent in agents.agents
-        ):
-            raise _error(
-                f"{path}.capabilities.agents",
-                "board profile action spaces must match board action_count",
-            )
-        semantics = capabilities.semantics
-        expected_semantics = (
-            "sequential",
-            "alternating",
-            "perfect_information_markov",
-            "complete_snapshot",
-            "deterministic",
-            "none",
-            "terminal_zero_sum",
-        )
-        actual_semantics = (
-            semantics.turn_kind,
-            semantics.turn_order,
-            semantics.information_model,
-            semantics.planning_state_model,
-            semantics.transition_dynamics,
-            semantics.chance_model,
-            semantics.reward_model,
-        )
-        if actual_semantics != expected_semantics:
-            raise _error(
-                f"{path}.capabilities.semantics",
-                "board profile requires deterministic alternating perfect-information "
-                "complete-snapshot terminal-zero-sum semantics",
-            )
+        _checked_usize_product((board.width, board.height), f"{board_path}.width/height")
     for algorithm_id, report in profiles.items():
         if report.algorithm_id != algorithm_id or report.env_id != env_id:
             raise _error(
@@ -913,9 +827,7 @@ def _index_unique(items: list[T], key: Callable[[T], str], kind: str) -> dict[st
 def _load_catalog(
     document: dict[str, Any],
 ) -> tuple[dict[str, AlgorithmDescriptor], dict[str, EnvironmentDescriptor]]:
-    _keys(
-        document, {"schema_version", "generated_by", "algorithms", "environments"}, "$"
-    )
+    _keys(document, {"schema_version", "generated_by", "algorithms", "environments"}, "$")
     schema_version = _u32(document["schema_version"], "$.schema_version", minimum=0)
     if schema_version != MANIFEST_SCHEMA_VERSION:
         raise RuntimeError(
@@ -936,9 +848,7 @@ def _load_catalog(
     environments = _index_unique(
         [
             _parse_environment(value, f"$.environments[{index}]", set(algorithms))
-            for index, value in enumerate(
-                _list(document["environments"], "$.environments")
-            )
+            for index, value in enumerate(_list(document["environments"], "$.environments"))
         ],
         lambda descriptor: descriptor.env_id,
         "environment",
@@ -954,9 +864,7 @@ def get_environment(env_id: str) -> EnvironmentDescriptor:
         return ENVIRONMENTS[env_id]
     except KeyError as exc:
         available = ", ".join(sorted(ENVIRONMENTS))
-        raise ValueError(
-            f"Unknown environment '{env_id}'. Available: {available}"
-        ) from exc
+        raise ValueError(f"Unknown environment '{env_id}'. Available: {available}") from exc
 
 
 def get_algorithm_descriptor(algorithm_id: str) -> AlgorithmDescriptor:
@@ -964,9 +872,7 @@ def get_algorithm_descriptor(algorithm_id: str) -> AlgorithmDescriptor:
         return ALGORITHMS[algorithm_id]
     except KeyError as exc:
         available = ", ".join(sorted(ALGORITHMS))
-        raise ValueError(
-            f"Unknown algorithm '{algorithm_id}'. Available: {available}"
-        ) from exc
+        raise ValueError(f"Unknown algorithm '{algorithm_id}'. Available: {available}") from exc
 
 
 def list_environments() -> list[str]:

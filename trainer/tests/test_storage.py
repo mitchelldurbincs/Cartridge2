@@ -166,22 +166,15 @@ class TestReplayV3Contract:
         shared_schema = Path(__file__).parents[2] / "sql" / "schema.sql"
         expected = shared_schema.read_text()
         assert _load_schema() == expected
-        assert (
-            Path(__file__).parents[2] / "scripts" / "init-postgres.sql"
-        ).read_text() == expected
+        assert (Path(__file__).parents[2] / "scripts" / "init-postgres.sql").read_text() == expected
 
         configmap = (
-            Path(__file__).parents[2]
-            / "k8s"
-            / "base"
-            / "postgres"
-            / "init-configmap.yaml"
+            Path(__file__).parents[2] / "k8s" / "base" / "postgres" / "init-configmap.yaml"
         ).read_text()
         marker = "  01-schema.sql: |\n"
         yaml_body = configmap.split(marker, maxsplit=1)[1]
         embedded = "\n".join(
-            line[4:] if line.startswith("    ") else line
-            for line in yaml_body.splitlines()
+            line[4:] if line.startswith("    ") else line for line in yaml_body.splitlines()
         )
         assert f"{embedded}\n" == expected
 
@@ -190,9 +183,7 @@ class TestReplayV3Contract:
         _validate_schema_tables(exact)
         with pytest.raises(RuntimeError, match="missing tables: replay_records"):
             _validate_schema_tables({"cartridge_schema_versions"})
-        with pytest.raises(
-            RuntimeError, match="unexpected tables: game_metadata, transitions"
-        ):
+        with pytest.raises(RuntimeError, match="unexpected tables: game_metadata, transitions"):
             _validate_schema_tables(exact | {"transitions", "game_metadata"})
 
     def test_record_schema_accepts_only_exact_columns_and_profile_primary_key(self):
@@ -415,9 +406,7 @@ class TestSelectionScopedSql:
             record.step_number,
             memoryview(record.payload),
         )
-        store, cursor, connection = store_with_recording_cursor(
-            fetchone=(1000,), fetchall=[row]
-        )
+        store, cursor, connection = store_with_recording_cursor(fetchone=(1000,), fetchall=[row])
 
         assert store.sample(3) == [record, record, record]
 
@@ -436,10 +425,7 @@ class TestSelectionScopedSql:
         assert sampled_call[1] == (3.0, *selection_key, 3)
         assert "FROM replay_records" in fallback_call[0]
         assert fallback_call[1] == (*selection_key, 3)
-        assert all(
-            "ARRAY_AGG" not in sql and "MATERIALIZED" not in sql
-            for sql, _ in cursor.calls
-        )
+        assert all("ARRAY_AGG" not in sql and "MATERIALIZED" not in sql for sql, _ in cursor.calls)
         assert connection.checkouts == 1
 
     def test_empty_selection_sample_fails_loudly(self):
@@ -548,9 +534,7 @@ class TestPostgresReplayStore:
 
     def test_multiple_selection_bound_connections(self):
         url = os.environ["CARTRIDGE_STORAGE_POSTGRES_URL"]
-        stores = [
-            create_replay_store(TEST_SELECTION, connection_string=url) for _ in range(3)
-        ]
+        stores = [create_replay_store(TEST_SELECTION, connection_string=url) for _ in range(3)]
         try:
             assert all(isinstance(store.count(), int) for store in stores)
         finally:
@@ -559,8 +543,7 @@ class TestPostgresReplayStore:
 
     def test_store_count_and_sample_round_trip(self, replay_store):
         records = [
-            make_record(record_id=f"round-trip-{index}", step_number=index)
-            for index in range(10)
+            make_record(record_id=f"round-trip-{index}", step_number=index) for index in range(10)
         ]
         replay_store.store_batch(records)
         assert replay_store.count() == 10
@@ -601,10 +584,7 @@ class TestPostgresReplayStore:
             ReplaySelection(profile, f"{index + 1:064x}", None)
             for index, profile in enumerate(profiles)
         ]
-        stores = [
-            create_replay_store(selection, connection_string=url)
-            for selection in selections
-        ]
+        stores = [create_replay_store(selection, connection_string=url) for selection in selections]
         try:
             for store in stores:
                 store.clear()
@@ -632,10 +612,7 @@ class TestPostgresReplayStore:
         try:
             other.clear()
             replay_store.store_batch(
-                [
-                    make_record(record_id=f"primary-{index}", step_number=index)
-                    for index in range(5)
-                ]
+                [make_record(record_id=f"primary-{index}", step_number=index) for index in range(5)]
             )
             other.store_batch(
                 [

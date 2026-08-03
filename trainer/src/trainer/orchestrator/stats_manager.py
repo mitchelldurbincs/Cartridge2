@@ -9,8 +9,8 @@ from datetime import datetime
 from crucible.orchestrator.config import IterationStats
 
 from ..stats import (
-    LoadedStatsSnapshotV2,
-    PreparedStatsSnapshotV2,
+    LoadedStatsSnapshotV3,
+    PreparedStatsSnapshotV3,
     write_stats_projection,
 )
 from ..storage.publisher import validate_sha256_digest
@@ -51,9 +51,7 @@ _UTC_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z")
 def _integer(value: object, *, field: str, positive: bool = False) -> int:
     minimum = 1 if positive else 0
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-        raise ValueError(
-            f"{field} must be a {'positive' if positive else 'nonnegative'} integer"
-        )
+        raise ValueError(f"{field} must be a {'positive' if positive else 'nonnegative'} integer")
     return value
 
 
@@ -105,9 +103,7 @@ def _validate_eval_record(record: dict, index: int) -> None:
     prefix = f"evaluation[{index}]"
     _integer(record["iteration"], field=f"{prefix}.iteration", positive=True)
     _integer(record["step"], field=f"{prefix}.step")
-    _digest(
-        record["candidate_checkpoint_id"], field=f"{prefix}.candidate_checkpoint_id"
-    )
+    _digest(record["candidate_checkpoint_id"], field=f"{prefix}.candidate_checkpoint_id")
     _digest(record["evaluation_id"], field=f"{prefix}.evaluation_id")
     champion_checkpoint = record["vs_champion_checkpoint_id"]
     champion_evaluation = record["vs_champion_evaluation_id"]
@@ -145,15 +141,11 @@ def _validate_eval_record(record: dict, index: int) -> None:
             field=f"{prefix}.vs_champion_average_game_length",
             minimum=0.0,
         )
-        _integer(
-            champion_iteration, field=f"{prefix}.vs_champion_iteration", positive=True
-        )
+        _integer(champion_iteration, field=f"{prefix}.vs_champion_iteration", positive=True)
         if champion_win + champion_draw > 1.0:
             raise ValueError(f"{prefix} champion rates exceed one")
 
-    random_win = _optional_rate(
-        record["vs_random_win_rate"], field=f"{prefix}.vs_random_win_rate"
-    )
+    random_win = _optional_rate(record["vs_random_win_rate"], field=f"{prefix}.vs_random_win_rate")
     random_draw = _optional_rate(
         record["vs_random_draw_rate"], field=f"{prefix}.vs_random_draw_rate"
     )
@@ -168,18 +160,13 @@ def _validate_eval_record(record: dict, index: int) -> None:
     else:
         if any(value is None for value in (random_win, random_draw, random_length)):
             raise ValueError(f"{prefix} has incomplete random results")
-        _number(
-            random_length, field=f"{prefix}.vs_random_average_game_length", minimum=0.0
-        )
+        _number(random_length, field=f"{prefix}.vs_random_average_game_length", minimum=0.0)
         if random_win + random_draw > 1.0:
             raise ValueError(f"{prefix} random rates exceed one")
 
     if not isinstance(record["promoted"], bool):
         raise ValueError(f"{prefix}.promoted must be boolean")
-    if (
-        not isinstance(record["promotion_reason"], str)
-        or not record["promotion_reason"].strip()
-    ):
+    if not isinstance(record["promotion_reason"], str) or not record["promotion_reason"].strip():
         raise ValueError(f"{prefix}.promotion_reason must be nonempty")
     if record["promotion_metric"] not in {"win_rate", "solver_optimal"}:
         raise ValueError(f"{prefix}.promotion_metric is invalid")
@@ -195,9 +182,7 @@ def _validate_eval_record(record: dict, index: int) -> None:
     )
     solver_positions = record["solver_positions"]
     if solver_positions is None:
-        if any(
-            value is not None for value in (solver_rate, solver_exact, solver_blunder)
-        ):
+        if any(value is not None for value in (solver_rate, solver_exact, solver_blunder)):
             raise ValueError(f"{prefix} has incomplete solver results")
     else:
         positions = _integer(solver_positions, field=f"{prefix}.solver_positions")
@@ -208,12 +193,8 @@ def _validate_eval_record(record: dict, index: int) -> None:
         if positions == 0 and (solver_rate != 0.0 or solver_exact != 0.0):
             raise ValueError(f"{prefix} zero-position solver rates must be zero")
         expected_blunder = 1.0 - solver_rate if positions else 0.0
-        if not math.isclose(
-            solver_blunder, expected_blunder, rel_tol=0.0, abs_tol=1e-12
-        ):
-            raise ValueError(
-                f"{prefix} solver blunder rate does not complement optimal rate"
-            )
+        if not math.isclose(solver_blunder, expected_blunder, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(f"{prefix} solver blunder rate does not complement optimal rate")
     _timestamp(record["timestamp"], field=f"{prefix}.timestamp", require_utc=True)
 
 
@@ -222,13 +203,9 @@ def _validate_eval_lineage(records: list[dict]) -> None:
     for index, record in enumerate(records):
         if champion is None:
             if record["vs_champion_checkpoint_id"] is not None:
-                raise ValueError(
-                    f"Evaluation record {index} refers to a champion outside history"
-                )
+                raise ValueError(f"Evaluation record {index} refers to a champion outside history")
             if not record["promoted"]:
-                raise ValueError(
-                    f"Evaluation record {index} must establish the first champion"
-                )
+                raise ValueError(f"Evaluation record {index} must establish the first champion")
         else:
             expected = (
                 champion["candidate_checkpoint_id"],
@@ -261,18 +238,13 @@ def _require_eval_history(value: object) -> list[dict]:
     if len(evaluation_ids) != len(set(evaluation_ids)):
         raise ValueError("Evaluation identifiers must be unique")
     eval_iterations = [record["iteration"] for record in records]
-    if any(
-        current <= previous
-        for previous, current in zip(eval_iterations, eval_iterations[1:])
-    ):
+    if any(current <= previous for previous, current in zip(eval_iterations, eval_iterations[1:])):
         raise ValueError("Evaluation iterations must be strictly increasing")
     _validate_eval_lineage(records)
     return records
 
 
-def _validate_resume_relationship(
-    history: list[IterationStats], eval_history: list[dict]
-) -> None:
+def _validate_resume_relationship(history: list[IterationStats], eval_history: list[dict]) -> None:
     loop_by_iteration = {item.iteration: item for item in history}
     if len(loop_by_iteration) != len(history):
         raise ValueError("Loop iteration identities must be unique")
@@ -280,9 +252,7 @@ def _validate_resume_relationship(
     for index, record in enumerate(eval_history):
         loop_record = loop_by_iteration.get(record["iteration"])
         if loop_record is None:
-            raise ValueError(
-                f"Evaluation record {index} has no completed loop iteration"
-            )
+            raise ValueError(f"Evaluation record {index} has no completed loop iteration")
         expected_rates = (
             record["vs_champion_win_rate"],
             record["vs_champion_draw_rate"],
@@ -292,9 +262,7 @@ def _validate_resume_relationship(
             loop_record.eval_draw_rate,
         )
         if observed_rates != expected_rates:
-            raise ValueError(
-                f"Evaluation record {index} disagrees with its loop iteration"
-            )
+            raise ValueError(f"Evaluation record {index} disagrees with its loop iteration")
 
 
 class StatsManager:
@@ -350,7 +318,7 @@ class StatsManager:
         history: list[IterationStats],
         eval_history: list[dict],
         solver_history: list[dict],
-        stats_snapshot: PreparedStatsSnapshotV2 | LoadedStatsSnapshotV2,
+        stats_snapshot: PreparedStatsSnapshotV3 | LoadedStatsSnapshotV3,
     ) -> None:
         """Rebuild every mutable view from one validated RunCommit chain."""
         records = _require_eval_history(eval_history)

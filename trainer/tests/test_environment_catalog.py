@@ -12,29 +12,32 @@ def manifest():
 
 
 def environment(document, env_id):
-    return next(
-        item for item in document["environments"] if item["metadata"]["id"] == env_id
-    )
+    return next(item for item in document["environments"] if item["metadata"]["id"] == env_id)
 
 
 def test_catalog_exposes_exact_environment_and_artifact_versions():
     environment = catalog.get_environment("connect4")
     algorithm = catalog.get_algorithm_descriptor("alphazero_board_v1")
 
-    assert environment.contract_version == 1
+    assert environment.contract_version == 2
     assert environment.capabilities.encoding.action_kind == "discrete_u32_little_endian"
-    assert environment.capabilities.encoding.observation_kind == "f32_little_endian"
+    assert environment.capabilities.encoding.observation_kind == "tensor"
     board = environment.require_board()
-    assert (
-        environment.capabilities.encoding.observation_elements
-        == board.observation.elements
-    )
+    tensor = environment.capabilities.encoding.observation_tensor
+    assert tensor is not None
+    assert tensor.dtype == "f32_little_endian"
+    assert tensor.fixed_elements == 84
+    assert board.size == 42
     assert environment.capabilities.semantics.turn_kind == "sequential"
     assert environment.capabilities.semantics.turn_order == "alternating"
     assert environment.capabilities.semantics.reward_model == "terminal_zero_sum"
     assert environment.capabilities.semantics.chance_model == "none"
     assert environment.capabilities.agents.kind == "fixed"
     assert [agent.id for agent in environment.capabilities.agents.agents] == [1, 2]
+    assert all(
+        agent.action_availability_kind == "discrete_mask"
+        for agent in environment.capabilities.agents.agents
+    )
     assert algorithm.model_artifact_schema_version == 1
     assert algorithm.components.serving == "alphazero_mcts_web_v1"
 
@@ -51,9 +54,7 @@ def test_catalog_carries_a_non_board_environment_without_alpha_zero_projection()
 def test_catalog_rejects_continuous_bounds_that_do_not_match_shape():
     document = manifest()
     counter = environment(document, "counter")
-    counter["capabilities"]["encoding"]["action"] = {
-        "kind": "continuous_f32_little_endian"
-    }
+    counter["capabilities"]["encoding"]["action"] = {"kind": "continuous_f32_little_endian"}
     counter["capabilities"]["agents"]["agents"][0]["action_space"] = {
         "kind": "continuous",
         "low": [-1.0, -1.0],
@@ -72,12 +73,12 @@ def test_catalog_rejects_continuous_bounds_that_do_not_match_shape():
         lambda document: environment(document, "counter")["capabilities"].update(
             contract_version=catalog.U32_MAX + 1
         ),
-        lambda document: environment(document, "counter")["capabilities"]["agents"][
-            "agents"
-        ][0].update(id=catalog.U32_MAX + 1),
-        lambda document: environment(document, "counter")["capabilities"]["agents"][
-            "agents"
-        ][0]["action_space"].update(size=catalog.U32_MAX + 1),
+        lambda document: environment(document, "counter")["capabilities"]["agents"]["agents"][
+            0
+        ].update(id=catalog.U32_MAX + 1),
+        lambda document: environment(document, "counter")["capabilities"]["agents"]["agents"][0][
+            "action_space"
+        ].update(size=catalog.U32_MAX + 1),
     ],
 )
 def test_catalog_rejects_values_outside_rust_u32_fields(mutate):
@@ -90,9 +91,7 @@ def test_catalog_rejects_values_outside_rust_u32_fields(mutate):
 
 def test_catalog_rejects_values_outside_rust_usize_fields():
     document = manifest()
-    environment(document, "connect4")["metadata"]["board"]["width"] = (
-        catalog.USIZE_MAX + 1
-    )
+    environment(document, "connect4")["metadata"]["board"]["width"] = catalog.USIZE_MAX + 1
 
     with pytest.raises(RuntimeError, match="usize integer"):
         catalog._load_catalog(document)
@@ -111,9 +110,7 @@ def test_catalog_rejects_board_layout_arithmetic_that_overflows_usize():
 def test_catalog_rejects_continuous_shape_product_that_overflows_usize():
     document = manifest()
     counter = environment(document, "counter")
-    counter["capabilities"]["encoding"]["action"] = {
-        "kind": "continuous_f32_little_endian"
-    }
+    counter["capabilities"]["encoding"]["action"] = {"kind": "continuous_f32_little_endian"}
     counter["capabilities"]["agents"]["agents"][0]["action_space"] = {
         "kind": "continuous",
         "low": [-1.0],
@@ -129,9 +126,7 @@ def test_catalog_rejects_continuous_shape_product_that_overflows_usize():
 def test_catalog_rejects_continuous_bounds_outside_finite_f32(invalid_bound):
     document = manifest()
     counter = environment(document, "counter")
-    counter["capabilities"]["encoding"]["action"] = {
-        "kind": "continuous_f32_little_endian"
-    }
+    counter["capabilities"]["encoding"]["action"] = {"kind": "continuous_f32_little_endian"}
     counter["capabilities"]["agents"]["agents"][0]["action_space"] = {
         "kind": "continuous",
         "low": [0.0],
@@ -169,9 +164,9 @@ def test_catalog_rejects_unknown_semantic_enums(field, value):
 
 def test_catalog_rejects_inconsistent_chance_and_dynamics():
     document = manifest()
-    environment(document, "counter")["capabilities"]["semantics"][
-        "chance_model"
-    ] = "environment_sampled"
+    environment(document, "counter")["capabilities"]["semantics"]["chance_model"] = (
+        "environment_sampled"
+    )
 
     with pytest.raises(RuntimeError, match="inconsistent stochasticity"):
         catalog._load_catalog(document)
@@ -223,9 +218,7 @@ def test_catalog_requires_custom_actions_for_explicit_chance():
 
 def test_catalog_rejects_string_boolean_instead_of_coercing_it():
     document = manifest()
-    document["environments"][0]["algorithm_profiles"]["alphazero_board_v1"][
-        "compatible"
-    ] = "false"
+    document["environments"][0]["algorithm_profiles"]["alphazero_board_v1"]["compatible"] = "false"
 
     with pytest.raises(RuntimeError, match="expected a boolean"):
         catalog._load_catalog(document)
@@ -239,13 +232,12 @@ def test_catalog_rejects_missing_contract_fields():
         catalog._load_catalog(document)
 
 
-def test_catalog_rejects_observation_contract_drift():
+def test_catalog_rejects_zero_sized_tensor_dimension():
     document = manifest()
-    document["environments"][0]["capabilities"]["encoding"]["observation"][
-        "elements"
-    ] += 1
+    observation = document["environments"][0]["capabilities"]["encoding"]["observation"]
+    observation["spec"]["dimensions"][0]["size"] = 0
 
-    with pytest.raises(RuntimeError, match="does not match board observation elements"):
+    with pytest.raises(RuntimeError, match="u32 integer between 1"):
         catalog._load_catalog(document)
 
 
@@ -264,22 +256,22 @@ def test_catalog_rejects_single_agent_semantics_with_multiple_fixed_agents():
     ("mutate", "message"),
     [
         (
-            lambda item: item["metadata"]["board"]["observation"].update(
-                legal_actions_offset=1
-            ),
-            "spatial_channels \\* board size",
+            lambda item: item["capabilities"]["agents"]["agents"][0].pop("action_availability"),
+            "action_availability",
         ),
         (
-            lambda item: item["capabilities"]["agents"]["agents"][0][
-                "action_space"
-            ].update(size=1),
-            "action spaces must match",
+            lambda item: item["capabilities"]["agents"]["agents"][0].update(
+                action_availability={"kind": "sometimes"}
+            ),
+            "unsupported action availability",
         ),
         (
-            lambda item: item["capabilities"]["semantics"].update(
-                reward_model="general"
+            lambda item: item["capabilities"]["encoding"]["observation"]["spec"][
+                "dimensions"
+            ].append(
+                dict(item["capabilities"]["encoding"]["observation"]["spec"]["dimensions"][0])
             ),
-            "board profile requires deterministic alternating",
+            "unique named dimensions",
         ),
     ],
 )

@@ -61,9 +61,7 @@ class BucketStats:
     @property
     def blunder_rate(self) -> float:
         blunders = (
-            self.blunders_win_to_draw
-            + self.blunders_win_to_loss
-            + self.blunders_draw_to_loss
+            self.blunders_win_to_draw + self.blunders_win_to_loss + self.blunders_draw_to_loss
         )
         return self._rate(blunders)
 
@@ -120,15 +118,11 @@ class SolverEvalResults:
 
     def __post_init__(self) -> None:
         if (self.checkpoint_id is None) != (self.step is None):
-            raise ValueError(
-                "checkpoint_id and step must either both be present or both be null"
-            )
+            raise ValueError("checkpoint_id and step must either both be present or both be null")
         if self.checkpoint_id is not None:
             validate_sha256_digest(self.checkpoint_id, field="checkpoint_id")
         if self.step is not None and (
-            isinstance(self.step, bool)
-            or not isinstance(self.step, int)
-            or self.step < 0
+            isinstance(self.step, bool) or not isinstance(self.step, int) or self.step < 0
         ):
             raise ValueError("step must be a non-negative integer or null")
         if (

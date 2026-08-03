@@ -6,14 +6,14 @@
 //! as an executable canary for generic catalog and runtime paths.
 
 use engine_core::{
-    register_environment, ActionSpace, AgentId, AgentModel, AgentObservation, AgentOutcome,
-    Capabilities, Decision, DecodeError, EncodeError, Encoding, EngineId, Environment,
-    EnvironmentError, EnvironmentMetadata, EnvironmentSemantics, EpisodeStatus, Timestep,
-    TransitionSource,
+    register_environment, ActionAvailability, ActionSpace, AgentId, AgentModel, AgentObservation,
+    AgentOutcome, Capabilities, Decision, DecodeError, EncodeError, Encoding, EngineId,
+    Environment, EnvironmentError, EnvironmentMetadata, EnvironmentSemantics, EpisodeStatus,
+    TensorSpec, Timestep, TransitionSource,
 };
 use rand_chacha::ChaCha20Rng;
 
-pub const ENV_CONTRACT_VERSION: u32 = 1;
+pub const ENV_CONTRACT_VERSION: u32 = 2;
 pub const AGENT: AgentId = AgentId(0);
 pub const TARGET: i32 = 3;
 pub const MAX_STEPS: u32 = 8;
@@ -60,9 +60,7 @@ impl CounterEnvironment {
             decision: if episode.is_done() {
                 Decision::None
             } else {
-                Decision::Agents {
-                    agent_ids: vec![AGENT],
-                }
+                Decision::single(AGENT, ActionAvailability::All)
             },
             episode,
             source,
@@ -87,7 +85,10 @@ impl Environment for CounterEnvironment {
         Capabilities {
             id: self.engine_id(),
             contract_version: ENV_CONTRACT_VERSION,
-            encoding: Encoding::discrete_u32_le_f32_le("counter-state:v1", 2),
+            encoding: Encoding::discrete_u32_le(
+                "counter-state:v1",
+                TensorSpec::f32_fixed([("feature", 2)]),
+            ),
             semantics: EnvironmentSemantics::deterministic_single_agent_general_reward(),
             max_horizon: Some(MAX_STEPS),
             agents: AgentModel::fixed_homogeneous([AGENT], ActionSpace::discrete(2)),

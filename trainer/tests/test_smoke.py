@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from trainer.algorithms.alphazero_board_v1 import ALGORITHM_ID, DESCRIPTOR
-from trainer.config import AlphaZeroLearnerConfig
+from trainer.algorithms.alphazero_config import AlphaZeroLearnerConfig
 from trainer.network import AlphaZeroLoss, PolicyValueNetwork, create_network
 from trainer.storage import ReplayProfile, ReplaySelection
 from trainer.trainer import AlphaZeroLearner
@@ -24,7 +24,7 @@ from trainer.trainer import AlphaZeroLearner
 def alphazero_profile(env_id: str = "tictactoe") -> ReplayProfile:
     return ReplayProfile(
         env_id=env_id,
-        env_contract_version=1,
+        env_contract_version=2,
         algorithm_id=ALGORITHM_ID,
         experience_schema=DESCRIPTOR.components.experience_schema,
     )
@@ -39,12 +39,12 @@ class TestNetwork:
 
     def test_network_creation(self):
         net = create_network("tictactoe")
-        assert net.obs_size == 29
+        assert net.obs_size == 18
         assert net.action_size == 9
 
     def test_network_forward(self):
         net = create_network("tictactoe")
-        batch = torch.randn(8, 29)
+        batch = torch.randn(8, 18)
 
         policy_logits, value = net(batch)
 
@@ -55,7 +55,7 @@ class TestNetwork:
 
     def test_network_predict_with_mask(self):
         net = create_network("tictactoe")
-        batch = torch.randn(4, 29)
+        batch = torch.randn(4, 18)
         # Mask out positions 0, 1, 2 as illegal
         legal_mask = torch.ones(4, 9)
         legal_mask[:, :3] = 0
@@ -90,9 +90,7 @@ class TestAlphaZeroLoss:
         value_targets = torch.rand(batch_size) * 2 - 1  # [-1, 1]
         legal_mask = torch.ones(batch_size, num_actions)
 
-        total, metrics = loss_fn(
-            policy_logits, values, policy_targets, value_targets, legal_mask
-        )
+        total, metrics = loss_fn(policy_logits, values, policy_targets, value_targets, legal_mask)
 
         assert total.shape == ()
         assert total > 0
@@ -114,9 +112,7 @@ class TestAlphaZeroLoss:
         legal_mask = torch.ones(batch_size, num_actions)
         legal_mask[:, :3] = 0
 
-        total, metrics = loss_fn(
-            policy_logits, values, policy_targets, value_targets, legal_mask
-        )
+        total, metrics = loss_fn(policy_logits, values, policy_targets, value_targets, legal_mask)
 
         # Loss should still compute
         assert total > 0
@@ -203,9 +199,7 @@ class TestStorageFactory:
         from trainer.storage import create_replay_store
 
         with patch.dict(os.environ, {}, clear=True):
-            with pytest.raises(
-                ValueError, match="PostgreSQL connection string required"
-            ):
+            with pytest.raises(ValueError, match="PostgreSQL connection string required"):
                 create_replay_store(alphazero_selection())
 
     @pytest.mark.skipif(

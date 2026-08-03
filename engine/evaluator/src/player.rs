@@ -2,8 +2,9 @@
 
 use algorithm_core::{BuiltinAlgorithm, ModelArtifactContract};
 use anyhow::{anyhow, Result};
-use engine_core::board_profile::{BoardGameMetadata, LegalMask};
-use engine_core::{Decision, EngineContext, EpisodeStatus, ErasedTimestep};
+use dqn_runtime::{available_actions, DqnQPolicy};
+use engine_core::board_profile::LegalMask;
+use engine_core::{ActionAvailability, ActionSpace, EngineContext, EpisodeStatus, ErasedTimestep};
 use mcts::{run_mcts, Evaluator, MctsConfig, OnnxEvaluator};
 use rand::Rng;
 use rand_chacha::ChaCha20Rng;
@@ -46,11 +47,7 @@ pub(crate) struct AlphaZeroPosition<'a> {
 }
 
 impl<'a> AlphaZeroPosition<'a> {
-    pub fn new(
-        state: &'a [u8],
-        timestep: &'a ErasedTimestep,
-        board: &BoardGameMetadata,
-    ) -> Result<Self> {
+    pub fn new(state: &'a [u8], timestep: &'a ErasedTimestep, action_count: usize) -> Result<Self> {
         if timestep.episode != EpisodeStatus::Running {
             return Err(anyhow!(
                 "AlphaZero can only select an action from a running timestep, got {:?}",
@@ -58,14 +55,13 @@ impl<'a> AlphaZeroPosition<'a> {
             ));
         }
 
-        let agent_id = match &timestep.decision {
-            Decision::Agents { agent_ids } if agent_ids.len() == 1 => agent_ids[0],
-            decision => {
-                return Err(anyhow!(
-                    "AlphaZero requires exactly one active decision agent, got {decision:?}"
-                ))
-            }
-        };
+        let decision = timestep.decision.sole_agent().ok_or_else(|| {
+            anyhow!(
+                "AlphaZero requires exactly one active decision agent, got {:?}",
+                timestep.decision
+            )
+        })?;
+        let agent_id = decision.agent_id;
         let encoded = timestep.sole_observation()?;
         if encoded.agent_id != agent_id {
             return Err(anyhow!(
@@ -75,12 +71,18 @@ impl<'a> AlphaZeroPosition<'a> {
             ));
         }
 
-        let legal_mask = board.legal_mask_from_obs(&encoded.data)?;
-        if legal_mask.num_actions() != board.action_count {
+        let ActionAvailability::DiscreteMask { mask } = &decision.availability else {
             return Err(anyhow!(
-                "AlphaZero legal mask has {} actions, board profile declares {}",
+                "AlphaZero requires a discrete legal mask for agent {}",
+                agent_id.0
+            ));
+        };
+        let legal_mask = mask.clone();
+        if legal_mask.num_actions() != action_count {
+            return Err(anyhow!(
+                "AlphaZero legal mask has {} actions, action space declares {}",
                 legal_mask.num_actions(),
-                board.action_count
+                action_count
             ));
         }
         if legal_mask.count_ones() == 0 {
@@ -96,7 +98,7 @@ impl<'a> AlphaZeroPosition<'a> {
             agent_id,
             observation: &encoded.data,
             legal_mask,
-            action_count: board.action_count,
+            action_count,
         })
     }
 }
@@ -105,6 +107,144 @@ impl<'a> AlphaZeroPosition<'a> {
 pub enum Player {
     Random,
     Model(Box<ModelPlayer>),
+}
+
+pub struct DqnModelPlayer {
+    policy: DqnQPolicy,
+    model_contract: ModelArtifactContract,
+    label: String,
+}
+
+/// A policy accepted by the single-agent DQN return evaluation suite.
+pub enum DqnPlayer {
+    Random,
+    Model(Box<DqnModelPlayer>),
+}
+
+impl DqnPlayer {
+    pub fn model(
+        model_contract: &ModelArtifactContract,
+        model_path: &str,
+        intra_threads: usize,
+    ) -> Result<Self> {
+        validate_onnx_intra_threads(intra_threads)?;
+        let descriptor = BuiltinAlgorithm::DqnV1.descriptor();
+        if model_contract.schema_version != descriptor.model_artifact_schema_version
+            || model_contract.algorithm_id != descriptor.id
+            || model_contract.model_contract != descriptor.components.model_contract
+        {
+            return Err(anyhow!(
+                "Model identity is not the '{}' DQN artifact contract",
+                descriptor.id
+            ));
+        }
+        let env_id = &model_contract.env_id;
+        let ctx = EngineContext::new(env_id)
+            .map_err(|error| anyhow!("Environment '{env_id}' is unavailable: {error}"))?;
+        let capabilities = ctx.capabilities();
+        if capabilities.contract_version != model_contract.env_contract_version {
+            return Err(anyhow!(
+                "Model targets environment '{}' contract v{}, but the registered environment is v{}",
+                env_id,
+                model_contract.env_contract_version,
+                capabilities.contract_version
+            ));
+        }
+        let obs_size = match &capabilities.encoding.observation {
+            engine_core::ObservationEncoding::Tensor { spec } => spec
+                .fixed_elements()
+                .ok_or_else(|| anyhow!("DQN requires a fixed observation tensor"))?,
+            other => return Err(anyhow!("DQN requires a tensor observation, got {other:?}")),
+        };
+        let agents = capabilities
+            .agents
+            .fixed_agents()
+            .ok_or_else(|| anyhow!("DQN requires one fixed agent"))?;
+        let [agent] = agents else {
+            return Err(anyhow!(
+                "DQN requires one fixed agent, got {}",
+                agents.len()
+            ));
+        };
+        let action_count = match agent.action_space {
+            ActionSpace::Discrete { size } => usize::try_from(size)?,
+            ref other => return Err(anyhow!("DQN requires discrete actions, got {other:?}")),
+        };
+        let policy = DqnQPolicy::load(
+            Path::new(model_path),
+            obs_size,
+            action_count,
+            intra_threads,
+            model_contract,
+        )?;
+        Ok(Self::Model(Box::new(DqnModelPlayer {
+            policy,
+            model_contract: model_contract.clone(),
+            label: format!(
+                "ONNX({})",
+                Path::new(model_path)
+                    .file_name()
+                    .unwrap_or_else(|| model_path.as_ref())
+                    .to_string_lossy()
+            ),
+        })))
+    }
+
+    pub fn name(&self) -> String {
+        match self {
+            Self::Random => "Random".to_string(),
+            Self::Model(model) => model.label.clone(),
+        }
+    }
+
+    pub(crate) fn require_environment_profile(
+        &self,
+        env_id: &str,
+        env_contract_version: u32,
+    ) -> Result<()> {
+        let Self::Model(model) = self else {
+            return Ok(());
+        };
+        if model.model_contract.env_id != env_id
+            || model.model_contract.env_contract_version != env_contract_version
+        {
+            return Err(anyhow!(
+                "Player '{}' targets environment '{}' contract v{}, not '{}' contract v{}",
+                model.label,
+                model.model_contract.env_id,
+                model.model_contract.env_contract_version,
+                env_id,
+                env_contract_version
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn select_action(
+        &mut self,
+        timestep: &ErasedTimestep,
+        action_count: usize,
+        rng: &mut ChaCha20Rng,
+    ) -> Result<u32> {
+        if timestep.episode != EpisodeStatus::Running {
+            return Err(anyhow!("DQN can only act on a running timestep"));
+        }
+        let decision = timestep
+            .decision
+            .sole_agent()
+            .ok_or_else(|| anyhow!("DQN requires exactly one active agent"))?;
+        let observation = timestep.sole_observation()?;
+        if observation.agent_id != decision.agent_id {
+            return Err(anyhow!("DQN decision and observation agents disagree"));
+        }
+        let actions = available_actions(&decision.availability, action_count)?;
+        match self {
+            Self::Random => Ok(actions[rng.gen_range(0..actions.len())]),
+            Self::Model(model) => model
+                .policy
+                .select_greedy(&observation.data, &decision.availability),
+        }
+    }
 }
 
 impl Player {
@@ -141,12 +281,28 @@ impl Player {
                 capabilities.contract_version
             ));
         }
-        let metadata = ctx.metadata();
-        let board = metadata.require_board()?;
+        let obs_size = match &capabilities.encoding.observation {
+            engine_core::ObservationEncoding::Tensor { spec } => spec
+                .fixed_elements()
+                .ok_or_else(|| anyhow!("AlphaZero requires a fixed observation tensor"))?,
+            other => {
+                return Err(anyhow!(
+                    "AlphaZero requires a tensor observation, got {other:?}"
+                ))
+            }
+        };
+        let action_count = match ctx.action_space(engine_core::AgentId(1)) {
+            Some(ActionSpace::Discrete { size }) => size as usize,
+            other => {
+                return Err(anyhow!(
+                    "AlphaZero requires discrete actions, got {other:?}"
+                ))
+            }
+        };
         let evaluator = OnnxEvaluator::load_from_file(
             model_path,
-            board.observation.elements,
-            board.action_count,
+            obs_size,
+            action_count,
             intra_threads,
             model_contract,
         )

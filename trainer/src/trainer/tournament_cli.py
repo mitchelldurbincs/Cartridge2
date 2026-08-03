@@ -43,9 +43,7 @@ def _u64_argument(value: str) -> int:
 
 
 def add_register_players_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--env-id", type=str, default="connect4", help="Game the players play"
-    )
+    parser.add_argument("--env-id", type=str, default="connect4", help="Game the players play")
     parser.add_argument(
         "--models-dir",
         type=str,
@@ -191,7 +189,5 @@ def run_tournament_command(args: argparse.Namespace) -> int:
 
     print(results.table())
     print(f"\nRatings are Elo above `{results.anchor}`.")
-    print(
-        f"{len(results.matches)} pairings in {results.wall_time_seconds:.1f}s -> {output_path}"
-    )
+    print(f"{len(results.matches)} pairings in {results.wall_time_seconds:.1f}s -> {output_path}")
     return 0

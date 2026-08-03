@@ -36,9 +36,9 @@ use engine_core::board_profile::{
 };
 use engine_core::typed::{
     ActionSpace, AgentId, AgentModel, Capabilities, DecodeError, EncodeError, Encoding, EngineId,
-    EnvironmentSemantics,
+    EnvironmentSemantics, TensorSpec,
 };
-use engine_core::{EnvironmentError, EnvironmentMetadata};
+use engine_core::{EnvironmentError, EnvironmentMetadata, LegalMask};
 use rand_chacha::ChaCha20Rng;
 
 pub mod action;
@@ -52,12 +52,12 @@ pub mod rules;
 use action::{decode_move, valid_move_target, Move};
 use board::{Tile, TileKind};
 use movement::{apply_move, transfer_tiles};
-use obs::{GeneralsObs, LEGAL_MASK_OFFSET, OBS_SIZE};
+use obs::GeneralsObs;
 use params::{BOARD_SIZE, MAX_TURNS, NUM_ACTIONS};
 use rules::{adjudicate_at_cap, apply_production, check_winner};
 
 /// Immutable environment contract revision for wire formats and semantics.
-pub const ENV_CONTRACT_VERSION: u32 = 2;
+pub const ENV_CONTRACT_VERSION: u32 = 3;
 
 /// Sentinel for an eliminated player's general index.
 const NO_GENERAL: u8 = u8::MAX;
@@ -126,12 +126,19 @@ impl BoardGame for Generals {
         Capabilities {
             id: self.engine_id(),
             contract_version: ENV_CONTRACT_VERSION,
-            encoding: Encoding::discrete_u32_le_f32_le("generals_state:v1", OBS_SIZE),
+            encoding: Encoding::discrete_u32_le(
+                "generals_state:v1",
+                TensorSpec::f32_fixed([
+                    ("channel", obs::NUM_CHANNELS as u32),
+                    ("row", params::HEIGHT as u32),
+                    ("column", params::WIDTH as u32),
+                ]),
+            ),
             semantics:
                 EnvironmentSemantics::deterministic_alternating_perfect_information_terminal_zero_sum(),
             // The sampled cap is either this exact bound or one ply earlier.
             max_horizon: Some(MAX_TURNS * 2),
-            agents: AgentModel::fixed_homogeneous(
+            agents: AgentModel::fixed_homogeneous_masked(
                 [AgentId(1), AgentId(2)],
                 ActionSpace::discrete(NUM_ACTIONS as u32),
             ),
@@ -146,9 +153,7 @@ impl BoardGame for Generals {
                  move armies, take cities, and grow your territory.",
             )
             .with_board(
-                BoardGameMetadata::new(params::WIDTH, params::HEIGHT, NUM_ACTIONS)
-                    // Planes are own/enemy relative to the actor.
-                    .with_observation(OBS_SIZE, obs::NUM_CHANNELS, LEGAL_MASK_OFFSET, true)
+                BoardGameMetadata::new(params::WIDTH, params::HEIGHT)
                     .with_players(vec![
                         BoardPlayerMetadata::new("Red", "R"),
                         BoardPlayerMetadata::new("Blue", "B"),
@@ -352,6 +357,19 @@ impl BoardGame for Generals {
     fn encode_observation(obs: &Self::Observation, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         obs.encode(out);
         Ok(())
+    }
+
+    fn legal_actions(state: &Self::State) -> Result<LegalMask, EnvironmentError> {
+        let mut mask = LegalMask::new(NUM_ACTIONS);
+        if state.is_done() || !state.alive[state.current_player as usize - 1] {
+            return Ok(mask);
+        }
+        for action in 0..NUM_ACTIONS as u32 {
+            if rules::is_action_legal(&state.tiles, state.current_player, action) {
+                mask.set(action as usize);
+            }
+        }
+        Ok(mask)
     }
 
     fn view(state: &Self::State) -> BoardView {

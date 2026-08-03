@@ -98,9 +98,7 @@ _SOLVER_FIELDS = frozenset(
         "solver_version",
     }
 )
-_RESULTS_FIELDS = frozenset(
-    {"vs_champion", "vs_random", "candidate_solver", "champion_solver"}
-)
+_RESULTS_FIELDS = frozenset({"vs_champion", "vs_random", "candidate_solver", "champion_solver"})
 _DECISION_FIELDS = frozenset({"promoted", "reason"})
 _ARTIFACT_FIELDS = frozenset(
     {
@@ -121,11 +119,7 @@ _ARTIFACT_FIELDS = frozenset(
 
 def utc_timestamp() -> str:
     """Return the strict UTC timestamp representation stored in artifacts."""
-    return (
-        datetime.now(timezone.utc)
-        .isoformat(timespec="microseconds")
-        .replace("+00:00", "Z")
-    )
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def _exact(value: object, fields: frozenset[str], *, context: str) -> Mapping[str, Any]:
@@ -148,12 +142,7 @@ def _integer(
     maximum: int = _MAX_U64,
 ) -> int:
     minimum = 1 if positive else 0
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or value < minimum
-        or value > maximum
-    ):
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum or value > maximum:
         qualifier = "positive" if positive else "nonnegative"
         raise ArtifactValidationError(f"{field} must be a {qualifier} integer")
     return value
@@ -193,9 +182,7 @@ def _string(value: object, *, field: str) -> str:
 
 def _timestamp(value: object, *, field: str) -> str:
     if not isinstance(value, str) or _TIMESTAMP_PATTERN.fullmatch(value) is None:
-        raise ArtifactValidationError(
-            f"{field} must be a UTC timestamp with six fractional digits"
-        )
+        raise ArtifactValidationError(f"{field} must be a UTC timestamp with six fractional digits")
     try:
         datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
@@ -349,9 +336,7 @@ class EvaluationRecipeV1:
             + self.requested_games.candidate_solver
             == 0
         ):
-            raise ArtifactValidationError(
-                "An evaluation recipe must request candidate evidence"
-            )
+            raise ArtifactValidationError("An evaluation recipe must request candidate evidence")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -368,13 +353,9 @@ class EvaluationRecipeV1:
     @classmethod
     def from_dict(cls, value: object) -> "EvaluationRecipeV1":
         data = _exact(value, _RECIPE_FIELDS, context="evaluation recipe")
-        schedule = _exact(
-            data["seat_schedule"], frozenset(_SEAT_SCHEDULE), context="seat schedule"
-        )
+        schedule = _exact(data["seat_schedule"], frozenset(_SEAT_SCHEDULE), context="seat schedule")
         if dict(schedule) != _SEAT_SCHEDULE:
-            raise ArtifactValidationError(
-                "seat schedule must be deterministic alternating_v1"
-            )
+            raise ArtifactValidationError("seat schedule must be deterministic alternating_v1")
         metric = _string(data["promotion_metric"], field="recipe.promotion_metric")
         return cls(
             simulations=_integer(
@@ -436,14 +417,10 @@ class HeadToHeadResultV1:
             raise ArtifactValidationError(
                 "Head-to-head wins, losses, and draws must partition games_played"
             )
-        if (
-            self.candidate_wins_as_first + self.candidate_wins_as_second
-            != self.candidate_wins
-        ):
+        if self.candidate_wins_as_first + self.candidate_wins_as_second != self.candidate_wins:
             raise ArtifactValidationError("Candidate seat wins do not sum to wins")
         if (
-            self.opponent_wins_while_candidate_first
-            + self.opponent_wins_while_candidate_second
+            self.opponent_wins_while_candidate_first + self.opponent_wins_while_candidate_second
             != self.opponent_wins
         ):
             raise ArtifactValidationError("Opponent seat wins do not sum to wins")
@@ -535,21 +512,13 @@ class SolverBucketV1:
         for field in _BUCKET_FIELDS:
             value = _integer(getattr(self, field), field=f"solver_bucket.{field}")
             if field != "positions" and value > self.positions:
-                raise ArtifactValidationError(
-                    f"solver_bucket.{field} cannot exceed positions"
-                )
+                raise ArtifactValidationError(f"solver_bucket.{field} cannot exceed positions")
         if self.exact_best > self.value_optimal:
-            raise ArtifactValidationError(
-                "solver_bucket.exact_best cannot exceed value_optimal"
-            )
+            raise ArtifactValidationError("solver_bucket.exact_best cannot exceed value_optimal")
         if self.forced > self.exact_best:
-            raise ArtifactValidationError(
-                "solver_bucket.forced cannot exceed exact_best"
-            )
+            raise ArtifactValidationError("solver_bucket.forced cannot exceed exact_best")
         blunders = (
-            self.blunders_win_to_draw
-            + self.blunders_win_to_loss
-            + self.blunders_draw_to_loss
+            self.blunders_win_to_draw + self.blunders_win_to_loss + self.blunders_draw_to_loss
         )
         if blunders != self.positions - self.value_optimal:
             raise ArtifactValidationError(
@@ -597,18 +566,14 @@ class SolverResultV1:
     def __post_init__(self) -> None:
         if not isinstance(self.overall, SolverBucketV1):
             raise ArtifactValidationError("solver.overall must be a solver bucket")
-        if not isinstance(self.by_ply, Mapping) or not isinstance(
-            self.by_seat, Mapping
-        ):
+        if not isinstance(self.by_ply, Mapping) or not isinstance(self.by_seat, Mapping):
             raise ArtifactValidationError("solver slice collections must be mappings")
         by_ply = dict(self.by_ply)
         by_seat = dict(self.by_seat)
         if not all(isinstance(bucket, SolverBucketV1) for bucket in by_ply.values()):
             raise ArtifactValidationError("solver.by_ply values must be solver buckets")
         if not all(isinstance(bucket, SolverBucketV1) for bucket in by_seat.values()):
-            raise ArtifactValidationError(
-                "solver.by_seat values must be solver buckets"
-            )
+            raise ArtifactValidationError("solver.by_seat values must be solver buckets")
         object.__setattr__(self, "by_ply", MappingProxyType(by_ply))
         object.__setattr__(self, "by_seat", MappingProxyType(by_seat))
         for field in (
@@ -665,18 +630,10 @@ class SolverResultV1:
             raise ArtifactValidationError("solver.by_seat fields must be exact")
         for field in _BUCKET_FIELDS:
             overall_value = getattr(self.overall, field)
-            if sum(getattr(bucket, field) for bucket in self.by_ply.values()) != (
-                overall_value
-            ):
-                raise ArtifactValidationError(
-                    f"solver.by_ply does not partition overall.{field}"
-                )
-            if sum(getattr(bucket, field) for bucket in self.by_seat.values()) != (
-                overall_value
-            ):
-                raise ArtifactValidationError(
-                    f"solver.by_seat does not partition overall.{field}"
-                )
+            if sum(getattr(bucket, field) for bucket in self.by_ply.values()) != (overall_value):
+                raise ArtifactValidationError(f"solver.by_ply does not partition overall.{field}")
+            if sum(getattr(bucket, field) for bucket in self.by_seat.values()) != (overall_value):
+                raise ArtifactValidationError(f"solver.by_seat does not partition overall.{field}")
         _string(self.solver_version, field="solver.solver_version")
 
     def to_dict(self) -> dict[str, object]:
@@ -688,12 +645,9 @@ class SolverResultV1:
             "average_game_length": self.average_game_length,
             "overall": self.overall.to_dict(),
             "by_ply": {
-                name: self.by_ply[name].to_dict()
-                for name in ("ply_1_8", "ply_9_20", "ply_21_plus")
+                name: self.by_ply[name].to_dict() for name in ("ply_1_8", "ply_9_20", "ply_21_plus")
             },
-            "by_seat": {
-                name: self.by_seat[name].to_dict() for name in ("first", "second")
-            },
+            "by_seat": {name: self.by_seat[name].to_dict() for name in ("first", "second")},
             "solver_queries": self.solver_queries,
             "solver_cache_hits": self.solver_cache_hits,
             "solver_time_seconds": self.solver_time_seconds,
@@ -717,9 +671,7 @@ class SolverResultV1:
         version = _string(data["solver_version"], field="solver.solver_version")
         return cls(
             games_played=_integer(data["games_played"], field="solver.games_played"),
-            candidate_wins=_integer(
-                data["candidate_wins"], field="solver.candidate_wins"
-            ),
+            candidate_wins=_integer(data["candidate_wins"], field="solver.candidate_wins"),
             opponent_wins=_integer(data["opponent_wins"], field="solver.opponent_wins"),
             draws=_integer(data["draws"], field="solver.draws"),
             average_game_length=_finite(
@@ -728,20 +680,10 @@ class SolverResultV1:
                 minimum=0.0,
             ),
             overall=SolverBucketV1.from_dict(data["overall"]),
-            by_ply={
-                name: SolverBucketV1.from_dict(by_ply_data[name])
-                for name in by_ply_data
-            },
-            by_seat={
-                name: SolverBucketV1.from_dict(by_seat_data[name])
-                for name in by_seat_data
-            },
-            solver_queries=_integer(
-                data["solver_queries"], field="solver.solver_queries"
-            ),
-            solver_cache_hits=_integer(
-                data["solver_cache_hits"], field="solver.solver_cache_hits"
-            ),
+            by_ply={name: SolverBucketV1.from_dict(by_ply_data[name]) for name in by_ply_data},
+            by_seat={name: SolverBucketV1.from_dict(by_seat_data[name]) for name in by_seat_data},
+            solver_queries=_integer(data["solver_queries"], field="solver.solver_queries"),
+            solver_cache_hits=_integer(data["solver_cache_hits"], field="solver.solver_cache_hits"),
             solver_time_seconds=_finite(
                 data["solver_time_seconds"],
                 field="solver.solver_time_seconds",
@@ -765,8 +707,7 @@ class SolverResultV1:
             average_game_length=results.avg_game_length,
             overall=SolverBucketV1.from_results(results.overall),
             by_ply={
-                name: SolverBucketV1.from_results(bucket)
-                for name, bucket in results.by_ply.items()
+                name: SolverBucketV1.from_results(bucket) for name, bucket in results.by_ply.items()
             },
             by_seat={
                 name: SolverBucketV1.from_results(bucket)
@@ -789,21 +730,13 @@ class ObservedResultsV1:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "vs_champion": (
-                self.vs_champion.to_dict() if self.vs_champion is not None else None
-            ),
-            "vs_random": (
-                self.vs_random.to_dict() if self.vs_random is not None else None
-            ),
+            "vs_champion": (self.vs_champion.to_dict() if self.vs_champion is not None else None),
+            "vs_random": (self.vs_random.to_dict() if self.vs_random is not None else None),
             "candidate_solver": (
-                self.candidate_solver.to_dict()
-                if self.candidate_solver is not None
-                else None
+                self.candidate_solver.to_dict() if self.candidate_solver is not None else None
             ),
             "champion_solver": (
-                self.champion_solver.to_dict()
-                if self.champion_solver is not None
-                else None
+                self.champion_solver.to_dict() if self.champion_solver is not None else None
             ),
         }
 
@@ -882,9 +815,7 @@ class EvaluationArtifactV2:
         _timestamp(self.started_at, field="evaluation.started_at")
         _timestamp(self.completed_at, field="evaluation.completed_at")
         if self.completed_at <= self.started_at:
-            raise ArtifactValidationError(
-                "Evaluation completion must be strictly after its start"
-            )
+            raise ArtifactValidationError("Evaluation completion must be strictly after its start")
         expected_pairs = (
             (
                 self.recipe.requested_games.vs_champion,
@@ -909,9 +840,7 @@ class EvaluationArtifactV2:
         )
         for requested, result, field in expected_pairs:
             if requested == 0 and result is not None:
-                raise ArtifactValidationError(
-                    f"{field} result exists with zero request"
-                )
+                raise ArtifactValidationError(f"{field} result exists with zero request")
             if requested > 0 and result is None:
                 raise ArtifactValidationError(f"{field} result missing for request")
             if result is not None and result.games_played != requested:
@@ -931,9 +860,7 @@ class EvaluationArtifactV2:
             )
         if self.champion_before is None:
             if self.previous_evaluation_id is not None:
-                raise ArtifactValidationError(
-                    "An evaluation after the first must have a champion"
-                )
+                raise ArtifactValidationError("An evaluation after the first must have a champion")
             if not self.decision.promoted:
                 raise ArtifactValidationError(
                     "The first valid candidate must establish champion state"
@@ -955,23 +882,17 @@ class EvaluationArtifactV2:
             and self.recipe.promotion_metric == "win_rate"
             and self.results.vs_champion is not None
         ):
-            expected = (
-                self.results.vs_champion.candidate_win_rate > self.recipe.win_threshold
-            )
+            expected = self.results.vs_champion.candidate_win_rate > self.recipe.win_threshold
             if self.decision.promoted != expected:
                 raise ArtifactValidationError(
                     "Promotion decision disagrees with the observed champion win rate"
                 )
-        if (
-            self.champion_before is not None
-            and self.recipe.promotion_metric == "solver_optimal"
-        ):
+        if self.champion_before is not None and self.recipe.promotion_metric == "solver_optimal":
             candidate_solver = self.results.candidate_solver
             champion_solver = self.results.champion_solver
             if candidate_solver is None or champion_solver is None:
                 raise ArtifactValidationError(
-                    "solver_optimal promotion requires fresh candidate and "
-                    "champion solver evidence"
+                    "solver_optimal promotion requires fresh candidate and champion solver evidence"
                 )
             if (
                 self.recipe.requested_games.candidate_solver
@@ -986,8 +907,7 @@ class EvaluationArtifactV2:
                 )
             expected = (
                 candidate_solver.overall.value_optimal_rate
-                > champion_solver.overall.value_optimal_rate
-                + self.recipe.promotion_margin
+                > champion_solver.overall.value_optimal_rate + self.recipe.promotion_margin
             )
             if self.decision.promoted != expected:
                 raise ArtifactValidationError(
@@ -1002,9 +922,7 @@ class EvaluationArtifactV2:
             "candidate_checkpoint_id": self.candidate_checkpoint_id,
             "previous_evaluation_id": self.previous_evaluation_id,
             "champion_before": (
-                self.champion_before.to_dict()
-                if self.champion_before is not None
-                else None
+                self.champion_before.to_dict() if self.champion_before is not None else None
             ),
             "recipe": self.recipe.to_dict(),
             "results": self.results.to_dict(),
@@ -1026,16 +944,12 @@ class EvaluationArtifactV2:
         fields = _exact(value, _ARTIFACT_FIELDS, context="evaluation artifact")
         if fields["schema_version"] != 2 or isinstance(fields["schema_version"], bool):
             raise ArtifactValidationError("evaluation.schema_version must be exactly 2")
-        profile_data = _exact(
-            fields["profile"], _PROFILE_FIELDS, context="evaluation profile"
-        )
+        profile_data = _exact(fields["profile"], _PROFILE_FIELDS, context="evaluation profile")
         champion = fields["champion_before"]
         artifact = cls(
             schema_version=2,
             profile=CheckpointProfileV1.from_dict(dict(profile_data)),
-            iteration=_integer(
-                fields["iteration"], field="evaluation.iteration", positive=True
-            ),
+            iteration=_integer(fields["iteration"], field="evaluation.iteration", positive=True),
             candidate_checkpoint_id=validate_sha256_digest(
                 fields["candidate_checkpoint_id"],
                 field="evaluation.candidate_checkpoint_id",
@@ -1049,22 +963,16 @@ class EvaluationArtifactV2:
                 else None
             ),
             champion_before=(
-                ChampionReferenceV1.from_dict(champion)
-                if champion is not None
-                else None
+                ChampionReferenceV1.from_dict(champion) if champion is not None else None
             ),
             recipe=EvaluationRecipeV1.from_dict(fields["recipe"]),
             results=ObservedResultsV1.from_dict(fields["results"]),
             decision=PromotionDecisionV1.from_dict(fields["decision"]),
             started_at=_timestamp(fields["started_at"], field="evaluation.started_at"),
-            completed_at=_timestamp(
-                fields["completed_at"], field="evaluation.completed_at"
-            ),
+            completed_at=_timestamp(fields["completed_at"], field="evaluation.completed_at"),
         )
         if artifact.to_bytes() != data:
-            raise ArtifactValidationError(
-                "evaluation artifact is not normalized canonical JSON"
-            )
+            raise ArtifactValidationError("evaluation artifact is not normalized canonical JSON")
         return artifact
 
 
@@ -1087,9 +995,7 @@ class EvaluationRepository(Protocol):
 
     def resolve_evaluation(self, evaluation_id: str) -> EvaluationRef: ...
 
-    def list_evaluations(
-        self, evaluation_head_id: str | None
-    ) -> list[EvaluationRef]: ...
+    def list_evaluations(self, evaluation_head_id: str | None) -> list[EvaluationRef]: ...
 
 
 class FilesystemEvaluationRepository:
@@ -1099,20 +1005,12 @@ class FilesystemEvaluationRepository:
         self.profile = checkpoints.contract.profile
 
     def _evaluation_path(self, evaluation_id: str) -> Path:
-        return (
-            self.model_root
-            / "evaluations"
-            / "manifests"
-            / "sha256"
-            / f"{evaluation_id}.json"
-        )
+        return self.model_root / "evaluations" / "manifests" / "sha256" / f"{evaluation_id}.json"
 
     def _validate_v2_evidence(self, artifact: EvaluationArtifactV2) -> None:
         if artifact.profile != self.profile:
             raise ArtifactValidationError("Evaluation profile mismatch")
-        self.checkpoints.read_checkpoint_manifest_exact(
-            artifact.candidate_checkpoint_id
-        )
+        self.checkpoints.read_checkpoint_manifest_exact(artifact.candidate_checkpoint_id)
         prior_lineage = self.list_evaluations(artifact.previous_evaluation_id)
         expected_champion: ChampionReferenceV1 | None = None
         for reference in prior_lineage:
@@ -1128,17 +1026,11 @@ class FilesystemEvaluationRepository:
         if artifact.previous_evaluation_id is not None:
             previous = prior_lineage[-1]
             if artifact.iteration <= previous.artifact.iteration:
-                raise ArtifactValidationError(
-                    "Evaluation iterations must be strictly increasing"
-                )
+                raise ArtifactValidationError("Evaluation iterations must be strictly increasing")
             if artifact.started_at <= previous.artifact.completed_at:
-                raise ArtifactValidationError(
-                    "Evaluation timestamps must be strictly increasing"
-                )
+                raise ArtifactValidationError("Evaluation timestamps must be strictly increasing")
         if expected_champion is not None:
-            self.checkpoints.read_checkpoint_manifest_exact(
-                expected_champion.checkpoint_id
-            )
+            self.checkpoints.read_checkpoint_manifest_exact(expected_champion.checkpoint_id)
 
     def validate_evidence(self, artifact: EvaluationArtifactV2) -> None:
         """Validate canonical evidence and its full ancestry without writing it."""
@@ -1197,9 +1089,7 @@ class FilesystemEvaluationRepository:
             if artifact.previous_evaluation_id != expected_previous:
                 raise ArtifactValidationError("Evaluation lineage is disconnected")
             if artifact.champion_before != champion:
-                raise ArtifactValidationError(
-                    "Evaluation lineage has an inconsistent champion"
-                )
+                raise ArtifactValidationError("Evaluation lineage has an inconsistent champion")
             if previous is not None:
                 if artifact.iteration <= previous.artifact.iteration:
                     raise ArtifactValidationError(
@@ -1209,9 +1099,7 @@ class FilesystemEvaluationRepository:
                     raise ArtifactValidationError(
                         "Evaluation timestamps must be strictly increasing"
                     )
-            self.checkpoints.read_checkpoint_manifest_exact(
-                artifact.candidate_checkpoint_id
-            )
+            self.checkpoints.read_checkpoint_manifest_exact(artifact.candidate_checkpoint_id)
             if artifact.decision.promoted:
                 champion = ChampionReferenceV1(
                     checkpoint_id=artifact.candidate_checkpoint_id,
@@ -1227,9 +1115,7 @@ class S3EvaluationRepository(FilesystemEvaluationRepository):
         self.checkpoints: S3CheckpointPublisher = checkpoints
 
     def _evaluation_key(self, evaluation_id: str) -> str:
-        return self.checkpoints._key(
-            f"evaluations/manifests/sha256/{evaluation_id}.json"
-        )
+        return self.checkpoints._key(f"evaluations/manifests/sha256/{evaluation_id}.json")
 
     def publish_evidence(self, artifact: EvaluationArtifactV2) -> EvaluationRef:
         """Persist exact evidence in both the remote store and local cache."""

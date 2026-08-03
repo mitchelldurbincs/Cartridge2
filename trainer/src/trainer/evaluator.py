@@ -57,31 +57,19 @@ _MAX_F32 = float.fromhex("0x1.fffffep+127")
 
 
 def _positive_u32(value: object, *, field: str) -> int:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or not 1 <= value <= _MAX_U32
-    ):
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= _MAX_U32:
         raise ValueError(f"{field} must be a positive u32 integer")
     return value
 
 
 def _u32(value: object, *, field: str) -> int:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or not 0 <= value <= _MAX_U32
-    ):
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= _MAX_U32:
         raise ValueError(f"{field} must be a nonnegative u32 integer")
     return value
 
 
 def _u64(value: object, *, field: str) -> int:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or not 0 <= value <= _MAX_U64
-    ):
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= _MAX_U64:
         raise ValueError(f"{field} must be a nonnegative u64 integer")
     return value
 
@@ -149,9 +137,7 @@ def find_eval_binary() -> Path:
         path = Path(override)
         if path.exists():
             return path
-        raise EvalBinaryNotFound(
-            f"{EVAL_BINARY_ENV} is set to {path}, which does not exist."
-        )
+        raise EvalBinaryNotFound(f"{EVAL_BINARY_ENV} is set to {path}, which does not exist.")
 
     for candidate in _BINARY_CANDIDATES:
         if candidate.exists():
@@ -205,15 +191,9 @@ class EvalResults:
             _u32(getattr(self, field), field=field)
         if self.player1_wins + self.player2_wins + self.draws != self.games_played:
             raise ValueError("evaluation outcome counts must sum to games_played")
-        if (
-            self.player1_wins_as_first + self.player1_wins_as_second
-            != self.player1_wins
-        ):
+        if self.player1_wins_as_first + self.player1_wins_as_second != self.player1_wins:
             raise ValueError("player1 seat-win counts must sum to player1_wins")
-        if (
-            self.player2_wins_as_first + self.player2_wins_as_second
-            != self.player2_wins
-        ):
+        if self.player2_wins_as_first + self.player2_wins_as_second != self.player2_wins:
             raise ValueError("player2 seat-win counts must sum to player2_wins")
         if (
             isinstance(self.avg_game_length, bool)
@@ -440,10 +420,14 @@ def run_evaluation(args: argparse.Namespace) -> int:
     environment = get_environment(args.env_id)
     algorithm.compatibility(environment).require_compatible()
     board = environment.require_board()
+    tensor = environment.capabilities.encoding.observation_tensor
+    agents = environment.capabilities.agents.agents
+    obs_size = tensor.fixed_elements if tensor is not None else None
+    num_actions = agents[0].action_space.discrete_size if agents else None
     logger.info(
         f"Environment {args.env_id} with {args.algorithm}: "
         f"board={board.width}x{board.height}, "
-        f"actions={board.action_count}, obs_size={board.observation.elements}"
+        f"actions={num_actions}, obs_size={obs_size}"
     )
 
     model_path = Path(args.model)
@@ -486,8 +470,6 @@ def run_evaluation(args: argparse.Namespace) -> int:
         print("\nModel is worse than random play!")
 
     if args.env_id == "tictactoe" and results.draw_rate > 0.8:
-        print(
-            "\nNote: High draw rate suggests defensive play, which is optimal for TicTacToe."
-        )
+        print("\nNote: High draw rate suggests defensive play, which is optimal for TicTacToe.")
 
     return 0

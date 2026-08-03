@@ -6,9 +6,9 @@
 //! why an environment is (or is not) compatible with it.
 
 use engine_core::typed::{
-    ActionEncoding, AgentId, AgentModel, Capabilities, ChanceModel, InformationModel,
-    ObservationEncoding, PlanningStateModel, RewardModel, SequentialTurnOrder, TransitionDynamics,
-    TurnModel, WIRE_ENCODING_SCHEMA_VERSION,
+    ActionAvailabilityContract, ActionEncoding, AgentId, AgentModel, Capabilities, ChanceModel,
+    InformationModel, ObservationEncoding, PlanningStateModel, RewardModel, SequentialTurnOrder,
+    TensorDType, TransitionDynamics, TurnModel, WIRE_ENCODING_SCHEMA_VERSION,
 };
 use engine_core::{ActionSpace, EngineContext, EnvironmentMetadata};
 use serde::Serialize;
@@ -17,6 +17,8 @@ use std::str::FromStr;
 
 /// Canonical identifier for the board-game AlphaZero cartridge.
 pub const ALPHAZERO_BOARD_V1_ID: &str = "alphazero_board_v1";
+/// Canonical identifier for the single-agent discrete DQN cartridge.
+pub const DQN_V1_ID: &str = "dqn_v1";
 pub const PROFILE_NAMESPACE_DIR: &str = "profiles";
 
 /// Version of the required model-artifact identity metadata schema.
@@ -33,7 +35,7 @@ const ALPHAZERO_REQUIREMENTS: &[&str] = &[
     "two fixed players",
     "one active player at a time with alternating turns",
     "canonical little-endian u32 discrete actions",
-    "fixed-size little-endian f32 spatial observations with an embedded legal mask and two-element player indicator",
+    "fixed-shape little-endian f32 spatial observations with first-class discrete legal-action masks",
     "complete deterministic planning snapshots after reset",
     "perfect-information Markov observations",
     "terminal-only zero-sum rewards emitted for every agent",
@@ -43,7 +45,21 @@ const ALPHAZERO_UNVERIFIED_ASSUMPTIONS: &[&str] = &[
     "state encoding is a complete round-trippable planning snapshot",
     "observations are Markov and reveal all strategically relevant state",
     "running transitions alternate seats 1 and 2",
-    "the embedded legal mask exactly matches actions accepted by the environment",
+    "the decision legal mask exactly matches actions accepted by the environment",
+];
+
+const DQN_REQUIREMENTS: &[&str] = &[
+    "one fixed agent acting alone",
+    "canonical little-endian u32 discrete actions",
+    "fixed-shape little-endian f32 observations",
+    "perfect-information Markov observations",
+    "finite episode horizon with general per-agent rewards",
+    "no explicit chance decisions",
+];
+
+const DQN_UNVERIFIED_ASSUMPTIONS: &[&str] = &[
+    "observations contain enough information for a feed-forward Q-network",
+    "the declared action availability exactly matches accepted actions",
 ];
 
 /// Stable names for the independently replaceable parts of an algorithm.
@@ -239,6 +255,7 @@ impl CompatibilityReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinAlgorithm {
     AlphaZeroBoardV1,
+    DqnV1,
 }
 
 const ALPHAZERO_DESCRIPTOR: AlgorithmDescriptor = AlgorithmDescriptor {
@@ -258,12 +275,31 @@ const ALPHAZERO_DESCRIPTOR: AlgorithmDescriptor = AlgorithmDescriptor {
     requirements: ALPHAZERO_REQUIREMENTS,
 };
 
-const BUILTIN_ALGORITHMS: &[BuiltinAlgorithm] = &[BuiltinAlgorithm::AlphaZeroBoardV1];
+const DQN_DESCRIPTOR: AlgorithmDescriptor = AlgorithmDescriptor {
+    id: DQN_V1_ID,
+    version: 1,
+    model_artifact_schema_version: MODEL_ARTIFACT_SCHEMA_VERSION,
+    display_name: "DQN single-agent discrete profile",
+    components: AlgorithmComponents {
+        collector: "dqn_epsilon_greedy_v1",
+        learner: "dqn_q_learning_v1",
+        orchestration: "off_policy_dqn_v1",
+        experience_schema: "dqn_transition_v1",
+        model_contract: "onnx_q_values_v1",
+        evaluation_suite: "single_agent_return_v1",
+        serving: "dqn_greedy_v1",
+    },
+    requirements: DQN_REQUIREMENTS,
+};
+
+const BUILTIN_ALGORITHMS: &[BuiltinAlgorithm] =
+    &[BuiltinAlgorithm::AlphaZeroBoardV1, BuiltinAlgorithm::DqnV1];
 
 impl BuiltinAlgorithm {
     pub const fn descriptor(self) -> &'static AlgorithmDescriptor {
         match self {
             Self::AlphaZeroBoardV1 => &ALPHAZERO_DESCRIPTOR,
+            Self::DqnV1 => &DQN_DESCRIPTOR,
         }
     }
 
@@ -282,6 +318,7 @@ impl BuiltinAlgorithm {
     ) -> CompatibilityReport {
         match self {
             Self::AlphaZeroBoardV1 => alphazero_compatibility(capabilities, metadata),
+            Self::DqnV1 => dqn_compatibility(capabilities, metadata),
         }
     }
 }
@@ -422,6 +459,37 @@ fn alphazero_compatibility(
         }
     };
 
+    let action_count = fixed_agents.and_then(|agents| {
+        let first = agents.first()?;
+        let ActionSpace::Discrete { size } = &first.action_space else {
+            return None;
+        };
+        Some(*size)
+    });
+    if let Some(agents) = fixed_agents {
+        for agent in agents {
+            match (&agent.action_space, action_count) {
+                (ActionSpace::Discrete { size }, Some(expected)) if *size == expected => {}
+                (other, _) => add_issue(
+                    "action_space.profile_mismatch",
+                    format!(
+                        "agent {} must share one non-empty discrete action space, got {other:?}",
+                        agent.id.0
+                    ),
+                ),
+            }
+            if agent.action_availability != ActionAvailabilityContract::DiscreteMask {
+                add_issue(
+                    "action_availability.discrete_mask",
+                    format!(
+                        "agent {} requires first-class discrete-mask availability, got {:?}",
+                        agent.id.0, agent.action_availability
+                    ),
+                );
+            }
+        }
+    }
+
     let board = metadata.board.as_ref();
     if board.is_none() {
         add_issue(
@@ -445,78 +513,24 @@ fn alphazero_compatibility(
                 ),
             );
         }
-        if board.action_count == 0 {
-            add_issue(
-                "action_space.empty",
-                "requires at least one discrete action".to_string(),
-            );
-        }
-        if board.observation.spatial_channels == 0 {
-            add_issue(
-                "observation.spatial_channels",
-                "requires at least one spatial observation channel".to_string(),
-            );
-        }
-        if let Some(agents) = fixed_agents {
-            for agent in agents {
-                match &agent.action_space {
-                    ActionSpace::Discrete { size } if *size as usize == board.action_count => {}
-                    other => add_issue(
-                        "action_space.profile_mismatch",
-                        format!(
-                            "agent {} requires Discrete({}), got {other:?}",
-                            agent.id.0, board.action_count
-                        ),
-                    ),
-                }
-            }
-        }
-
-        match board.board_size() {
-            Ok(board_size) => match board.observation.spatial_channels.checked_mul(board_size) {
-                Some(expected_mask_offset)
-                    if board.observation.legal_actions_offset == expected_mask_offset => {}
-                Some(expected_mask_offset) => add_issue(
-                    "observation.legal_mask_offset",
-                    format!(
-                        "expected legal mask at {}, got {}",
-                        expected_mask_offset, board.observation.legal_actions_offset
-                    ),
-                ),
-                None => add_issue(
-                    "observation.layout_overflow",
-                    "spatial observation layout overflows the platform size".to_string(),
-                ),
-            },
-            Err(error) => add_issue("observation.board_shape", error.to_string()),
-        }
-        match board
-            .observation
-            .legal_actions_offset
-            .checked_add(board.action_count)
-            .and_then(|elements| elements.checked_add(2))
-        {
-            Some(expected_elements) if board.observation.elements == expected_elements => {}
-            Some(expected_elements) => add_issue(
-                "observation.layout_size",
-                format!(
-                    "expected {expected_elements} f32 values (planes + legal mask + player one-hot), got {}",
-                    board.observation.elements
-                ),
-            ),
-            None => add_issue(
-                "observation.layout_overflow",
-                "observation element count overflows the platform size".to_string(),
-            ),
-        }
         match &capabilities.encoding.observation {
-            ObservationEncoding::F32LittleEndian { elements }
-                if *elements == board.observation.elements => {}
+            ObservationEncoding::Tensor { spec }
+                if spec.dtype == TensorDType::F32LittleEndian
+                    && matches!(
+                        spec.dimensions.as_slice(),
+                        [channel, row, column]
+                            if channel.name == "channel"
+                                && channel.size.is_some_and(|size| size > 0)
+                                && row.name == "row"
+                                && row.size == u32::try_from(board.height).ok()
+                                && column.name == "column"
+                                && column.size == u32::try_from(board.width).ok()
+                    ) => {}
             other => add_issue(
                 "observation.encoding",
                 format!(
-                    "requires F32LittleEndian({}), got {other:?}",
-                    board.observation.elements
+                    "requires a fixed f32 [channel,row,column] tensor matching the {}x{} board, got {other:?}",
+                    board.width, board.height
                 ),
             ),
         }
@@ -596,21 +610,153 @@ fn alphazero_compatibility(
     }
 }
 
+fn dqn_compatibility(
+    capabilities: &Capabilities,
+    metadata: &EnvironmentMetadata,
+) -> CompatibilityReport {
+    let mut issues = Vec::new();
+    let mut add_issue = |code, message| issues.push(CompatibilityIssue { code, message });
+
+    if capabilities.id.env_id != metadata.id {
+        add_issue(
+            "identity.env_id_mismatch",
+            format!(
+                "capabilities use '{}' but metadata uses '{}'",
+                capabilities.id.env_id, metadata.id
+            ),
+        );
+    }
+    if capabilities.contract_version == 0 {
+        add_issue(
+            "identity.contract_version",
+            "requires a non-zero immutable environment contract version".to_string(),
+        );
+    }
+    if capabilities.encoding.schema_version != WIRE_ENCODING_SCHEMA_VERSION {
+        add_issue(
+            "encoding.schema_version",
+            format!(
+                "requires wire encoding schema version {}, got {}",
+                WIRE_ENCODING_SCHEMA_VERSION, capabilities.encoding.schema_version
+            ),
+        );
+    }
+    if capabilities.encoding.action != ActionEncoding::DiscreteU32LittleEndian {
+        add_issue(
+            "action.encoding",
+            format!(
+                "requires DiscreteU32LittleEndian actions, got {:?}",
+                capabilities.encoding.action
+            ),
+        );
+    }
+    match &capabilities.encoding.observation {
+        ObservationEncoding::Tensor { spec }
+            if spec.dtype == TensorDType::F32LittleEndian
+                && !spec.dimensions.is_empty()
+                && spec
+                    .dimensions
+                    .iter()
+                    .all(|dimension| dimension.size.is_some_and(|size| size > 0)) => {}
+        other => add_issue(
+            "observation.encoding",
+            format!("requires a fixed non-empty f32 tensor, got {other:?}"),
+        ),
+    }
+    match &capabilities.agents {
+        AgentModel::Fixed { agents } if agents.len() == 1 => {
+            let agent = &agents[0];
+            match &agent.action_space {
+                ActionSpace::Discrete { size } if *size > 0 => {}
+                other => add_issue(
+                    "action_space.discrete",
+                    format!("requires one non-empty discrete action space, got {other:?}"),
+                ),
+            }
+            if !matches!(
+                &agent.action_availability,
+                ActionAvailabilityContract::All | ActionAvailabilityContract::DiscreteMask
+            ) {
+                add_issue(
+                    "action_availability.unsupported",
+                    format!(
+                        "requires all-actions or discrete-mask availability, got {:?}",
+                        agent.action_availability
+                    ),
+                );
+            }
+        }
+        AgentModel::Fixed { agents } => add_issue(
+            "agents.fixed_count",
+            format!("requires exactly one fixed agent, got {}", agents.len()),
+        ),
+        AgentModel::Dynamic { .. } => add_issue(
+            "agents.dynamic",
+            "requires exactly one fixed agent".to_string(),
+        ),
+    }
+    if capabilities.semantics.turn_model != TurnModel::SingleAgent {
+        add_issue(
+            "semantics.turn_model",
+            format!(
+                "requires single-agent turns, got {:?}",
+                capabilities.semantics.turn_model
+            ),
+        );
+    }
+    if capabilities.semantics.information_model != InformationModel::PerfectInformationMarkov {
+        add_issue(
+            "semantics.information_model",
+            format!(
+                "requires Markov observations, got {:?}",
+                capabilities.semantics.information_model
+            ),
+        );
+    }
+    if capabilities.semantics.chance_model == ChanceModel::Explicit {
+        add_issue(
+            "semantics.explicit_chance",
+            "explicit chance decisions are not supported by the DQN collector".to_string(),
+        );
+    }
+    if capabilities.semantics.reward_model != RewardModel::General {
+        add_issue(
+            "semantics.reward_model",
+            format!(
+                "requires general per-agent rewards, got {:?}",
+                capabilities.semantics.reward_model
+            ),
+        );
+    }
+    if capabilities.max_horizon.is_none() || capabilities.max_horizon == Some(0) {
+        add_issue(
+            "episode.max_horizon",
+            "requires a finite non-zero maximum horizon".to_string(),
+        );
+    }
+
+    CompatibilityReport {
+        algorithm_id: DQN_V1_ID,
+        env_id: metadata.id.clone(),
+        compatible: issues.is_empty(),
+        issues,
+        unverified_assumptions: DQN_UNVERIFIED_ASSUMPTIONS,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use engine_core::board_profile::{BoardGameMetadata, BoardPlayerMetadata};
-    use engine_core::typed::{AgentModel, Encoding, EngineId, EnvironmentSemantics};
+    use engine_core::typed::{AgentModel, Encoding, EngineId, EnvironmentSemantics, TensorSpec};
     use engine_core::EnvironmentMetadata;
 
     fn compatible_contract() -> (Capabilities, EnvironmentMetadata) {
         let metadata = EnvironmentMetadata::new("test", "Test").with_board(
-            BoardGameMetadata::new(3, 3, 9)
-                .with_observation(29, 2, 18, false)
-                .with_players(vec![
-                    BoardPlayerMetadata::new("A", "A"),
-                    BoardPlayerMetadata::new("B", "B"),
-                ]),
+            BoardGameMetadata::new(3, 3).with_players(vec![
+                BoardPlayerMetadata::new("A", "A"),
+                BoardPlayerMetadata::new("B", "B"),
+            ]),
         );
         let capabilities = Capabilities {
             id: EngineId {
@@ -618,15 +764,38 @@ mod tests {
                 build_id: "test".into(),
             },
             contract_version: 1,
-            encoding: Encoding::discrete_u32_le_f32_le("test_state:v1", 29),
+            encoding: Encoding::discrete_u32_le(
+                "test_state:v1",
+                TensorSpec::f32_fixed([("channel", 2), ("row", 3), ("column", 3)]),
+            ),
             semantics:
                 EnvironmentSemantics::deterministic_alternating_perfect_information_terminal_zero_sum(),
             max_horizon: Some(9),
-            agents: AgentModel::fixed_homogeneous(
+            agents: AgentModel::fixed_homogeneous_masked(
                 [AgentId(1), AgentId(2)],
                 ActionSpace::discrete(9),
             ),
             preferred_batch: 1,
+        };
+        (capabilities, metadata)
+    }
+
+    fn dqn_compatible_contract() -> (Capabilities, EnvironmentMetadata) {
+        let metadata = EnvironmentMetadata::new("counter", "Counter");
+        let capabilities = Capabilities {
+            id: EngineId {
+                env_id: "counter".into(),
+                build_id: "test".into(),
+            },
+            contract_version: 2,
+            encoding: Encoding::discrete_u32_le(
+                "counter_state:v1",
+                TensorSpec::f32_fixed([("feature", 2)]),
+            ),
+            semantics: EnvironmentSemantics::deterministic_single_agent_general_reward(),
+            max_horizon: Some(8),
+            agents: AgentModel::fixed_homogeneous([AgentId(0)], ActionSpace::discrete(2)),
+            preferred_batch: 32,
         };
         (capabilities, metadata)
     }
@@ -651,6 +820,46 @@ mod tests {
             descriptor.model_artifact_schema_version,
             MODEL_ARTIFACT_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn dqn_descriptor_and_single_agent_contract_are_explicit() {
+        let algorithm = resolve_algorithm(DQN_V1_ID).unwrap();
+        let descriptor = algorithm.descriptor();
+        assert_eq!(descriptor.id, DQN_V1_ID);
+        assert_eq!(descriptor.components.model_contract, "onnx_q_values_v1");
+        assert_eq!(descriptor.components.experience_schema, "dqn_transition_v1");
+
+        let (capabilities, metadata) = dqn_compatible_contract();
+        let report = algorithm.compatibility_for(&capabilities, &metadata);
+        assert!(report.compatible, "{:?}", report.issues);
+        assert_eq!(report.unverified_assumptions, DQN_UNVERIFIED_ASSUMPTIONS);
+
+        let alpha = BuiltinAlgorithm::AlphaZeroBoardV1.compatibility_for(&capabilities, &metadata);
+        assert!(!alpha.compatible);
+    }
+
+    #[test]
+    fn dqn_rejects_multi_agent_continuous_and_explicit_chance_contracts() {
+        let (mut capabilities, metadata) = dqn_compatible_contract();
+        capabilities.agents = AgentModel::fixed_homogeneous(
+            [AgentId(0), AgentId(1)],
+            ActionSpace::Continuous {
+                low: vec![-1.0],
+                high: vec![1.0],
+                shape: vec![1],
+            },
+        );
+        capabilities.semantics.chance_model = ChanceModel::Explicit;
+
+        let report = BuiltinAlgorithm::DqnV1.compatibility_for(&capabilities, &metadata);
+        let codes = report
+            .issues
+            .iter()
+            .map(|issue| issue.code)
+            .collect::<Vec<_>>();
+        assert!(codes.contains(&"agents.fixed_count"));
+        assert!(codes.contains(&"semantics.explicit_chance"));
     }
 
     #[test]
@@ -751,7 +960,9 @@ mod tests {
         capabilities.encoding.action = ActionEncoding::Custom {
             id: "discrete_u32_little_endian_extended".into(),
         };
-        capabilities.encoding.observation = ObservationEncoding::F32LittleEndian { elements: 28 };
+        capabilities.encoding.observation = ObservationEncoding::Tensor {
+            spec: TensorSpec::f32_fixed([("feature", 28)]),
+        };
 
         let report = BuiltinAlgorithm::AlphaZeroBoardV1.compatibility_for(&capabilities, &metadata);
         let codes: Vec<_> = report.issues.iter().map(|issue| issue.code).collect();
@@ -777,7 +988,7 @@ mod tests {
     #[test]
     fn incompatibility_report_collects_all_action_agent_and_layout_failures() {
         let (mut capabilities, mut metadata) = compatible_contract();
-        capabilities.agents = AgentModel::fixed_homogeneous(
+        capabilities.agents = AgentModel::fixed_homogeneous_masked(
             [AgentId(1), AgentId(2)],
             ActionSpace::Continuous {
                 low: vec![-1.0],
@@ -787,7 +998,9 @@ mod tests {
         );
         let board = metadata.board.as_mut().unwrap();
         board.players.pop();
-        board.observation.elements = 7;
+        capabilities.encoding.observation = ObservationEncoding::Tensor {
+            spec: TensorSpec::f32_fixed([("feature", 7)]),
+        };
 
         let report = BuiltinAlgorithm::AlphaZeroBoardV1.compatibility_for(&capabilities, &metadata);
         let codes: Vec<_> = report.issues.iter().map(|issue| issue.code).collect();
@@ -795,7 +1008,7 @@ mod tests {
         assert!(!report.compatible);
         assert!(codes.contains(&"action_space.profile_mismatch"));
         assert!(codes.contains(&"agents.player_count"));
-        assert!(codes.contains(&"observation.layout_size"));
+        assert!(codes.contains(&"observation.encoding"));
         assert!(report.require_compatible().is_err());
     }
 
@@ -804,5 +1017,6 @@ mod tests {
         let error = resolve_algorithm("ppo").unwrap_err().to_string();
         assert!(error.contains("ppo"));
         assert!(error.contains(ALPHAZERO_BOARD_V1_ID));
+        assert!(error.contains(DQN_V1_ID));
     }
 }

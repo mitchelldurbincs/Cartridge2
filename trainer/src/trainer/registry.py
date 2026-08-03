@@ -79,22 +79,10 @@ def artifact_contract_for(env_id: str, algorithm_id: str) -> OnnxArtifactContrac
     algorithm = get_algorithm(algorithm_id)
     environment = get_environment(env_id)
     algorithm.compatibility(environment).require_compatible()
-    board = environment.require_board()
-    descriptor = algorithm.descriptor
-    return OnnxArtifactContract(
-        algorithm_id=descriptor.id,
-        env_id=environment.env_id,
-        env_contract_version=environment.contract_version,
-        model_artifact_schema_version=descriptor.model_artifact_schema_version,
-        model_contract=descriptor.components.model_contract,
-        obs_size=board.observation.elements,
-        num_actions=board.action_count,
-    )
+    return algorithm.artifact_contract(environment)
 
 
-def random_player_id(
-    *, env_id: str, env_contract_version: int, algorithm_id: str
-) -> str:
+def random_player_id(*, env_id: str, env_contract_version: int, algorithm_id: str) -> str:
     """Globally unique identity for one profile's random baseline."""
     return f"{algorithm_id}:{env_id}:v{env_contract_version}:random"
 
@@ -125,13 +113,9 @@ def checkpoint_player_id(
 
 def _model_root_from_blob(path: Path) -> Path:
     """Recover and validate the repository root encoded by an immutable blob path."""
-    if (
-        path.suffix != ".onnx"
-        or path.parent.name != "sha256"
-        or path.parent.parent.name != "blobs"
-    ):
+    if path.suffix != ".onnx" or path.parent.name != "sha256" or path.parent.parent.name != "blobs":
         raise ArtifactValidationError(
-            "Registered ONNX path must use " "<model-root>/blobs/sha256/<digest>.onnx"
+            "Registered ONNX path must use <model-root>/blobs/sha256/<digest>.onnx"
         )
     validate_sha256_digest(path.stem, field="onnx_path digest")
     return path.parents[2]
@@ -184,54 +168,36 @@ class PlayerRecord:
         ):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value:
-                raise ValueError(
-                    f"PlayerRecord.{field_name} must be a non-empty string"
-                )
+                raise ValueError(f"PlayerRecord.{field_name} must be a non-empty string")
         for field_name in (
             "env_contract_version",
             "model_artifact_schema_version",
         ):
             value = getattr(self, field_name)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or not 1 <= value <= _MAX_U32
-            ):
-                raise ValueError(
-                    f"PlayerRecord.{field_name} must be a positive u32 integer"
-                )
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= _MAX_U32:
+                raise ValueError(f"PlayerRecord.{field_name} must be a positive u32 integer")
         if self.kind not in {"model", "random"}:
             raise ValueError(f"Player '{self.id}' has unknown kind '{self.kind}'")
-        canonical_temperature = _validate_adapter_settings(
-            self.simulations, self.temperature
-        )
+        canonical_temperature = _validate_adapter_settings(self.simulations, self.temperature)
         object.__setattr__(self, "temperature", canonical_temperature)
         if self.step is not None and (
             isinstance(self.step, bool)
             or not isinstance(self.step, int)
             or not 0 <= self.step <= _MAX_U64
         ):
-            raise ValueError(
-                "PlayerRecord.step must be a nonnegative u64 integer or null"
-            )
+            raise ValueError("PlayerRecord.step must be a nonnegative u64 integer or null")
         try:
             datetime.fromisoformat(self.registered_at)
         except ValueError as exc:
-            raise ValueError(
-                "PlayerRecord.registered_at must be an ISO-8601 timestamp"
-            ) from exc
+            raise ValueError("PlayerRecord.registered_at must be an ISO-8601 timestamp") from exc
 
         if self.kind == "random":
             if self.checkpoint_id is not None or self.onnx_path is not None:
-                raise ValueError(
-                    "Random players cannot declare a checkpoint or ONNX blob"
-                )
+                raise ValueError("Random players cannot declare a checkpoint or ONNX blob")
             if self.step is not None:
                 raise ValueError("Random players cannot declare a training step")
             if self.simulations != 0 or self.temperature != 0.0:
-                raise ValueError(
-                    "Random players cannot declare search or sampling settings"
-                )
+                raise ValueError("Random players cannot declare search or sampling settings")
         else:
             validate_sha256_digest(self.checkpoint_id, field="checkpoint_id")
             if not isinstance(self.onnx_path, str) or not self.onnx_path:
@@ -254,8 +220,7 @@ class PlayerRecord:
         ]
         if mismatches:
             raise ValueError(
-                f"Player '{self.id}' does not match the engine profile: "
-                + "; ".join(mismatches)
+                f"Player '{self.id}' does not match the engine profile: " + "; ".join(mismatches)
             )
 
         expected_id = (
@@ -276,8 +241,7 @@ class PlayerRecord:
         )
         if self.id != expected_id:
             raise ValueError(
-                f"Player id {self.id!r} is not canonical for its profile; "
-                f"expected {expected_id!r}"
+                f"Player id {self.id!r} is not canonical for its profile; expected {expected_id!r}"
             )
         return contract
 
@@ -364,8 +328,7 @@ class PlayerRegistry:
                 and player.env_contract_version == env_contract_version
                 and player.algorithm_id == algorithm_id
                 and player.model_contract == contract.model_contract
-                and player.model_artifact_schema_version
-                == contract.model_artifact_schema_version
+                and player.model_artifact_schema_version == contract.model_artifact_schema_version
             ),
             key=lambda player: (
                 0 if player.step is None else 1,
@@ -387,9 +350,7 @@ class PlayerRegistry:
             parse_constant=_reject_json_constant,
         )
         if not isinstance(raw, dict) or set(raw) != {"schema_version", "players"}:
-            raise ValueError(
-                "Player registry must contain exactly 'schema_version' and 'players'"
-            )
+            raise ValueError("Player registry must contain exactly 'schema_version' and 'players'")
         schema_version = raw["schema_version"]
         if (
             isinstance(schema_version, bool)
@@ -397,8 +358,7 @@ class PlayerRegistry:
             or schema_version != SCHEMA_VERSION
         ):
             raise ValueError(
-                f"Unsupported player registry schema {schema_version!r}; "
-                f"expected {SCHEMA_VERSION}"
+                f"Unsupported player registry schema {schema_version!r}; expected {SCHEMA_VERSION}"
             )
         entries = raw["players"]
         if not isinstance(entries, list):
@@ -406,9 +366,7 @@ class PlayerRegistry:
         fields = set(PlayerRecord.__dataclass_fields__)
         players = []
         for index, entry in enumerate(entries):
-            if not isinstance(entry, dict) or not all(
-                isinstance(key, str) for key in entry
-            ):
+            if not isinstance(entry, dict) or not all(isinstance(key, str) for key in entry):
                 raise ValueError(f"Player registry entry {index} must be an object")
             if set(entry) != fields:
                 missing = sorted(fields - set(entry))
@@ -419,8 +377,7 @@ class PlayerRegistry:
                 if extra:
                     details.append("unknown " + ", ".join(extra))
                 raise ValueError(
-                    f"Player registry entry {index} has invalid fields: "
-                    + "; ".join(details)
+                    f"Player registry entry {index} has invalid fields: " + "; ".join(details)
                 )
             players.append(PlayerRecord(**entry))
         return cls(players)
@@ -439,9 +396,7 @@ class PlayerRegistry:
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write(
             path,
-            lambda temporary: Path(temporary).write_text(
-                json.dumps(payload, indent=2) + "\n"
-            ),
+            lambda temporary: Path(temporary).write_text(json.dumps(payload, indent=2) + "\n"),
         )
 
 
@@ -469,9 +424,7 @@ def discover_checkpoints(repository: CheckpointPublisher) -> list[CheckpointRef]
     checkpoints = repository.list_checkpoints()
     checkpoint_ids = [checkpoint.checkpoint_id for checkpoint in checkpoints]
     if len(checkpoint_ids) != len(set(checkpoint_ids)):
-        raise ArtifactValidationError(
-            "Checkpoint repository returned a duplicate manifest ID"
-        )
+        raise ArtifactValidationError("Checkpoint repository returned a duplicate manifest ID")
     ordered = sorted(
         checkpoints,
         key=lambda checkpoint: (checkpoint.manifest.step, checkpoint.checkpoint_id),

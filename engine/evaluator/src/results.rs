@@ -23,6 +23,20 @@ pub struct EvalSummary {
     pub avg_game_length: f64,
 }
 
+/// Aggregate result for the DQN single-agent return suite.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DqnEvalSummary {
+    pub env_id: String,
+    pub player_name: String,
+    pub episodes_played: u32,
+    pub terminated_episodes: u32,
+    pub truncated_episodes: u32,
+    pub mean_return: f64,
+    pub min_return: f64,
+    pub max_return: f64,
+    pub avg_episode_length: f64,
+}
+
 impl EvalSummary {
     /// Record one finished game.
     ///

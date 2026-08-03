@@ -51,8 +51,8 @@ pub use games_tictactoe::register_tictactoe;
 mod tests {
     use super::*;
     use engine_core::{
-        is_registered, list_registered_environments, Decision, EpisodeStatus, Presentation,
-        TransitionSource,
+        is_registered, list_registered_environments, ActionAvailability, EpisodeStatus,
+        ObservationEncoding, Presentation, TensorDType, TransitionSource,
     };
 
     #[test]
@@ -97,28 +97,25 @@ mod tests {
                 continue;
             }
             checked += 1;
+            let capabilities = context.capabilities();
             let metadata = context.metadata();
             let board = metadata.require_board().unwrap();
             let board_size = board.board_size().unwrap();
-
-            assert!(
-                board.observation.spatial_channels > 0,
-                "{env_id}: obs_channels must be declared (got 0)"
-            );
             assert!(board_size > 0, "{env_id}: board_size must be non-zero");
-            assert_eq!(
-                board.observation.legal_actions_offset,
-                board.observation.spatial_channels * board_size,
-                "{env_id}: legal mask must start immediately after the board planes \
-                 (obs_channels={} * board_size={})",
-                board.observation.spatial_channels,
-                board_size,
-            );
-            assert_eq!(
-                board.observation.elements,
-                board.observation.legal_actions_offset + board.action_count + 2,
-                "{env_id}: obs_size must be planes + legal mask + 2-element player one-hot",
-            );
+            let ObservationEncoding::Tensor { spec } = &capabilities.encoding.observation else {
+                panic!("{env_id}: AlphaZero-compatible observation must be a tensor");
+            };
+            assert_eq!(spec.dtype, TensorDType::F32LittleEndian);
+            assert!(matches!(
+                spec.dimensions.as_slice(),
+                [channel, row, column]
+                    if channel.name == "channel"
+                        && channel.size.is_some_and(|size| size > 0)
+                        && row.name == "row"
+                        && row.size == u32::try_from(board.height).ok()
+                        && column.name == "column"
+                        && column.size == u32::try_from(board.width).ok()
+            ));
         }
 
         assert!(
@@ -169,19 +166,17 @@ mod tests {
 
             // A constant stub would satisfy everything above. Playing a legal
             // move must move the view.
-            let active_agent = match &reset.timestep.decision {
-                Decision::Agents { agent_ids } if agent_ids.len() == 1 => agent_ids[0],
-                decision => panic!("{env_id}: expected one actor, got {decision:?}"),
-            };
-            let observation = reset
+            let active = reset
                 .timestep
-                .observation_for(active_agent)
-                .expect("observation for actor");
-            let action = board
-                .extract_legal_moves(observation)
-                .unwrap_or_else(|error| panic!("{env_id}: invalid fresh observation: {error}"))
-                .first()
-                .copied()
+                .decision
+                .sole_agent()
+                .unwrap_or_else(|| panic!("{env_id}: expected exactly one actor"));
+            let ActionAvailability::DiscreteMask { mask } = &active.availability else {
+                panic!("{env_id}: expected a discrete legal-action mask");
+            };
+            let action = mask
+                .iter_ones()
+                .next()
                 .unwrap_or_else(|| panic!("{env_id}: fresh game has no legal move"));
             let step = ctx
                 .step(&reset.state, &(action as u32).to_le_bytes())
@@ -215,7 +210,6 @@ mod tests {
                 continue;
             }
             let mut second = engine_core::EngineContext::new(&env_id).unwrap();
-            let board = first.metadata().require_board().unwrap().clone();
             let left_reset = first.reset(19, &[]).unwrap();
             let right_reset = second.reset(19, &[]).unwrap();
             assert_eq!(
@@ -254,15 +248,18 @@ mod tests {
                         .all(|outcome| outcome.reward == 0.0),
                     "{env_id}: non-terminal reward is not zero"
                 );
-                let actor = match &left_timestep.decision {
-                    Decision::Agents { agent_ids } if agent_ids.len() == 1 => agent_ids[0],
-                    decision => panic!("{env_id}: unexpected decision {decision:?}"),
-                };
+                let active = left_timestep
+                    .decision
+                    .sole_agent()
+                    .unwrap_or_else(|| panic!("{env_id}: expected exactly one actor"));
+                let actor = active.agent_id;
                 if let Some(previous) = previous_actor {
                     assert_ne!(actor, previous, "{env_id}: seats did not alternate");
                 }
-                let observation = left_timestep.observation_for(actor).unwrap();
-                let action = board.extract_legal_moves(observation).unwrap()[0] as u32;
+                let ActionAvailability::DiscreteMask { mask } = &active.availability else {
+                    panic!("{env_id}: expected a discrete legal-action mask");
+                };
+                let action = mask.iter_ones().next().unwrap() as u32;
                 let next_left = first.step(&left_state, &action.to_le_bytes()).unwrap();
                 let next_right = second.step(&right_state, &action.to_le_bytes()).unwrap();
                 assert_eq!(

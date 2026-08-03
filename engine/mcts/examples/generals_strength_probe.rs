@@ -8,19 +8,22 @@
 //!        --release -- <model.onnx> [games] [sims]
 
 use algorithm_core::{resolve_algorithm, ALPHAZERO_BOARD_V1_ID};
-use engine_core::{Decision, EngineContext, EpisodeStatus, ErasedTimestep};
+use engine_core::{
+    ActionAvailability, ActionSpace, AgentId, EngineContext, EpisodeStatus, ErasedTimestep,
+    ObservationEncoding,
+};
 use mcts::{run_mcts, MctsConfig, OnnxEvaluator};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
-fn active_agent_and_observation(timestep: &ErasedTimestep) -> (u8, &[u8]) {
-    let agent = match &timestep.decision {
-        Decision::Agents { agent_ids } if agent_ids.len() == 1 => agent_ids[0],
-        decision => panic!("expected one agent, got {decision:?}"),
+fn active_agent_and_mask(timestep: &ErasedTimestep) -> (u8, &engine_core::LegalMask) {
+    let active = timestep.decision.sole_agent().expect("expected one agent");
+    let ActionAvailability::DiscreteMask { mask } = &active.availability else {
+        panic!("expected a discrete legal-action mask");
     };
     (
-        u8::try_from(agent.0).expect("board seat fits u8"),
-        timestep.observation_for(agent).unwrap(),
+        u8::try_from(active.agent_id.0).expect("board seat fits u8"),
+        mask,
     )
 }
 
@@ -43,20 +46,25 @@ fn main() {
 
     engine_games::register_all_environments();
     let mut ctx = EngineContext::new("generals_8x8").unwrap();
-    let meta = ctx.metadata();
-    let board = meta.require_board().unwrap();
+    let capabilities = ctx.capabilities();
+    let ObservationEncoding::Tensor { spec } = &capabilities.encoding.observation else {
+        panic!("expected tensor observations");
+    };
+    let obs_size = spec.fixed_elements().expect("fixed observation shape");
+    let ActionSpace::Discrete { size: action_count } = capabilities
+        .action_space(AgentId(1))
+        .expect("agent 1 action space")
+    else {
+        panic!("expected discrete actions");
+    };
+    let action_count = usize::try_from(*action_count).expect("action count fits usize");
     let model_contract = resolve_algorithm(ALPHAZERO_BOARD_V1_ID)
         .unwrap()
         .descriptor()
         .model_artifact_contract("generals_8x8", ctx.capabilities().contract_version);
-    let evaluator = OnnxEvaluator::load_from_file(
-        model_path,
-        board.observation.elements,
-        board.action_count,
-        1,
-        &model_contract,
-    )
-    .unwrap();
+    let evaluator =
+        OnnxEvaluator::load_from_file(model_path, obs_size, action_count, 1, &model_contract)
+            .unwrap();
 
     // Evaluation config: greedy, no exploration noise
     let config = MctsConfig::for_evaluation()
@@ -77,8 +85,7 @@ fn main() {
         let mut rng = ChaCha20Rng::seed_from_u64(game_idx);
 
         loop {
-            let (current, observation) = active_agent_and_observation(&timestep);
-            let mask = board.legal_mask_from_obs(observation).unwrap();
+            let (current, mask) = active_agent_and_mask(&timestep);
             let action: u32 = if current == model_seat {
                 let mut search_rng = ChaCha20Rng::seed_from_u64(game_idx * 10_000);
                 run_mcts(

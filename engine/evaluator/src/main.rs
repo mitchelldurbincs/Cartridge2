@@ -19,8 +19,8 @@ use algorithm_core::ModelArtifactContract;
 use anyhow::{Context, Result};
 use clap::Parser;
 use evaluator::{
-    canonical_evaluation_temperature, preflight_evaluation, run_evaluation,
-    validate_evaluation_schedule, validate_onnx_intra_threads, Player, PositionRecord,
+    canonical_evaluation_temperature, preflight_evaluation, run_dqn_evaluation, run_evaluation,
+    validate_evaluation_schedule, validate_onnx_intra_threads, DqnPlayer, Player, PositionRecord,
 };
 
 /// The `--p1`/`--p2` value meaning "the uniform random baseline"; anything
@@ -116,6 +116,17 @@ fn build_player(
     )
 }
 
+fn build_dqn_player(
+    model_contract: &ModelArtifactContract,
+    spec: &str,
+    intra_threads: usize,
+) -> Result<DqnPlayer> {
+    if spec == RANDOM_SPEC {
+        return Ok(DqnPlayer::Random);
+    }
+    DqnPlayer::model(model_contract, spec, intra_threads)
+}
+
 fn write_positions(path: &PathBuf, positions: &[PositionRecord]) -> Result<()> {
     let file = File::create(path)
         .with_context(|| format!("Failed to create position dump at {}", path.display()))?;
@@ -141,37 +152,60 @@ fn main() -> Result<()> {
         .descriptor()
         .model_artifact_contract(args.env_id.clone(), env_contract_version);
 
-    let mut player1 = build_player(
-        &model_contract,
-        &args.p1,
-        args.p1_temperature,
-        args.p1_sims,
-        args.onnx_intra_threads,
-    )?;
-    let mut player2 = build_player(
-        &model_contract,
-        &args.p2,
-        args.p2_temperature,
-        args.p2_sims,
-        args.onnx_intra_threads,
-    )?;
-
-    let mut positions = args.dump_positions.as_ref().map(|_| Vec::new());
-    let summary = run_evaluation(
-        &args.algorithm,
-        &args.env_id,
-        &mut player1,
-        &mut player2,
-        args.games,
-        args.seed,
-        positions.as_mut(),
-    )?;
-
-    if let (Some(path), Some(positions)) = (&args.dump_positions, &positions) {
-        write_positions(path, positions)?;
-    }
-
-    let json = serde_json::to_string_pretty(&summary)?;
+    let json = match algorithm {
+        algorithm_core::BuiltinAlgorithm::AlphaZeroBoardV1 => {
+            let mut player1 = build_player(
+                &model_contract,
+                &args.p1,
+                args.p1_temperature,
+                args.p1_sims,
+                args.onnx_intra_threads,
+            )?;
+            let mut player2 = build_player(
+                &model_contract,
+                &args.p2,
+                args.p2_temperature,
+                args.p2_sims,
+                args.onnx_intra_threads,
+            )?;
+            let mut positions = args.dump_positions.as_ref().map(|_| Vec::new());
+            let summary = run_evaluation(
+                &args.algorithm,
+                &args.env_id,
+                &mut player1,
+                &mut player2,
+                args.games,
+                args.seed,
+                positions.as_mut(),
+            )?;
+            if let (Some(path), Some(positions)) = (&args.dump_positions, &positions) {
+                write_positions(path, positions)?;
+            }
+            serde_json::to_string_pretty(&summary)?
+        }
+        algorithm_core::BuiltinAlgorithm::DqnV1 => {
+            if args.p2 != RANDOM_SPEC
+                || args.p1_temperature != 0.0
+                || args.p2_temperature != 0.0
+                || args.p1_sims != 0
+                || args.p2_sims != 0
+                || args.dump_positions.is_some()
+            {
+                anyhow::bail!(
+                    "DQN evaluation accepts one --p1 policy and does not accept a second player, temperature, MCTS, or board-position dump"
+                );
+            }
+            let mut player = build_dqn_player(&model_contract, &args.p1, args.onnx_intra_threads)?;
+            let summary = run_dqn_evaluation(
+                &args.algorithm,
+                &args.env_id,
+                &mut player,
+                args.games,
+                args.seed,
+            )?;
+            serde_json::to_string_pretty(&summary)?
+        }
+    };
     match &args.output {
         Some(path) => std::fs::write(path, format!("{json}\n"))
             .with_context(|| format!("Failed to write summary to {}", path.display()))?,

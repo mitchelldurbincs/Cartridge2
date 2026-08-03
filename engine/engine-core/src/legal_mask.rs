@@ -1,16 +1,53 @@
-//! Dynamic-width legal action mask.
+//! Dynamic-width discrete action-availability mask.
 //!
-//! A `LegalMask` holds one bit per action for any action-space size.
-//!
-//! The authoritative source of legality is the observation: every game
-//! writes a 0.0/1.0 legal-move plane at the board profile's declared offset.
-//! Use [`LegalMask::from_obs`] to read it.
+//! A `LegalMask` holds one bit per action for any action-space size and is
+//! carried directly by the decision envelope. It is not embedded in an
+//! algorithm-specific observation tensor.
+
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
 /// Bit mask of legal actions with no fixed width limit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LegalMask {
     num_actions: usize,
     words: Box<[u64]>,
+}
+
+impl<'de> Deserialize<'de> for LegalMask {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            num_actions: usize,
+            words: Box<[u64]>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let expected_words = wire.num_actions.div_ceil(64);
+        if wire.words.len() != expected_words {
+            return Err(D::Error::custom(format!(
+                "legal mask for {} actions requires {expected_words} words, got {}",
+                wire.num_actions,
+                wire.words.len()
+            )));
+        }
+        if let Some(last) = wire.words.last() {
+            let used_bits = wire.num_actions % 64;
+            if used_bits != 0 && (*last >> used_bits) != 0 {
+                return Err(D::Error::custom(
+                    "legal mask has set padding bits above num_actions",
+                ));
+            }
+        }
+        Ok(Self {
+            num_actions: wire.num_actions,
+            words: wire.words,
+        })
+    }
 }
 
 impl LegalMask {
@@ -50,47 +87,6 @@ impl LegalMask {
             mask.words[0] = bits & keep;
         }
         mask
-    }
-
-    /// Read the legal-move plane out of an encoded observation.
-    ///
-    /// The observation is f32 little-endian; exact `0.0`/`1.0` values starting
-    /// at float index `legal_mask_offset` mark illegal/legal actions. Truncated
-    /// or malformed observations are contract errors, never an all-legal mask.
-    pub fn from_obs(
-        obs: &[u8],
-        legal_mask_offset: usize,
-        num_actions: usize,
-    ) -> Result<Self, LegalMaskError> {
-        let start = legal_mask_offset
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or(LegalMaskError::LayoutOverflow)?;
-        let mask_bytes = num_actions
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or(LegalMaskError::LayoutOverflow)?;
-        let end = start
-            .checked_add(mask_bytes)
-            .ok_or(LegalMaskError::LayoutOverflow)?;
-        if obs.len() < end {
-            return Err(LegalMaskError::ObservationTooShort {
-                expected_at_least: end,
-                actual: obs.len(),
-            });
-        }
-
-        let mut mask = Self::new(num_actions);
-        for (action, chunk) in obs[start..end]
-            .chunks_exact(std::mem::size_of::<f32>())
-            .enumerate()
-        {
-            let value = f32::from_le_bytes(chunk.try_into().expect("four-byte chunk"));
-            match value {
-                0.0 => {}
-                1.0 => mask.set(action),
-                _ => return Err(LegalMaskError::InvalidValue { action, value }),
-            }
-        }
-        Ok(mask)
     }
 
     /// Mark an action as legal.
@@ -136,21 +132,6 @@ impl LegalMask {
             .map(move |w| base + w.trailing_zeros() as usize)
         })
     }
-}
-
-#[derive(Debug, thiserror::Error, PartialEq)]
-pub enum LegalMaskError {
-    #[error("legal mask observation layout overflows the platform size")]
-    LayoutOverflow,
-    #[error(
-        "observation is too short for legal mask: need at least {expected_at_least} bytes, got {actual}"
-    )]
-    ObservationTooShort {
-        expected_at_least: usize,
-        actual: usize,
-    },
-    #[error("legal mask action {action} must be encoded as exactly 0.0 or 1.0, got {value}")]
-    InvalidValue { action: usize, value: f32 },
 }
 
 #[cfg(test)]
@@ -216,18 +197,6 @@ mod tests {
     }
 
     #[test]
-    fn from_obs_rejects_overflowing_layout_before_allocation() {
-        assert_eq!(
-            LegalMask::from_obs(&[], usize::MAX, 1),
-            Err(LegalMaskError::LayoutOverflow)
-        );
-        assert_eq!(
-            LegalMask::from_obs(&[], 0, usize::MAX),
-            Err(LegalMaskError::LayoutOverflow)
-        );
-    }
-
-    #[test]
     fn test_iter_ones() {
         let mut mask = LegalMask::new(257);
         let expected = [0usize, 3, 63, 64, 200, 256];
@@ -245,43 +214,6 @@ mod tests {
     }
 
     #[test]
-    fn test_from_obs() {
-        // 5-action game, mask at float offset 3: legal = actions 1, 4
-        let mut obs = vec![0u8; (3 + 5) * 4];
-        for action in [1usize, 4] {
-            let at = (3 + action) * 4;
-            obs[at..at + 4].copy_from_slice(&1.0f32.to_le_bytes());
-        }
-        let mask = LegalMask::from_obs(&obs, 3, 5).unwrap();
-        assert_eq!(mask.count_ones(), 2);
-        assert!(mask.is_legal(1));
-        assert!(mask.is_legal(4));
-        assert!(!mask.is_legal(0));
-    }
-
-    #[test]
-    fn test_from_obs_short_buffer_is_rejected() {
-        let obs = vec![0u8; 8];
-        assert!(matches!(
-            LegalMask::from_obs(&obs, 3, 5),
-            Err(LegalMaskError::ObservationTooShort { .. })
-        ));
-    }
-
-    #[test]
-    fn test_from_obs_non_binary_value_is_rejected() {
-        let mut obs = vec![0u8; 4];
-        obs.copy_from_slice(&0.75f32.to_le_bytes());
-        assert_eq!(
-            LegalMask::from_obs(&obs, 0, 1),
-            Err(LegalMaskError::InvalidValue {
-                action: 0,
-                value: 0.75
-            })
-        );
-    }
-
-    #[test]
     fn test_large_action_space_matches_othello_and_generals() {
         // Othello: 65 actions, Generals 8x8: 257 actions — both past the u64 cliff
         for n in [65usize, 257] {
@@ -290,5 +222,13 @@ mod tests {
             assert!(mask.is_legal(n - 1));
             assert_eq!(mask.iter_ones().collect::<Vec<_>>(), vec![n - 1]);
         }
+    }
+
+    #[test]
+    fn deserialization_rejects_malformed_word_counts_and_padding() {
+        assert!(serde_json::from_str::<LegalMask>(r#"{"num_actions":65,"words":[1]}"#).is_err());
+        assert!(serde_json::from_str::<LegalMask>(r#"{"num_actions":65,"words":[1,2]}"#).is_err());
+        let valid: LegalMask = serde_json::from_str(r#"{"num_actions":65,"words":[1,1]}"#).unwrap();
+        assert!(valid.is_legal(64));
     }
 }

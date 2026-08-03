@@ -11,7 +11,8 @@ use std::time::Instant;
 use algorithm_core::BuiltinAlgorithm;
 use engine_core::board_profile::LegalMask;
 use engine_core::{
-    ActionSpace, AgentId, Decision, EngineContext, EpisodeStatus, ErasedTimestep, TransitionSource,
+    ActionAvailability, ActionSpace, AgentId, EngineContext, EpisodeStatus, ErasedTimestep,
+    TransitionSource,
 };
 use rand_chacha::ChaCha20Rng;
 use tracing::debug;
@@ -33,8 +34,6 @@ pub struct MctsSearch<'a, E: Evaluator> {
     evaluator: &'a E,
     config: MctsConfig,
     num_actions: usize,
-    /// Float offset of the legal-move plane in the observation.
-    legal_mask_offset: usize,
     root_state: Vec<u8>,
     root_obs: Vec<u8>,
     step_state_buf: Vec<u8>,
@@ -55,14 +54,13 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             .compatibility(ctx)
             .require_compatible()
             .map_err(|error| SearchError::IncompatibleEnvironment(error.to_string()))?;
-        let active_agent = match &timestep.decision {
-            Decision::Agents { agent_ids } if agent_ids.len() == 1 => agent_ids[0],
-            decision => {
-                return Err(SearchError::InvalidTimestep(format!(
-                    "AlphaZero requires one active agent, got {decision:?}"
-                )))
-            }
-        };
+        let active = timestep.decision.sole_agent().ok_or_else(|| {
+            SearchError::InvalidTimestep(format!(
+                "AlphaZero requires one active agent, got {:?}",
+                timestep.decision
+            ))
+        })?;
+        let active_agent = active.agent_id;
         let obs = timestep
             .observation_for(active_agent)
             .ok_or_else(|| {
@@ -76,14 +74,7 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             Some(ActionSpace::Discrete { size }) => size as usize,
             _ => return Err(SearchError::UnsupportedActionSpace),
         };
-        let metadata = ctx.metadata();
-        let board = metadata
-            .require_board()
-            .map_err(|error| SearchError::IncompatibleEnvironment(error.to_string()))?;
-        let legal_mask_offset = board.observation.legal_actions_offset;
-        let legal_moves_mask = board
-            .legal_mask_from_obs(&obs)
-            .map_err(|error| SearchError::InvalidTimestep(error.to_string()))?;
+        let legal_moves_mask = decision_legal_mask(active, num_actions)?.clone();
         if legal_moves_mask.num_actions() != num_actions {
             return Err(SearchError::LegalMaskWidthMismatch {
                 expected: num_actions,
@@ -99,7 +90,6 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             evaluator,
             config,
             num_actions,
-            legal_mask_offset,
             root_state: state,
             root_obs: obs,
             step_state_buf: Vec::with_capacity(state_capacity),
@@ -466,17 +456,23 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
                 ))
             })?;
             let done = self.step_timestep_buf.episode != EpisodeStatus::Running;
-            let child_obs = self
-                .step_timestep_buf
-                .sole_observation()
-                .map_err(|error| SearchError::InvalidTimestep(error.to_string()))?
-                .data
-                .as_slice();
-
-            // Read the child's legal moves from its authoritative observation.
-            let child_legal_mask =
-                LegalMask::from_obs(child_obs, self.legal_mask_offset, self.num_actions)
-                    .map_err(|error| SearchError::EngineError(error.to_string()))?;
+            // Terminal nodes have no next decision. Running nodes carry their
+            // exact availability in the decision envelope.
+            let child_legal_mask = if done {
+                LegalMask::new(self.num_actions)
+            } else {
+                let next = self
+                    .step_timestep_buf
+                    .decision
+                    .sole_agent()
+                    .ok_or_else(|| {
+                        SearchError::InvalidTimestep(format!(
+                            "expected one next actor, got {:?}",
+                            self.step_timestep_buf.decision
+                        ))
+                    })?;
+                decision_legal_mask(next, self.num_actions)?.clone()
+            };
 
             // Terminal value (negated for opponent's perspective)
             let terminal_value = if done { -reward } else { 0.0 };
@@ -531,17 +527,38 @@ fn effective_eval_batch_size(config: &MctsConfig) -> usize {
 }
 
 fn decision_observation(timestep: &ErasedTimestep) -> Result<&[u8], SearchError> {
-    let agent_id = match &timestep.decision {
-        Decision::Agents { agent_ids } if agent_ids.len() == 1 => agent_ids[0],
-        decision => {
-            return Err(SearchError::InvalidTimestep(format!(
-                "expected one next actor, got {decision:?}"
-            )))
-        }
-    };
+    let agent_id = timestep
+        .decision
+        .sole_agent()
+        .ok_or_else(|| {
+            SearchError::InvalidTimestep(format!(
+                "expected one next actor, got {:?}",
+                timestep.decision
+            ))
+        })?
+        .agent_id;
     timestep.observation_for(agent_id).ok_or_else(|| {
         SearchError::InvalidTimestep(format!("missing observation for next agent {}", agent_id.0))
     })
+}
+
+fn decision_legal_mask(
+    decision: &engine_core::AgentDecision,
+    num_actions: usize,
+) -> Result<&LegalMask, SearchError> {
+    let ActionAvailability::DiscreteMask { mask } = &decision.availability else {
+        return Err(SearchError::InvalidTimestep(format!(
+            "AlphaZero requires a discrete legal mask for agent {}",
+            decision.agent_id.0
+        )));
+    };
+    if mask.num_actions() != num_actions {
+        return Err(SearchError::LegalMaskWidthMismatch {
+            expected: num_actions,
+            actual: mask.num_actions(),
+        });
+    }
+    Ok(mask)
 }
 
 fn transition_actor(timestep: &ErasedTimestep) -> Result<AgentId, SearchError> {

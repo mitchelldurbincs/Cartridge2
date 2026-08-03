@@ -62,9 +62,7 @@ class TestFindEvalBinary:
     def test_env_var_wins(self, stub_binary):
         assert find_eval_binary() == stub_binary
 
-    def test_missing_env_var_target_is_an_error_not_a_silent_fallback(
-        self, monkeypatch, tmp_path
-    ):
+    def test_missing_env_var_target_is_an_error_not_a_silent_fallback(self, monkeypatch, tmp_path):
         # Falling back to a stale build here would evaluate with the wrong
         # binary and report the result as if nothing were wrong.
         monkeypatch.setenv(evaluator.EVAL_BINARY_ENV, str(tmp_path / "nope"))

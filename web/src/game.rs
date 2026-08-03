@@ -6,7 +6,8 @@ use algorithm_core::BuiltinAlgorithm;
 use anyhow::{anyhow, Result};
 use engine_core::board_profile::{BoardGameMetadata, BoardView};
 use engine_core::{
-    AgentId, Decision, EngineContext, EpisodeStatus, ErasedTimestep, Presentation, TransitionSource,
+    ActionAvailability, AgentId, Decision, EngineContext, EpisodeStatus, ErasedTimestep, LegalMask,
+    Presentation, TransitionSource,
 };
 #[cfg(feature = "onnx")]
 use mcts::{run_mcts, MctsConfig, SharedOnnxEvaluator};
@@ -87,7 +88,7 @@ enum ExpectedTransition {
 /// Narrow one generic timestep to the position shape this serving cartridge
 /// understands. Chance and simultaneous decisions are rejected here rather
 /// than being assigned a synthetic board player.
-fn active_observation(timestep: &ErasedTimestep) -> Result<(AgentId, &[u8])> {
+fn active_observation(timestep: &ErasedTimestep) -> Result<(AgentId, &[u8], &LegalMask)> {
     if timestep.episode != EpisodeStatus::Running {
         return Err(anyhow!(
             "AlphaZero board action selection requires a running episode, got {:?}",
@@ -95,12 +96,13 @@ fn active_observation(timestep: &ErasedTimestep) -> Result<(AgentId, &[u8])> {
         ));
     }
 
-    let active_agent = match &timestep.decision {
-        Decision::Agents { agent_ids } if agent_ids.len() == 1 => agent_ids[0],
-        decision => anyhow::bail!(
-            "AlphaZero board serving requires exactly one active decision agent, got {decision:?}"
-        ),
-    };
+    let decision = timestep.decision.sole_agent().ok_or_else(|| {
+        anyhow!(
+            "AlphaZero board serving requires exactly one active decision agent, got {:?}",
+            timestep.decision
+        )
+    })?;
+    let active_agent = decision.agent_id;
     if !matches!(active_agent, AgentId(1) | AgentId(2)) {
         return Err(anyhow!(
             "AlphaZero board serving only supports seats 1 and 2, got {}",
@@ -116,7 +118,13 @@ fn active_observation(timestep: &ErasedTimestep) -> Result<(AgentId, &[u8])> {
             active_agent.0
         ));
     }
-    Ok((active_agent, observation.data.as_slice()))
+    let ActionAvailability::DiscreteMask { mask } = &decision.availability else {
+        anyhow::bail!(
+            "AlphaZero board serving requires a discrete legal mask for agent {}",
+            active_agent.0
+        );
+    };
+    Ok((active_agent, observation.data.as_slice(), mask))
 }
 
 fn validate_two_player_outcomes(timestep: &ErasedTimestep) -> Result<()> {
@@ -202,7 +210,7 @@ fn validate_timestep(timestep: &ErasedTimestep, expected: ExpectedTransition) ->
     validate_two_player_outcomes(timestep)?;
     match timestep.episode {
         EpisodeStatus::Running => {
-            let (next_agent, _) = active_observation(timestep)?;
+            let (next_agent, _, _) = active_observation(timestep)?;
             if let ExpectedTransition::Agent(actor) = expected {
                 if next_agent == actor {
                     return Err(anyhow!(
@@ -276,7 +284,7 @@ fn require_board_view(
                     view.winner
                 ));
             }
-            let (active_agent, _) = active_observation(timestep)?;
+            let (active_agent, _, _) = active_observation(timestep)?;
             if u32::from(view.current_player) != active_agent.0 {
                 return Err(anyhow!(
                     "board presentation current player {} disagrees with active agent {}",
@@ -414,11 +422,9 @@ impl GameSession {
             return Ok(Vec::new());
         }
 
-        Ok(self
-            .board
-            .extract_legal_moves(active_observation(&self.timestep)?.1)
-            .map_err(|error| anyhow!(error))?
-            .into_iter()
+        Ok(active_observation(&self.timestep)?
+            .2
+            .iter_ones()
             .map(|i| i as u32)
             .collect())
     }
@@ -429,9 +435,9 @@ impl GameSession {
             return Ok(false);
         }
 
-        self.board
-            .is_action_legal(active_observation(&self.timestep)?.1, position as usize)
-            .map_err(|error| anyhow!(error))
+        Ok(active_observation(&self.timestep)?
+            .2
+            .is_legal(position as usize))
     }
 
     /// Check if game is over
@@ -670,12 +676,11 @@ mod tests {
     }
 
     #[test]
-    fn test_legal_moves_handles_short_obs() {
+    fn legal_moves_rejects_a_missing_discrete_mask() {
         engine_games::register_all_environments();
 
         let mut session = GameSession::new("tictactoe").unwrap();
-        // Corrupt the encoded observation to simulate a mismatch with metadata.
-        session.timestep.observations[0].data.truncate(4);
+        session.timestep.decision = Decision::single(AgentId(1), ActionAvailability::All);
 
         assert!(session.legal_moves().is_err());
         assert!(session.is_legal_move(0).is_err());
@@ -693,9 +698,7 @@ mod tests {
             .to_string()
             .contains("Chance"));
 
-        session.timestep.decision = Decision::Agents {
-            agent_ids: vec![AgentId(1), AgentId(2)],
-        };
+        session.timestep.decision = Decision::agents([AgentId(1), AgentId(2)]);
         assert!(session
             .legal_moves()
             .unwrap_err()

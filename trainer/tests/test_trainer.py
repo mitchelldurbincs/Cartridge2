@@ -18,10 +18,10 @@ import torch
 
 from trainer import step_metrics as step_metrics_module
 from trainer.algorithms.alphazero_board_v1 import DESCRIPTOR
-from trainer.config import AlphaZeroLearnerConfig
+from trainer.algorithms.alphazero_config import AlphaZeroLearnerConfig
 from trainer.environment_catalog import get_environment
 from trainer.evaluator import EvalResults
-from trainer.stats import EvalStats, TrainerStats
+from trainer.stats import EvaluationStats, TrainerStats
 from trainer.storage.base import ReplayProfile, ReplaySelection
 from trainer.storage.publisher import ArtifactValidationError, RunHeadV2
 from trainer.trainer import AlphaZeroLearner as _AlphaZeroLearner
@@ -32,9 +32,7 @@ def make_learner(config: AlphaZeroLearnerConfig) -> _AlphaZeroLearner:
     head_path = Path(config.model_dir) / "channels" / "current.json"
     source_checkpoint_id = None
     if head_path.exists():
-        source_checkpoint_id = RunHeadV2.from_bytes(
-            head_path.read_bytes()
-        ).checkpoint_id
+        source_checkpoint_id = RunHeadV2.from_bytes(head_path.read_bytes()).checkpoint_id
     environment = get_environment(config.env_id)
     config.replay_selection = ReplaySelection(
         profile=ReplayProfile(
@@ -103,9 +101,7 @@ class TestAlphaZeroLearnerInitialization:
         _ = make_learner(config)
         assert model_dir.exists()
 
-    def test_fresh_run_replaces_stale_projection_when_run_head_is_absent(
-        self, tmp_path
-    ):
+    def test_fresh_run_replaces_stale_projection_when_run_head_is_absent(self, tmp_path):
         stats_path = tmp_path / "stats.json"
         stats_path.write_text('{"step":999}', encoding="utf-8")
         config = AlphaZeroLearnerConfig(
@@ -190,7 +186,7 @@ class TestAlphaZeroLearnerCheckpoint:
         assert checkpoint["profile"] == {
             "algorithm_id": "alphazero_board_v1",
             "env_id": "tictactoe",
-            "env_contract_version": 1,
+            "env_contract_version": 2,
             "model_artifact_schema_version": 1,
             "model_contract": "onnx_policy_value_v1",
         }
@@ -301,14 +297,9 @@ class TestAlphaZeroLearnerCheckpoint:
         second = trainer._save_checkpoint(10)
 
         assert second == first
-        assert (
-            len(list((tmp_path / "models" / "manifests" / "sha256").glob("*.json")))
-            == 1
-        )
+        assert len(list((tmp_path / "models" / "manifests" / "sha256").glob("*.json"))) == 1
 
-    def test_identical_checkpoint_stats_publish_is_run_commit_idempotent(
-        self, tmp_path
-    ):
+    def test_identical_checkpoint_stats_publish_is_run_commit_idempotent(self, tmp_path):
         config = AlphaZeroLearnerConfig(
             env_id="tictactoe",
             model_dir=str(tmp_path / "models"),
@@ -370,9 +361,7 @@ class TestAlphaZeroLearnerCheckpoint:
         assert head.run_commit_id == second.run_commit_id
         assert [
             reference.run_commit_id
-            for reference in resumed.run_commit_repository.resolve_chain(
-                head.run_commit_id
-            )
+            for reference in resumed.run_commit_repository.resolve_chain(head.run_commit_id)
         ] == [
             first.run_commit_id,
             second.run_commit_id,
@@ -600,9 +589,7 @@ class TestAlphaZeroLearnerTrainingStep:
         observations = np.random.randn(batch_size, obs_size).astype(np.float32)
         policy_targets = np.random.randn(batch_size, num_actions).astype(np.float32)
         # Softmax normalization for policy targets
-        policy_targets = np.exp(policy_targets) / np.exp(policy_targets).sum(
-            axis=1, keepdims=True
-        )
+        policy_targets = np.exp(policy_targets) / np.exp(policy_targets).sum(axis=1, keepdims=True)
         value_targets = np.random.randn(batch_size).astype(np.float32)
 
         # Execute training step (new signature takes numpy arrays)
@@ -635,9 +622,7 @@ class TestAlphaZeroLearnerTrainingStep:
         # Create batch data as numpy arrays
         observations = np.random.randn(batch_size, obs_size).astype(np.float32)
         policy_targets = np.random.randn(batch_size, num_actions).astype(np.float32)
-        policy_targets = np.exp(policy_targets) / np.exp(policy_targets).sum(
-            axis=1, keepdims=True
-        )
+        policy_targets = np.exp(policy_targets) / np.exp(policy_targets).sum(axis=1, keepdims=True)
         value_targets = np.random.randn(batch_size).astype(np.float32)
 
         # Should not raise error (mask is extracted from observations internally)
@@ -650,8 +635,8 @@ class TestAlphaZeroLearnerEvaluation:
     """Test evaluation metrics computation."""
 
     def test_eval_stats_creation(self, tmp_path):
-        """Test that EvalStats can be created from EvalResults."""
-        # EvalStats is created directly from EvalResults in the trainer
+        """Test that EvaluationStats can be created from EvalResults."""
+        # EvaluationStats is created directly from EvalResults in the trainer
         mock_results = EvalResults(
             env_id="tictactoe",
             player1_name="model",
@@ -667,23 +652,25 @@ class TestAlphaZeroLearnerEvaluation:
             avg_game_length=8.5,
         )
 
-        # Create EvalStats directly as the trainer does
-        eval_stats = EvalStats(
+        # Create EvaluationStats directly as the trainer does
+        eval_stats = EvaluationStats(
             step=5,
-            win_rate=mock_results.player1_win_rate,
-            draw_rate=mock_results.draw_rate,
-            loss_rate=mock_results.player2_win_rate,
-            games_played=mock_results.games_played,
-            avg_game_length=mock_results.avg_game_length,
+            metrics={
+                "outcome/win_rate": mock_results.player1_win_rate,
+                "outcome/draw_rate": mock_results.draw_rate,
+                "outcome/loss_rate": mock_results.player2_win_rate,
+            },
+            episodes=mock_results.games_played,
+            mean_episode_length=mock_results.avg_game_length,
             timestamp=0.0,
         )
 
-        assert isinstance(eval_stats, EvalStats)
-        assert eval_stats.win_rate == 0.7
-        assert eval_stats.draw_rate == 0.2
+        assert isinstance(eval_stats, EvaluationStats)
+        assert eval_stats.metrics["outcome/win_rate"] == 0.7
+        assert eval_stats.metrics["outcome/draw_rate"] == 0.2
 
     def test_eval_stats_vs_random(self, tmp_path):
-        """Test EvalStats creation from vs-random evaluation results."""
+        """Test EvaluationStats creation from vs-random evaluation results."""
         mock_results = EvalResults(
             env_id="tictactoe",
             player1_name="model",
@@ -699,19 +686,21 @@ class TestAlphaZeroLearnerEvaluation:
             avg_game_length=9.2,
         )
 
-        eval_stats = EvalStats(
+        eval_stats = EvaluationStats(
             step=10,
-            win_rate=mock_results.player1_win_rate,
-            draw_rate=mock_results.draw_rate,
-            loss_rate=mock_results.player2_win_rate,
-            games_played=mock_results.games_played,
-            avg_game_length=mock_results.avg_game_length,
+            metrics={
+                "outcome/win_rate": mock_results.player1_win_rate,
+                "outcome/draw_rate": mock_results.draw_rate,
+                "outcome/loss_rate": mock_results.player2_win_rate,
+            },
+            episodes=mock_results.games_played,
+            mean_episode_length=mock_results.avg_game_length,
             timestamp=0.0,
         )
 
-        assert eval_stats.win_rate == 0.8
-        assert eval_stats.games_played == 50
-        assert eval_stats.avg_game_length == 9.2
+        assert eval_stats.metrics["outcome/win_rate"] == 0.8
+        assert eval_stats.episodes == 50
+        assert eval_stats.mean_episode_length == 9.2
 
 
 class TestAlphaZeroLearnerStats:
@@ -731,13 +720,12 @@ class TestAlphaZeroLearnerStats:
         # Simulate some training
         trainer.stats = TrainerStats()
         trainer.stats.total_steps = 50
-        trainer.stats.policy_loss = 1.5
-        trainer.stats.value_loss = 0.5
+        trainer.stats.metrics = {"loss/policy": 1.5, "loss/value": 0.5}
         trainer.stats.samples_seen = 200
 
         # Verify stats
         assert trainer.stats.total_steps == 50
-        assert trainer.stats.policy_loss == 1.5
+        assert trainer.stats.metrics["loss/policy"] == 1.5
         assert trainer.stats.samples_seen == 200
 
     def test_save_checkpoint_creates_file(self, tmp_path):
@@ -766,9 +754,7 @@ class TestAlphaZeroLearnerStats:
         trainer = make_learner(config)
         previous_parent = trainer.parent_checkpoint_id
         trainer.checkpoint_publisher = MagicMock()
-        trainer.checkpoint_publisher.stage_checkpoint.side_effect = RuntimeError(
-            "upload failed"
-        )
+        trainer.checkpoint_publisher.stage_checkpoint.side_effect = RuntimeError("upload failed")
 
         with pytest.raises(RuntimeError, match="upload failed"):
             trainer._save_checkpoint(step=10)
@@ -831,9 +817,7 @@ class TestAlphaZeroLearnerStats:
 
         assert trainer.stats.timestamp == 100.0
 
-    def test_overlapping_stats_and_checkpoint_ticks_create_one_run_commit(
-        self, tmp_path
-    ):
+    def test_overlapping_stats_and_checkpoint_ticks_create_one_run_commit(self, tmp_path):
         config = AlphaZeroLearnerConfig(
             env_id="tictactoe",
             model_dir=str(tmp_path / "models"),
@@ -917,9 +901,7 @@ class TestMetricsHook:
 
     def test_hook_called_at_stats_interval(self, tmp_path):
         calls = []
-        trainer = self._make_learner(
-            tmp_path, lambda payload, step: calls.append((payload, step))
-        )
+        trainer = self._make_learner(tmp_path, lambda payload, step: calls.append((payload, step)))
 
         trainer._record_step_metrics(
             step=10,
@@ -934,9 +916,9 @@ class TestMetricsHook:
         assert len(calls) == 1
         payload, step = calls[0]
         assert step == 410
-        assert payload["total_loss"] == 1.5
-        assert payload["value_loss"] == 0.5
-        assert payload["policy_loss"] == 1.0
+        assert payload["metrics"]["loss/total"] == 1.5
+        assert payload["metrics"]["loss/value"] == 0.5
+        assert payload["metrics"]["loss/policy"] == 1.0
         assert "learning_rate" in payload
         assert "samples_seen" in payload
 

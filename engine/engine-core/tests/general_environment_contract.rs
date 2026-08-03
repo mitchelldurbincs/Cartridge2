@@ -1,9 +1,9 @@
 use engine_core::{
-    ActionEncoding, ActionSpace, AgentId, AgentModel, AgentObservation, AgentOutcome, Capabilities,
-    ChanceModel, Decision, DecodeError, EncodeError, Encoding, EngineContext, EngineId,
-    Environment, EnvironmentError, EnvironmentMetadata, EnvironmentSemantics, EpisodeStatus,
-    InformationModel, PlanningStateModel, RewardModel, SequentialTurnOrder, Timestep,
-    TransitionDynamics, TransitionSource, TurnModel,
+    ActionAvailabilityContract, ActionEncoding, ActionSpace, AgentId, AgentModel, AgentObservation,
+    AgentOutcome, Capabilities, ChanceModel, Decision, DecodeError, EncodeError, Encoding,
+    EngineContext, EngineId, Environment, EnvironmentError, EnvironmentMetadata,
+    EnvironmentSemantics, EpisodeStatus, InformationModel, PlanningStateModel, RewardModel,
+    SequentialTurnOrder, TensorSpec, Timestep, TransitionDynamics, TransitionSource, TurnModel,
 };
 use rand_chacha::ChaCha20Rng;
 
@@ -96,9 +96,7 @@ impl Environment for SimultaneousEnvironment {
                         truncated: false,
                     },
                 ],
-                decision: Decision::Agents {
-                    agent_ids: vec![AgentId(10), AgentId(20)],
-                },
+                decision: Decision::agents([AgentId(10), AgentId(20)]),
                 episode: EpisodeStatus::Running,
                 source: TransitionSource::Reset,
                 info: Vec::new(),
@@ -211,7 +209,9 @@ impl Environment for ExplicitChanceEnvironment {
                 action: ActionEncoding::Custom {
                     id: "chance-or-agent:v1".into(),
                 },
-                observation: engine_core::ObservationEncoding::F32LittleEndian { elements: 1 },
+                observation: engine_core::ObservationEncoding::Tensor {
+                    spec: TensorSpec::f32_fixed([("feature", 1)]),
+                },
                 schema_version: engine_core::WIRE_ENCODING_SCHEMA_VERSION,
             },
             semantics: EnvironmentSemantics {
@@ -277,9 +277,7 @@ impl Environment for ExplicitChanceEnvironment {
                         terminated: false,
                         truncated: false,
                     }],
-                    decision: Decision::Agents {
-                        agent_ids: vec![AgentId(5)],
-                    },
+                    decision: Decision::agents([AgentId(5)]),
                     episode: EpisodeStatus::Running,
                     source: TransitionSource::Chance,
                     info: Vec::new(),
@@ -369,7 +367,10 @@ impl Environment for DynamicRosterEnvironment {
         Capabilities {
             id: self.engine_id(),
             contract_version: 1,
-            encoding: Encoding::discrete_u32_le_f32_le("dynamic-state:v1", 1),
+            encoding: Encoding::discrete_u32_le(
+                "dynamic-state:v1",
+                TensorSpec::f32_fixed([("feature", 1)]),
+            ),
             semantics: EnvironmentSemantics {
                 turn_model: TurnModel::Sequential {
                     order: SequentialTurnOrder::EnvironmentDefined,
@@ -383,6 +384,7 @@ impl Environment for DynamicRosterEnvironment {
             max_horizon: Some(2),
             agents: AgentModel::Dynamic {
                 action_space: ActionSpace::discrete(1),
+                action_availability: ActionAvailabilityContract::All,
             },
             preferred_batch: 1,
         }
@@ -411,9 +413,7 @@ impl Environment for DynamicRosterEnvironment {
                     terminated: false,
                     truncated: false,
                 }],
-                decision: Decision::Agents {
-                    agent_ids: vec![AgentId(1)],
-                },
+                decision: Decision::agents([AgentId(1)]),
                 episode: EpisodeStatus::Running,
                 source: TransitionSource::Reset,
                 info: Vec::new(),
@@ -455,9 +455,7 @@ impl Environment for DynamicRosterEnvironment {
                             truncated: false,
                         },
                     ],
-                    decision: Decision::Agents {
-                        agent_ids: vec![AgentId(2)],
-                    },
+                    decision: Decision::agents([AgentId(2)]),
                     episode: EpisodeStatus::Running,
                     source: TransitionSource::Agents {
                         agent_ids: vec![AgentId(1)],
@@ -537,7 +535,10 @@ impl Environment for MultiDiscreteEnvironment {
         Capabilities {
             id: self.engine_id(),
             contract_version: 1,
-            encoding: Encoding::multi_discrete_u32_le_f32_le("multi-state:v1", 1),
+            encoding: Encoding::multi_discrete_u32_le(
+                "multi-state:v1",
+                TensorSpec::f32_fixed([("feature", 1)]),
+            ),
             semantics: EnvironmentSemantics::deterministic_single_agent_general_reward(),
             max_horizon: Some(1),
             agents: AgentModel::fixed_homogeneous(
@@ -631,7 +632,10 @@ impl Environment for ContinuousEnvironment {
         Capabilities {
             id: self.engine_id(),
             contract_version: 1,
-            encoding: Encoding::continuous_f32_le_f32_le("continuous-state:v1", 1),
+            encoding: Encoding::continuous_f32_le(
+                "continuous-state:v1",
+                TensorSpec::f32_fixed([("feature", 1)]),
+            ),
             semantics: EnvironmentSemantics::deterministic_single_agent_general_reward(),
             max_horizon: Some(1),
             agents: AgentModel::fixed_homogeneous(
@@ -725,9 +729,7 @@ fn one_agent_running(observation: f32) -> Timestep<f32> {
             terminated: false,
             truncated: false,
         }],
-        decision: Decision::Agents {
-            agent_ids: vec![AgentId(0)],
-        },
+        decision: Decision::agents([AgentId(0)]),
         episode: EpisodeStatus::Running,
         source: TransitionSource::Reset,
         info: Vec::new(),
@@ -759,9 +761,7 @@ fn simultaneous_private_observations_and_joint_custom_action_run_end_to_end() {
     let reset = context.reset(1, &[]).unwrap();
     assert_eq!(
         reset.timestep.decision,
-        Decision::Agents {
-            agent_ids: vec![AgentId(10), AgentId(20)]
-        }
+        Decision::agents([AgentId(10), AgentId(20)])
     );
     assert_ne!(
         reset.timestep.observation_for(AgentId(10)),
@@ -782,12 +782,7 @@ fn explicit_chance_then_agent_decision_runs_end_to_end() {
 
     let chance = context.step(&reset.state, &[0, 7]).unwrap();
     assert_eq!(chance.timestep.source, TransitionSource::Chance);
-    assert_eq!(
-        chance.timestep.decision,
-        Decision::Agents {
-            agent_ids: vec![AgentId(5)]
-        }
-    );
+    assert_eq!(chance.timestep.decision, Decision::agents([AgentId(5)]));
 
     let mut agent_action = vec![1];
     agent_action.extend_from_slice(&1u32.to_le_bytes());
@@ -810,12 +805,7 @@ fn dynamic_roster_spawns_and_retires_agents_with_a_final_transition() {
             agent_ids: vec![AgentId(1)]
         }
     );
-    assert_eq!(
-        spawned.timestep.decision,
-        Decision::Agents {
-            agent_ids: vec![AgentId(2)]
-        }
-    );
+    assert_eq!(spawned.timestep.decision, Decision::agents([AgentId(2)]));
 
     let removed = context.step(&spawned.state, &0u32.to_le_bytes()).unwrap();
     assert_eq!(removed.timestep.agents, vec![AgentId(2)]);

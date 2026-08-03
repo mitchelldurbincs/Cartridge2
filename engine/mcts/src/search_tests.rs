@@ -3,6 +3,7 @@
 use super::*;
 use crate::evaluator::UniformEvaluator;
 use crate::MctsConfigError;
+use engine_core::{ActionAvailability, ActionSpace};
 use rand::SeedableRng;
 use tracing::trace;
 
@@ -11,14 +12,15 @@ fn setup_tictactoe() -> EngineContext {
     EngineContext::new("tictactoe").unwrap()
 }
 
-fn active_observation(timestep: &ErasedTimestep) -> &[u8] {
-    let agent_id = match &timestep.decision {
-        Decision::Agents { agent_ids } if agent_ids.len() == 1 => agent_ids[0],
-        decision => panic!("expected one active agent, got {decision:?}"),
+fn active_legal_mask(timestep: &ErasedTimestep) -> &LegalMask {
+    let active = timestep
+        .decision
+        .sole_agent()
+        .expect("expected one active agent");
+    let ActionAvailability::DiscreteMask { mask } = &active.availability else {
+        panic!("expected a discrete legal-action mask");
     };
-    timestep
-        .observation_for(agent_id)
-        .expect("observation for active agent")
+    mask
 }
 
 #[test]
@@ -168,13 +170,7 @@ fn test_mcts_winning_move_has_positive_value() {
         timestep = step.timestep;
     }
 
-    // Extract legal mask from the observation (the authoritative source)
-    let metadata = ctx.metadata();
-    let legal_mask = metadata
-        .require_board()
-        .unwrap()
-        .legal_mask_from_obs(active_observation(&timestep))
-        .unwrap();
+    let legal_mask = active_legal_mask(&timestep);
 
     // Verify position 2 is legal
     assert!(
@@ -275,12 +271,11 @@ fn test_mcts_generals_257_actions() {
     let config = MctsConfig::for_testing().with_simulations(50);
 
     let reset = ctx.reset(42, &[]).unwrap();
-    let metadata = ctx.metadata();
-    let board = metadata.require_board().unwrap();
-    assert_eq!(board.action_count, 257);
-    let legal_mask = board
-        .legal_mask_from_obs(active_observation(&reset.timestep))
-        .unwrap();
+    assert!(matches!(
+        ctx.capabilities().action_space(AgentId(1)),
+        Some(ActionSpace::Discrete { size: 257 })
+    ));
+    let legal_mask = active_legal_mask(&reset.timestep).clone();
     // Wait (action 256, past the u64 boundary) must be legal at the root
     assert!(legal_mask.is_legal(256));
 

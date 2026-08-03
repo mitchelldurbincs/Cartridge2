@@ -30,9 +30,7 @@ class TestAlphaZeroGameConfig:
             board_height=5,
             num_actions=25,
             obs_size=50,
-            legal_mask_offset=25,
             obs_channels=2,
-            player_relative_obs=False,
         )
 
         assert config.env_id == "test"
@@ -41,7 +39,6 @@ class TestAlphaZeroGameConfig:
         assert config.board_height == 5
         assert config.num_actions == 25
         assert config.obs_size == 50
-        assert config.legal_mask_offset == 25
         # Check defaults
         assert config.hidden_size == 128
         assert config.network_type == "mlp"
@@ -57,14 +54,12 @@ class TestAlphaZeroGameConfig:
             board_width=8,
             board_height=8,
             num_actions=64,
-            obs_size=200,
-            legal_mask_offset=128,
+            obs_size=192,
             hidden_size=512,
             network_type="resnet",
             num_res_blocks=6,
             num_filters=256,
             obs_channels=3,
-            player_relative_obs=False,
         )
 
         assert config.hidden_size == 512
@@ -81,10 +76,8 @@ class TestAlphaZeroGameConfig:
             board_width=3,
             board_height=3,
             num_actions=9,
-            obs_size=20,
-            legal_mask_offset=10,
+            obs_size=9,
             obs_channels=1,
-            player_relative_obs=False,
         )
 
         assert config.board_size == 9
@@ -95,30 +88,11 @@ class TestAlphaZeroGameConfig:
             board_width=7,
             board_height=6,
             num_actions=7,
-            obs_size=100,
-            legal_mask_offset=50,
+            obs_size=42,
             obs_channels=1,
-            player_relative_obs=False,
         )
 
         assert config2.board_size == 42
-
-    def test_legal_mask_end_property(self):
-        """Test legal_mask_end property calculation."""
-        config = AlphaZeroGameConfig(
-            env_id="test",
-            display_name="Test Game",
-            board_width=3,
-            board_height=3,
-            num_actions=9,
-            obs_size=20,
-            legal_mask_offset=10,
-            obs_channels=1,
-            player_relative_obs=False,
-        )
-
-        # 10 + 9 = 19
-        assert config.legal_mask_end == 19
 
 
 class TestEnvironmentCatalog:
@@ -199,10 +173,8 @@ class TestTicTacToeConfig:
         """Test TicTacToe observation structure."""
         config = get_game_config("tictactoe")
 
-        # obs_size = 18 (board) + 9 (legal mask) + 2 (player) = 29
-        assert config.obs_size == 29
-        assert config.legal_mask_offset == 18
-        assert config.legal_mask_end == 27  # 18 + 9
+        assert config.obs_size == 18
+        assert config.obs_channels == 2
 
     def test_tictactoe_network_type(self):
         """Test TicTacToe uses MLP network."""
@@ -233,10 +205,7 @@ class TestConnect4Config:
         """Test Connect4 observation structure."""
         config = get_game_config("connect4")
 
-        # obs_size = 42 (Red) + 42 (Yellow) + 7 (legal) + 2 (player) = 93
-        assert config.obs_size == 93
-        assert config.legal_mask_offset == 84  # After both board views
-        assert config.legal_mask_end == 91  # 84 + 7
+        assert config.obs_size == 84
 
     def test_connect4_network_type(self):
         """Test Connect4 uses ResNet."""
@@ -272,10 +241,7 @@ class TestOthelloConfig:
         """Test Othello observation structure."""
         config = get_game_config("othello")
 
-        # obs_size = 128 (board: 64*2) + 65 (legal) + 2 (player) = 195
-        assert config.obs_size == 195
-        assert config.legal_mask_offset == 128  # After board encoding
-        assert config.legal_mask_end == 193  # 128 + 65
+        assert config.obs_size == 128
 
     def test_othello_network_type(self):
         """Test Othello uses ResNet."""
@@ -325,8 +291,7 @@ class TestGeneralsConfig:
         assert config.board_width == 8
         assert config.board_height == 8
         assert config.num_actions == 257  # 64 tiles * 4 directions + wait
-        assert config.obs_size == 899  # 640 planes + 257 legal + 2 player
-        assert config.legal_mask_offset == 640
+        assert config.obs_size == 640
 
     def test_generals_uses_player_relative_resnet(self):
         config = get_game_config("generals_8x8")
@@ -335,10 +300,8 @@ class TestGeneralsConfig:
         assert config.num_res_blocks == 6
         assert config.num_filters == 128
         # 10 generals_obs:v2 planes, encoded own/enemy relative to the player to
-        # act and including the exact cap countdown — so the network must not
-        # also receive the player indicator.
+        # act and including the exact cap countdown.
         assert config.obs_channels == 10
-        assert config.player_relative_obs is True
 
 
 class TestManifestIntegrity:
@@ -367,12 +330,9 @@ class TestManifestIntegrity:
         for env_id in list_compatible_environments():
             config = get_game_config(env_id)
             assert config.obs_channels > 0, f"{env_id}: obs_channels unset"
-            assert (
-                config.legal_mask_offset == config.obs_channels * config.board_size
-            ), f"{env_id}: legal mask must start immediately after the board planes"
-            assert (
-                config.obs_size == config.legal_mask_offset + config.num_actions + 2
-            ), f"{env_id}: obs_size must be planes + legal mask + player one-hot"
+            assert config.obs_size == config.obs_channels * config.board_size, (
+                f"{env_id}: observation must be exactly the spatial tensor"
+            )
 
     def test_facts_are_not_restated_in_python(self):
         """The registry must be built from the manifest, not hardcoded.
@@ -385,30 +345,25 @@ class TestManifestIntegrity:
         from importlib.resources import files
 
         manifest = json.loads(
-            files("trainer")
-            .joinpath("environment_manifest.json")
-            .read_text(encoding="utf-8")
+            files("trainer").joinpath("environment_manifest.json").read_text(encoding="utf-8")
         )
         by_id = {
-            environment["metadata"]["id"]: environment
-            for environment in manifest["environments"]
+            environment["metadata"]["id"]: environment for environment in manifest["environments"]
         }
 
         assert set(by_id) == set(ENVIRONMENTS)
         for env_id, environment in ENVIRONMENTS.items():
-            board = by_id[env_id]["metadata"]["board"]
+            source = by_id[env_id]
+            board = source["metadata"]["board"]
             if board is None:
                 assert environment.board is None
                 continue
             parsed = environment.require_board()
-            expected = {
-                "elements": board["observation"]["elements"],
-                "legal_actions_offset": board["observation"]["legal_actions_offset"],
-                "spatial_channels": board["observation"]["spatial_channels"],
-            }
-            for field, value in expected.items():
-                assert getattr(parsed.observation, field) == value, f"{env_id}.{field}"
-            assert parsed.action_count == board["action_count"]
+            assert parsed.width == board["width"]
+            assert parsed.height == board["height"]
+            tensor = environment.capabilities.encoding.observation_tensor
+            assert tensor is not None
+            assert tensor.fixed_elements == get_game_config(env_id).obs_size
 
     def test_every_environment_has_the_alpha_zero_compatibility_report(self):
         for env_id in list_environments():

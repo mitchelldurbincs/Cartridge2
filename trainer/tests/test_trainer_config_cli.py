@@ -2,7 +2,7 @@ import argparse
 
 import pytest
 
-from trainer.config import AlphaZeroLearnerConfig
+from trainer.algorithms.alphazero_config import AlphaZeroLearnerConfig
 
 
 def test_configure_parser_adds_expected_arguments():

@@ -33,7 +33,7 @@ fn test_observation_legal_mask_exactly_matches_step_acceptance() {
     }
 
     for state in [State::new(), full_column] {
-        let observation = observation_from_state(&state).unwrap();
+        let legal = Connect4::legal_actions(&state).unwrap();
         for action in 0..COLS as u8 {
             let mut candidate = state.clone();
             let before = candidate.clone();
@@ -42,8 +42,8 @@ fn test_observation_legal_mask_exactly_matches_step_acceptance() {
                 .is_ok();
             assert_eq!(
                 accepted,
-                observation.legal_moves[action as usize] == 1.0,
-                "action {action} disagrees with the observation mask for {state:?}"
+                legal.is_legal(action as usize),
+                "action {action} disagrees with the decision mask for {state:?}"
             );
             if !accepted {
                 assert_eq!(candidate, before, "rejected action mutated the state");
@@ -237,10 +237,10 @@ fn test_observation_encoding() {
 
     // All board positions should be 0 initially
     assert_eq!(obs.board_view, [0.0; BOARD_SIZE * 2]);
-    // All columns should be legal
-    assert_eq!(obs.legal_moves, [1.0; COLS]);
-    // Red should be current player
-    assert_eq!(obs.current_player, [1.0, 0.0]);
+    assert_eq!(
+        Connect4::legal_actions(&state).unwrap().count_ones(),
+        COLS as u32
+    );
 }
 
 #[test]
@@ -259,8 +259,16 @@ fn test_game_trait_implementation() {
     // Reward should be 0 for ongoing game
     assert_eq!(transition.actor_reward, 0.0);
 
-    assert_eq!(transition.observation.legal_moves, [1.0; COLS]);
-    assert_eq!(transition.observation.current_player, [0.0, 1.0]);
+    assert_eq!(
+        transition.observation.board_view[BOARD_SIZE + State::pos(3, 0)],
+        1.0
+    );
+    assert_eq!(
+        Connect4::legal_actions(&state.drop_piece(3))
+            .unwrap()
+            .count_ones(),
+        COLS as u32
+    );
 }
 
 #[test]
@@ -300,8 +308,8 @@ fn test_observation_byte_encoding() {
     let mut buf = Vec::new();
     Connect4::encode_observation(&obs, &mut buf).unwrap();
 
-    // Should be OBS_SIZE * 4 bytes (OBS_SIZE f32 values)
-    assert_eq!(buf.len(), OBS_SIZE * 4);
+    // Two player-relative board planes.
+    assert_eq!(buf.len(), BOARD_SIZE * 2 * 4);
 }
 
 #[test]
@@ -364,7 +372,6 @@ fn test_metadata() {
     let board = meta.require_board().unwrap();
     assert_eq!(board.width, COLS);
     assert_eq!(board.height, ROWS);
-    assert_eq!(board.action_count, COLS);
     assert_eq!(board.players.len(), 2);
 }
 
@@ -433,17 +440,14 @@ fn test_random_games_invariants() {
                 );
             }
 
+            let legal = Connect4::legal_actions(&state).unwrap();
+            let encoded = legal
+                .iter_ones()
+                .fold(0u8, |mask, index| mask | (1u8 << index));
             assert_eq!(
-                transition
-                    .observation
-                    .legal_moves
-                    .iter()
-                    .enumerate()
-                    .fold(0u8, |mask, (index, value)| {
-                        mask | (u8::from(*value == 1.0) << index)
-                    }),
+                encoded,
                 state.legal_moves_mask(),
-                "Observation mask should match state (seed={})",
+                "Decision mask should match state (seed={})",
                 seed
             );
         }

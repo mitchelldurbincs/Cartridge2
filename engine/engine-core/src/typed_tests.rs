@@ -43,9 +43,7 @@ fn timestep_represents_simultaneous_agents_and_individual_outcomes() {
                 truncated: false,
             },
         ],
-        decision: Decision::Agents {
-            agent_ids: vec![AgentId(10), AgentId(20)],
-        },
+        decision: Decision::agents([AgentId(10), AgentId(20)]),
         episode: EpisodeStatus::Running,
         source: TransitionSource::Chance,
         info: vec![1, 2, 3],
@@ -83,6 +81,7 @@ fn continuing_and_chance_environments_are_expressible() {
                 high: vec![1.0],
                 shape: vec![1],
             },
+            action_availability: ActionAvailabilityContract::All,
         },
         preferred_batch: 32,
     };

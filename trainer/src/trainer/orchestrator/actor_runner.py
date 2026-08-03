@@ -1,7 +1,8 @@
 """Subprocess runner for Cartridge2 collector implementations."""
 
+import json
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from crucible.orchestrator.actor_runner import ActorRunner as _CoreActorRunner
 
@@ -31,6 +32,7 @@ class ActorRunner(_CoreActorRunner):
     def __init__(
         self,
         config: LoopConfig,
+        collector_config_builder: Callable[[Any, int], dict],
         shutdown_check: Callable[[], bool] | None = None,
     ):
         super().__init__(
@@ -38,6 +40,7 @@ class ActorRunner(_CoreActorRunner):
             shutdown_check=shutdown_check,
             binary_candidates=_BINARY_CANDIDATES,
         )
+        self._collector_config_builder = collector_config_builder
         self._replay_selection: ReplaySelection | None = None
 
     def select_replay(self, selection: ReplaySelection) -> None:
@@ -61,6 +64,12 @@ class ActorRunner(_CoreActorRunner):
         selection = self._replay_selection
         if selection is None:
             raise RuntimeError("Collector replay selection has not been established")
+        collector_config = self._collector_config_builder(self.config, num_simulations)
+        if not isinstance(collector_config, dict):
+            raise TypeError("collector cartridge configuration must be a dict")
+        collector_config_json = json.dumps(
+            collector_config, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
         command = [
             str(actor_binary),
             "--algorithm",
@@ -75,28 +84,12 @@ class ActorRunner(_CoreActorRunner):
             str(self.config.actor_log_interval),
             "--log-level",
             self.config.log_level.lower(),
-            "--num-simulations",
-            str(num_simulations),
-            "--c-puct",
-            str(self.config.c_puct),
-            "--temperature",
-            str(self.config.temperature),
-            "--late-temperature",
-            str(self.config.late_temperature),
-            "--temp-threshold",
-            str(self.config.temp_threshold),
-            "--dirichlet-alpha",
-            str(self.config.dirichlet_alpha),
-            "--dirichlet-weight",
-            str(self.config.dirichlet_weight),
+            "--collector-config",
+            collector_config_json,
             "--actor-id",
             actor_id,
             "--episode-timeout-secs",
             str(self.config.actor_episode_timeout_seconds),
-            "--eval-batch-size",
-            str(self.config.actor_eval_batch_size),
-            "--onnx-intra-threads",
-            str(self.config.actor_onnx_intra_threads),
             "--collection-scope-id",
             selection.collection_scope_id,
         ]

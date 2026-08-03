@@ -3,7 +3,7 @@
 Tests cover:
 - Forward pass shapes for the registered 2-channel games (Connect4, Othello)
 - Arbitrary spatial channel counts (e.g. 9 channels for a future game)
-- Observation reshape logic (board planes + derived current-player plane)
+- Observation reshape logic for exact environment-declared board planes
 - ONNX export signature is preserved regardless of channel count
 """
 
@@ -16,21 +16,18 @@ import torch
 from trainer.algorithms.alphazero_board_v1 import (
     AlphaZeroGameConfig,
     get_game_config,
+    policy_value_artifact_contract,
 )
 from trainer.checkpoint import export_onnx_artifact
 from trainer.environment_catalog import get_environment
 from trainer.network import create_network
 from trainer.resnet import ConvPolicyValueNetwork
-from trainer.storage.publisher import OnnxArtifactContract
 
 
-def make_config(
-    obs_channels: int, width: int = 5, height: int = 4
-) -> AlphaZeroGameConfig:
+def make_config(obs_channels: int, width: int = 5, height: int = 4) -> AlphaZeroGameConfig:
     """Build a synthetic AlphaZero game config with N spatial channels.
 
-    Observation layout: obs_channels board planes, then legal mask
-    (num_actions), then the 2-element player one-hot.
+    Observation layout: exactly ``obs_channels`` board planes.
     """
     board_size = width * height
     num_actions = board_size
@@ -40,24 +37,17 @@ def make_config(
         board_width=width,
         board_height=height,
         num_actions=num_actions,
-        obs_size=obs_channels * board_size + num_actions + 2,
-        legal_mask_offset=obs_channels * board_size,
+        obs_size=obs_channels * board_size,
         network_type="resnet",
         num_res_blocks=1,
         num_filters=16,
         obs_channels=obs_channels,
-        player_relative_obs=False,
     )
 
 
 def make_obs(config: AlphaZeroGameConfig, batch_size: int) -> torch.Tensor:
-    """Random observation batch with a valid player one-hot."""
-    obs = torch.rand(batch_size, config.obs_size)
-    offset = config.player_indicator_offset
-    obs[:, offset : offset + 2] = 0.0
-    obs[: batch_size // 2, offset] = 1.0  # first player to move
-    obs[batch_size // 2 :, offset + 1] = 1.0  # second player to move
-    return obs
+    """Random observation batch with the declared tensor shape."""
+    return torch.rand(batch_size, config.obs_size)
 
 
 class TestRegisteredGames:
@@ -81,8 +71,8 @@ class TestRegisteredGames:
         network = ConvPolicyValueNetwork(config)
 
         assert network.board_planes == 2
-        assert network.input_channels == 3  # +1 derived player plane
-        assert network.initial_conv.in_channels == 3
+        assert network.input_channels == 2
+        assert network.initial_conv.in_channels == 2
 
 
 class TestArbitraryChannels:
@@ -97,8 +87,8 @@ class TestArbitraryChannels:
         policy_logits, value = network(obs)
 
         assert network.board_planes == channels
-        assert network.input_channels == channels + 1
-        assert network.initial_conv.in_channels == channels + 1
+        assert network.input_channels == channels
+        assert network.initial_conv.in_channels == channels
         assert policy_logits.shape == (4, config.num_actions)
         assert value.shape == (4, 1)
 
@@ -113,7 +103,7 @@ class TestArbitraryChannels:
         board_size = config.board_size
         assert spatial.shape == (
             4,
-            channels + 1,
+            channels,
             config.board_height,
             config.board_width,
         )
@@ -123,9 +113,6 @@ class TestArbitraryChannels:
                 4, config.board_height, config.board_width
             )
             assert torch.equal(spatial[:, i], expected)
-        # Derived player plane: +1 for first player, -1 for second
-        assert torch.all(spatial[:2, channels] == 1.0)
-        assert torch.all(spatial[2:, channels] == -1.0)
 
     @pytest.mark.parametrize("channels", [2, 9])
     def test_onnx_export_signature(self, channels, tmp_path):
@@ -135,10 +122,9 @@ class TestArbitraryChannels:
 
         checkpoint_path = export_onnx_artifact(
             network=network,
-            obs_size=config.obs_size,
             output_path=tmp_path / "model.onnx",
             device=torch.device("cpu"),
-            artifact_contract=OnnxArtifactContract(
+            artifact_contract=policy_value_artifact_contract(
                 algorithm_id="alphazero_board_v1",
                 env_id=config.env_id,
                 env_contract_version=1,
@@ -167,26 +153,20 @@ class TestArbitraryChannels:
         observations = make_obs(config, batch_size=3)
         with torch.no_grad():
             expected_policy, expected_value = network(observations)
-        session = ort.InferenceSession(
-            str(checkpoint_path), providers=["CPUExecutionProvider"]
-        )
+        session = ort.InferenceSession(str(checkpoint_path), providers=["CPUExecutionProvider"])
         actual_policy, actual_value = session.run(
             ["policy_logits", "value"],
             {"observation": observations.numpy()},
         )
-        np.testing.assert_allclose(
-            actual_policy, expected_policy.numpy(), rtol=1e-4, atol=1e-5
-        )
-        np.testing.assert_allclose(
-            actual_value, expected_value.numpy(), rtol=1e-4, atol=1e-5
-        )
+        np.testing.assert_allclose(actual_policy, expected_policy.numpy(), rtol=1e-4, atol=1e-5)
+        np.testing.assert_allclose(actual_value, expected_value.numpy(), rtol=1e-4, atol=1e-5)
 
 
-def test_generals_v2_deep_resnet_export_passes_runtime_equivalence(tmp_path):
+def test_generals_v3_deep_resnet_export_passes_runtime_equivalence(tmp_path):
     environment = get_environment("generals_8x8")
     config = get_game_config(environment.env_id)
-    assert environment.contract_version == 2
-    assert config.obs_size == 899
+    assert environment.contract_version == 3
+    assert config.obs_size == 640
     assert config.num_actions == 257
     assert config.num_res_blocks == 6
     assert config.num_filters == 128
@@ -196,10 +176,9 @@ def test_generals_v2_deep_resnet_export_passes_runtime_equivalence(tmp_path):
 
     checkpoint_path = export_onnx_artifact(
         network=network,
-        obs_size=config.obs_size,
-        output_path=tmp_path / "generals-v2.onnx",
+        output_path=tmp_path / "generals-v3.onnx",
         device=torch.device("cpu"),
-        artifact_contract=OnnxArtifactContract(
+        artifact_contract=policy_value_artifact_contract(
             algorithm_id="alphazero_board_v1",
             env_id=environment.env_id,
             env_contract_version=environment.contract_version,
@@ -216,7 +195,7 @@ def test_generals_v2_deep_resnet_export_passes_runtime_equivalence(tmp_path):
         [dim.dim_param or dim.dim_value for dim in item.type.tensor_type.shape.dim]
         for item in tensors
     ] == [
-        ["batch_size", 899],
+        ["batch_size", 640],
         ["batch_size", 257],
         ["batch_size", 1],
     ]

@@ -23,8 +23,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from trainer.algorithms.alphazero_board_v1 import ALGORITHM_ID
+from trainer.algorithms.alphazero_config import AlphaZeroLearnerConfig
 from trainer.algorithms.registry import get_algorithm
-from trainer.config import AlphaZeroLearnerConfig
 from trainer.environment_catalog import get_environment
 from trainer.network import PolicyValueNetwork, create_network
 from trainer.storage import ReplayProfile, ReplaySelection, create_replay_store
@@ -72,7 +72,7 @@ def test_network():
     assert isinstance(net, PolicyValueNetwork)
 
     # Test forward pass
-    batch = torch.randn(4, 29)
+    batch = torch.randn(4, 18)
     policy_logits, value = net(batch)
 
     assert policy_logits.shape == (4, 9), f"Expected (4, 9), got {policy_logits.shape}"
@@ -141,9 +141,7 @@ def test_training_with_postgres():
     """Run a minimal training loop with PostgreSQL (if configured)."""
     postgres_url = os.environ.get("CARTRIDGE_STORAGE_POSTGRES_URL")
     if not postgres_url:
-        print(
-            "\nSkipping PostgreSQL integration test (CARTRIDGE_STORAGE_POSTGRES_URL not set)"
-        )
+        print("\nSkipping PostgreSQL integration test (CARTRIDGE_STORAGE_POSTGRES_URL not set)")
         return
 
     print("\nTesting training loop with PostgreSQL...")
@@ -171,9 +169,7 @@ def test_training_with_postgres():
         replay.close()
 
         if count < 32:
-            print(
-                f"  Not enough data in database ({count} transitions), skipping training"
-            )
+            print(f"  Not enough data in database ({count} transitions), skipping training")
             return
 
         stats = learner.train()

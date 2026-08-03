@@ -14,6 +14,7 @@ use tracing::{error, info};
 mod actor;
 mod algorithms;
 mod config;
+mod dqn_actor;
 mod mcts_policy;
 mod resources;
 mod stats;
@@ -77,16 +78,7 @@ async fn main() -> Result<()> {
         actor_id = %config.actor_id,
         collection_scope_id = %config.collection_scope_id,
         source_checkpoint_id = config.source_checkpoint_id.as_deref().unwrap_or("root"),
-        num_simulations = config.num_simulations,
-        c_puct = config.c_puct,
-        temperature = config.temperature,
-        late_temperature = config.late_temperature,
-        temp_threshold = config.temp_threshold,
-        dirichlet_alpha = config.dirichlet_alpha,
-        dirichlet_weight = config.dirichlet_weight,
-        eval_batch_size = config.eval_batch_size,
-        onnx_intra_threads = config.onnx_intra_threads,
-        "Actor configuration loaded"
+        "Common collector configuration loaded"
     );
 
     // Create actor instance

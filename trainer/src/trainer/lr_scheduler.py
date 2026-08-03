@@ -284,8 +284,7 @@ class WarmupCosineScheduler:
         # by the optimizer checkpoint, and stepping continues the cosine normally.
         saved_last_lr = cosine_state.get("_last_lr") or []
         floored = abs(self.get_lr() - self.config.min_lr) < 1e-12 or (
-            len(saved_last_lr) > 0
-            and abs(saved_last_lr[0] - self.config.min_lr) < 1e-12
+            len(saved_last_lr) > 0 and abs(saved_last_lr[0] - self.config.min_lr) < 1e-12
         )
         if floored:
             closed_form_lr = (
@@ -298,8 +297,7 @@ class WarmupCosineScheduler:
             self._cosine_scheduler._last_lr = [closed_form_lr]
 
         logger.info(
-            f"Restored LR scheduler (epoch={last_epoch}, T_max={t_max}, "
-            f"LR={self.get_lr():.2e})"
+            f"Restored LR scheduler (epoch={last_epoch}, T_max={t_max}, LR={self.get_lr():.2e})"
         )
 
     # -------------------------------------------------------------------------

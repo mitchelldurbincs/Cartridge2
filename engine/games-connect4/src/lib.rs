@@ -38,9 +38,9 @@ use engine_core::board_profile::{
 };
 use engine_core::typed::{
     ActionSpace, AgentId, AgentModel, Capabilities, DecodeError, EncodeError, Encoding, EngineId,
-    EnvironmentSemantics,
+    EnvironmentSemantics, TensorSpec,
 };
-use engine_core::{EnvironmentError, EnvironmentMetadata};
+use engine_core::{EnvironmentError, EnvironmentMetadata, LegalMask};
 use rand_chacha::ChaCha20Rng;
 
 /// Board dimensions
@@ -49,7 +49,7 @@ pub const ROWS: usize = 6;
 pub const BOARD_SIZE: usize = COLS * ROWS; // 42
 
 /// Immutable environment contract revision for wire formats and semantics.
-pub const ENV_CONTRACT_VERSION: u32 = 1;
+pub const ENV_CONTRACT_VERSION: u32 = 2;
 
 /// Register Connect4 with the global game registry
 ///
@@ -227,16 +227,12 @@ impl Default for State {
 /// Connect4 action - column to drop a piece in (0-6)
 pub type Action = u8;
 
-/// Connect4 observation (84 board view + 7 legal moves + 2 current player = 93 floats)
-pub type Observation = TwoPlayerObs<84, 7>;
+/// Player-relative Connect4 observation: two 6x7 occupancy planes.
+pub type Observation = TwoPlayerObs<84>;
 
 /// Create observation from game state
 pub fn observation_from_state(state: &State) -> Result<Observation, TwoPlayerObsError> {
-    TwoPlayerObs::from_board_with_legal_actions(
-        &state.board,
-        state.legal_moves().into_iter().map(usize::from),
-        state.current_player,
-    )
+    TwoPlayerObs::from_board(&state.board, state.current_player)
 }
 
 /// Connect4 game implementation
@@ -256,9 +252,7 @@ impl Default for Connect4 {
     }
 }
 
-/// Observation size: 42 (Red) + 42 (Yellow) + 7 (legal) + 2 (player) = 93
-const OBS_SIZE: usize = BOARD_SIZE * 2 + COLS + 2;
-
+/// Observation size: two player-relative board planes.
 impl BoardGame for Connect4 {
     type State = State;
     type Action = Action;
@@ -275,11 +269,18 @@ impl BoardGame for Connect4 {
         Capabilities {
             id: self.engine_id(),
             contract_version: ENV_CONTRACT_VERSION,
-            encoding: Encoding::discrete_u32_le_f32_le("connect4_state:v1", OBS_SIZE),
+            encoding: Encoding::discrete_u32_le(
+                "connect4_state:v1",
+                TensorSpec::f32_fixed([
+                    ("channel", 2),
+                    ("row", ROWS as u32),
+                    ("column", COLS as u32),
+                ]),
+            ),
             semantics:
                 EnvironmentSemantics::deterministic_alternating_perfect_information_terminal_zero_sum(),
             max_horizon: Some(BOARD_SIZE as u32),
-            agents: AgentModel::fixed_homogeneous(
+            agents: AgentModel::fixed_homogeneous_masked(
                 [AgentId(1), AgentId(2)],
                 ActionSpace::discrete(COLS as u32),
             ),
@@ -291,8 +292,7 @@ impl BoardGame for Connect4 {
         EnvironmentMetadata::new("connect4", "Connect 4")
             .with_description("Drop discs to connect four in a row!")
             .with_board(
-                BoardGameMetadata::new(COLS, ROWS, COLS)
-                    .with_observation(OBS_SIZE, 2, BOARD_SIZE * 2, false)
+                BoardGameMetadata::new(COLS, ROWS)
                     .with_players(vec![
                         BoardPlayerMetadata::new("Red", "🔴"),
                         BoardPlayerMetadata::new("Yellow", "🟡"),
@@ -413,6 +413,10 @@ impl BoardGame for Connect4 {
     fn encode_observation(obs: &Self::Observation, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         obs.encode(out);
         Ok(())
+    }
+
+    fn legal_actions(state: &Self::State) -> Result<LegalMask, EnvironmentError> {
+        Ok(LegalMask::from_u64(state.legal_moves_mask() as u64, COLS))
     }
 
     fn view(state: &Self::State) -> BoardView {

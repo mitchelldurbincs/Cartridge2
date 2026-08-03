@@ -7,7 +7,7 @@ use crate::typed::{
     ActionEncoding, ActionSpace, AgentId, AgentModel, AgentObservation, AgentOutcome, Capabilities,
     ChanceModel, Decision, DecodeError, EncodeError, Encoding, EngineId, Environment,
     EnvironmentError, EnvironmentSemantics, EpisodeStatus, ObservationEncoding, PlanningStateModel,
-    RewardModel, Timestep, TransitionDynamics, TransitionSource, TurnModel,
+    RewardModel, TensorSpec, Timestep, TransitionDynamics, TransitionSource, TurnModel,
 };
 
 #[derive(Debug)]
@@ -33,9 +33,7 @@ impl CounterEnvironment {
             decision: if done {
                 Decision::None
             } else {
-                Decision::Agents {
-                    agent_ids: vec![AgentId(7)],
-                }
+                Decision::agents([AgentId(7)])
             },
             episode: if done {
                 EpisodeStatus::Terminated
@@ -349,6 +347,7 @@ fn timestep_rejects_multiple_agents_under_single_agent_semantics() {
     let (mut capabilities, timestep) = simultaneous_contract();
     capabilities.agents = AgentModel::Dynamic {
         action_space: ActionSpace::discrete(2),
+        action_availability: crate::ActionAvailabilityContract::All,
     };
     capabilities.semantics.turn_model = TurnModel::SingleAgent;
 
@@ -364,7 +363,10 @@ fn valid_board_descriptors() -> (EngineId, Capabilities, EnvironmentMetadata) {
     let capabilities = Capabilities {
         id: id.clone(),
         contract_version: 1,
-        encoding: Encoding::discrete_u32_le_f32_le("board-state:v1", 29),
+        encoding: Encoding::discrete_u32_le(
+            "board-state:v1",
+            TensorSpec::f32_fixed([("channel", 2), ("row", 3), ("column", 3)]),
+        ),
         semantics:
             EnvironmentSemantics::deterministic_alternating_perfect_information_terminal_zero_sum(),
         max_horizon: Some(9),
@@ -372,12 +374,10 @@ fn valid_board_descriptors() -> (EngineId, Capabilities, EnvironmentMetadata) {
         preferred_batch: 1,
     };
     let metadata = EnvironmentMetadata::new("board-test", "Board Test").with_board(
-        BoardGameMetadata::new(3, 3, 9)
-            .with_observation(29, 2, 18, false)
-            .with_players(vec![
-                BoardPlayerMetadata::new("One", "1"),
-                BoardPlayerMetadata::new("Two", "2"),
-            ]),
+        BoardGameMetadata::new(3, 3).with_players(vec![
+            BoardPlayerMetadata::new("One", "1"),
+            BoardPlayerMetadata::new("Two", "2"),
+        ]),
     );
     (id, capabilities, metadata)
 }
@@ -388,14 +388,9 @@ fn descriptors_validate_the_entire_board_profile() {
     crate::contract::validate_descriptors(&id, &capabilities, &metadata).unwrap();
 
     let mut malformed = metadata.clone();
-    malformed
-        .board
-        .as_mut()
-        .unwrap()
-        .observation
-        .legal_actions_offset = 17;
+    malformed.board.as_mut().unwrap().players.pop();
     let error = crate::contract::validate_descriptors(&id, &capabilities, &malformed).unwrap_err();
-    assert!(error.to_string().contains("mask offset"));
+    assert!(error.to_string().contains("exactly two players"));
 
     let mut overflow = metadata;
     let board = overflow.board.as_mut().unwrap();
@@ -408,7 +403,9 @@ fn descriptors_validate_the_entire_board_profile() {
 #[test]
 fn adapter_validates_declared_f32_observation_payloads() {
     let mut capabilities = capabilities_with_action_space(ActionSpace::discrete(2));
-    capabilities.encoding.observation = ObservationEncoding::F32LittleEndian { elements: 2 };
+    capabilities.encoding.observation = ObservationEncoding::Tensor {
+        spec: TensorSpec::f32_fixed([("feature", 2)]),
+    };
 
     assert!(crate::contract::validate_encoded_observation(
         &capabilities,
@@ -460,9 +457,7 @@ fn simultaneous_contract() -> (Capabilities, Timestep<f32>) {
                 truncated: false,
             },
         ],
-        decision: Decision::Agents {
-            agent_ids: vec![AgentId(7), AgentId(8)],
-        },
+        decision: Decision::agents([AgentId(7), AgentId(8)]),
         episode: EpisodeStatus::Running,
         source: TransitionSource::Chance,
         info: Vec::new(),
@@ -532,6 +527,7 @@ fn dynamic_departure_stays_in_the_transition_roster_for_its_final_outcome() {
     let (mut capabilities, mut timestep) = simultaneous_contract();
     capabilities.agents = AgentModel::Dynamic {
         action_space: ActionSpace::discrete(2),
+        action_availability: crate::ActionAvailabilityContract::All,
     };
     capabilities.semantics.turn_model = TurnModel::Sequential {
         order: crate::typed::SequentialTurnOrder::EnvironmentDefined,
@@ -540,9 +536,7 @@ fn dynamic_departure_stays_in_the_transition_roster_for_its_final_outcome() {
         .observations
         .retain(|item| item.agent_id == AgentId(8));
     timestep.outcomes[0].terminated = true;
-    timestep.decision = Decision::Agents {
-        agent_ids: vec![AgentId(8)],
-    };
+    timestep.decision = Decision::agents([AgentId(8)]);
     timestep.source = TransitionSource::Agents {
         agent_ids: vec![AgentId(7)],
     };

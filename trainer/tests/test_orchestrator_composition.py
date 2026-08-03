@@ -23,7 +23,9 @@ from trainer.algorithms.alphazero_board_v1 import (
     ALGORITHM_ID,
     DESCRIPTOR,
     get_game_config,
+    policy_value_artifact_contract,
 )
+from trainer.algorithms.alphazero_config import AlphaZeroLearnerConfig
 from trainer.central_config import WandbConfig
 from trainer.checkpoint import (
     LearnerStateContract,
@@ -31,7 +33,6 @@ from trainer.checkpoint import (
     learner_config_sha256,
     write_learner_state_artifact,
 )
-from trainer.config import AlphaZeroLearnerConfig
 from trainer.environment_catalog import get_environment
 from trainer.network import create_network
 from trainer.orchestrator import eval_runner as eval_runner_module
@@ -46,7 +47,6 @@ from trainer.storage import ReplayProfile, ReplaySelection
 from trainer.storage.publisher import (
     ArtifactValidationError,
     FilesystemCheckpointPublisher,
-    OnnxArtifactContract,
 )
 from trainer.structured_logging import get_trace_context
 
@@ -101,7 +101,7 @@ class FakeReplayStore:
 def replay_profile(env_id: str) -> ReplayProfile:
     return ReplayProfile(
         env_id=env_id,
-        env_contract_version=1,
+        env_contract_version=2,
         algorithm_id=ALGORITHM_ID,
         experience_schema=DESCRIPTOR.components.experience_schema,
     )
@@ -126,7 +126,7 @@ def make_stub_learner(monkeypatch):
         def train(self):
             game = get_game_config(self.config.env_id)
             environment = get_environment(self.config.env_id)
-            contract = OnnxArtifactContract(
+            contract = policy_value_artifact_contract(
                 algorithm_id=ALGORITHM_ID,
                 env_id=self.config.env_id,
                 env_contract_version=environment.contract_version,
@@ -146,7 +146,6 @@ def make_stub_learner(monkeypatch):
             with tempfile.TemporaryDirectory() as staging:
                 onnx_path = export_onnx_artifact(
                     network,
-                    game.obs_size,
                     f"{staging}/model.onnx",
                     torch.device("cpu"),
                     contract,
@@ -163,9 +162,7 @@ def make_stub_learner(monkeypatch):
                     onnx_path,
                     learner_path,
                     step=step,
-                    parent_checkpoint_id=(
-                        parent.checkpoint_id if parent is not None else None
-                    ),
+                    parent_checkpoint_id=(parent.checkpoint_id if parent is not None else None),
                     config_sha256=config_sha256,
                     learner_state_contract=LearnerStateContract(network, optimizer),
                 )
@@ -173,22 +170,18 @@ def make_stub_learner(monkeypatch):
                 step=step,
                 total_steps=step,
                 samples_seen=step * self.config.batch_size,
-                total_loss=0.25,
+                metrics={"loss/total": 0.25},
                 last_checkpoint=self.last_checkpoint_ref.checkpoint_id,
                 env_id=self.config.env_id,
             )
-            self.last_prepared_stats = prepare_stats_snapshot(
-                stats, self.last_checkpoint_ref
-            )
+            self.last_prepared_stats = prepare_stats_snapshot(stats, self.last_checkpoint_ref)
             return stats
 
     monkeypatch.setattr(trainer_mod, "AlphaZeroLearner", StubLearner)
     return built
 
 
-def make_solver_results(
-    value_optimal_rate: float, positions: int = 10
-) -> SolverEvalResults:
+def make_solver_results(value_optimal_rate: float, positions: int = 10) -> SolverEvalResults:
     """A real SolverEvalResults with a chosen overall value-optimal rate."""
     results = SolverEvalResults(
         env_id="connect4",
@@ -222,7 +215,7 @@ def publish_current_checkpoint(
 ):
     game = get_game_config(config.env_id)
     environment = get_environment(config.env_id)
-    contract = OnnxArtifactContract(
+    contract = policy_value_artifact_contract(
         algorithm_id=ALGORITHM_ID,
         env_id=config.env_id,
         env_contract_version=environment.contract_version,
@@ -236,7 +229,6 @@ def publish_current_checkpoint(
     with tempfile.TemporaryDirectory() as staging:
         onnx_path = export_onnx_artifact(
             network,
-            game.obs_size,
             f"{staging}/model.onnx",
             torch.device("cpu"),
             contract,
@@ -268,9 +260,7 @@ class TestEvalRunnerComposition:
             "create_replay_store",
             lambda selection: FakeReplayStore(selection),
         )
-        runner = Orchestrator(
-            LoopConfig(data_dir=tmp_path, env_id="tictactoe")
-        ).eval_runner
+        runner = Orchestrator(LoopConfig(data_dir=tmp_path, env_id="tictactoe")).eval_runner
 
         assert type(runner) is eval_runner_module.EvalRunner
         assert callable(runner.prepare)
@@ -354,17 +344,11 @@ class TestOrchestratorComposition:
 
         assert not config.loop_stats_path.exists()
 
-    def test_unknown_algorithm_fails_before_replay_is_opened(
-        self, tmp_path, monkeypatch
-    ):
+    def test_unknown_algorithm_fails_before_replay_is_opened(self, tmp_path, monkeypatch):
         def unexpected_replay_open(profile):
-            raise AssertionError(
-                "replay storage must not open before algorithm preflight"
-            )
+            raise AssertionError("replay storage must not open before algorithm preflight")
 
-        monkeypatch.setattr(
-            orchestrator_module, "create_replay_store", unexpected_replay_open
-        )
+        monkeypatch.setattr(orchestrator_module, "create_replay_store", unexpected_replay_open)
 
         with pytest.raises(ValueError, match="Unknown algorithm"):
             Orchestrator(
@@ -392,9 +376,7 @@ class TestOrchestratorComposition:
             buffers.append(buffer)
             return buffer
 
-        monkeypatch.setattr(
-            orchestrator_module, "create_replay_store", fake_replay_factory
-        )
+        monkeypatch.setattr(orchestrator_module, "create_replay_store", fake_replay_factory)
         built = make_stub_learner(monkeypatch)
 
         fake_binary = tmp_path / "actor-stub.exe"
@@ -453,10 +435,7 @@ class TestOrchestratorComposition:
         assert tc.shutdown_check() is False
         assert tc.metrics_hook is not None
         assert tc.replay_selection == buffers[-1].selection
-        assert (
-            buffers[0].selection.collection_scope_id
-            != buffers[1].selection.collection_scope_id
-        )
+        assert buffers[0].selection.collection_scope_id != buffers[1].selection.collection_scope_id
         head = orchestrator.eval_runner.checkpoints.resolve_run_head()
         assert head is not None
         committed = orchestrator.run_commits.resolve(head.run_commit_id).commit
@@ -466,9 +445,7 @@ class TestOrchestratorComposition:
         )
         assert committed.orchestration.source_checkpoint_id is None
 
-    def test_exact_episode_seal_aborts_before_learning_or_commit(
-        self, tmp_path, monkeypatch
-    ):
+    def test_exact_episode_seal_aborts_before_learning_or_commit(self, tmp_path, monkeypatch):
         buffers: list[FakeReplayStore] = []
 
         def fake_replay_factory(selection):
@@ -476,9 +453,7 @@ class TestOrchestratorComposition:
             buffers.append(buffer)
             return buffer
 
-        monkeypatch.setattr(
-            orchestrator_module, "create_replay_store", fake_replay_factory
-        )
+        monkeypatch.setattr(orchestrator_module, "create_replay_store", fake_replay_factory)
         built = make_stub_learner(monkeypatch)
         monkeypatch.setattr(
             ShimActorRunner,
@@ -598,9 +573,7 @@ class TestLoopConfigComposition:
             ),
         ],
     )
-    def test_operational_and_search_values_fail_at_config_construction(
-        self, overrides, message
-    ):
+    def test_operational_and_search_values_fail_at_config_construction(self, overrides, message):
         with pytest.raises((TypeError, ValueError), match=message):
             LoopConfig(**overrides)
 
@@ -632,9 +605,7 @@ class TestLoopConfigComposition:
             dirichlet_weight=0.3,
         )
 
-        recipe = orchestrator_module._run_recipe(
-            config, get_algorithm(config.algorithm_id)
-        )
+        recipe = orchestrator_module._run_recipe(config, get_algorithm(config.algorithm_id))
 
         assert recipe.collector_c_puct == pytest.approx(1.75)
         assert recipe.collector_temperature == pytest.approx(0.9)
@@ -668,7 +639,8 @@ class TestActorRunnerComposition:
             dirichlet_alpha=0.45,
             dirichlet_weight=0.3,
         )
-        runner = ShimActorRunner(config)
+        algorithm = get_algorithm(ALGORITHM_ID)
+        runner = ShimActorRunner(config, algorithm.collector_config)
         selection = ReplaySelection(
             replay_profile("connect4"),
             "a" * 64,
@@ -685,17 +657,10 @@ class TestActorRunnerComposition:
 
         assert command[1:3] == ["--algorithm", ALGORITHM_ID]
         assert "--no-watch" not in command
-        expected_search = {
-            "--num-simulations": "25",
-            "--c-puct": str(config.c_puct),
-            "--temperature": str(config.temperature),
-            "--late-temperature": str(config.late_temperature),
-            "--dirichlet-alpha": str(config.dirichlet_alpha),
-            "--dirichlet-weight": str(config.dirichlet_weight),
-        }
-        assert {
-            flag: command[command.index(flag) + 1] for flag in expected_search
-        } == expected_search
+        encoded = command[command.index("--collector-config") + 1]
+        assert json.loads(encoded) == algorithm.collector_config(config, 25)
+        assert "--num-simulations" not in command
+        assert "--c-puct" not in command
         assert command[command.index("--log-level") + 1] == config.log_level.lower()
         assert command[-4:] == [
             "--collection-scope-id",
@@ -707,7 +672,11 @@ class TestActorRunnerComposition:
     def test_root_collector_command_omits_source_checkpoint_flag(self, tmp_path):
         binary = tmp_path / "actor"
         binary.touch()
-        runner = ShimActorRunner(LoopConfig(data_dir=tmp_path, env_id="tictactoe"))
+        config = LoopConfig(data_dir=tmp_path, env_id="tictactoe")
+        runner = ShimActorRunner(
+            config,
+            get_algorithm(ALGORITHM_ID).collector_config,
+        )
         selection = ReplaySelection(replay_profile("tictactoe"), "c" * 64, None)
         runner.select_replay(selection)
 

@@ -95,9 +95,7 @@ def _require_exact_fields(
     return value
 
 
-def _require_positive_integer(
-    value: object, *, field: str, maximum: int | None = None
-) -> int:
+def _require_positive_integer(value: object, *, field: str, maximum: int | None = None) -> int:
     if (
         isinstance(value, bool)
         or not isinstance(value, int)
@@ -108,9 +106,7 @@ def _require_positive_integer(
     return value
 
 
-def _require_nonnegative_integer(
-    value: object, *, field: str, maximum: int | None = None
-) -> int:
+def _require_nonnegative_integer(value: object, *, field: str, maximum: int | None = None) -> int:
     if (
         isinstance(value, bool)
         or not isinstance(value, int)
@@ -133,9 +129,7 @@ def _require_digest(value: object, *, field: str) -> str:
         or len(value) != _DIGEST_LENGTH
         or any(character not in _DIGEST_CHARACTERS for character in value)
     ):
-        raise ArtifactValidationError(
-            f"{field} must be a lowercase 64-character SHA-256 digest"
-        )
+        raise ArtifactValidationError(f"{field} must be a lowercase 64-character SHA-256 digest")
     return value
 
 
@@ -156,42 +150,82 @@ def _decode_json(data: bytes, *, context: str) -> object:
 
 
 @dataclass(frozen=True)
+class OnnxTensorSpec:
+    """One exact named tensor at an ONNX model boundary."""
+
+    name: str
+    dtype: str
+    shape: tuple[str | int, ...]
+
+    def __post_init__(self) -> None:
+        _require_nonempty_string(self.name, field="OnnxTensorSpec.name")
+        if self.dtype not in {"float32"}:
+            raise ValueError(f"OnnxTensorSpec.dtype {self.dtype!r} is not supported")
+        if not isinstance(self.shape, tuple) or not self.shape:
+            raise ValueError("OnnxTensorSpec.shape must be a non-empty tuple")
+        for index, dimension in enumerate(self.shape):
+            field = f"OnnxTensorSpec.shape[{index}]"
+            if isinstance(dimension, bool):
+                raise ValueError(f"{field} must be a positive integer or symbol")
+            if isinstance(dimension, int):
+                if dimension <= 0:
+                    raise ValueError(f"{field} must be positive")
+                continue
+            if not isinstance(dimension, str) or not dimension.isidentifier():
+                raise ValueError(f"{field} must be a valid non-empty symbol")
+
+
+@dataclass(frozen=True)
 class OnnxArtifactContract:
-    """Identity and tensor interface required by one learner/runtime profile."""
+    """Identity and exact tensor interface for one model artifact profile."""
 
     algorithm_id: str
     env_id: str
     env_contract_version: int
     model_artifact_schema_version: int
     model_contract: str
-    obs_size: int
-    num_actions: int
+    inputs: tuple[OnnxTensorSpec, ...]
+    outputs: tuple[OnnxTensorSpec, ...]
 
     def __post_init__(self) -> None:
         for field_name in ("algorithm_id", "env_id", "model_contract"):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value.strip():
-                raise ValueError(
-                    f"OnnxArtifactContract.{field_name} must be a non-empty string"
-                )
+                raise ValueError(f"OnnxArtifactContract.{field_name} must be a non-empty string")
         for field_name in (
             "env_contract_version",
             "model_artifact_schema_version",
-            "obs_size",
-            "num_actions",
         ):
             value = getattr(self, field_name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(
-                    f"OnnxArtifactContract.{field_name} must be a positive integer"
-                )
+                raise ValueError(f"OnnxArtifactContract.{field_name} must be a positive integer")
         if self.env_contract_version > _MAX_U32:
             raise ValueError("OnnxArtifactContract.env_contract_version exceeds u32")
         if self.model_artifact_schema_version > _MAX_U32:
-            raise ValueError(
-                "OnnxArtifactContract.model_artifact_schema_version exceeds u32"
-            )
+            raise ValueError("OnnxArtifactContract.model_artifact_schema_version exceeds u32")
+        for field_name in ("inputs", "outputs"):
+            tensors = getattr(self, field_name)
+            if not isinstance(tensors, tuple) or not tensors:
+                raise ValueError(f"OnnxArtifactContract.{field_name} must be a non-empty tuple")
+            if any(not isinstance(tensor, OnnxTensorSpec) for tensor in tensors):
+                raise TypeError(f"OnnxArtifactContract.{field_name} must contain OnnxTensorSpec")
+            names = [tensor.name for tensor in tensors]
+            if len(names) != len(set(names)):
+                raise ValueError(f"OnnxArtifactContract.{field_name} names must be unique")
         RuntimeProfile(self.algorithm_id, self.env_id, self.env_contract_version)
+
+    def input(self, name: str) -> OnnxTensorSpec:
+        return self._tensor(self.inputs, name, boundary="input")
+
+    def output(self, name: str) -> OnnxTensorSpec:
+        return self._tensor(self.outputs, name, boundary="output")
+
+    @staticmethod
+    def _tensor(tensors: tuple[OnnxTensorSpec, ...], name: str, *, boundary: str) -> OnnxTensorSpec:
+        matches = [tensor for tensor in tensors if tensor.name == name]
+        if not matches:
+            raise ValueError(f"ONNX contract has no {boundary} named {name!r}")
+        return matches[0]
 
     @property
     def profile(self) -> "CheckpointProfileV1":
@@ -269,9 +303,7 @@ class BlobDescriptorV1:
 
     def __post_init__(self) -> None:
         _require_digest(self.sha256, field="blob.sha256")
-        _require_positive_integer(
-            self.size_bytes, field="blob.size_bytes", maximum=_MAX_U64
-        )
+        _require_positive_integer(self.size_bytes, field="blob.size_bytes", maximum=_MAX_U64)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "BlobDescriptorV1":
@@ -306,9 +338,7 @@ class CheckpointManifestV1:
             raise ArtifactValidationError("manifest.schema_version must be exactly 1")
         _require_nonnegative_integer(self.step, field="manifest.step", maximum=_MAX_U64)
         if self.parent_checkpoint_id is not None:
-            _require_digest(
-                self.parent_checkpoint_id, field="manifest.parent_checkpoint_id"
-            )
+            _require_digest(self.parent_checkpoint_id, field="manifest.parent_checkpoint_id")
         _require_digest(self.config_sha256, field="manifest.config_sha256")
 
     def to_dict(self) -> dict[str, object]:
@@ -332,9 +362,7 @@ class CheckpointManifestV1:
     @classmethod
     def from_bytes(cls, data: bytes) -> "CheckpointManifestV1":
         value = _decode_json(data, context="checkpoint manifest")
-        fields = _require_exact_fields(
-            value, _MANIFEST_FIELDS, context="checkpoint manifest"
-        )
+        fields = _require_exact_fields(value, _MANIFEST_FIELDS, context="checkpoint manifest")
         if fields["schema_version"] != 1 or isinstance(fields["schema_version"], bool):
             raise ArtifactValidationError("manifest.schema_version must be exactly 1")
         parent = fields["parent_checkpoint_id"]
@@ -347,9 +375,7 @@ class CheckpointManifestV1:
                 fields["step"], field="manifest.step", maximum=_MAX_U64
             ),
             parent_checkpoint_id=parent,
-            config_sha256=_require_digest(
-                fields["config_sha256"], field="manifest.config_sha256"
-            ),
+            config_sha256=_require_digest(fields["config_sha256"], field="manifest.config_sha256"),
             onnx=BlobDescriptorV1.from_dict(fields["onnx"], field="manifest.onnx"),
             learner_state=BlobDescriptorV1.from_dict(
                 fields["learner_state"], field="manifest.learner_state"
@@ -385,12 +411,8 @@ class RunHeadV2:
         if fields["schema_version"] != 2 or isinstance(fields["schema_version"], bool):
             raise ArtifactValidationError("head.schema_version must be exactly 2")
         return cls(
-            checkpoint_id=_require_digest(
-                fields["checkpoint_id"], field="head.checkpoint_id"
-            ),
-            run_commit_id=_require_digest(
-                fields["run_commit_id"], field="head.run_commit_id"
-            ),
+            checkpoint_id=_require_digest(fields["checkpoint_id"], field="head.checkpoint_id"),
+            run_commit_id=_require_digest(fields["run_commit_id"], field="head.run_commit_id"),
         )
 
 
@@ -404,9 +426,7 @@ class CheckpointRef:
     def __post_init__(self) -> None:
         _require_digest(self.checkpoint_id, field="checkpoint_id")
         if self.manifest.checkpoint_id != self.checkpoint_id:
-            raise ArtifactValidationError(
-                "CheckpointRef ID does not match its canonical manifest"
-            )
+            raise ArtifactValidationError("CheckpointRef ID does not match its canonical manifest")
 
 
 class CheckpointPublisher(Protocol):
@@ -475,32 +495,37 @@ def _validate_tensor(
     path: Path,
     value_info: Any,
     *,
-    name: str,
-    feature_count: int,
+    spec: OnnxTensorSpec,
 ) -> None:
+    name = spec.name
     value_type = value_info.type
     if value_type.WhichOneof("value") != "tensor_type":
         raise _fail(path, f"'{name}' must be a tensor")
     tensor_type = value_type.tensor_type
-    if tensor_type.elem_type != TensorProto.FLOAT:
-        raise _fail(path, f"'{name}' must use float32 elements")
+    expected_element_type = {"float32": TensorProto.FLOAT}[spec.dtype]
+    if tensor_type.elem_type != expected_element_type:
+        raise _fail(path, f"'{name}' must use {spec.dtype} elements")
     dims = list(tensor_type.shape.dim)
-    if len(dims) != 2:
-        raise _fail(path, f"'{name}' must have rank 2, got rank {len(dims)}")
-    if dims[0].WhichOneof("value") != "dim_param" or dims[0].dim_param != "batch_size":
-        raise _fail(path, f"'{name}' batch dimension must be dynamic 'batch_size'")
-    if dims[1].WhichOneof("value") != "dim_value" or dims[1].dim_value != feature_count:
+    if len(dims) != len(spec.shape):
         raise _fail(
             path,
-            f"'{name}' feature dimension must be {feature_count}, "
-            f"got {dims[1].dim_param or dims[1].dim_value}",
+            f"'{name}' must have rank {len(spec.shape)}, got rank {len(dims)}",
         )
+    for index, (actual, expected) in enumerate(zip(dims, spec.shape, strict=True)):
+        if isinstance(expected, int):
+            valid = actual.WhichOneof("value") == "dim_value" and actual.dim_value == expected
+        else:
+            valid = actual.WhichOneof("value") == "dim_param" and actual.dim_param == expected
+        if not valid:
+            value = actual.dim_param or actual.dim_value
+            raise _fail(
+                path,
+                f"'{name}' dimension {index} must be {expected!r}, got {value!r}",
+            )
 
 
-def validate_onnx_checkpoint(
-    checkpoint_path: str | Path, contract: OnnxArtifactContract
-) -> None:
-    """Require exact identity, an inline valid graph, and policy/value tensors."""
+def validate_onnx_checkpoint(checkpoint_path: str | Path, contract: OnnxArtifactContract) -> None:
+    """Require exact identity and the cartridge-declared tensor interface."""
     path = Path(checkpoint_path)
     if not path.is_file():
         raise _fail(path, "file does not exist")
@@ -513,8 +538,7 @@ def validate_onnx_checkpoint(
     external_initializers = [
         initializer.name
         for initializer in model.graph.initializer
-        if initializer.data_location == TensorProto.EXTERNAL
-        or initializer.external_data
+        if initializer.data_location == TensorProto.EXTERNAL or initializer.external_data
     ]
     if external_initializers:
         raise _fail(
@@ -547,20 +571,16 @@ def validate_onnx_checkpoint(
             raise _fail(path, f"metadata '{key}' is {actual!r}, expected {expected!r}")
     inputs = list(model.graph.input)
     outputs = list(model.graph.output)
-    if [value.name for value in inputs] != ["observation"]:
-        raise _fail(path, "graph inputs must be exactly ['observation']")
-    if [value.name for value in outputs] != ["policy_logits", "value"]:
-        raise _fail(path, "graph outputs must be exactly ['policy_logits', 'value']")
-    _validate_tensor(
-        path, inputs[0], name="observation", feature_count=contract.obs_size
-    )
-    _validate_tensor(
-        path,
-        outputs[0],
-        name="policy_logits",
-        feature_count=contract.num_actions,
-    )
-    _validate_tensor(path, outputs[1], name="value", feature_count=1)
+    expected_inputs = [tensor.name for tensor in contract.inputs]
+    expected_outputs = [tensor.name for tensor in contract.outputs]
+    if [value.name for value in inputs] != expected_inputs:
+        raise _fail(path, f"graph inputs must be exactly {expected_inputs!r}")
+    if [value.name for value in outputs] != expected_outputs:
+        raise _fail(path, f"graph outputs must be exactly {expected_outputs!r}")
+    for value, spec in zip(inputs, contract.inputs, strict=True):
+        _validate_tensor(path, value, spec=spec)
+    for value, spec in zip(outputs, contract.outputs, strict=True):
+        _validate_tensor(path, value, spec=spec)
 
 
 def _verified_blob(data: bytes, descriptor: BlobDescriptorV1, *, name: str) -> None:
@@ -773,9 +793,7 @@ class FilesystemCheckpointPublisher:
         _decode_json(data, context="run commit")
         return data
 
-    def publish_run_preparation_bytes(
-        self, parent_run_commit_id: str | None, data: bytes
-    ) -> None:
+    def publish_run_preparation_bytes(self, parent_run_commit_id: str | None, data: bytes) -> None:
         if parent_run_commit_id is not None:
             _require_digest(parent_run_commit_id, field="parent_run_commit_id")
         if not isinstance(data, bytes):
@@ -783,18 +801,14 @@ class FilesystemCheckpointPublisher:
         _decode_json(data, context="run preparation")
         _create_or_verify(self._run_preparation_path(parent_run_commit_id), data)
 
-    def read_run_preparation_bytes(
-        self, parent_run_commit_id: str | None
-    ) -> bytes | None:
+    def read_run_preparation_bytes(self, parent_run_commit_id: str | None) -> bytes | None:
         if parent_run_commit_id is not None:
             _require_digest(parent_run_commit_id, field="parent_run_commit_id")
         path = self._run_preparation_path(parent_run_commit_id)
         if not path.exists():
             return None
         if not path.is_file():
-            raise ArtifactValidationError(
-                f"Run preparation must be a regular file: {path}"
-            )
+            raise ArtifactValidationError(f"Run preparation must be a regular file: {path}")
         data = path.read_bytes()
         _decode_json(data, context="run preparation")
         return data
@@ -814,9 +828,7 @@ class FilesystemCheckpointPublisher:
             _require_digest(expected_config_sha256, field="expected_config_sha256")
         manifest_data = self._read_manifest_bytes(checkpoint_id)
         if manifest_data is None:
-            raise ArtifactValidationError(
-                f"Checkpoint manifest does not exist for {checkpoint_id}"
-            )
+            raise ArtifactValidationError(f"Checkpoint manifest does not exist for {checkpoint_id}")
         if sha256_bytes(manifest_data) != checkpoint_id:
             raise ArtifactValidationError(
                 "Checkpoint manifest SHA-256 does not match checkpoint ID"
@@ -938,9 +950,7 @@ class FilesystemCheckpointPublisher:
         _require_digest(run_commit_id, field="run_commit_id")
         if expected_run_commit_id is not None:
             _require_digest(expected_run_commit_id, field="expected_run_commit_id")
-        run_commit = self._decode_typed_run_commit(
-            self.read_run_commit_bytes(run_commit_id)
-        )
+        run_commit = self._decode_typed_run_commit(self.read_run_commit_bytes(run_commit_id))
         if run_commit.run_commit_id != run_commit_id:
             raise ArtifactValidationError("Run commit identity mismatch")
         if run_commit.checkpoint_id != checkpoint_id:
@@ -961,11 +971,7 @@ class FilesystemCheckpointPublisher:
 
         with self.run_head_commit_guard():
             current_version = self._read_head_version()
-            current = (
-                None
-                if current_version is None
-                else RunHeadV2.from_bytes(current_version[0])
-            )
+            current = None if current_version is None else RunHeadV2.from_bytes(current_version[0])
             chain = self._resolve_run_commit_chain(run_commit_id)
             if not chain or chain[-1].run_commit_id != run_commit_id:
                 raise ArtifactValidationError("RunCommit lineage is incomplete")
@@ -1001,9 +1007,7 @@ class FilesystemCheckpointPublisher:
                         "RunCommit checkpoint step must strictly increase"
                     )
             elif checkpoint.manifest.parent_checkpoint_id is not None:
-                raise ArtifactValidationError(
-                    "The first RunCommit must select a root checkpoint"
-                )
+                raise ArtifactValidationError("The first RunCommit must select a root checkpoint")
 
             observed = self._compare_and_set_head_version(
                 expected=current_version,
@@ -1030,9 +1034,7 @@ class FilesystemCheckpointPublisher:
         )
         return head
 
-    def resolve_head(
-        self, *, expected_config_sha256: str | None = None
-    ) -> CheckpointRef | None:
+    def resolve_head(self, *, expected_config_sha256: str | None = None) -> CheckpointRef | None:
         if expected_config_sha256 is not None:
             _require_digest(expected_config_sha256, field="expected_config_sha256")
         head = self.resolve_run_head()
@@ -1057,9 +1059,7 @@ class FilesystemCheckpointPublisher:
         onnx_path = self._blob_path(manifest.onnx, "onnx")
         learner_path = self._blob_path(manifest.learner_state, "pt")
         self._verify_local_blob(onnx_path, manifest.onnx, name="ONNX blob")
-        self._verify_local_blob(
-            learner_path, manifest.learner_state, name="learner-state blob"
-        )
+        self._verify_local_blob(learner_path, manifest.learner_state, name="learner-state blob")
         validate_onnx_checkpoint(onnx_path, self.contract)
         _validate_learner_state(
             learner_path,
@@ -1112,9 +1112,7 @@ class FilesystemCheckpointPublisher:
             checkpoint_id = path.stem
             _require_digest(checkpoint_id, field="manifest filename checkpoint_id")
             checkpoint_ids.append(checkpoint_id)
-        checkpoints = [
-            self.resolve_checkpoint(checkpoint_id) for checkpoint_id in checkpoint_ids
-        ]
+        checkpoints = [self.resolve_checkpoint(checkpoint_id) for checkpoint_id in checkpoint_ids]
         checkpoints.sort(
             key=lambda checkpoint: (
                 checkpoint.manifest.step,
@@ -1133,19 +1131,14 @@ class FilesystemCheckpointPublisher:
                 "Checkpoint profile mismatch: "
                 f"got {manifest.profile.to_dict()}, expected {self.contract.profile.to_dict()}"
             )
-        if (
-            expected_config_sha256 is not None
-            and manifest.config_sha256 != expected_config_sha256
-        ):
+        if expected_config_sha256 is not None and manifest.config_sha256 != expected_config_sha256:
             raise ArtifactValidationError(
                 "Checkpoint config_sha256 mismatch: "
                 f"got {manifest.config_sha256}, expected {expected_config_sha256}"
             )
 
     @staticmethod
-    def _verify_local_blob(
-        path: Path, descriptor: BlobDescriptorV1, *, name: str
-    ) -> None:
+    def _verify_local_blob(path: Path, descriptor: BlobDescriptorV1, *, name: str) -> None:
         if not path.is_file():
             raise ArtifactValidationError(f"{name} does not exist: {path}")
         _verified_blob(path.read_bytes(), descriptor, name=name)
@@ -1286,9 +1279,7 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
         _decode_json(data, context="run commit")
         return data
 
-    def publish_run_preparation_bytes(
-        self, parent_run_commit_id: str | None, data: bytes
-    ) -> None:
+    def publish_run_preparation_bytes(self, parent_run_commit_id: str | None, data: bytes) -> None:
         if parent_run_commit_id is not None:
             _require_digest(parent_run_commit_id, field="parent_run_commit_id")
         if not isinstance(data, bytes):
@@ -1301,9 +1292,7 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
             "application/json",
         )
 
-    def read_run_preparation_bytes(
-        self, parent_run_commit_id: str | None
-    ) -> bytes | None:
+    def read_run_preparation_bytes(self, parent_run_commit_id: str | None) -> bytes | None:
         if parent_run_commit_id is not None:
             _require_digest(parent_run_commit_id, field="parent_run_commit_id")
         name = "root" if parent_run_commit_id is None else parent_run_commit_id
@@ -1359,9 +1348,7 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
     ) -> RunHeadV2:
         if expected is not None and expected[1] is None:
             raise ArtifactValidationError("S3 run-head CAS requires an ETag")
-        condition = (
-            {"IfNoneMatch": "*"} if expected is None else {"IfMatch": expected[1]}
-        )
+        condition = {"IfNoneMatch": "*"} if expected is None else {"IfMatch": expected[1]}
         try:
             self._client.put_object(
                 Bucket=self.bucket,
@@ -1373,9 +1360,7 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
         except Exception as exc:
             confirmed = self._get_versioned(self._head_key)
             # The write can have committed even when the response was lost.
-            if confirmed is not None and self._head_selects_or_descends_from(
-                confirmed[0], target
-            ):
+            if confirmed is not None and self._head_selects_or_descends_from(confirmed[0], target):
                 return RunHeadV2.from_bytes(confirmed[0])
             if _is_s3_precondition_failed(exc):
                 raise ArtifactValidationError(
@@ -1383,15 +1368,11 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
                 ) from exc
             raise
         confirmed = self._get_versioned(self._head_key)
-        if confirmed is None or not self._head_selects_or_descends_from(
-            confirmed[0], target
-        ):
+        if confirmed is None or not self._head_selects_or_descends_from(confirmed[0], target):
             raise ArtifactValidationError("S3 run head update could not be confirmed")
         return RunHeadV2.from_bytes(confirmed[0])
 
-    def _head_selects_or_descends_from(
-        self, confirmed_data: bytes, target_data: bytes
-    ) -> bool:
+    def _head_selects_or_descends_from(self, confirmed_data: bytes, target_data: bytes) -> bool:
         if confirmed_data == target_data:
             return True
         confirmed = RunHeadV2.from_bytes(confirmed_data)
@@ -1460,15 +1441,11 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
         )
         self._validate_manifest_lineage(manifest)
         onnx_data = self._get(self._key(f"blobs/sha256/{manifest.onnx.sha256}.onnx"))
-        learner_data = self._get(
-            self._key(f"blobs/sha256/{manifest.learner_state.sha256}.pt")
-        )
+        learner_data = self._get(self._key(f"blobs/sha256/{manifest.learner_state.sha256}.pt"))
         if onnx_data is None or learner_data is None:
             raise ArtifactValidationError("S3 checkpoint is missing a blob")
         _verified_blob(onnx_data, manifest.onnx, name="S3 ONNX blob")
-        _verified_blob(
-            learner_data, manifest.learner_state, name="S3 learner-state blob"
-        )
+        _verified_blob(learner_data, manifest.learner_state, name="S3 learner-state blob")
         checkpoint = self._materialize_immutables(manifest, onnx_data, learner_data)
         validate_onnx_checkpoint(checkpoint.onnx_path, self.contract)
         _validate_learner_state(
@@ -1519,34 +1496,22 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
             response = self._client.list_objects_v2(**request)
             contents = response.get("Contents", [])
             if not isinstance(contents, list):
-                raise ArtifactValidationError(
-                    "S3 checkpoint listing Contents is invalid"
-                )
+                raise ArtifactValidationError("S3 checkpoint listing Contents is invalid")
             for item in contents:
                 if not isinstance(item, dict) or not isinstance(item.get("Key"), str):
-                    raise ArtifactValidationError(
-                        "S3 checkpoint listing entry is invalid"
-                    )
+                    raise ArtifactValidationError("S3 checkpoint listing entry is invalid")
                 key = item["Key"]
                 relative = key.removeprefix(prefix)
-                if (
-                    not key.startswith(prefix)
-                    or "/" in relative
-                    or not relative.endswith(".json")
-                ):
+                if not key.startswith(prefix) or "/" in relative or not relative.endswith(".json"):
                     raise ArtifactValidationError(
                         f"Unexpected S3 checkpoint manifest object: {key}"
                     )
                 checkpoint_id = relative.removesuffix(".json")
-                _require_digest(
-                    checkpoint_id, field="S3 manifest filename checkpoint_id"
-                )
+                _require_digest(checkpoint_id, field="S3 manifest filename checkpoint_id")
                 checkpoint_ids.append(checkpoint_id)
             truncated = response.get("IsTruncated", False)
             if not isinstance(truncated, bool):
-                raise ArtifactValidationError(
-                    "S3 checkpoint listing IsTruncated is invalid"
-                )
+                raise ArtifactValidationError("S3 checkpoint listing IsTruncated is invalid")
             if not truncated:
                 break
             next_token = response.get("NextContinuationToken")
@@ -1556,12 +1521,8 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
                 )
             continuation_token = next_token
         if len(checkpoint_ids) != len(set(checkpoint_ids)):
-            raise ArtifactValidationError(
-                "S3 checkpoint listing contains duplicate objects"
-            )
-        checkpoints = [
-            self.resolve_checkpoint(checkpoint_id) for checkpoint_id in checkpoint_ids
-        ]
+            raise ArtifactValidationError("S3 checkpoint listing contains duplicate objects")
+        checkpoints = [self.resolve_checkpoint(checkpoint_id) for checkpoint_id in checkpoint_ids]
         checkpoints.sort(
             key=lambda checkpoint: (
                 checkpoint.manifest.step,
@@ -1614,6 +1575,7 @@ __all__ = [
     "CheckpointRef",
     "FilesystemCheckpointPublisher",
     "OnnxArtifactContract",
+    "OnnxTensorSpec",
     "S3CheckpointPublisher",
     "canonical_json_bytes",
     "create_checkpoint_publisher",

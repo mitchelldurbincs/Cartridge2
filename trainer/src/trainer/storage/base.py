@@ -25,15 +25,9 @@ def _integer(
     minimum: int,
     maximum: int,
 ) -> int:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or value < minimum
-        or value > maximum
-    ):
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum or value > maximum:
         raise ValueError(
-            f"{field} must be an integer in the inclusive range "
-            f"[{minimum}, {maximum}]"
+            f"{field} must be an integer in the inclusive range [{minimum}, {maximum}]"
         )
     return value
 

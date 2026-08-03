@@ -24,19 +24,20 @@ import torch.optim as optim
 
 from . import checkpoint_runner, replay_setup, step_metrics
 from . import metrics as prom_metrics
+from .algorithms import get_algorithm
 from .algorithms.alphazero_board_v1 import (
     ALGORITHM_ID,
     DESCRIPTOR,
     decode_replay_batch,
     get_game_config,
 )
+from .algorithms.alphazero_config import AlphaZeroLearnerConfig
 from .checkpoint import learner_config_sha256, restore_learner_state
-from .config import AlphaZeroLearnerConfig
 from .environment_catalog import get_environment
 from .lr_scheduler import LRConfig, WarmupCosineScheduler
 from .network import AlphaZeroLoss, create_network
 from .stats import (
-    PreparedStatsSnapshotV2,
+    PreparedStatsSnapshotV3,
     TrainerStats,
     decode_stats_snapshot,
     prepare_stats_snapshot,
@@ -48,7 +49,6 @@ from .storage.evaluation import create_evaluation_repository
 from .storage.publisher import (
     ArtifactValidationError,
     CheckpointRef,
-    OnnxArtifactContract,
     create_checkpoint_publisher,
 )
 from .storage.run_commit import RunCommitRepository, RunCommitV1
@@ -90,15 +90,7 @@ class AlphaZeroLearner:
             )
         self.replay_selection = config.replay_selection
         self.model_contract = DESCRIPTOR.components.model_contract
-        self.artifact_contract = OnnxArtifactContract(
-            algorithm_id=self.replay_profile.algorithm_id,
-            env_id=config.env_id,
-            env_contract_version=environment.contract_version,
-            model_artifact_schema_version=DESCRIPTOR.model_artifact_schema_version,
-            model_contract=self.model_contract,
-            obs_size=self.game_config.obs_size,
-            num_actions=self.game_config.num_actions,
-        )
+        self.artifact_contract = get_algorithm(ALGORITHM_ID).artifact_contract(environment)
         self.config_sha256 = learner_config_sha256(config)
 
         # Create model directory
@@ -120,9 +112,7 @@ class AlphaZeroLearner:
             self.artifact_contract,
             Path(config.model_dir),
         )
-        self.evaluation_repository = create_evaluation_repository(
-            self.checkpoint_publisher
-        )
+        self.evaluation_repository = create_evaluation_repository(self.checkpoint_publisher)
         self.run_commit_repository = RunCommitRepository(
             self.checkpoint_publisher,
             self.evaluation_repository,
@@ -146,9 +136,7 @@ class AlphaZeroLearner:
                 )
             run_commit = run_chain[-1].commit
             if run_commit.checkpoint_id != run_head.checkpoint_id:
-                raise ArtifactValidationError(
-                    "RunHead checkpoint does not match its RunCommit"
-                )
+                raise ArtifactValidationError("RunHead checkpoint does not match its RunCommit")
             if run_commit.profile != self.artifact_contract.profile:
                 raise ArtifactValidationError("RunCommit learner profile mismatch")
             if run_commit.config_sha256 != self.config_sha256:
@@ -173,16 +161,12 @@ class AlphaZeroLearner:
             self.current_run_commit = run_commit
             self.current_run_commit_id = run_head.run_commit_id
 
-        expected_source_checkpoint_id = (
-            run_head.checkpoint_id if run_head is not None else None
-        )
+        expected_source_checkpoint_id = run_head.checkpoint_id if run_head is not None else None
         if self.replay_selection.source_checkpoint_id != expected_source_checkpoint_id:
-            raise ArtifactValidationError(
-                "Learner replay source checkpoint does not match RunHead"
-            )
+            raise ArtifactValidationError("Learner replay source checkpoint does not match RunHead")
 
         self.last_checkpoint_ref: CheckpointRef | None = checkpoint_ref
-        self.last_prepared_stats: PreparedStatsSnapshotV2 | None = None
+        self.last_prepared_stats: PreparedStatsSnapshotV3 | None = None
         self.parent_checkpoint_id: str | None = (
             checkpoint_ref.checkpoint_id if checkpoint_ref is not None else None
         )
@@ -208,9 +192,7 @@ class AlphaZeroLearner:
 
         # Initialize LR scheduler (warmup + cosine annealing)
         # Use lr_total_steps for continuous decay across iterations if set
-        lr_horizon = (
-            config.lr_total_steps if config.lr_total_steps > 0 else config.total_steps
-        )
+        lr_horizon = config.lr_total_steps if config.lr_total_steps > 0 else config.total_steps
         lr_config = LRConfig(
             target_lr=config.learning_rate,
             warmup_steps=config.lr_warmup_steps,
@@ -312,9 +294,7 @@ class AlphaZeroLearner:
         """
         logger.info(f"Starting training for {self.config.total_steps} steps")
         if self.config.grad_clip_norm > 0:
-            logger.info(
-                f"Gradient clipping enabled: max_norm={self.config.grad_clip_norm}"
-            )
+            logger.info(f"Gradient clipping enabled: max_norm={self.config.grad_clip_norm}")
         if self.lr_scheduler.config.enabled:
             logger.info(f"LR scheduler: {self.lr_scheduler}")
 
@@ -413,16 +393,11 @@ class AlphaZeroLearner:
         policy_targets_t = torch.from_numpy(policy_targets).to(self.device)
         value_targets_t = torch.from_numpy(value_targets).to(self.device)
 
-        # Extract legal mask from observations using game-specific offsets
-        legal_mask = self.game_config.extract_legal_mask(obs_t)
-
         # Forward pass
         policy_logits, value_pred = self.network(obs_t)
 
         # Compute loss with soft policy targets
-        loss, metrics = self.loss_fn(
-            policy_logits, value_pred, policy_targets_t, value_targets_t, legal_mask
-        )
+        loss, metrics = self.loss_fn(policy_logits, value_pred, policy_targets_t, value_targets_t)
 
         # Backward pass
         loss.backward()
@@ -441,7 +416,7 @@ class AlphaZeroLearner:
     def _save_checkpoint(self, step: int) -> CheckpointRef:
         return checkpoint_runner.save_checkpoint(self, step)
 
-    def _prepare_run_state(self, checkpoint: CheckpointRef) -> PreparedStatsSnapshotV2:
+    def _prepare_run_state(self, checkpoint: CheckpointRef) -> PreparedStatsSnapshotV3:
         """Bind current in-memory stats to one staged checkpoint."""
         self.stats.last_checkpoint = checkpoint.checkpoint_id
         prepared = prepare_stats_snapshot(self.stats, checkpoint)
@@ -452,9 +427,7 @@ class AlphaZeroLearner:
     def _publish_run_state(self, checkpoint: CheckpointRef) -> RunCommitV1:
         """Publish one standalone RunCommit and atomically advance RunHeadV2."""
         if self.config.defer_run_commit:
-            raise RuntimeError(
-                "Deferred loop learners cannot commit RunHead from inside training"
-            )
+            raise RuntimeError("Deferred loop learners cannot commit RunHead from inside training")
         prepared = self._prepare_run_state(checkpoint)
         parent = self.current_run_commit
         parent_id = self.current_run_commit_id
@@ -479,9 +452,7 @@ class AlphaZeroLearner:
             checkpoint_id=checkpoint.checkpoint_id,
             stats_snapshot=prepared,
             champion=parent.champion if parent is not None else None,
-            evaluation_head_id=(
-                parent.evaluation_head_id if parent is not None else None
-            ),
+            evaluation_head_id=(parent.evaluation_head_id if parent is not None else None),
             orchestration=None,
         )
         reference = self.run_commit_repository.publish(commit)

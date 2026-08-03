@@ -592,31 +592,37 @@ Host: localhost:8080
 {
   "step": 1500,
   "total_steps": 5000,
-  "total_loss": 0.2345,
-  "policy_loss": 0.1234,
-  "value_loss": 0.1111,
+  "metrics": {
+    "loss/total": 0.2345,
+    "loss/policy": 0.1234,
+    "loss/value": 0.1111
+  },
   "samples_seen": 192000,
   "replay_record_count": 125000,
   "last_checkpoint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "learning_rate": 0.0001,
   "timestamp": 1704067200.0,
   "env_id": "tictactoe",
-  "last_eval": {
+  "last_evaluation": {
     "step": 1500,
-    "win_rate": 0.72,
-    "draw_rate": 0.15,
-    "loss_rate": 0.13,
-    "games_played": 50,
-    "avg_game_length": 7.2,
+    "metrics": {
+      "outcome/win_rate": 0.72,
+      "outcome/draw_rate": 0.15,
+      "outcome/loss_rate": 0.13
+    },
+    "episodes": 50,
+    "mean_episode_length": 7.2,
     "timestamp": 1704067200.0
   },
-  "eval_history": [...],
+  "evaluation_history": [...],
   "history": [
     {
       "step": 100,
-      "total_loss": 0.8,
-      "policy_loss": 0.4,
-      "value_loss": 0.4,
+      "metrics": {
+        "loss/total": 0.8,
+        "loss/policy": 0.4,
+        "loss/value": 0.4
+      },
       "learning_rate": 0.001,
       "grad_norm": 0.73
     }
@@ -630,29 +636,25 @@ Host: localhost:8080
 |-------|------|-------------|
 | `step` | number | Current training step |
 | `total_steps` | number | Total planned training steps |
-| `total_loss` | number | Combined loss (policy + value) |
-| `policy_loss` | number | Policy head loss |
-| `value_loss` | number | Value head loss |
+| `metrics` | object | Finite algorithm-owned metric names and values |
 | `samples_seen` | number | Total learner samples consumed through this checkpoint |
 | `replay_record_count` | number | Number of records in the exact sealed replay selection |
 | `last_checkpoint` | string | SHA-256 identity of the latest committed checkpoint |
 | `learning_rate` | number | Current learning rate |
 | `timestamp` | number | Unix timestamp of last update |
 | `env_id` | string | Game being trained |
-| `last_eval` | EvalStats \| null | Most recent evaluation results |
-| `eval_history` | EvalStats[] | History of all evaluations |
-| `history` | HistoryEntry[] | Training loss history (downsampled) |
+| `last_evaluation` | EvaluationStats \| null | Most recent evaluation results |
+| `evaluation_history` | EvaluationStats[] | History of all evaluations |
+| `history` | HistoryEntry[] | Training metric history (downsampled) |
 
-**EvalStats Fields**
+**EvaluationStats Fields**
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `step` | number | Training step when evaluated |
-| `win_rate` | number | Win rate against the random baseline (0.0 - 1.0) |
-| `draw_rate` | number | Draw rate against the random baseline (0.0 - 1.0) |
-| `loss_rate` | number | Loss rate against the random baseline (0.0 - 1.0) |
-| `games_played` | number | Games in evaluation |
-| `avg_game_length` | number | Average moves per game |
+| `metrics` | object | Algorithm-owned metrics (for example win rate or mean return) |
+| `episodes` | number | Episodes in evaluation |
+| `mean_episode_length` | number | Average transitions per episode |
 | `timestamp` | number | Unix timestamp |
 
 **HistoryEntry Fields**
@@ -660,9 +662,7 @@ Host: localhost:8080
 | Field | Type | Description |
 |-------|------|-------------|
 | `step` | number | Training step |
-| `total_loss` | number | Total loss at step |
-| `policy_loss` | number | Policy loss at step |
-| `value_loss` | number | Value loss at step |
+| `metrics` | object | Algorithm-owned metrics at the step |
 | `learning_rate` | number | Learning rate at step |
 | `grad_norm` | number \| null | Gradient norm when recorded |
 
@@ -849,35 +849,29 @@ interface MoveRequest {
 interface TrainingStats {
   step: number;
   total_steps: number;
-  total_loss: number;
-  policy_loss: number;
-  value_loss: number;
+  metrics: Record<string, number>;
   samples_seen: number;
   replay_record_count: number;
   last_checkpoint: string;
   learning_rate: number;
   timestamp: number;
   env_id: string;
-  last_eval: EvalStats | null;
-  eval_history: EvalStats[];
+  last_evaluation: EvaluationStats | null;
+  evaluation_history: EvaluationStats[];
   history: HistoryEntry[];
 }
 
-interface EvalStats {
+interface EvaluationStats {
   step: number;
-  win_rate: number;
-  draw_rate: number;
-  loss_rate: number;
-  games_played: number;
-  avg_game_length: number;
+  metrics: Record<string, number>;
+  episodes: number;
+  mean_episode_length: number;
   timestamp: number;
 }
 
 interface HistoryEntry {
   step: number;
-  total_loss: number;
-  policy_loss: number;
-  value_loss: number;
+  metrics: Record<string, number>;
   learning_rate: number;
   grad_norm: number | null;
 }
@@ -1097,7 +1091,7 @@ curl http://localhost:8080/model
 
 # Get training stats
 curl http://localhost:8080/stats
-# Response: {"step":1500,"total_loss":0.234,...}
+# Response: {"step":1500,"metrics":{"loss/total":0.234},...}
 
 # Monitor training progress
 watch -n 5 'curl -s http://localhost:8080/stats | jq .step'

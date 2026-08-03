@@ -86,10 +86,7 @@ def handle_replay_cleanup(
         replay: Exact-selection-bound replay store.
         env_id: Environment identifier.
     """
-    if (
-        trainer.config.replay_window > 0
-        and global_step % trainer._replay_cleanup_every == 0
-    ):
+    if trainer.config.replay_window > 0 and global_step % trainer._replay_cleanup_every == 0:
         deleted = replay.cleanup(trainer.config.replay_window)
         if deleted > 0:
             logger.info(

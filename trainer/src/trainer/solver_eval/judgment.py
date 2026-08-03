@@ -62,9 +62,7 @@ def judge_move(legal_scores: dict[int, int], chosen: int) -> MoveJudgment:
             indicates a bug upstream, so fail loud rather than skip.
     """
     if chosen not in legal_scores:
-        raise ValueError(
-            f"Chosen move {chosen} not in scored legal moves {sorted(legal_scores)}"
-        )
+        raise ValueError(f"Chosen move {chosen} not in scored legal moves {sorted(legal_scores)}")
 
     best_score = max(legal_scores.values())
     chosen_class = classify_score(legal_scores[chosen])

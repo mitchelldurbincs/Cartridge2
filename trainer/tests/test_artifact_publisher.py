@@ -7,10 +7,13 @@ import json
 from dataclasses import replace
 from unittest.mock import patch
 
+import onnx
 import pytest
 import torch
+from onnx import TensorProto, helper
 from torch.optim import Adam
 
+from trainer.algorithms.alphazero_board_v1 import policy_value_artifact_contract
 from trainer.central_config import StorageConfig
 from trainer.checkpoint import (
     LearnerStateContract,
@@ -25,6 +28,7 @@ from trainer.storage.publisher import (
     CheckpointManifestV1,
     FilesystemCheckpointPublisher,
     OnnxArtifactContract,
+    OnnxTensorSpec,
     RunHeadV2,
     S3CheckpointPublisher,
     canonical_json_bytes,
@@ -34,7 +38,7 @@ from trainer.storage.publisher import (
 )
 from trainer.storage.run_commit import RunCommitRepository, RunCommitV1
 
-CONTRACT = OnnxArtifactContract(
+CONTRACT = policy_value_artifact_contract(
     algorithm_id="alphazero_board_v1",
     env_id="tictactoe",
     env_contract_version=1,
@@ -53,7 +57,6 @@ def staged_blobs(tmp_path_factory):
     optimizer = Adam(network.parameters(), lr=0.001)
     onnx_path = export_onnx_artifact(
         network,
-        29,
         root / "model.onnx",
         torch.device("cpu"),
         CONTRACT,
@@ -114,9 +117,7 @@ def _publish(publisher, staged_blobs, **overrides):
         evaluation_head_id=None,
         orchestration=None,
     )
-    RunCommitRepository(publisher, create_evaluation_repository(publisher)).publish(
-        commit
-    )
+    RunCommitRepository(publisher, create_evaluation_repository(publisher)).publish(commit)
     publisher.commit_run_head(
         checkpoint_id=checkpoint.checkpoint_id,
         run_commit_id=commit.run_commit_id,
@@ -129,6 +130,40 @@ def test_generated_checkpoint_satisfies_strict_onnx_contract(staged_blobs):
     validate_onnx_checkpoint(staged_blobs[0], CONTRACT)
 
 
+def test_validator_accepts_a_cartridge_declared_q_value_interface(tmp_path):
+    contract = OnnxArtifactContract(
+        algorithm_id="dqn_v1",
+        env_id="counter",
+        env_contract_version=2,
+        model_artifact_schema_version=1,
+        model_contract="onnx_q_values_v1",
+        inputs=(OnnxTensorSpec("observation", "float32", ("batch_size", 2)),),
+        outputs=(OnnxTensorSpec("q_values", "float32", ("batch_size", 2)),),
+    )
+    graph = helper.make_graph(
+        [helper.make_node("Identity", ["observation"], ["q_values"])],
+        "dqn_q_values",
+        [helper.make_tensor_value_info("observation", TensorProto.FLOAT, ["batch_size", 2])],
+        [helper.make_tensor_value_info("q_values", TensorProto.FLOAT, ["batch_size", 2])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+    metadata = {
+        "cartridge.schema_version": "1",
+        "cartridge.algorithm_id": "dqn_v1",
+        "cartridge.model_contract": "onnx_q_values_v1",
+        "cartridge.env_id": "counter",
+        "cartridge.env_contract_version": "2",
+    }
+    for key, value in metadata.items():
+        entry = model.metadata_props.add()
+        entry.key = key
+        entry.value = value
+    path = tmp_path / "q-values.onnx"
+    onnx.save_model(model, path)
+
+    validate_onnx_checkpoint(path, contract)
+
+
 @pytest.mark.parametrize(
     ("changes", "message"),
     [
@@ -137,8 +172,8 @@ def test_generated_checkpoint_satisfies_strict_onnx_contract(staged_blobs):
         ({"model_contract": "  "}, "model_contract"),
         ({"env_contract_version": True}, "positive integer"),
         ({"model_artifact_schema_version": "1"}, "positive integer"),
-        ({"obs_size": 1.5}, "positive integer"),
-        ({"num_actions": 0}, "positive integer"),
+        ({"inputs": ()}, "non-empty tuple"),
+        ({"outputs": (CONTRACT.outputs[0], CONTRACT.outputs[0])}, "unique"),
     ],
 )
 def test_artifact_contract_rejects_unsafe_identity(changes, message):
@@ -146,9 +181,22 @@ def test_artifact_contract_rejects_unsafe_identity(changes, message):
         replace(CONTRACT, **changes)
 
 
-def test_filesystem_publication_has_exact_content_addressed_layout(
-    tmp_path, staged_blobs
-):
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"name": ""}, "non-empty"),
+        ({"dtype": "float64"}, "not supported"),
+        ({"shape": ()}, "non-empty tuple"),
+        ({"shape": ("batch-size", 9)}, "valid non-empty symbol"),
+        ({"shape": ("batch_size", 0)}, "must be positive"),
+    ],
+)
+def test_onnx_tensor_spec_rejects_invalid_boundaries(changes, message):
+    with pytest.raises(ValueError, match=message):
+        replace(CONTRACT.inputs[0], **changes)
+
+
+def test_filesystem_publication_has_exact_content_addressed_layout(tmp_path, staged_blobs):
     publisher = FilesystemCheckpointPublisher(model_root=tmp_path, contract=CONTRACT)
     checkpoint = _publish(publisher, staged_blobs)
     head = publisher.resolve_run_head()
@@ -162,9 +210,7 @@ def test_filesystem_publication_has_exact_content_addressed_layout(
         "channels/current.json",
     }
     assert {
-        str(path.relative_to(tmp_path))
-        for path in tmp_path.rglob("*")
-        if path.is_file()
+        str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*") if path.is_file()
     } == expected
     assert checkpoint.onnx_path == (
         tmp_path / "blobs" / "sha256" / f"{checkpoint.manifest.onnx.sha256}.onnx"
@@ -178,9 +224,7 @@ def test_manifest_and_channels_are_exact_canonical_json(tmp_path, staged_blobs):
         FilesystemCheckpointPublisher(model_root=tmp_path, contract=CONTRACT),
         staged_blobs,
     )
-    manifest_path = (
-        tmp_path / "manifests" / "sha256" / f"{checkpoint.checkpoint_id}.json"
-    )
+    manifest_path = tmp_path / "manifests" / "sha256" / f"{checkpoint.checkpoint_id}.json"
     data = manifest_path.read_bytes()
     decoded = json.loads(data)
 
@@ -208,14 +252,10 @@ def test_manifest_and_channels_are_exact_canonical_json(tmp_path, staged_blobs):
     }
 
 
-def test_republishing_identical_checkpoint_deduplicates_immutables(
-    tmp_path, staged_blobs
-):
+def test_republishing_identical_checkpoint_deduplicates_immutables(tmp_path, staged_blobs):
     publisher = FilesystemCheckpointPublisher(model_root=tmp_path, contract=CONTRACT)
     first = _stage(publisher, staged_blobs)
-    first_manifest_stat = (
-        tmp_path / "manifests" / "sha256" / f"{first.checkpoint_id}.json"
-    ).stat()
+    first_manifest_stat = (tmp_path / "manifests" / "sha256" / f"{first.checkpoint_id}.json").stat()
     second = _stage(publisher, staged_blobs)
 
     assert second == first
@@ -240,9 +280,7 @@ def test_staging_publishes_the_exact_private_snapshot(tmp_path, staged_blobs):
         learner_source.write_bytes(b"mutated after snapshot")
         validate_onnx_checkpoint(snapshot_path, contract)
 
-    publisher = FilesystemCheckpointPublisher(
-        model_root=tmp_path / "models", contract=CONTRACT
-    )
+    publisher = FilesystemCheckpointPublisher(model_root=tmp_path / "models", contract=CONTRACT)
     with patch(
         "trainer.storage.publisher.validate_onnx_checkpoint",
         side_effect=mutate_caller_owned_sources,
@@ -276,9 +314,7 @@ def test_parent_checkpoint_id_changes_manifest_identity(tmp_path, staged_blobs):
     assert second.manifest.parent_checkpoint_id == first.checkpoint_id
 
 
-def test_publication_requires_exact_head_parent_and_increasing_step(
-    tmp_path, staged_blobs
-):
+def test_publication_requires_exact_head_parent_and_increasing_step(tmp_path, staged_blobs):
     publisher = FilesystemCheckpointPublisher(model_root=tmp_path, contract=CONTRACT)
     root = _publish(publisher, staged_blobs, step=10)
 
@@ -396,9 +432,7 @@ def test_live_learner_contract_rejects_restore_incompatible_state_before_staging
     torch.save(state, invalid)
     publisher = FilesystemCheckpointPublisher(model_root=model_root, contract=CONTRACT)
 
-    with pytest.raises(
-        ArtifactValidationError, match="Learner (model|optimizer|scheduler)"
-    ):
+    with pytest.raises(ArtifactValidationError, match="Learner (model|optimizer|scheduler)"):
         publisher.stage_checkpoint(
             staged_blobs[0],
             invalid,
@@ -427,9 +461,7 @@ def test_live_learner_contract_snapshots_every_tensor_on_cpu(staged_blobs):
     assert tensor_devices(contract._optimizer_state) <= {"cpu"}
 
 
-def test_resolve_head_and_list_checkpoints_are_strict_and_step_sorted(
-    tmp_path, staged_blobs
-):
+def test_resolve_head_and_list_checkpoints_are_strict_and_step_sorted(tmp_path, staged_blobs):
     publisher = FilesystemCheckpointPublisher(model_root=tmp_path, contract=CONTRACT)
     earlier = _publish(publisher, staged_blobs, step=10)
     later = _publish(
@@ -444,9 +476,7 @@ def test_resolve_head_and_list_checkpoints_are_strict_and_step_sorted(
     assert publisher.list_checkpoints() == [earlier, later]
 
 
-def test_list_checkpoints_rejects_unexpected_or_corrupt_manifest(
-    tmp_path, staged_blobs
-):
+def test_list_checkpoints_rejects_unexpected_or_corrupt_manifest(tmp_path, staged_blobs):
     publisher = FilesystemCheckpointPublisher(model_root=tmp_path, contract=CONTRACT)
     _publish(publisher, staged_blobs)
     unexpected = tmp_path / "manifests" / "sha256" / "README"
@@ -456,9 +486,7 @@ def test_list_checkpoints_rejects_unexpected_or_corrupt_manifest(
         publisher.list_checkpoints()
 
 
-def test_immutable_object_with_different_bytes_is_never_overwritten(
-    tmp_path, staged_blobs
-):
+def test_immutable_object_with_different_bytes_is_never_overwritten(tmp_path, staged_blobs):
     publisher = FilesystemCheckpointPublisher(model_root=tmp_path, contract=CONTRACT)
     onnx_data = staged_blobs[0].read_bytes()
     digest = sha256_bytes(onnx_data)
@@ -516,9 +544,7 @@ def test_head_rejects_profile_and_config_mismatch(tmp_path, staged_blobs):
         wrong_profile.resolve_head(expected_config_sha256=CONFIG_SHA256)
 
 
-def test_strict_json_rejects_extra_fields_and_noncanonical_encoding(
-    tmp_path, staged_blobs
-):
+def test_strict_json_rejects_extra_fields_and_noncanonical_encoding(tmp_path, staged_blobs):
     checkpoint = _publish(
         FilesystemCheckpointPublisher(model_root=tmp_path, contract=CONTRACT),
         staged_blobs,
@@ -577,9 +603,7 @@ class FakeS3:
         if ContinuationToken is not None:
             raise AssertionError("fake listing is not paginated")
         return {
-            "Contents": [
-                {"Key": key} for key in sorted(self.objects) if key.startswith(Prefix)
-            ],
+            "Contents": [{"Key": key} for key in sorted(self.objects) if key.startswith(Prefix)],
             "IsTruncated": False,
         }
 
@@ -601,9 +625,7 @@ class ConflictOnceS3(FakeS3):
         super().put_object(**kwargs)
 
 
-def test_s3_publishes_verified_immutables_before_authoritative_head(
-    tmp_path, staged_blobs
-):
+def test_s3_publishes_verified_immutables_before_authoritative_head(tmp_path, staged_blobs):
     client = FakeS3()
     publisher = S3CheckpointPublisher(
         model_root=tmp_path,
@@ -625,9 +647,7 @@ def test_s3_publishes_verified_immutables_before_authoritative_head(
     assert not any("/_coordination/" in key for key in client.objects)
 
 
-def test_s3_deduplicates_and_can_resolve_into_a_fresh_local_cache(
-    tmp_path, staged_blobs
-):
+def test_s3_deduplicates_and_can_resolve_into_a_fresh_local_cache(tmp_path, staged_blobs):
     client = FakeS3()
     source = S3CheckpointPublisher(
         model_root=tmp_path / "source",
@@ -638,9 +658,7 @@ def test_s3_deduplicates_and_can_resolve_into_a_fresh_local_cache(
     first = _publish(source, staged_blobs)
     assert _stage(source, staged_blobs) == first
     immutable_writes = [
-        item
-        for item in client.puts
-        if "/blobs/" in item["Key"] or "/manifests/" in item["Key"]
+        item for item in client.puts if "/blobs/" in item["Key"] or "/manifests/" in item["Key"]
     ]
     assert len([item for item in immutable_writes if "IfNoneMatch" in item]) == 3
 
@@ -713,9 +731,7 @@ def test_s3_head_publication_uses_conditional_compare_and_set(tmp_path, staged_b
     assert publisher._head_key not in client.objects
 
 
-def test_s3_ambiguous_head_write_reconciles_exact_committed_bytes(
-    tmp_path, staged_blobs
-):
+def test_s3_ambiguous_head_write_reconciles_exact_committed_bytes(tmp_path, staged_blobs):
     client = ConflictOnceS3()
     publisher = S3CheckpointPublisher(
         model_root=tmp_path,
@@ -754,18 +770,14 @@ def test_s3_head_confirmation_accepts_a_valid_descendant(tmp_path, staged_blobs)
     # Model an ambiguous root write whose confirming GET observes that another
     # writer has already advanced root -> child. The desired root was selected
     # in that valid immutable lineage, so reporting failure would be false.
-    observed = publisher._compare_and_set_head_version(
-        expected=None, target=root_head_bytes
-    )
+    observed = publisher._compare_and_set_head_version(expected=None, target=root_head_bytes)
 
     assert client.objects[publisher._head_key] == child_head_bytes
     assert observed == RunHeadV2.from_bytes(child_head_bytes)
     assert publisher.resolve_head() == child
 
 
-def test_s3_head_confirmation_rejects_a_mismatched_checkpoint_binding(
-    tmp_path, staged_blobs
-):
+def test_s3_head_confirmation_rejects_a_mismatched_checkpoint_binding(tmp_path, staged_blobs):
     client = FakeS3()
     publisher = S3CheckpointPublisher(
         model_root=tmp_path,
@@ -805,14 +817,10 @@ def test_s3_failure_before_manifest_does_not_publish_pointers(tmp_path, staged_b
     onnx_data = staged_blobs[0].read_bytes()
     learner_data = staged_blobs[1].read_bytes()
     # Derive the ID without mutating the destination.
-    shadow = FilesystemCheckpointPublisher(
-        model_root=tmp_path / "shadow", contract=CONTRACT
-    )
+    shadow = FilesystemCheckpointPublisher(model_root=tmp_path / "shadow", contract=CONTRACT)
     shadow_ref = _publish(shadow, staged_blobs)
     del onnx_data, learner_data
-    client.fail_key = publisher._key(
-        f"manifests/sha256/{shadow_ref.checkpoint_id}.json"
-    )
+    client.fail_key = publisher._key(f"manifests/sha256/{shadow_ref.checkpoint_id}.json")
 
     with pytest.raises(RuntimeError, match="S3 unavailable"):
         _publish(publisher, staged_blobs)
@@ -838,13 +846,9 @@ def test_factory_uses_canonical_storage_config(tmp_path):
 
 def test_factory_rejects_incomplete_or_unknown_config(tmp_path):
     with pytest.raises(ValueError, match="CARTRIDGE_STORAGE_S3_BUCKET"):
-        create_checkpoint_publisher(
-            CONTRACT, tmp_path, StorageConfig(model_backend="s3")
-        )
+        create_checkpoint_publisher(CONTRACT, tmp_path, StorageConfig(model_backend="s3"))
     with pytest.raises(ValueError, match="Unknown checkpoint publication backend"):
-        create_checkpoint_publisher(
-            CONTRACT, tmp_path, StorageConfig(model_backend="legacy")
-        )
+        create_checkpoint_publisher(CONTRACT, tmp_path, StorageConfig(model_backend="legacy"))
 
 
 def test_canonical_json_is_raw_utf8_cross_language_golden():
@@ -863,8 +867,7 @@ def test_canonical_json_is_raw_utf8_cross_language_golden():
     assert encoded == golden
     assert b"\\u" not in encoded
     assert (
-        sha256_bytes(encoded)
-        == "2e4360a215d64b8654fc51e28743d8761b5816bef04a30ceefa3314a1f151189"
+        sha256_bytes(encoded) == "2e4360a215d64b8654fc51e28743d8761b5816bef04a30ceefa3314a1f151189"
     )
 
     # ASCII identity fields are unaffected by the raw-UTF-8 rule.

@@ -67,15 +67,11 @@ def eval_record(
         "vs_champion_checkpoint_id": (
             champion["candidate_checkpoint_id"] if champion is not None else None
         ),
-        "vs_champion_evaluation_id": (
-            champion["evaluation_id"] if champion is not None else None
-        ),
+        "vs_champion_evaluation_id": (champion["evaluation_id"] if champion is not None else None),
         "vs_champion_win_rate": 0.5 if champion is not None else None,
         "vs_champion_draw_rate": 0.25 if champion is not None else None,
         "vs_champion_average_game_length": 5.0 if champion is not None else None,
-        "vs_champion_iteration": (
-            champion["iteration"] if champion is not None else None
-        ),
+        "vs_champion_iteration": (champion["iteration"] if champion is not None else None),
         "promoted": promoted,
         "promotion_reason": "promotion decision",
         "vs_random_win_rate": None,
@@ -180,23 +176,15 @@ def test_rebuild_writes_every_projection_from_supplied_authority(tmp_path):
     )
 
     assert (
-        json.loads(stats_manager.config.loop_stats_path.read_bytes())["iterations"][-1][
-            "iteration"
-        ]
+        json.loads(stats_manager.config.loop_stats_path.read_bytes())["iterations"][-1]["iteration"]
         == 3
     )
-    assert json.loads(stats_manager.config.eval_stats_path.read_bytes())[
-        "evaluations"
-    ] == [
+    assert json.loads(stats_manager.config.eval_stats_path.read_bytes())["evaluations"] == [
         first,
         second,
     ]
     assert (
-        len(
-            json.loads(stats_manager.config.solver_stats_path.read_bytes())[
-                "solver_evaluations"
-            ]
-        )
+        len(json.loads(stats_manager.config.solver_stats_path.read_bytes())["solver_evaluations"])
         == 2
     )
     assert json.loads(stats_manager.config.stats_path.read_bytes())["step"] == 3
@@ -260,9 +248,7 @@ def test_rebuild_rejects_loop_and_evaluation_rate_disagreement(tmp_path):
         ([eval_record(3), eval_record(1)], "iterations must be strictly increasing"),
     ],
 )
-def test_eval_projection_rejects_duplicate_and_out_of_order_records(
-    tmp_path, records, message
-):
+def test_eval_projection_rejects_duplicate_and_out_of_order_records(tmp_path, records, message):
     with pytest.raises(ValueError, match=message):
         manager(tmp_path).save_eval_stats(records)
 
