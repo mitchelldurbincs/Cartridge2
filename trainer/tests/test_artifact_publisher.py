@@ -845,3 +845,27 @@ def test_factory_rejects_incomplete_or_unknown_config(tmp_path):
         create_checkpoint_publisher(
             CONTRACT, tmp_path, StorageConfig(model_backend="legacy")
         )
+
+
+def test_canonical_json_is_raw_utf8_cross_language_golden():
+    """Python and Rust must produce byte-identical canonical JSON.
+
+    serde_json (used by model-watcher/actor consumers) parses then
+    re-serializes canonical objects and rejects any byte difference, and it
+    never emits ``\\uXXXX`` escapes for non-ASCII text. These golden bytes are
+    asserted verbatim on the Rust side in
+    engine/model-watcher/src/artifact.rs.
+    """
+    value = {"name": "café", "piece": "♟", "z": 1}
+    golden = '{"name":"café","piece":"♟","z":1}'.encode("utf-8")
+
+    encoded = canonical_json_bytes(value)
+    assert encoded == golden
+    assert b"\\u" not in encoded
+    assert (
+        sha256_bytes(encoded)
+        == "2e4360a215d64b8654fc51e28743d8761b5816bef04a30ceefa3314a1f151189"
+    )
+
+    # ASCII identity fields are unaffected by the raw-UTF-8 rule.
+    assert canonical_json_bytes({"b": 2, "a": 1}) == b'{"a":1,"b":2}'

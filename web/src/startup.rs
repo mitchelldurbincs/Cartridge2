@@ -12,7 +12,7 @@ use axum::{
     Router,
 };
 #[cfg(feature = "onnx")]
-pub use mcts::OnnxEvaluator;
+pub use mcts::SharedOnnxEvaluator;
 use std::sync::Arc;
 // Note: We use std::sync::RwLock (aliased as StdRwLock) for `evaluator` and `model_info`
 // because they are shared with the model_watcher crate which requires std::sync::RwLock.
@@ -78,7 +78,7 @@ pub fn resolve_startup_profile(algorithm_id: &str, env_id: &str) -> Result<Start
 
 /// Stub evaluator type when ONNX is disabled (for testing)
 #[cfg(not(feature = "onnx"))]
-pub type OnnxEvaluator = ();
+pub type SharedOnnxEvaluator = ();
 
 /// Stub ModelInfo when ONNX is disabled
 #[cfg(not(feature = "onnx"))]
@@ -94,15 +94,18 @@ pub struct ModelInfo {
 
 /// Shared application state
 pub struct AppState {
-    /// Current game session (tokio async Mutex - held across awaits in handlers)
-    pub session: Mutex<GameSession>,
+    /// Current game session. Wrapped in an Arc so handlers can take an owned
+    /// lock guard and run synchronous MCTS on a blocking worker thread
+    /// without stalling the async runtime.
+    pub session: Arc<Mutex<GameSession>>,
     /// Current game ID (tokio async RwLock - owned by AppState)
     pub current_game: RwLock<String>,
     /// Data directory for stats.json
     pub data_dir: String,
-    /// Shared evaluator for MCTS (std RwLock - shared with model_watcher crate)
-    /// Only read briefly in sync code, never held across await points.
-    pub evaluator: Arc<StdRwLock<Option<OnnxEvaluator>>>,
+    /// Shared evaluator slot for MCTS (std RwLock - shared with model_watcher
+    /// crate). Readers clone the inner handle and release the lock before
+    /// searching, so it is only ever held briefly.
+    pub evaluator: Arc<StdRwLock<Option<SharedOnnxEvaluator>>>,
     /// Model info (std RwLock - shared with model_watcher crate)
     /// Only read briefly, never held across await points.
     pub model_info: Arc<StdRwLock<ModelInfo>>,
@@ -195,13 +198,13 @@ pub fn create_app(state: Arc<AppState>) -> Router {
 #[cfg(test)]
 pub fn create_test_state() -> Arc<AppState> {
     engine_games::register_all_environments();
-    let evaluator: Arc<StdRwLock<Option<OnnxEvaluator>>> = Arc::new(StdRwLock::new(None));
+    let evaluator: Arc<StdRwLock<Option<SharedOnnxEvaluator>>> = Arc::new(StdRwLock::new(None));
     let model_info = Arc::new(StdRwLock::new(ModelInfo::default()));
     let session = GameSession::with_evaluator("tictactoe", Arc::clone(&evaluator))
         .expect("Failed to create game session");
 
     Arc::new(AppState {
-        session: Mutex::new(session),
+        session: Arc::new(Mutex::new(session)),
         current_game: RwLock::new("tictactoe".to_string()),
         data_dir: "./test_data".to_string(),
         evaluator,

@@ -9,12 +9,13 @@ use engine_core::{
     AgentId, Decision, EngineContext, EpisodeStatus, ErasedTimestep, Presentation, TransitionSource,
 };
 #[cfg(feature = "onnx")]
-use mcts::{run_mcts, MctsConfig, OnnxEvaluator};
+use mcts::{run_mcts, MctsConfig, SharedOnnxEvaluator};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 // Note: Uses std::sync::RwLock (not tokio) because this is shared with model_watcher
-// crate which requires std::sync::RwLock. The lock is only held briefly during
-// synchronous bot_move() calls, never across await points.
+// crate which requires std::sync::RwLock. bot_move() only clones the current
+// evaluator handle out of the lock and releases it before searching, so a hot
+// reload never waits on MCTS and MCTS never blocks a reload.
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(feature = "onnx")]
@@ -22,7 +23,7 @@ use tracing::debug;
 
 use crate::types::GameStateResponse;
 #[cfg(not(feature = "onnx"))]
-use crate::OnnxEvaluator;
+use crate::SharedOnnxEvaluator;
 
 // =============================================================================
 // Configuration Constants
@@ -63,11 +64,11 @@ pub struct GameSession {
     rng: ChaCha20Rng,
     /// Shared evaluator for MCTS (loaded from model file)
     #[cfg(feature = "onnx")]
-    evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,
+    evaluator: Arc<RwLock<Option<SharedOnnxEvaluator>>>,
     /// Stub evaluator when ONNX is disabled
     #[cfg(not(feature = "onnx"))]
     #[allow(dead_code)]
-    evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,
+    evaluator: Arc<RwLock<Option<SharedOnnxEvaluator>>>,
     /// MCTS configuration for bot play
     #[cfg(feature = "onnx")]
     mcts_config: MctsConfig,
@@ -347,7 +348,7 @@ impl GameSession {
     /// Without the `onnx` feature the evaluator is a stub and MCTS is skipped.
     pub fn with_evaluator(
         env_id: &str,
-        evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,
+        evaluator: Arc<RwLock<Option<SharedOnnxEvaluator>>>,
     ) -> Result<Self> {
         let mut ctx = EngineContext::new(env_id)
             .map_err(|error| anyhow!("Environment '{env_id}' is unavailable: {error}"))?;
@@ -468,26 +469,22 @@ impl GameSession {
             return Err(anyhow!("No legal moves available"));
         }
 
-        // Check if we have a model
-        let has_model = {
+        // Snapshot the current model and release the reload lock before the
+        // search. The clone pins this move to one model generation while a
+        // concurrent hot reload can proceed immediately.
+        let evaluator = {
             let guard = self
                 .evaluator
                 .read()
                 .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
-            guard.is_some()
+            guard.clone()
         };
 
-        let position = if has_model {
+        let position = if let Some(evaluator) = evaluator {
             // Try to use MCTS with neural network
             debug!("Attempting MCTS for bot move");
 
             let mcts_result = (|| -> Result<u32> {
-                let guard = self
-                    .evaluator
-                    .read()
-                    .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
-                let evaluator = guard.as_ref().unwrap();
-
                 // Use pre-created simulation context (avoids repeated registry lookups)
                 let sim_ctx = self
                     .mcts_sim_ctx
@@ -496,7 +493,7 @@ impl GameSession {
 
                 let result = run_mcts(
                     sim_ctx,
-                    evaluator,
+                    &evaluator,
                     self.mcts_config.clone(),
                     self.state.clone(),
                     self.timestep.clone(),

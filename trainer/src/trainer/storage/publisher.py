@@ -57,13 +57,20 @@ class ArtifactValidationError(ValueError):
 
 
 def canonical_json_bytes(value: object) -> bytes:
-    """Encode the one canonical JSON representation used for IDs and storage."""
+    """Encode the one canonical JSON representation used for IDs and storage.
+
+    Non-ASCII text is emitted as raw UTF-8 (``ensure_ascii=False``) because
+    Rust consumers canonicalize with serde_json, which never writes ``\\uXXXX``
+    escapes. Both languages must agree byte-for-byte or content-addressed IDs
+    diverge across the boundary.
+    """
     try:
         return json.dumps(
             value,
             sort_keys=True,
             separators=(",", ":"),
             allow_nan=False,
+            ensure_ascii=False,
         ).encode("utf-8")
     except (TypeError, ValueError) as exc:
         raise ArtifactValidationError(f"Value is not canonical JSON: {exc}") from exc

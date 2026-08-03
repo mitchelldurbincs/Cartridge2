@@ -3,7 +3,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::{error::ProvideErrorMetadata, operation::get_object::GetObjectError, Client};
-use mcts::OnnxEvaluator;
+use mcts::SharedOnnxEvaluator;
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -50,7 +50,7 @@ struct S3LoadContext<'a> {
     cache_dir: &'a Path,
     model_spec: &'a ModelLoadSpec,
     selection: ModelSelection,
-    evaluator: &'a Arc<RwLock<Option<OnnxEvaluator>>>,
+    evaluator: &'a Arc<RwLock<Option<SharedOnnxEvaluator>>>,
     accepted_head: &'a Arc<RwLock<Option<AcceptedHead>>>,
     model_info: &'a Arc<RwLock<ModelInfo>>,
 }
@@ -61,7 +61,7 @@ pub struct S3ModelWatcher {
     prefix: String,
     model_spec: ModelLoadSpec,
     selection: ModelSelection,
-    evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,
+    evaluator: Arc<RwLock<Option<SharedOnnxEvaluator>>>,
     accepted_head: Arc<RwLock<Option<AcceptedHead>>>,
     poll_interval: Duration,
     cache_dir: PathBuf,
@@ -73,7 +73,7 @@ impl S3ModelWatcher {
         config: S3Config,
         model_spec: ModelLoadSpec,
         selection: ModelSelection,
-        evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,
+        evaluator: Arc<RwLock<Option<SharedOnnxEvaluator>>>,
     ) -> Result<Self> {
         if config.bucket.trim().is_empty() {
             bail!("S3 model watcher bucket cannot be empty");

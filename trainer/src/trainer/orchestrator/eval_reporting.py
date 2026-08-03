@@ -498,7 +498,7 @@ class EvalReportingMixin:
             "bitbully_version": solver.solver_version,
             "timestamp": artifact.completed_at,
             "iteration": artifact.iteration,
-            "global_step": checkpoint.manifest.step,
+            "global_step": checkpoint.step,
             "context": "loop",
             "evaluation_id": evaluation.evaluation_id,
         }

@@ -391,7 +391,7 @@ fn champion_selection_tracks_rejection_and_promotion_without_losing_head_generat
         .read()
         .unwrap()
         .as_ref()
-        .map(|value| value as *const OnnxEvaluator as usize)
+        .map(|value| value.instance_ptr() as usize)
         .unwrap();
 
     let (rejected_checkpoint, rejected_standalone) = publish_test_checkpoint_with_parent(
@@ -423,7 +423,7 @@ fn champion_selection_tracks_rejection_and_promotion_without_losing_head_generat
             .read()
             .unwrap()
             .as_ref()
-            .map(|value| value as *const OnnxEvaluator as usize),
+            .map(|value| value.instance_ptr() as usize),
         Some(champion_evaluator)
     );
     assert_eq!(
