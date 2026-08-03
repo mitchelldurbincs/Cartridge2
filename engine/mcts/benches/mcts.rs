@@ -9,38 +9,38 @@
 //! - Game comparison (TicTacToe vs Connect4)
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use engine_core::{EngineContext, LegalMask};
+use engine_core::board_profile::LegalMask;
+use engine_core::{EngineContext, ErasedTimestep};
 use mcts::{MctsConfig, MctsSearch, MctsTree, UniformEvaluator};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
 /// Register all games and return TicTacToe context.
 fn setup_tictactoe() -> EngineContext {
-    engine_games::register_all_games();
+    engine_games::register_all_environments();
     EngineContext::new("tictactoe").unwrap()
 }
 
 /// Register all games and return Connect4 context.
 fn setup_connect4() -> EngineContext {
-    engine_games::register_all_games();
+    engine_games::register_all_environments();
     EngineContext::new("connect4").unwrap()
 }
 
 /// Helper to create a game state after playing a sequence of moves.
-fn play_moves(ctx: &mut EngineContext, seed: u64, moves: &[u32]) -> (Vec<u8>, Vec<u8>, LegalMask) {
+fn play_moves(ctx: &mut EngineContext, seed: u64, moves: &[u32]) -> (Vec<u8>, ErasedTimestep) {
     let reset = ctx.reset(seed, &[]).unwrap();
     let mut state = reset.state;
-    let mut obs = reset.obs;
+    let mut timestep = reset.timestep;
 
     for &m in moves {
         let action = m.to_le_bytes().to_vec();
         let step = ctx.step(&state, &action).unwrap();
         state = step.state;
-        obs = step.obs;
+        timestep = step.timestep;
     }
 
-    let legal_mask = ctx.metadata().legal_mask_from_obs(&obs);
-    (state, obs, legal_mask)
+    (state, timestep)
 }
 
 // =============================================================================
@@ -60,7 +60,6 @@ fn bench_mcts_search_simulations(c: &mut Criterion) {
 
             b.iter(|| {
                 let reset = ctx.reset(42, &[]).unwrap();
-                let legal_mask = LegalMask::all_legal(9);
                 let mut rng = ChaCha20Rng::seed_from_u64(42);
 
                 let mut search = MctsSearch::new(
@@ -68,8 +67,7 @@ fn bench_mcts_search_simulations(c: &mut Criterion) {
                     &evaluator,
                     config.clone(),
                     reset.state,
-                    reset.obs,
-                    legal_mask,
+                    reset.timestep,
                 )
                 .unwrap();
 
@@ -98,7 +96,6 @@ fn bench_mcts_connect4(c: &mut Criterion) {
 
             b.iter(|| {
                 let reset = ctx.reset(42, &[]).unwrap();
-                let legal_mask = LegalMask::all_legal(7); // All 7 columns legal
                 let mut rng = ChaCha20Rng::seed_from_u64(42);
 
                 let mut search = MctsSearch::new(
@@ -106,8 +103,7 @@ fn bench_mcts_connect4(c: &mut Criterion) {
                     &evaluator,
                     config.clone(),
                     reset.state,
-                    reset.obs,
-                    legal_mask,
+                    reset.timestep,
                 )
                 .unwrap();
 
@@ -135,7 +131,6 @@ fn bench_game_comparison(c: &mut Criterion) {
 
         b.iter(|| {
             let reset = ctx.reset(42, &[]).unwrap();
-            let legal_mask = LegalMask::all_legal(9);
             let mut rng = ChaCha20Rng::seed_from_u64(42);
 
             let mut search = MctsSearch::new(
@@ -143,8 +138,7 @@ fn bench_game_comparison(c: &mut Criterion) {
                 &evaluator,
                 config.clone(),
                 reset.state,
-                reset.obs,
-                legal_mask,
+                reset.timestep,
             )
             .unwrap();
 
@@ -160,7 +154,6 @@ fn bench_game_comparison(c: &mut Criterion) {
 
         b.iter(|| {
             let reset = ctx.reset(42, &[]).unwrap();
-            let legal_mask = LegalMask::all_legal(7);
             let mut rng = ChaCha20Rng::seed_from_u64(42);
 
             let mut search = MctsSearch::new(
@@ -168,8 +161,7 @@ fn bench_game_comparison(c: &mut Criterion) {
                 &evaluator,
                 config.clone(),
                 reset.state,
-                reset.obs,
-                legal_mask,
+                reset.timestep,
             )
             .unwrap();
 
@@ -192,7 +184,6 @@ fn bench_mcts_game_phases(c: &mut Criterion) {
 
         b.iter(|| {
             let reset = ctx.reset(42, &[]).unwrap();
-            let legal_mask = LegalMask::all_legal(9);
             let mut rng = ChaCha20Rng::seed_from_u64(42);
 
             let mut search = MctsSearch::new(
@@ -200,8 +191,7 @@ fn bench_mcts_game_phases(c: &mut Criterion) {
                 &evaluator,
                 config.clone(),
                 reset.state,
-                reset.obs,
-                legal_mask,
+                reset.timestep,
             )
             .unwrap();
 
@@ -217,12 +207,11 @@ fn bench_mcts_game_phases(c: &mut Criterion) {
         let config = MctsConfig::for_testing().with_simulations(sims);
 
         b.iter(|| {
-            let (state, obs, legal_mask) = play_moves(&mut ctx, 42, &[4, 0, 2, 6]);
+            let (state, timestep) = play_moves(&mut ctx, 42, &[4, 0, 2, 6]);
             let mut rng = ChaCha20Rng::seed_from_u64(42);
 
             let mut search =
-                MctsSearch::new(&mut ctx, &evaluator, config.clone(), state, obs, legal_mask)
-                    .unwrap();
+                MctsSearch::new(&mut ctx, &evaluator, config.clone(), state, timestep).unwrap();
 
             black_box(search.run(&mut rng).unwrap())
         });
@@ -236,12 +225,11 @@ fn bench_mcts_game_phases(c: &mut Criterion) {
         let config = MctsConfig::for_testing().with_simulations(sims);
 
         b.iter(|| {
-            let (state, obs, legal_mask) = play_moves(&mut ctx, 42, &[0, 3, 1, 4]);
+            let (state, timestep) = play_moves(&mut ctx, 42, &[0, 3, 1, 4]);
             let mut rng = ChaCha20Rng::seed_from_u64(42);
 
             let mut search =
-                MctsSearch::new(&mut ctx, &evaluator, config.clone(), state, obs, legal_mask)
-                    .unwrap();
+                MctsSearch::new(&mut ctx, &evaluator, config.clone(), state, timestep).unwrap();
 
             black_box(search.run(&mut rng).unwrap())
         });
@@ -393,7 +381,6 @@ fn bench_mcts_configs(c: &mut Criterion) {
 
         b.iter(|| {
             let reset = ctx.reset(42, &[]).unwrap();
-            let legal_mask = LegalMask::all_legal(9);
             let mut rng = ChaCha20Rng::seed_from_u64(42);
 
             let mut search = MctsSearch::new(
@@ -401,8 +388,7 @@ fn bench_mcts_configs(c: &mut Criterion) {
                 &evaluator,
                 config.clone(),
                 reset.state,
-                reset.obs,
-                legal_mask,
+                reset.timestep,
             )
             .unwrap();
 
@@ -418,7 +404,6 @@ fn bench_mcts_configs(c: &mut Criterion) {
 
         b.iter(|| {
             let reset = ctx.reset(42, &[]).unwrap();
-            let legal_mask = LegalMask::all_legal(9);
             let mut rng = ChaCha20Rng::seed_from_u64(42);
 
             let mut search = MctsSearch::new(
@@ -426,8 +411,7 @@ fn bench_mcts_configs(c: &mut Criterion) {
                 &evaluator,
                 config.clone(),
                 reset.state,
-                reset.obs,
-                legal_mask,
+                reset.timestep,
             )
             .unwrap();
 
@@ -446,7 +430,6 @@ fn bench_mcts_configs(c: &mut Criterion) {
 
             b.iter(|| {
                 let reset = ctx.reset(42, &[]).unwrap();
-                let legal_mask = LegalMask::all_legal(9);
                 let mut rng = ChaCha20Rng::seed_from_u64(42);
 
                 let mut search = MctsSearch::new(
@@ -454,8 +437,7 @@ fn bench_mcts_configs(c: &mut Criterion) {
                     &evaluator,
                     config.clone(),
                     reset.state,
-                    reset.obs,
-                    legal_mask,
+                    reset.timestep,
                 )
                 .unwrap();
 
@@ -491,7 +473,6 @@ fn bench_batch_sizes(c: &mut Criterion) {
 
                 b.iter(|| {
                     let reset = ctx.reset(42, &[]).unwrap();
-                    let legal_mask = LegalMask::all_legal(9);
                     let mut rng = ChaCha20Rng::seed_from_u64(42);
 
                     let mut search = MctsSearch::new(
@@ -499,8 +480,7 @@ fn bench_batch_sizes(c: &mut Criterion) {
                         &evaluator,
                         config.clone(),
                         reset.state,
-                        reset.obs,
-                        legal_mask,
+                        reset.timestep,
                     )
                     .unwrap();
 
@@ -524,7 +504,6 @@ fn bench_batch_sizes(c: &mut Criterion) {
 
                 b.iter(|| {
                     let reset = ctx.reset(42, &[]).unwrap();
-                    let legal_mask = LegalMask::all_legal(7);
                     let mut rng = ChaCha20Rng::seed_from_u64(42);
 
                     let mut search = MctsSearch::new(
@@ -532,8 +511,7 @@ fn bench_batch_sizes(c: &mut Criterion) {
                         &evaluator,
                         config.clone(),
                         reset.state,
-                        reset.obs,
-                        legal_mask,
+                        reset.timestep,
                     )
                     .unwrap();
 

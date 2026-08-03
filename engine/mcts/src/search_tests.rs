@@ -2,12 +2,23 @@
 
 use super::*;
 use crate::evaluator::UniformEvaluator;
+use crate::MctsConfigError;
 use rand::SeedableRng;
 use tracing::trace;
 
 fn setup_tictactoe() -> EngineContext {
-    engine_games::register_all_games();
+    engine_games::register_all_environments();
     EngineContext::new("tictactoe").unwrap()
+}
+
+fn active_observation(timestep: &ErasedTimestep) -> &[u8] {
+    let agent_id = match &timestep.decision {
+        Decision::Agents { agent_ids } if agent_ids.len() == 1 => agent_ids[0],
+        decision => panic!("expected one active agent, got {decision:?}"),
+    };
+    timestep
+        .observation_for(agent_id)
+        .expect("observation for active agent")
 }
 
 #[test]
@@ -17,17 +28,13 @@ fn test_mcts_basic_search() {
     let config = MctsConfig::for_testing();
 
     let reset = ctx.reset(42, &[]).unwrap();
-    // All 9 positions are legal at the start of TicTacToe
-    let legal_mask = LegalMask::from_u64(0b111111111, 9);
-
     let mut rng = ChaCha20Rng::seed_from_u64(42);
     let result = run_mcts(
         &mut ctx,
         &evaluator,
         config,
         reset.state,
-        reset.obs,
-        legal_mask,
+        reset.timestep,
         &mut rng,
     );
 
@@ -43,6 +50,48 @@ fn test_mcts_basic_search() {
 
     // Should have run simulations
     assert!(result.simulations > 0);
+}
+
+#[test]
+fn test_mcts_rejects_a_timestep_without_the_active_observation() {
+    let mut ctx = setup_tictactoe();
+    let evaluator = UniformEvaluator::new();
+    let reset = ctx.reset(42, &[]).unwrap();
+
+    let mut timestep = reset.timestep;
+    timestep.observations.clear();
+    let error = MctsSearch::new(
+        &mut ctx,
+        &evaluator,
+        MctsConfig::for_testing(),
+        reset.state,
+        timestep,
+    )
+    .err()
+    .expect("missing actor observation cannot drive search");
+
+    assert!(matches!(error, SearchError::InvalidTimestep(_)));
+}
+
+#[test]
+fn test_mcts_rejects_zero_simulations_before_running_search() {
+    let mut ctx = setup_tictactoe();
+    let evaluator = UniformEvaluator::new();
+    let reset = ctx.reset(42, &[]).unwrap();
+    let error = MctsSearch::new(
+        &mut ctx,
+        &evaluator,
+        MctsConfig::for_testing().with_simulations(0),
+        reset.state,
+        reset.timestep,
+    )
+    .err()
+    .expect("zero simulations cannot produce a visit policy");
+
+    assert!(matches!(
+        error,
+        SearchError::InvalidConfig(MctsConfigError::ZeroSimulations)
+    ));
 }
 
 #[test]
@@ -65,23 +114,18 @@ fn test_mcts_finds_winning_move() {
     // Play moves: X at 0, O at 3, X at 1, O at 4
     let moves = [0u32, 3, 1, 4];
     let mut state = reset.state;
-    let mut obs = reset.obs;
+    let mut timestep = reset.timestep;
 
     for m in moves {
         let action = m.to_le_bytes().to_vec();
         let step = ctx.step(&state, &action).unwrap();
         state = step.state;
-        obs = step.obs;
+        timestep = step.timestep;
     }
 
     // Now it's X's turn, position 2 wins
-    let legal_mask = LegalMask::from_u64(0b111100100, 9); // positions 2, 5, 6, 7, 8 are legal
-
     let mut rng = ChaCha20Rng::seed_from_u64(42);
-    let result = run_mcts(
-        &mut ctx, &evaluator, config, state, obs, legal_mask, &mut rng,
-    )
-    .unwrap();
+    let result = run_mcts(&mut ctx, &evaluator, config, state, timestep, &mut rng).unwrap();
 
     // With enough simulations, MCTS should find the winning move
     // Note: With uniform evaluator, it may not always find it, but should favor it
@@ -115,17 +159,22 @@ fn test_mcts_winning_move_has_positive_value() {
     // Play moves: X at 0, O at 3, X at 1, O at 4
     let moves = [0u32, 3, 1, 4];
     let mut state = reset.state;
-    let mut obs = reset.obs;
+    let mut timestep = reset.timestep;
 
     for m in moves {
         let action = m.to_le_bytes().to_vec();
         let step = ctx.step(&state, &action).unwrap();
         state = step.state;
-        obs = step.obs;
+        timestep = step.timestep;
     }
 
     // Extract legal mask from the observation (the authoritative source)
-    let legal_mask = ctx.metadata().legal_mask_from_obs(&obs);
+    let metadata = ctx.metadata();
+    let legal_mask = metadata
+        .require_board()
+        .unwrap()
+        .legal_mask_from_obs(active_observation(&timestep))
+        .unwrap();
 
     // Verify position 2 is legal
     assert!(
@@ -135,7 +184,7 @@ fn test_mcts_winning_move_has_positive_value() {
     );
 
     let mut rng = ChaCha20Rng::seed_from_u64(42);
-    let mut search = MctsSearch::new(&mut ctx, &evaluator, config, state, obs, legal_mask).unwrap();
+    let mut search = MctsSearch::new(&mut ctx, &evaluator, config, state, timestep).unwrap();
     let result = search.run(&mut rng).unwrap();
 
     // Check the tree directly
@@ -219,16 +268,19 @@ fn test_mcts_winning_move_has_positive_value() {
 #[test]
 fn test_mcts_generals_257_actions() {
     // Regression test for the u64 mask ceiling: generals_8x8 has 257 actions
-    // (256 moves + wait), which cannot fit in a u64 mask or in info_bits.
-    engine_games::register_all_games();
+    // (256 moves + wait), which cannot fit in a packed u64 mask.
+    engine_games::register_all_environments();
     let mut ctx = EngineContext::new("generals_8x8").unwrap();
     let evaluator = UniformEvaluator::new();
     let config = MctsConfig::for_testing().with_simulations(50);
 
     let reset = ctx.reset(42, &[]).unwrap();
-    let meta = ctx.metadata();
-    assert_eq!(meta.num_actions, 257);
-    let legal_mask = meta.legal_mask_from_obs(&reset.obs);
+    let metadata = ctx.metadata();
+    let board = metadata.require_board().unwrap();
+    assert_eq!(board.action_count, 257);
+    let legal_mask = board
+        .legal_mask_from_obs(active_observation(&reset.timestep))
+        .unwrap();
     // Wait (action 256, past the u64 boundary) must be legal at the root
     assert!(legal_mask.is_legal(256));
 
@@ -238,8 +290,7 @@ fn test_mcts_generals_257_actions() {
         &evaluator,
         config,
         reset.state,
-        reset.obs.clone(),
-        legal_mask.clone(),
+        reset.timestep,
         &mut rng,
     )
     .unwrap();
@@ -269,8 +320,6 @@ fn test_policy_target_is_independent_of_play_temperature() {
     // low-temperature phase covers almost every ply of every episode.
     let mut ctx = setup_tictactoe();
     let evaluator = UniformEvaluator::new();
-    let legal_mask = LegalMask::from_u64(0b111111111, 9);
-
     let policy_for = |ctx: &mut EngineContext, temperature: f32| {
         let config = MctsConfig::for_testing()
             .with_simulations(200)
@@ -283,8 +332,7 @@ fn test_policy_target_is_independent_of_play_temperature() {
             &evaluator,
             config,
             reset.state,
-            reset.obs,
-            legal_mask.clone(),
+            reset.timestep,
             &mut rng,
         )
         .unwrap()
@@ -315,31 +363,28 @@ fn test_policy_target_is_independent_of_play_temperature() {
 }
 
 #[test]
-fn test_single_batch_search_spreads_visits() {
-    // Regression test for the virtual-loss sign bug: when all simulations
-    // fit in one evaluation batch (sims <= eval_batch_size), virtual loss
-    // with the wrong sign made every simulation pile onto one child (the
-    // last-index tie-winner), producing one-hot policy targets and
-    // collapsing self-play training.
-    engine_games::register_all_games();
+fn test_capped_batched_search_spreads_visits() {
+    // Regression test for the virtual-loss sign bug under multi-leaf batches.
+    // The configured batch exceeds the simulation budget, but search caps the
+    // effective batch to sims / 4 so evaluation and selection interleave.
+    // Virtual loss must still diversify the leaves within each capped batch.
+    engine_games::register_all_environments();
     let mut ctx = EngineContext::new("tictactoe").unwrap();
     let evaluator = UniformEvaluator::new();
     let config = MctsConfig::for_testing()
         .with_simulations(9)
-        .with_eval_batch_size(64) // all sims in a single batch
+        .with_eval_batch_size(64)
         .with_temperature(1.0); // visit-proportional policy, not greedy
+    assert_eq!(effective_eval_batch_size(&config), 2);
 
     let reset = ctx.reset(42, &[]).unwrap();
-    let legal_mask = LegalMask::from_u64(0b111111111, 9);
-
     let mut rng = ChaCha20Rng::seed_from_u64(42);
     let result = run_mcts(
         &mut ctx,
         &evaluator,
         config,
         reset.state,
-        reset.obs,
-        legal_mask,
+        reset.timestep,
         &mut rng,
     )
     .unwrap();
@@ -347,7 +392,7 @@ fn test_single_batch_search_spreads_visits() {
     let support = result.policy.iter().filter(|&&p| p > 0.0).count();
     assert!(
         support >= 5,
-        "single-batch search must spread visits over children, support={} policy={:?}",
+        "capped batched search must spread visits over children, support={} policy={:?}",
         support,
         result.policy
     );

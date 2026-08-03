@@ -13,7 +13,7 @@ restatement had drifted.
 4. [Actor Component](#4-actor-component)
 5. [Trainer Component](#5-trainer-component)
 6. [Web Component](#6-web-component)
-7. [Storage Backends](#7-storage-backends) — incl. [game metadata single-sourcing](#73-game-metadata-single-sourcing)
+7. [Storage Backends](#7-storage-backends) — incl. [environment and algorithm catalog single-sourcing](#73-environment-and-algorithm-catalog-single-sourcing)
 8. [Configuration System](#8-configuration-system)
 9. [Data Flow](#9-data-flow)
 10. [Deployment](#10-deployment) — incl. [Observability](#observability)
@@ -23,14 +23,65 @@ restatement had drifted.
 
 ## 1. Overview
 
-Cartridge2 is a simplified AlphaZero training and visualization platform that enables training neural network game agents via self-play and lets users play against trained models through a web interface.
+Cartridge2 is an algorithm-oriented reinforcement-learning platform. An
+environment supplies game mechanics and capabilities; an algorithm cartridge
+supplies a compatible collector, learner, orchestration recipe, experience
+schema, model contract, evaluation suite, and serving implementation. The web
+application remains a way to inspect training and play against supported
+models.
 
 ### Key Design Philosophy
 
 - **Monolithic over Microservices**: local processes over shared storage, instead of gRPC between services. (Kubernetes manifests and Terraform modules do exist under `k8s/` and `terraform/` for cloud deployment — what is avoided is service-to-service RPC, not orchestration.)
 - **Library-First**: Engine is a Rust library, not a service
-- **Engine as source of truth**: game facts — board dimensions, action counts, observation layout — are declared once in the Rust game crates. The Python trainer reads them from a generated manifest, and the database row is a cross-check, not a second definition. See [§7.3](#73-game-metadata-single-sourcing).
+- **Engine as source of truth**: game facts — board dimensions, action counts, observation layout — are declared once in the Rust game crates. The Python trainer reads them from a generated manifest, and the database row is a cross-check, not a second definition. See [§7.3](#73-environment-and-algorithm-catalog-single-sourcing).
+- **Explicit algorithm composition**: registration means an environment exists,
+  not that every algorithm can train it. Runtime composition resolves a
+  canonical algorithm ID and validates its generated compatibility profile
+  before doing work.
 - **Hot-Reloadable**: Models update without restarting services
+
+### Environment and algorithm contracts
+
+The canonical algorithm catalog lives in `engine/algorithm-core`. Each
+descriptor has a stable ID and version plus language-neutral identifiers for
+its seven replaceable components:
+
+| Component | `alphazero_board_v1` contract |
+|-----------|---------------------------------|
+| Collector | `alphazero_mcts_self_play_v1` |
+| Learner | `alphazero_policy_value_v1` |
+| Orchestration | `synchronized_alphazero_v1` |
+| Experience schema | `alphazero_transition_v1` |
+| Model contract | `onnx_policy_value_v1` |
+| Evaluation suite | `two_player_seat_balanced_v1` |
+| Serving | `alphazero_mcts_web_v1` |
+
+Rust dispatches the collector and evaluator through this catalog. Python reads
+the same descriptors from manifest schema version 4 and binds its concrete
+implementations in `trainer/algorithms/registry.py`. `[algorithm].id`,
+`--algorithm`, and `CARTRIDGE_ALGORITHM_ID` all select the same canonical ID.
+
+Before replay connections, model watchers, or evaluation matches begin, each
+entry point resolves the algorithm and calls its compatibility guard for the
+selected environment. Unknown IDs and reports with machine-checkable issues are
+startup errors.
+
+The first cartridge, `alphazero_board_v1`, supports exactly two fixed players,
+alternating turns, indexed discrete actions, observation-embedded legal masks,
+fixed spatial `f32` observations, perfect information, deterministic planning
+snapshots, and terminal-only zero-sum rewards. The environment contract exposes
+these agents/action spaces, turn, information, planning-state, chance,
+transition, reward, horizon, and wire-encoding semantics in machine-readable
+form. The optional nested board profile supplies the AlphaZero observation and
+presentation facts, so the compatibility result is exact.
+
+The generic ABI represents single-agent and simultaneous decisions, fixed or
+dynamic populations, explicit or environment-sampled chance, partial
+observation, stochastic transitions, general per-agent rewards, truncation, and
+multi-discrete or continuous actions. The first cartridge rejects those
+profiles; using them requires a matching collector/learner/model/evaluation
+cartridge (and a recurrent model contract where history is required).
 
 ### Target Games
 
@@ -39,7 +90,7 @@ Cartridge2 is a simplified AlphaZero training and visualization platform that en
 | TicTacToe | Complete | 3x3 | 9 | 29 | MLP (hidden 128) |
 | Connect 4 | Complete | 7x6 | 7 | 93 | ResNet 4x128 |
 | Othello | Complete | 8x8 | 65 (64 cells + pass) | 195 | ResNet 6x256 |
-| Generals 8x8 | Engine + trainer complete; not yet stronger than random; no web renderer | 8x8 | 257 (64 tiles x 4 dirs + wait) | 835 | ResNet 6x128, 9 planes |
+| Generals 8x8 | Engine/trainer/web complete; not yet stronger than random | 8x8 | 257 (64 tiles x 4 dirs + wait) | 899 | ResNet 6x128, 10 planes |
 
 See [§3.6](#36-generals-8x8) for the Generals ruleset and why it departs from
 the real game.
@@ -64,70 +115,31 @@ the real game.
 ### High-Level Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           Shared Filesystem / Storage                        │
-│  PostgreSQL                 - Replay buffer database                         │
-│  ./data/models/latest.onnx - Current ONNX model (hot-reloaded)              │
-│  ./data/stats.json         - Training telemetry for web UI                  │
+┌──────────────────────── Synchronized trainer process ───────────────────────┐
+│ Python orchestrator                                                        │
+│   ├─ bounded Rust collectors ── exact ReplaySelection ──► PostgreSQL        │
+│   ├─ PyTorch learner ◄───────── same sealed selection ───┘                  │
+│   ├─ Rust evaluator                                                        │
+│   └─ immutable checkpoint/evaluation/RunCommit ── CAS RunHead ─► FS or S3  │
 └─────────────────────────────────────────────────────────────────────────────┘
-         ▲                   ▲                   ▲                    ▲
-         │                   │                   │                    │
-┌────────┴────────┐  ┌───────┴───────┐  ┌────────┴────────┐  ┌────────┴────────┐
-│     Actor       │  │    Trainer    │  │   Web Server    │  │    Frontend     │
-│  (Rust Binary)  │  │   (Python)    │  │  (Axum :8080)   │  │  (Svelte :5173) │
-│                 │  │               │  │                 │  │                 │
-│  - Engine lib   │  │  - PyTorch    │  │  - Engine lib   │  │  - Play UI      │
-│  - MCTS policy  │  │  - PostgreSQL │  │  - Game API     │  │  - Stats charts │
-│  - Self-play    │  │  - ONNX export│  │  - Stats API    │  │  - Loss display │
-│  - Model watch  │  │  - Evaluation │  │  - Model watch  │  │                 │
-└─────────────────┘  └───────────────┘  └─────────────────┘  └─────────────────┘
+                                              │ ChampionOrLatest + projection
+                                 ┌────────────▼────────────┐
+                                 │ Axum web server :8080   │
+                                 └────────────┬────────────┘
+                                              │ HTTP
+                                 ┌────────────▼────────────┐
+                                 │ Svelte frontend :5173   │
+                                 └─────────────────────────┘
 ```
 
 ### Component Interactions
 
-```
-                                     ┌──────────────┐
-                                     │   Browser    │
-                                     │   (User)     │
-                                     └──────┬───────┘
-                                            │ HTTP
-                                     ┌──────▼───────┐
-                                     │   Frontend   │
-                                     │   (Svelte)   │
-                                     └──────┬───────┘
-                                            │ API calls
-                                     ┌──────▼───────┐
-                                     │  Web Server  │
-                                     │   (Axum)     │
-                                     └──────┬───────┘
-                                            │ reads
-                              ┌─────────────┼─────────────┐
-                              │             │             │
-                       ┌──────▼──────┐ ┌────▼────┐ ┌──────▼──────┐
-                       │ latest.onnx │ │stats.json│ │Engine (lib) │
-                       └──────▲──────┘ └────▲────┘ └─────────────┘
-                              │             │
-              writes (atomic) │             │ writes (atomic)
-                              │             │
-                       ┌──────┴──────┐ ┌────┴─────────────┐
-                       │   Trainer   │ │                  │
-                       │  (Python)   │ │                  │
-                       └──────▲──────┘ │                  │
-                              │ samples│                  │
-                       ┌──────┴──────┐ │                  │
-                       │  PostgreSQL │◄┘                  │
-                       │  (Database) │                    │
-                       └──────▲──────┘                    │
-                              │ stores transitions        │
-                       ┌──────┴──────┐                    │
-                       │    Actor    │────────────────────┘
-                       │   (Rust)    │  uses Engine lib
-                       └──────┬──────┘
-                              │ reads (hot-reload)
-                       ┌──────▼──────┐
-                       │ latest.onnx │
-                       └─────────────┘
-```
+The orchestrator is the only owner of synchronized iteration state. It derives
+the parent from RunHead, creates the collection scope, starts finite collector
+children, verifies their exact episode seal, invokes the learner/evaluator, and
+publishes the RunCommit. Collectors load Latest once; they are not independent
+services. Web independently follows the accepted RunHead using
+ChampionOrLatest, while the frontend sees only the web API.
 
 ### Training Modes
 
@@ -135,33 +147,33 @@ the real game.
 
 Each iteration follows this pattern:
 ```
-┌──────────────────────────────────────────────────────────────┐
-│ Iteration N                                                  │
-├──────────────────────────────────────────────────────────────┤
-│ 1. Clear replay buffer (fresh data from current model)       │
-│ 2. Run Actor: Generate N episodes via self-play              │
-│ 3. Run Trainer: Train for M steps on fresh data              │
-│ 4. Run Evaluator: Test against best model + random           │
-│ 5. Promote if win_rate > threshold                           │
-│ 6. Export latest.onnx (actor hot-reloads)                    │
-└──────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│ Iteration N                                                        │
+├────────────────────────────────────────────────────────────────────┤
+│ 1. Resolve the exact parent checkpoint (or root)                   │
+│ 2. Allocate a fresh cryptographic replay collection scope          │
+│ 3. Run bounded collectors pinned to that source checkpoint         │
+│ 4. Seal exactly N complete episodes; fail closed on any mismatch   │
+│ 5. Train for M steps using only that exact replay selection        │
+│ 6. Evaluate and write immutable checkpoint/evaluation/RunCommit    │
+│ 7. Compare-and-set the sole models/channels/current.json RunHead   │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
-#### Continuous Mode (Alternative)
+Every attempt gets a new scope. The loop does not clear the profile; rows from
+older or failed attempts are retained but cannot match the current selection.
+Collection uses system entropy (`system_entropy_v1`, with no recorded seed), so
+self-play is intentionally not bit reproducible. Evaluation uses the recorded
+`evaluation_seed` and exact seat recipe and is deterministic evidence.
 
-Actor and trainer run concurrently:
-```
-┌─────────────────┐     ┌─────────────────┐
-│     Actor       │     │    Trainer      │
-│  (continuous)   │     │  (continuous)   │
-│                 │     │                 │
-│  Generate ──────┼────►│  Sample ────────┤
-│  episodes       │     │  batches        │
-│                 │◄────┼──────────────── │
-│  Hot-reload     │     │  Export ONNX    │
-│  model          │     │                 │
-└─────────────────┘     └─────────────────┘
-```
+#### Standalone Commands (Disjoint)
+
+Direct `train` requires an explicit `--collection-scope-id` and exactly one of
+`--source-checkpoint-id` or `--source-root`. It can continue only a standalone
+lineage; it refuses a RunHead owned by a synchronized recipe. Conversely, the
+synchronized loop requires its exact persisted `RunRecipe` and cannot absorb a
+standalone lineage. `solver-eval` is diagnostic/log-only and cannot write
+evaluation authority. There is no continuous actor/trainer mode in Phase 1.
 
 ---
 
@@ -172,35 +184,38 @@ Actor and trainer run concurrently:
 ```
 engine/
 ├── Cargo.toml                 # Workspace root
+├── algorithm-core/           # Algorithm descriptors, compatibility, dispatch keys
 ├── engine-config/             # Centralized config.toml loading (shared by actor/web)
-├── engine-core/               # Core abstractions (Game trait, registry, context)
+├── engine-core/               # Generic Environment ABI, registry, context
 │   └── src/
 │       ├── lib.rs             # Public API exports
-│       ├── typed.rs           # Game trait (compile-time type safety)
-│       ├── erased.rs          # ErasedGame trait (runtime polymorphism)
-│       ├── adapter.rs         # GameAdapter (typed → erased conversion)
+│       ├── typed.rs           # Environment, Timestep, semantics, agents/actions
+│       ├── contract.rs        # Shared descriptor/timestep validation
+│       ├── erased.rs          # Sealed bytes-only runtime boundary
+│       ├── adapter.rs         # Private typed erasure + validation
 │       ├── context.rs         # EngineContext high-level API
-│       ├── registry.rs        # Static game registration
-│       ├── metadata.rs        # GameMetadata for UI/config
-│       ├── board_view.rs      # BoardView (display projection of a state)
+│       ├── registry.rs        # Immutable environment registration
+│       ├── metadata.rs        # Generic metadata + optional board profile
+│       ├── board_view.rs      # Optional Board/Custom presentation projection
 │       ├── legal_mask.rs      # LegalMask (dynamic-width action mask)
-│       ├── game_utils.rs      # Shared helpers for game implementations
-│       └── board_game.rs      # TwoPlayerObs generic type
+│       ├── board_game_utils.rs # Narrow two-player board helpers
+│       └── board_game.rs      # Narrow board family → generic ABI adapter
+├── envs-counter/              # Direct non-board Environment reference/canary
 ├── engine-games/              # Registration of all bundled games
 │   ├── src/
-│   │   ├── lib.rs             # register_all_games() + layout invariants
-│   │   ├── manifest.rs        # Game-metadata manifest rendering
+│   │   ├── lib.rs             # register_all_environments() + profile invariants
+│   │   ├── manifest.rs        # Environment/algorithm manifest rendering
 │   │   └── bin/
-│   │       └── gen-game-manifest.rs   # `make game-manifest`
+│   │       └── generate-environment-manifest.rs # `make environment-manifest`
 │   └── tests/
-│       └── manifest_golden.rs # Fails when the committed manifest drifts
-├── evaluator/                 # `cartridge-eval`: plays evaluation games
+│       └── environment_manifest_golden.rs # Rejects committed catalog drift
+├── evaluator/                 # Algorithm-dispatched `cartridge-eval`
 │   └── src/
 │       ├── lib.rs             # Match loop, seat alternation, position dump
 │       ├── player.rs          # Random or model (with optional MCTS) seats
 │       ├── results.rs         # EvalSummary + PositionRecord wire formats
 │       └── main.rs            # CLI
-├── metrics-common/            # Prometheus registration/encoding shared by actor + web
+├── metrics-common/            # Prometheus registration/encoding utilities
 ├── games-tictactoe/           # TicTacToe implementation
 ├── games-connect4/            # Connect 4 implementation
 ├── games-othello/             # Othello implementation
@@ -223,85 +238,120 @@ engine/
 
 ### Core Abstractions
 
-#### Game Trait (Typed)
+#### Environment Trait (Typed)
 
-The typed `Game` trait provides compile-time type safety:
+The typed `Environment` trait is algorithm-neutral and provides compile-time
+type safety:
 
 ```rust
-pub trait Game: Send + Sync + Debug + 'static {
-    type State;      // Game state (e.g., board configuration)
-    type Action;     // Action type (e.g., position index)
-    type Obs;        // Observation (neural network input)
+pub trait Environment: Send + Sync + Debug + 'static {
+    type State;
+    type Action;      // May encode a joint action for simultaneous decisions
+    type Observation;
 
-    // Identity and self-description
     fn engine_id(&self) -> EngineId;
-    fn capabilities(&self) -> Capabilities;   // incl. max_horizon, encodings
-    fn metadata(&self) -> GameMetadata;       // board dims, obs layout, UI hints
+    fn capabilities(&self) -> Capabilities;
+    fn metadata(&self) -> EnvironmentMetadata;
 
     fn reset(&mut self, rng: &mut ChaCha20Rng, hint: &[u8])
-        -> (Self::State, Self::Obs);
+        -> Result<(Self::State, Timestep<Self::Observation>), EnvironmentError>;
     fn step(&mut self, state: &mut Self::State, action: Self::Action,
-        rng: &mut ChaCha20Rng) -> (Self::Obs, f32, bool, u64);
+        rng: &mut ChaCha20Rng)
+        -> Result<Timestep<Self::Observation>, EnvironmentError>;
 
     fn encode_state(state: &Self::State, out: &mut Vec<u8>) -> Result<(), EncodeError>;
     fn decode_state(buf: &[u8]) -> Result<Self::State, DecodeError>;
-    // ... plus encode/decode for Action, and encode_obs
+    // ... plus strict Action codecs and Observation encoding
 }
 ```
 
-`metadata()` is the linchpin of the engine-as-source-of-truth design: it is what
-the actor, the web server, the database row and the trainer's generated manifest
-all ultimately read. See [§7.3](#73-game-metadata-single-sourcing).
+`Timestep` carries an explicit transition roster, observations and
+`{reward, terminated, truncated}` outcomes per stable `AgentId`, plus
+`Decision::{Agents, Chance, None}`, transition provenance, and episode status.
+Fixed environments emit their complete declared population. Dynamic
+environments include newly/currently active agents and retain a departing agent
+on the transition that terminates or truncates it; that agent leaves the next
+decision immediately and is omitted from the following timestep. This local
+transition roster preserves its final outcome and provenance, but the generic
+runtime does not yet validate source/identity lifecycles across arbitrary
+branchable snapshots. `Capabilities` declares fixed/dynamic agents
+with their own action spaces, wire codecs, an optional horizon, and exact
+environment semantics. The environment ID is also the runtime artifact
+namespace and is restricted to lowercase ASCII letters, digits, `_`, and `-`.
 
-#### ErasedGame Trait (Runtime)
+`CompleteSnapshot` promises that state bytes contain every transition-relevant
+input and can be branched or replayed without hidden mutable state.
+Environment-sampled chance consumes the runtime RNG stream and is therefore
+required to declare `ExternalState`; explicit chance can remain a complete
+snapshot because the resolved outcome is supplied as an action.
 
-The erased trait enables runtime polymorphism with byte-only interface:
+`metadata()` is display-oriented. Its `board` member is optional; board
+dimensions, AlphaZero observation layout, players, and renderer are not fields
+of the generic ABI. The trainer's generated manifest preserves this separation.
+See
+[§7.3](#73-environment-and-algorithm-catalog-single-sourcing).
+
+The standard action encodings are one little-endian `u32` for discrete, one
+little-endian `u32` per declared multi-discrete dimension, and flattened
+row-major little-endian `f32` values for continuous actions. Simultaneous joint
+actions and explicit chance outcomes currently use an environment-defined
+`Custom` codec. The matching algorithm cartridge must understand that codec;
+the generic ABI does not yet define a shared per-decision action envelope.
+
+#### Sealed Runtime Boundary
+
+The implementation uses a byte-only erased trait for runtime polymorphism, but
+that trait and its adapter are private to `engine-core`. The public entry point
+is `EngineContext`, constructed either from a registered environment ID or a
+typed `Environment`. This prevents callers from installing unchecked erased
+implementations or bypassing contract validation.
 
 ```rust
-pub trait ErasedGame: Send + Sync + Debug + 'static {
-    fn engine_id(&self) -> EngineId;
-    fn capabilities(&self) -> Capabilities;
-    fn metadata(&self) -> GameMetadata;
-
-    fn reset(&mut self, seed: u64, hint: &[u8],
-        out_state: &mut Vec<u8>, out_obs: &mut Vec<u8>) -> Result<(), ErasedGameError>;
-    fn step(&mut self, state: &[u8], action: &[u8],
-        out_state: &mut Vec<u8>, out_obs: &mut Vec<u8>)
-        -> Result<(f32, bool, u64), ErasedGameError>;
-}
+let mut registered = EngineContext::new("counter")?;
+let mut isolated = EngineContext::from_environment(CounterEnvironment)?;
 ```
 
-#### GameAdapter Pattern
+#### Adapter Pattern
 
-Converts typed games to erased interface:
+The generic adapter validates identity, codecs, agent/action descriptors,
+per-agent outcomes, decisions, and episode consistency before exposing bytes:
 
 ```
-Typed Game (State, Action, Obs)
+Typed Environment (State, Action, Observation)
         ↓
-GameAdapter<T: Game>
-    ├─ Wraps game instance
+EnvironmentAdapter<E: Environment>
+    ├─ Private to engine-core
+    ├─ Validates immutable descriptors and every Timestep
     ├─ Manages RNG (re-seeded on reset)
     └─ Handles encode/decode
         ↓
-ErasedGame trait (bytes-only)
+sealed ErasedEnvironment trait (bytes-only)
         ↓
-Registry storage
+EngineContext
 ```
+
+The bundled games use a second, explicitly narrow layer, exported through
+`engine_core::board_profile`:
+`BoardGame → BoardGameEnvironment → EnvironmentAdapter`. The board adapters are
+private; only that layer converts alternating two-seat scalar actor rewards
+into per-agent zero-sum outcomes and produces board presentations.
 
 #### Registry System
 
-Static compile-time registration with runtime lookup:
+Typed registration with runtime lookup. The registry derives its key from the
+environment's validated descriptor, eliminating a duplicate caller-supplied ID:
 
 ```rust
 // Registration (called at startup)
+use engine_core::board_profile::register_board_game;
+
 pub fn register_tictactoe() {
-    register_game("tictactoe".to_string(), || {
-        Box::new(GameAdapter::new(TicTacToe::new()))
-    });
+    register_board_game::<TicTacToe>()
+        .expect("tictactoe must only be registered once");
 }
 
 // Lookup (at runtime)
-let game = create_game("tictactoe")?;
+let context = EngineContext::new("tictactoe")?;
 ```
 
 #### EngineContext API
@@ -312,7 +362,7 @@ High-level convenience wrapper:
 let mut ctx = EngineContext::new("tictactoe")?;
 let reset = ctx.reset(42, &[])?;           // seed=42
 let step = ctx.step(&reset.state, &action)?;
-println!("Reward: {}, Done: {}", step.reward, step.done);
+println!("Episode: {:?}", step.timestep.episode);
 ```
 
 ### MCTS Implementation
@@ -366,11 +416,9 @@ pub struct EvalResult {
 }
 ```
 
-The mask is an `engine_core::LegalMask` (a dynamic-width bitset), not a `u64`.
-The old `u64` capped action spaces at 64, which Othello (65) already exceeded
-and Generals (257) exceeds by far; masks are read from the observation at
-`legal_mask_offset` rather than from `info_bits`, which cannot hold them and
-aliases the player/winner fields past 16 actions.
+The mask is an `engine_core::board_profile::LegalMask`, a dynamic-width bitset.
+It is read from the authoritative observation at `legal_mask_offset`, so board
+action spaces are not constrained by a packed integer side channel.
 
 Implementations:
 - `UniformEvaluator`: Equal probability for legal moves (testing)
@@ -438,11 +486,11 @@ between learning and not.
 |----------|-------|
 | Board | 8x8 grid |
 | Actions | 257 (64 tiles x 4 directions, + wait) |
-| Observation | 835 f32s (576 planes + 257 legal + 2 player) |
-| Obs channels | 9, **player-relative** |
+| Observation | 899 f32s (640 planes + 257 legal + 2 player) |
+| Obs channels | 10, **player-relative** |
 | Network | ResNet 6 blocks x 128 filters |
-| Board Type | "grid" (no dedicated renderer — see below) |
-| Max horizon | 402 plies |
+| Board Type | "generals" |
+| Max horizon | 400 plies |
 
 Ported from the Go engine in `GeneralsReinforcementLearning/internal/game/`:
 combat, captures, production, general-capture tile transfer, and
@@ -456,25 +504,30 @@ or trainable:
   one tick. The obvious bridge — stash player 1's move and resolve it on player
   2's step — leaks the pending move into the searcher's true state, so each ply
   resolves immediately instead. Production and the round clock tick after player
-  2's ply, which also keeps the actor's depth-parity outcome backfill sound.
+  2's ply, preserving the alternating-turn contract required by the installed
+  AlphaZero cartridge.
 - **No half-moves.** Every move sends `army - 1`, halving the action space.
 - **Territory adjudication at the round cap.** At `MAX_TURNS` the game is
   decided on tiles, then total armies, drawing only on an exact tie. A pure draw
   cap collapsed self-play into 100% draws — zero value signal.
 - **Parity-randomized ply cap.** The cap is `2 * MAX_TURNS` or one less,
-  coin-flipped at reset and deliberately absent from the observation. With a
-  fixed even cap player 2 always owns the pre-adjudication move, wins nearly
-  every near-symmetric game, and the value head degenerates into a seat detector.
+  coin-flipped at reset. The exact remaining-ply countdown is a constant
+  observation plane, so the randomized rule state remains fully Markov-visible.
+  With a fixed even cap player 2 always owns the pre-adjudication move, wins
+  nearly every near-symmetric game, and the value head degenerates into a seat
+  detector.
 - **No fog of war.** The observation is full-information. Fog is not a flag that
   can be flipped: vanilla MCTS re-simulates from the true state and would be
   omniscient under it. The fog variant needs observation history — a recurrent
   policy or IS-MCTS — and gets its own env id, obs schema version, and algorithm.
 
-The observation schema is versioned `generals_obs:v1` and is player-relative:
-9 channels x 64 (own/enemy/neutral territory, own/enemy log-armies, cities,
-mountains, generals +1/-1, turn progress). Because the planes are already
-seat-relative, the network must **not** additionally receive the player
-indicator — hence `player_relative_obs = true`.
+The observation schema is versioned `generals_obs:v2` and is player-relative:
+10 channels x 64 (own/enemy/neutral territory, own/enemy log-armies, cities,
+mountains, generals +1/-1, turn progress, exact normalized plies remaining).
+Because the planes are already seat-relative, the network must **not**
+additionally receive the player indicator — hence
+`player_relative_obs = true`. This schema change is Generals environment
+contract version 2; v1 models and replay are intentionally incompatible.
 
 **Current status.** The engine and trainer paths are complete and training runs
 end to end, but no model has yet beaten random at local compute scale.
@@ -494,25 +547,55 @@ API's action indices are `u32` rather than `u8`.
 
 ### Model Watcher
 
-Hot-reload system for ONNX models:
+Hot-reload system for strict, content-addressed ONNX checkpoints. Filesystem
+mode watches the selected profile's `models/channels/current.json`; S3 mode
+polls the equivalent object key and downloads validated RunCommit,
+checkpoint-manifest, and blob objects to a profile cache. Actor collection uses
+`ModelSelection::Latest` once and drops the watcher. Web serving uses
+`ModelSelection::ChampionOrLatest`: it selects champion state from the latest
+validated RunCommit, falling back to that commit's latest checkpoint before
+the first promotion.
 
 ```
-Trainer exports model:
-  1. Write to latest.onnx.tmp
-  2. Atomic rename to latest.onnx
+Trainer publishes checkpoint:
+  1. Safely validate the staged ONNX and learner-state envelope
+  2. Create/verify immutable blobs, manifest, evaluation, and RunCommit objects
+  3. Validate exact parent checkpoint/RunCommit lineage and persisted recipe
+  4. Compare-and-set channels/current.json as the sole RunHeadV2 authority
 
 ModelWatcher detects:
-  1. inotify event (or polling fallback)
-  2. Load new ONNX model
-  3. Acquire write lock on evaluator
-  4. Atomic swap
-  5. Signal subscribers
+  1. RunHead generation change (filesystem notification or polling)
+  2. Verify canonical RunHead and complete immutable RunCommit/checkpoint chains
+  3. Apply Latest or ChampionOrLatest selection to the latest accepted commit
+  4. Verify profile, blob size/digest, ONNX identity, and tensor interface
+  5. Load the selected candidate, acquire evaluator write lock, and swap
+  6. Signal subscribers, even when an accepted generation retains its champion
 ```
 
 Features:
-- Dual strategy: inotify + polling (Docker compatibility)
-- Atomic model loading (no partial loads)
+- Filesystem notifications plus polling, or S3 channel polling
+- Immutable model/evaluation/RunCommit objects and one CAS-protected RunHead
 - Concurrent-safe via Arc<RwLock<>>
+- Schema-v1 artifact identity validation before the evaluator swap
+
+Every ONNX file must carry these exact custom metadata values:
+
+| Key | Required value |
+|-----|----------------|
+| `cartridge.schema_version` | `1` |
+| `cartridge.algorithm_id` | Selected algorithm ID, currently `alphazero_board_v1` |
+| `cartridge.model_contract` | The selected descriptor's model contract, currently `onnx_policy_value_v1` |
+| `cartridge.env_id` | Selected environment ID |
+| `cartridge.env_contract_version` | Selected environment contract version |
+
+The expected identity is derived from the resolved algorithm descriptor and
+startup environment, never from the artifact itself. Filesystem and S3 loads,
+the actor, web server, evaluator, and direct MCTS ONNX loaders all use the same
+check. If no `current` channel exists, the actor/web evaluator remains empty and
+play falls back to the random policy. A present malformed or mismatched pointer,
+manifest, or blob fails initial loading. Hot reload constructs and validates a
+new evaluator before acquiring the swap lock; a rejected update is logged and
+the last valid evaluator remains active.
 
 ---
 
@@ -525,38 +608,53 @@ actor/
 ├── Cargo.toml
 └── src/
     ├── main.rs            # Entry point, CLI parsing
-    ├── actor.rs           # Episode runner, main loop
+    ├── algorithms.rs      # Algorithm ID -> collector dispatch
+    ├── actor.rs           # AlphaZeroCollector implementation
     ├── mcts_policy.rs     # MCTS action selection
-    ├── game_config.rs     # Type alias over engine GameMetadata
     ├── config.rs          # CLI configuration (defaults from engine-config)
-    ├── health.rs          # Health check endpoint
-    ├── metrics.rs         # Prometheus metrics
-    ├── stats.rs           # Self-play statistics (actor_stats.json)
+    ├── resources.rs       # Process resource diagnostics
+    ├── stats.rs           # Process-local self-play telemetry
     └── storage/
         ├── mod.rs         # ReplayStore trait
         └── postgres.rs    # PostgreSQL backend
 ```
 
-### Actor Struct
+### Collector dispatch
+
+`main.rs` passes the selected ID to `build_collector`. The dispatcher resolves
+it through `algorithm-core`; the concrete collector then builds an
+`EngineContext` and requires a compatible report before it pins a model or
+opens replay storage.
 
 ```rust
-pub struct Actor {
+pub trait CollectorAlgorithm {
+    async fn run(&self) -> Result<()>;
+    fn shutdown(&self);
+}
+
+pub struct AlphaZeroCollector {
     config: Config,
-    game_config: GameConfig,
+    replay_selection: ReplaySelection,
+    board_metadata: BoardGameMetadata,
     engine: Mutex<EngineContext>,
     mcts_policy: Mutex<MctsPolicy>,
     replay: Arc<dyn ReplayStore>,
     episode_count: AtomicU32,
     shutdown_signal: AtomicBool,
-    model_watcher: Option<ModelWatcher>,  // None in --no-watch mode
     stats: ActorStats,
 }
 ```
 
+Each actor is a bounded one-shot worker. `--max-episodes` and
+`--collection-scope-id` are required. It loads `ModelSelection::Latest` once,
+requires the loaded checkpoint to equal `--source-checkpoint-id` (or requires
+an absent RunHead at root), then drops the watcher before opening replay. The
+evaluator cannot change during collection.
+
 ### Episode Execution Flow
 
 ```
-actor.run_episode():
+AlphaZeroCollector.run_episode():
   1. Reset game with random seed
   2. Loop while !done:
      a. Lock policy
@@ -565,20 +663,18 @@ actor.run_episode():
      d. Lock engine
      e. Execute action, get next state
      f. Unlock engine
-     g. Create Transition with MCTS policy
-  3. Backfill game outcomes:
-     For each transition:
-       steps_from_end = total_steps - step_number - 1
-       outcome = final_reward × (-1)^steps_from_end
-  4. Batch store to replay buffer
-  5. Return (steps, reward)
+     g. Retain observation, acting agent, and MCTS policy in memory
+  3. Require a terminal outcome for both agents
+  4. Encode each pending item with its acting agent's terminal value
+  5. Wrap opaque payloads in ReplayRecord envelopes and batch store
+  6. Return episode statistics
 ```
 
 ### MCTS Policy
 
 ```rust
 pub struct MctsPolicy {
-    evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,  // Hot-swappable
+    evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,  // Pinned for actor lifetime
     config: MctsConfig,
     base_temperature: f32,
     late_temperature: f32,
@@ -588,10 +684,13 @@ pub struct MctsPolicy {
 
 Temperature schedule (**disabled by default** — `temp_threshold` defaults to `0`):
 - Before threshold: `temperature = 1.0` (exploration)
-- After threshold: `temperature = 0.1` (exploitation)
+- At and after threshold: `temperature = 0.1` (exploitation)
+
+A nonzero threshold must be strictly below the selected environment's declared
+`max_horizon`; the trainer and actor both reject an unreachable late phase.
 
 This affects **action selection only**. The policy target stored in the
-transition is the raw visit distribution regardless — see
+payload is the raw visit distribution regardless — see
 [Search results and the training target](#search-results-and-the-training-target).
 
 When enabling it, size the threshold against actual episode length: a value
@@ -601,44 +700,39 @@ of every episode, which flattens self-play diversity.
 Fallback behavior:
 - If no model loaded: Random legal action with uniform policy
 
-### Transition Data
+### Replay Record and AlphaZero Payload
+
+The storage envelope is generic. A future cartridge owns a different
+`experience_schema` and payload codec without changing the replay table:
 
 ```rust
-pub struct Transition {
-    pub id: String,                // "{episode_id}-step-{n}"
+pub struct ReplayRecord {
+    pub id: String,
     pub env_id: String,
+    pub env_contract_version: u32,
+    pub algorithm_id: String,
+    pub experience_schema: String,
+    pub collection_scope_id: String,
+    pub source_checkpoint_id: Option<String>,
     pub episode_id: String,
     pub step_number: u32,
-    pub state: Vec<u8>,
-    pub action: Vec<u8>,           // u32 little-endian
-    pub next_state: Vec<u8>,
-    pub observation: Vec<u8>,      // f32[obs_size]
-    pub next_observation: Vec<u8>,
-    pub reward: f32,
-    pub done: bool,
-    pub timestamp: u64,
-    pub policy_probs: Vec<u8>,     // f32[num_actions] MCTS distribution
-    pub mcts_value: f32,
-    pub game_outcome: Option<f32>, // Backfilled after episode
+    pub payload: Vec<u8>,
 }
 ```
 
-### Game Configuration Auto-Derivation
+For `alphazero_transition_v1`, `payload` is exactly
+`observation[obs_size] || policy[num_actions] || terminal_value[1]` as
+little-endian `f32` values. The collector keeps the acting agent alongside each
+pending position only until the matching terminal value can be encoded; it is
+not a storage column.
 
-The actor does not define a config type of its own — it uses the engine's
-metadata directly:
+### Environment metadata use
 
-```rust
-// actor/src/game_config.rs
-pub type GameConfig = GameMetadata;
-
-pub fn get_config(env_id: &str) -> Result<GameConfig> {
-    Ok(EngineContext::new(env_id)?.metadata())
-}
-```
-
-That alias is the pattern the rest of the system follows: consumers read game
-facts from the engine rather than restating them.
+The collector reads generic capabilities and `EnvironmentMetadata` from its
+`EngineContext`, then explicitly requires the optional `board` profile because
+`alphazero_board_v1` needs its observation layout and legal mask. Those facts
+parameterize the cartridge-owned codec and model contract; PostgreSQL neither
+stores nor interprets them.
 
 ### Episode Outcomes
 
@@ -646,28 +740,30 @@ An episode ends one of two ways:
 
 ```rust
 pub(crate) enum EpisodeOutcome {
-    Completed { steps: u32, total_reward: f32, stats: EpisodeStats },
+    Completed { steps: u32, player_one_outcome: f32, stats: EpisodeStats },
     Abandoned { reason: AbandonReason, steps: u32, discarded: usize, timeout_secs: u64 },
 }
 ```
 
-`Abandoned` means the wall-clock budget ran out (`AbandonReason::Timeout`) or
-the step guard tripped (`AbandonReason::MaxSteps`). **All of that episode's
-transitions are discarded**: without a terminal state there is no game outcome
-to backfill, and value targets *are* the game outcome. Storing them anyway
-would push the trainer onto its `mcts_value` fallback and degrade training
-quietly rather than loudly.
+`Abandoned` means the wall-clock budget ran out (`AbandonReason::Timeout`), the
+step guard tripped (`AbandonReason::MaxSteps`), or the environment truncated
+without terminal outcomes (`AbandonReason::EnvironmentTruncated`). **All of
+that episode's pending records are discarded**: without a terminal state the
+AlphaZero codec cannot construct its required value target.
 
 Because the loss is real, it is counted rather than swallowed: every
-abandonment increments `episodes_abandoned` / `transitions_discarded` in
-`actor_stats.json`, bumps `actor_episodes_abandoned_total{reason}` and
-`actor_transitions_discarded_total`, and logs a warning carrying the running
-abandonment rate.
+abandonment updates process-local `ActorStats`, emits a structured warning, and
+then fails the bounded worker immediately. Partial rows remain quarantined in
+that failed scope; a retry receives a new scope. This prevents
+retry-until-success length bias and gives every actor process a hard terminal
+condition. Bounded actors expose no HTTP/Prometheus service and write no shared
+stats projection; successful workers emit one final structured stats/RSS log.
 
-The wall-clock budget scales with the game. `episode_timeout_secs` is treated
-as a floor and raised to at least one second per move of the game's horizon, so
-a timeout tuned for a short game does not silently truncate a long one — which
-would bias the buffer, since the episodes it kills are the long ones.
+`episode_timeout_secs` is the exact authenticated wall-clock bound. It is never
+silently raised from environment metadata. Operators must choose it for the
+selected game and search budget; a timeout that is too short preferentially
+kills long episodes and therefore biases collection by making the whole scoped
+attempt fail.
 
 ---
 
@@ -681,60 +777,62 @@ trainer/
 ├── tests/                 # Pytest suite
 └── src/trainer/
     ├── __main__.py        # CLI (train, evaluate, loop, solver-eval)
-    ├── trainer.py         # Training loop
+    ├── algorithms/        # Algorithm protocols, registry, implementations
+    ├── environment_catalog.py # Strict manifest-v4 parser and catalog
+    ├── runtime_profile.py # Canonical runtime namespace
+    ├── trainer.py         # AlphaZeroLearner
     ├── network.py         # MLP architecture
     ├── resnet.py          # ResNet architecture
     ├── evaluator.py       # Drives `cartridge-eval`; parses its summary
     ├── players.py         # Who occupies a seat in an evaluation game
-    ├── registry.py        # Durable player records (data/players.json)
+    ├── registry.py        # Immutable player registry schema v5
     ├── tournament.py      # Round-robin + Bradley-Terry Elo
     ├── tournament_cli.py  # register-players / tournament commands
     ├── solver_eval/       # Perfect-solver move scoring (Connect4)
-    ├── wandb_logger.py    # W&B wrapper (shim over crucible)
-    ├── config.py          # TrainerConfig
-    ├── game_config.py     # Engine manifest + network overrides
-    ├── game_metadata.json # GENERATED by `make game-manifest`
+    ├── config.py          # AlphaZeroLearnerConfig
+    ├── environment_manifest.json # GENERATED manifest schema v4
     ├── checkpoint.py      # ONNX + PyTorch save/load
     ├── checkpoint_runner.py
-    ├── replay_setup.py    # Buffer setup + metadata cross-check
+    ├── replay_setup.py    # Exact ReplaySelection setup
     ├── step_metrics.py
     ├── stats.py           # Statistics tracking
     ├── lr_scheduler.py    # Warmup + cosine annealing
-    ├── atomic_io.py       # Shim over crucible
-    ├── backoff.py         # Shim over crucible
     ├── logging_utils.py
     ├── structured_logging.py
     ├── central_config.py  # config.toml loading
     ├── metrics.py         # Prometheus metrics export
     ├── orchestrator/      # Synchronized AlphaZero loop
     │   ├── orchestrator.py # Main loop coordinator
-    │   ├── cli.py         # `trainer loop` argument parsing
+    │   ├── cli.py         # Cartridge `loop` command arguments
     │   ├── config.py      # LoopConfig
     │   ├── actor_runner.py # Actor process management
     │   ├── eval_runner.py # Evaluation runner
-    │   └── stats_manager.py # Stats aggregation
+    │   └── eval_reporting.py # Evaluation/result adapter
     └── storage/
-        ├── base.py        # Abstract interfaces
-        ├── factory.py     # Backend factory
-        ├── postgres.py    # PostgreSQL implementation
-        ├── s3.py          # S3 model storage
-        └── filesystem.py  # Filesystem model storage
+        ├── base.py        # Exact replay profile + selection contracts
+        ├── factory.py     # Replay backend factory
+        ├── postgres.py    # PostgreSQL replay implementation
+        ├── publisher.py   # Strict filesystem/S3 checkpoint publication
+        └── schema.sql     # Packaged replay schema
 ```
 
 ### CLI Commands
 
 ```bash
-# Standalone training
-python -m trainer train --steps 1000
+# Train from one exact root replay selection (scope must already contain data)
+python -m trainer --algorithm alphazero_board_v1 train \
+  --steps 1000 \
+  --collection-scope-id 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --source-root
 
 # Model evaluation
-python -m trainer evaluate --model ./data/models/latest.onnx --games 100
+python -m trainer --algorithm alphazero_board_v1 evaluate --games 100
 
 # Perfect-solver move scoring (Connect4 only)
-python -m trainer solver-eval --model ./data/models/latest.onnx --games 100
+python -m trainer --algorithm alphazero_board_v1 solver-eval --env-id connect4 --games 100
 
 # Synchronized AlphaZero (recommended)
-python -m trainer loop --iterations 50 --episodes 500 --steps 1000
+python -m trainer --algorithm alphazero_board_v1 loop --iterations 50 --episodes 500 --steps 1000
 ```
 
 > The trainer reads the replay-buffer connection string only from the
@@ -803,51 +901,34 @@ LR
 
 ### Orchestrator (Synchronized Training)
 
-> **The orchestration core lives in a sibling repository.** The synchronized
-> loop (`Orchestrator`), the `ActorRunner`/`EvalRunner` base classes, the stats
-> manager, promotion and eval-reporting logic, `LoopConfig`, plus
-> `wandb_logger`, `atomic_io` and `backoff` were extracted to
+> **The generic coordination core lives in a sibling repository.** Crucible's
+> base `Orchestrator` and actor-runner protocol, iteration value types,
+> `wandb_logger`, `atomic_io`, and `backoff` live in
 > [`crucible`](https://github.com/mitchelldurbincs/crucible). It is a declared
 > dependency of `cartridge-trainer`, pinned to a commit; CI installs the same
-> pin. Generation, training and evaluation backends are injected through the
-> `typing.Protocol` seams in `crucible/protocols.py`.
+> pin.
 >
-> This repo keeps two things: **shims** under `trainer/src/trainer/` (and
-> `trainer/src/trainer/orchestrator/`) that re-export from `crucible` so
-> existing `trainer.*` imports keep working, and a **composition root** at
-> `trainer/src/trainer/orchestrator/orchestrator.py` that binds this repo's
-> concrete pieces — `storage.create_replay_buffer`, `Trainer`/`TrainerConfig`
-> via `TrainSpec`, the shim runners, structured-logging tracing — into the core
-> `Orchestrator`, keeping the `Orchestrator(config)` signature unchanged for
-> callers.
+> The composition root at
+> `trainer/src/trainer/orchestrator/orchestrator.py` resolves `algorithm_id`
+> and validates the selected environment and persisted RunRecipe before it
+> opens an attempt scope. Cartridge2 owns the exact replay fencing, prepared-run
+> journal, immutable evaluation/RunCommit publication, recovery, and disposable
+> projection rebuilds; algorithm factories supply collection, learning, and
+> evaluation implementations.
 >
 > For local development against a sibling checkout, install it editable *first*
 > (`pip install -e ../../crucible`); pip then keeps it instead of fetching the
 > pinned URL.
 
-```python
-class LoopConfig:
-    iterations: int = 100
-    episodes_per_iteration: int = 500
-    steps_per_iteration: int = 1000
-
-    # MCTS simulation ramping
-    mcts_start_sims: int = 50
-    mcts_max_sims: int = 400
-    mcts_sim_ramp_rate: int = 20
-
-    # Evaluation gatekeeper
-    eval_interval: int = 1
-    eval_games: int = 50
-    eval_win_threshold: float = 0.55
-
-    # Weights & Biases (the local subclass exists to restore this default)
-    wandb: WandbConfig
-```
+`--iterations` is a global target, not “iterations to add.” Restart resolves
+the selected RunCommit chain and executes only missing iterations. Recipe
+fields are authenticated in that chain; changing them under an existing
+RunHead fails closed instead of silently changing the experiment.
 
 ### Weights & Biases
 
-One W&B run per `trainer loop`, logging `train/`, `eval/`, `solver/` and `loop/`
+One W&B run per cartridge `loop` invocation, logging `train/`, `eval/`,
+`solver/` and `loop/`
 metrics against a shared global-training-step x-axis. Configured under
 `[wandb]` in `config.toml`; disabled by default.
 
@@ -865,7 +946,7 @@ self-play, and reads back a JSON summary.
 
 ```
 trainer.evaluator.evaluate()
-  -> cartridge-eval --env-id X --games N --p1 <model|random> --p2 ...
+  -> cartridge-eval --algorithm A --env-id X --games N --p1 <model|random> --p2 ...
        (plays through EngineContext; optional MCTS per seat)
   -> eval.json  --> EvalResults --> promotion gate
 ```
@@ -883,22 +964,27 @@ the Python Connect 4 mirror stored its board column-major while the engine
 stores it row-major.
 
 **Search during evaluation.** `[evaluation] simulations` sets the MCTS budget
-per move. It defaults to `0`, meaning the policy head is played directly — what
-the Python evaluator did, kept as the default so eval numbers stay comparable.
-Raising it makes evaluation measure the system as it actually plays: a Connect 4
+per move. It defaults to `0`, meaning the policy head is played directly for a
+cheap evaluation pass. Raising it makes evaluation measure the system as it
+actually plays: a Connect 4
 checkpoint that scores 15/20 vs random at `simulations = 0` scores 19/20 at 100.
 
 ### Player Registry and Tournaments
 
 A *player* is anything that can occupy a seat: the random baseline, a
 checkpoint, the same checkpoint given a search budget, later a PPO checkpoint.
-`data/players.json` makes them explicit rather than identified by filename
-convention, and `trainer/registry.py` resolves a record into the player spec
-`cartridge-eval` consumes.
+The selected runtime profile's `players.json` makes them explicit rather than
+identified by filename convention. Registry schema v5 records the algorithm,
+environment/model contract, checkpoint manifest ID, immutable ONNX blob path,
+manifest step, and gameplay-adapter settings. A model player ID contains the
+full checkpoint ID plus a hash of the versioned simulations/temperature
+adapter. `trainer/registry.py` resolves and revalidates every registered
+manifest and blob before producing the player spec `cartridge-eval` consumes;
+missing or corrupt artifacts fail the tournament.
 
 ```bash
-trainer register-players --env-id connect4     # every checkpoint + the baseline
-trainer tournament --env-id connect4 --games 40
+trainer --algorithm alphazero_board_v1 register-players --env-id connect4
+trainer --algorithm alphazero_board_v1 tournament --env-id connect4 --games 40
 ```
 
 `trainer/tournament.py` plays every pairing once and fits Bradley-Terry ratings
@@ -909,11 +995,9 @@ would rate differently depending on scheduling.
 
 **Why a round-robin rather than win rate vs. random.** Win rate against one
 opponent depends entirely on who that opponent was, and saturates — every decent
-Connect 4 checkpoint beats random ~75% and the curve goes flat exactly where you
-want resolution. Ratings separate them. On the existing checkpoints this
-immediately showed that `best.onnx` sits ~100-170 Elo *below* every step
-checkpoint, while looking identical to `latest` on win-rate-vs-random (both
-15-5).
+Connect 4 checkpoint can look similar against random exactly where more
+resolution is needed. Registering immutable checkpoint identities and rating
+the whole field separates them without relying on mutable filenames.
 
 **Play temperature is not optional here.** Two greedy models on a deterministic
 opening replay the same game every time, so a 40-game match is one game counted
@@ -927,9 +1011,17 @@ the same pool and gets a comparable rating.
 
 ### Perfect-Solver Evaluation (Connect 4)
 
-`trainer solver-eval` scores model decisions against the `bitbully` perfect
+`trainer --algorithm alphazero_board_v1 solver-eval` scores model decisions
+against the `bitbully` perfect
 solver, reporting value-optimal-move rate, blunder rate and exact-best rate,
 broken down overall / by ply bucket / by seat.
+
+The default model is the latest checkpoint selected through
+`models/channels/current.json`.
+`--all-checkpoints` discovers and verifies every immutable repository manifest
+in step order. `--model PATH` is deliberately a one-off escape hatch and its
+result has no checkpoint ID or repository step. The two options are mutually
+exclusive.
 
 The engine plays and Python judges: `cartridge-eval --dump-positions` writes
 every decision it made as JSONL, and the scorer replays that through bitbully,
@@ -938,10 +1030,15 @@ query. (Previously it played its own Python games and cross-checked bitbully
 against *those*, so nothing compared either to the engine.)
 
 It is not only a standalone command: the loop runs it automatically each
-evaluation for Connect 4 (`solver_games`, `solver_seed`), and
+evaluation for Connect 4 (`solver_games`, `evaluation_seed`), and
 `promotion_metric = "solver_optimal"` switches the gatekeeper from win-rate to
 solver-optimal rate with a `promotion_margin` over the incumbent, falling back
 to win-rate when solver eval is unavailable.
+
+Standalone `solver-eval` prints diagnostics only. Synchronized solver evidence
+is authoritative solely when embedded in a validated immutable
+`EvaluationArtifactV2` selected through `RunCommitV1`; projection files are
+never reused as promotion evidence.
 
 MCTS ramping formula:
 ```
@@ -950,13 +1047,65 @@ sims = min(start_sims + (iter-1) × ramp_rate, max_sims)
 
 ### Checkpoint System
 
-Two-file approach:
-1. **ONNX** (`model_step_XXXXXX.onnx`): For actor inference
-2. **PyTorch** (`latest.pt`): For training continuity
+Each checkpoint is a content-addressed pair of immutable blobs plus one
+canonical manifest:
 
-Atomic write-then-rename pattern prevents partial reads.
+```text
+models/blobs/sha256/{onnx_digest}.onnx
+models/blobs/sha256/{learner_digest}.pt
+models/manifests/sha256/{checkpoint_id}.json
+models/evaluations/manifests/sha256/{evaluation_id}.json
+models/run-commits/sha256/{run_commit_id}.json
+models/channels/current.json
+```
+
+`checkpoint_id` is the SHA-256 of the canonical manifest bytes. The manifest
+binds the exact profile, step, parent checkpoint, learner-config digest, and
+both blob descriptors. A RunCommit binds one checkpoint, an exact embedded stats
+snapshot, champion/evaluation state, and its parent RunCommit. `current` is the
+sole mutable RunHead for inference and learner continuity. Staging creates only
+immutable objects; full RunCommit/checkpoint lineages are validated before
+`current` advances with compare-and-set semantics.
+
+Each `evaluation_id` is the digest of canonical promotion evidence binding the
+candidate checkpoint, prior champion/evaluation lineage, deterministic
+seat-and-seed recipe, requested counts, observed head-to-head/solver results,
+and decision. Champion state exists only in the selected RunCommit and is valid
+only when that evidence and the full lineage resolve. Solver promotion
+uses fresh symmetric candidate and incumbent runs; historical projections are
+never reused as decision evidence.
+
+Artifact identity schema version 1 is enforced inside both blobs:
+
+- ONNX stores `cartridge.schema_version=1`, `cartridge.algorithm_id`,
+  `cartridge.model_contract`, `cartridge.env_id`, and
+  `cartridge.env_contract_version` as custom metadata.
+- Learner state stores top-level `schema_version=1`, the exact profile, step,
+  config digest, and model/optimizer/scheduler state.
+
+Resume and inference verify the RunHead, RunCommit lineage, manifest digest,
+profile, blob size/digest, and embedded artifact contract. An absent RunHead
+means the learner starts fresh; a present invalid object raises. Old mutable checkpoint
+filenames and ONNX exports are intentionally not accepted and must be
+retrained/re-exported through the current publisher. There is no automatic
+converter or shape-based fallback.
 
 ### Statistics Tracking
+
+Statistics authority is part of the immutable RunCommit:
+
+```text
+models/run-commits/sha256/{run_commit_id}.json  # embeds exact stats snapshot
+models/channels/current.json                    # sole mutable RunHead
+stats.json                                      # disposable web projection
+```
+
+`stats_id` is the SHA-256 of the canonical embedded snapshot. Learner resume
+validates it together with the selected RunCommit and checkpoint lineage; it
+never reads `stats.json`, `eval_stats.json`, `solver_stats.json`, or
+`loop_stats.json` as authority. Those files are disposable projections rebuilt
+from the selected chain. An absent RunHead starts empty, while present corrupt
+or incomplete authority fails closed.
 
 ```python
 @dataclass
@@ -967,7 +1116,7 @@ class TrainerStats:
     policy_loss: float
     value_loss: float
     learning_rate: float
-    replay_buffer_size: int
+    replay_record_count: int
     history: List[Dict]      # Per-interval entries (downsampled)
     eval_history: List[Dict] # Evaluation results
 ```
@@ -994,7 +1143,7 @@ web/
 │   ├── handlers/
 │   │   ├── game.rs        # Game endpoints
 │   │   ├── health.rs      # Health check
-│   │   └── stats.rs       # Training + actor stats
+│   │   └── stats.rs       # Training stats
 │   └── types/
 │       ├── requests.rs    # Request DTOs
 │       └── responses.rs   # Response DTOs
@@ -1025,7 +1174,6 @@ web/
 | `/game/state` | GET | Get current board |
 | `/move` | POST | Make player move + bot response |
 | `/stats` | GET | Training statistics |
-| `/actor-stats` | GET | Actor self-play statistics |
 | `/model` | GET | Model info |
 
 ### GameSession
@@ -1033,12 +1181,10 @@ web/
 ```rust
 pub struct GameSession {
     ctx: EngineContext,
-    metadata: GameMetadata,
+    board: BoardGameMetadata,
     state: Vec<u8>,
-    obs: Vec<u8>,
-    board: Vec<u8>,
-    current_player: u8,
-    winner: u8,
+    timestep: ErasedTimestep,
+    view: BoardView,
     human_player: u8,
     evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,
     mcts_config: MctsConfig,
@@ -1046,10 +1192,10 @@ pub struct GameSession {
 ```
 
 Bot AI:
-1. Extract legal moves from observation
+1. Narrow the generic timestep to one active board agent and its observation
 2. If model loaded: Run MCTS (200 sims, temp=0.5)
 3. If no model: Random legal move
-4. Execute selected action
+4. Execute the selected action and validate the next timestep/presentation
 
 ### Frontend Components
 
@@ -1074,129 +1220,221 @@ Features:
 ### Replay Buffer (PostgreSQL)
 
 ```python
-# Connection string from the CARTRIDGE_STORAGE_POSTGRES_URL env var...
-replay = create_replay_buffer()
-# ...or passed explicitly
-replay = create_replay_buffer(
+profile = ReplayProfile(
+    env_id="connect4",
+    env_contract_version=1,
+    algorithm_id="alphazero_board_v1",
+    experience_schema="alphazero_transition_v1",
+)
+selection = ReplaySelection(
+    profile=profile,
+    collection_scope_id="<64 lowercase hex characters>",
+    source_checkpoint_id="<checkpoint_id or None at root>",
+)
+
+# Connection string comes from CARTRIDGE_STORAGE_POSTGRES_URL...
+replay = create_replay_store(selection)
+# ...or is passed explicitly.
+replay = create_replay_store(
+    selection,
     connection_string="postgresql://user:pass@host:5432/db"
 )
 ```
+
+`ReplaySelection` is an isolation boundary, not just query metadata. The store's
+`count`, `sample`, `clear`, `cleanup`, `store`, and `store_batch` operations
+always filter by the exact
+`(env_id, env_contract_version, algorithm_id, experience_schema,
+collection_scope_id, source_checkpoint_id)` tuple. Nullable source identity is
+compared with `IS NOT DISTINCT FROM`, never as a wildcard. Writes are rejected
+if a `ReplayRecord` does not match the bound selection.
+Storage interprets none of the payload bytes; the algorithm cartridge named by
+`(algorithm_id, experience_schema)` owns their codec.
 
 Schema — the authoritative copy is [`sql/schema.sql`](../sql/schema.sql), which
 the Rust actor embeds at compile time (`include_str!`) and the Python trainer
 reads at runtime:
 
 ```sql
-CREATE TABLE IF NOT EXISTS transitions (
-    id TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS cartridge_schema_versions (
+    component TEXT PRIMARY KEY,
+    schema_version INTEGER NOT NULL CHECK (schema_version > 0)
+);
+
+INSERT INTO cartridge_schema_versions (component, schema_version)
+VALUES ('replay', 3)
+ON CONFLICT (component) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS replay_records (
+    id TEXT NOT NULL,
     env_id TEXT NOT NULL,
+    env_contract_version BIGINT NOT NULL
+        CHECK (env_contract_version BETWEEN 1 AND 4294967295),
+    algorithm_id TEXT NOT NULL,
+    experience_schema TEXT NOT NULL,
+    collection_scope_id TEXT NOT NULL
+        CHECK (collection_scope_id ~ '^[0-9a-f]{64}$'),
+    source_checkpoint_id TEXT
+        CHECK (
+            source_checkpoint_id IS NULL
+            OR source_checkpoint_id ~ '^[0-9a-f]{64}$'
+        ),
     episode_id TEXT NOT NULL,
-    step_number INTEGER NOT NULL,
-    state BYTEA NOT NULL,
-    action BYTEA NOT NULL,
-    next_state BYTEA NOT NULL,
-    observation BYTEA NOT NULL,
-    next_observation BYTEA NOT NULL,
-    reward REAL NOT NULL,
-    done BOOLEAN NOT NULL,
-    timestamp BIGINT NOT NULL,
-    policy_probs BYTEA,              -- f32[num_actions], tau=1 visit distribution
-    mcts_value REAL DEFAULT 0.0,
-    game_outcome REAL,               -- backfilled at episode end
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    step_number BIGINT NOT NULL
+        CHECK (step_number BETWEEN 0 AND 4294967295),
+    payload BYTEA NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (
+        env_id, env_contract_version, algorithm_id, experience_schema,
+        collection_scope_id, id
+    )
 );
 
-CREATE INDEX IF NOT EXISTS idx_transitions_timestamp ON transitions(timestamp);
-CREATE INDEX IF NOT EXISTS idx_transitions_episode   ON transitions(episode_id);
-CREATE INDEX IF NOT EXISTS idx_transitions_env_id    ON transitions(env_id);
+CREATE INDEX IF NOT EXISTS idx_replay_records_selection_created
+    ON replay_records(
+        env_id, env_contract_version, algorithm_id, experience_schema,
+        collection_scope_id, source_checkpoint_id, created_at DESC
+    );
 
-CREATE TABLE IF NOT EXISTS game_metadata (
-    env_id TEXT PRIMARY KEY,
-    display_name TEXT NOT NULL,
-    board_width INTEGER NOT NULL,
-    board_height INTEGER NOT NULL,
-    num_actions INTEGER NOT NULL,
-    obs_size INTEGER NOT NULL,
-    legal_mask_offset INTEGER NOT NULL,
-    player_count INTEGER NOT NULL,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+CREATE INDEX IF NOT EXISTS idx_replay_records_selection_episode
+    ON replay_records(
+        env_id, env_contract_version, algorithm_id, experience_schema,
+        collection_scope_id, source_checkpoint_id, episode_id, step_number
+    );
 ```
 
-Supports concurrent writers from multiple actors.
+Selection/creation-time and selection/episode indexes support concurrent
+writers, sampling, retention cleanup, and episode inspection without adding
+algorithm-specific columns.
 
-> **Note:** [`scripts/init-postgres.sql`](../scripts/init-postgres.sql) is a
-> separate, larger script used for containerised first-boot. It creates the two
-> tables above plus `training_stats` and `model_versions`, and issues `GRANT`s.
-> The two files have diverged; `sql/schema.sql` is what the running code uses.
+> **Clean schema cutover:** existing replay databases must be recreated from
+> `sql/schema.sql`. Cartridge2 deliberately provides no migration from the old
+> concrete transition columns to an opaque payload because there is no honest,
+> generic codec that can be inferred for those rows.
 
-### 7.3 Game metadata single-sourcing
+The runtime requires the exact replay protocol marker
+`cartridge_schema_versions(component='replay', schema_version=3)`. The actor
+embeds `sql/schema.sql`, and the trainer's packaged copy is byte-identical.
+Compose and K8s bootstrap scripts implement the same tables, constraints, keys,
+and indexes, then add deployment-specific grants. The only tables in the replay
+contract are `cartridge_schema_versions` and `replay_records`; there are no
+board, environment-metadata, model, or training-stat tables.
 
-Game facts are declared once, in the Rust game crates, and flow outward:
+`alphazero_board_v1` owns `alphazero_transition_v1`. Its exact language-neutral
+payload is a concatenation of little-endian `f32` values:
 
 ```text
-games-*/src/lib.rs  ──  metadata()  ──►  GameMetadata (engine-core)
-                                            │
-        ┌───────────────────────────────────┼──────────────────────────┐
-        │                                   │                          │
-   actor (in-process)              make game-manifest            web (in-process)
-        │                                   │                          │
-        │                     trainer/src/trainer/game_metadata.json    │
-        │                                   │                          │
-        │                          trainer GAME_CONFIGS                │
-        ▼                                   ▼                          ▼
-  game_metadata table  ◄── cross-checked by ──  replay_setup.py
+observation[obs_size] || policy[num_actions] || terminal_value[1]
 ```
 
-- **The manifest is generated, not written.** `make game-manifest` renders every
-  registered game's metadata to `trainer/src/trainer/game_metadata.json`, which
-  ships inside the Python package (`[tool.setuptools.package-data]`) and is
-  loaded with `importlib.resources`. A golden test in `engine-games` fails if
-  the committed file drifts from the game crates, so `cargo test` catches
-  staleness — CI cannot compare the two languages live, because the Python job
-  has no Rust toolchain and no artifacts pass between jobs.
-- **The trainer splits facts from choices.** `_ENGINE_FACT_FIELDS` come from the
-  manifest; `_TRAINING_OVERRIDES` holds the network architecture, which has no
-  engine counterpart. A manifest game with no override entry raises, so adding a
-  game in Rust forces a deliberate architecture decision instead of silently
-  defaulting a spatial game to an MLP.
-- **The database row is a cross-check, not a source.** The actor upserts its
-  metadata on startup, so the row reflects the actor binary that ran most
-  recently. `replay_setup.py` compares it against the manifest and **raises** on
-  an `obs_size` / `legal_mask_offset` / `num_actions` disagreement: that means
-  the actor and trainer were built from different commits, and the buffered
-  transitions do not match the network's input layout. Descriptive differences
-  only warn.
+The actor validates and encodes this layout only after an episode has a terminal
+target. The learner validates record lineage, payload length, finite values,
+policy bounds and sum, and value bounds before constructing training tensors.
 
-Two invariants are asserted for every registered game, on both sides:
+### 7.3 Environment and algorithm catalog single-sourcing
+
+Environment facts and algorithm contracts are declared in Rust and flow
+outward through one generated catalog:
 
 ```text
-legal_mask_offset == obs_channels * board_size
-obs_size          == legal_mask_offset + num_actions + 2
+Environment::metadata() ──────┐
+Environment::capabilities() ──┼──► engine-games manifest generator
+algorithm-core catalog ───────┘                  │
+                                                ▼
+                      trainer/src/trainer/environment_manifest.json
+                                                │
+                           environment_catalog.py + algorithms/
+
+EnvironmentMetadata.board ──► AlphaZero actor/web
+algorithm descriptor + environment contract ──► ReplayProfile
+orchestrator attempt + source checkpoint ──────► ReplaySelection
+AlphaZero board dimensions ──► alphazero_transition_v1 codec
+                                         │
+                                         ▼
+                               ReplayRecord.payload
+                                         │
+                                         ▼
+                                  replay_records
+```
+
+- **The manifest is generated, not written.** `make environment-manifest`
+  renders schema version 4 to
+  `trainer/src/trainer/environment_manifest.json`. It ships inside the Python
+  package and is loaded with `importlib.resources`. The `engine-games` golden
+  test fails when the committed catalog drifts.
+- **The v4 shape is generic.** The top level contains `algorithms` and
+  `environments`; each environment is exactly `{metadata, capabilities,
+  algorithm_profiles}`. Generic metadata is `{id, display_name, description,
+  board}` and `board` may be null. Capabilities carry identity/version,
+  encodings, semantics (including chance and rewards emitted per agent), optional
+  horizon, and fixed/dynamic agents with action spaces.
+- **Algorithms are first-class catalog entries.** The top-level `algorithms`
+  collection carries descriptors and requirements. Every environment carries
+  an `algorithm_profiles` map whose values include `compatible`, structured
+  issues, and `unverified_assumptions`.
+- **Python separates environment facts from algorithm recipes.**
+  `environment_catalog.py` parses the engine-owned catalog. An installed
+  algorithm module, such as `algorithms/alphazero_board_v1.py`, owns its network
+  recipe and concrete factories. Merely adding an environment does not force it
+  into an AlphaZero configuration table.
+- **Replay storage is algorithm-neutral.** Environment compatibility supplies
+  the dimensions required by an installed algorithm codec, while the database
+  stores only the profile-bound envelope and opaque payload. Changing either
+  the environment contract or payload codec means a new profile namespace.
+
+The AlphaZero compatibility guard asserts the nested board-layout invariants:
+
+```text
+board.observation.legal_actions_offset
+    == board.observation.spatial_channels * board.width * board.height
+board.observation.elements
+    == board.observation.legal_actions_offset + board.action_count + 2
 ```
 
 ### Model Storage
 
 #### Filesystem (Local)
 
-```
-./data/models/
-├── latest.onnx           # Current model (hot-reloaded)
-├── best.onnx             # Best model (gatekeeper)
-├── model_step_000100.onnx
-├── model_step_000200.onnx
-└── ...
+```text
+./data/profiles/{algorithm}/{env}/v{env_contract_version}/
+├── models/
+│   ├── blobs/sha256/{onnx_digest}.onnx
+│   ├── blobs/sha256/{learner_digest}.pt
+│   ├── manifests/sha256/{checkpoint_id}.json
+│   ├── evaluations/manifests/sha256/{evaluation_id}.json
+│   ├── run-commits/sha256/{run_commit_id}.json
+│   ├── run-preparations/by-parent/{root|parent_run_commit_id}.json
+│   └── channels/current.json # Sole RunHeadV2 authority
+├── stats.json                # Web projection
+└── eval_stats.json, players.json, ...
 ```
 
 #### S3 (Kubernetes)
 
-```python
-store = create_model_store(
-    backend="s3",
-    bucket="cartridge-models",
-    endpoint="http://minio:9000"  # Optional, for MinIO
-)
+```text
+s3://{bucket}/profiles/{algorithm}/{env}/v{env_contract_version}/models/
+├── blobs/sha256/{onnx_digest}.onnx
+├── blobs/sha256/{learner_digest}.pt
+├── manifests/sha256/{checkpoint_id}.json
+├── evaluations/manifests/sha256/{evaluation_id}.json
+├── run-commits/sha256/{run_commit_id}.json
+├── run-preparations/by-parent/{root|parent_run_commit_id}.json
+└── channels/current.json
 ```
+
+The checkpoint ID is the SHA-256 digest of the canonical manifest bytes. Each
+manifest binds the runtime profile, step, parent checkpoint, learner-config
+digest, and the size/digest of both immutable blobs. Publication validates the
+complete ONNX graph, tensor interface, dtypes, shapes, and five identity fields,
+materializes all immutable objects, and only then compare-and-sets the sole
+RunHead. Filesystem and S3 use the same repository layout and
+validation contract.
+
+S3 uses the exact `channels/current.json` object ETag as its serialization
+token. Initial creation is conditional on absence; later advancement is
+conditional on the ETag that was read and validated. There is no lock object,
+lease, timeout, or recovery command. Filesystem publication uses a local
+advisory directory lock and an exact compare-and-set check.
 
 ---
 
@@ -1223,41 +1461,35 @@ with the shipped files on ~25 keys. Read them at the source:
 | Rust structs | `engine/engine-config/src/structs.rs` |
 | Python mirror | `trainer/src/trainer/central_config.py` |
 
-`config.defaults.toml` is loaded by both languages: Rust embeds it at compile
-time (`include_str!`), Python reads it at runtime and deep-merges `config.toml`
-over it.
+`config.defaults.toml` is loaded by both languages. Rust embeds the repository
+copy at compile time (`include_str!`). The Python wheel ships a byte-identical
+package resource; a source checkout prefers the repository copy and fails if
+the two copies diverge. Python then deep-merges `config.toml` over those
+canonical defaults. Missing or incomplete defaults are fatal.
 
-Sections: `[common]`, `[training]`, `[evaluation]`, `[actor]`, `[web]`,
+Sections: `[common]`, `[algorithm]`, `[training]`, `[evaluation]`, `[actor]`, `[web]`,
 `[mcts]`, `[logging]`, `[storage]`, `[wandb]`.
 
-> **Not every section reaches every component.** `[wandb]` and the solver-eval
-> keys under `[evaluation]` (`solver_games`, `solver_seed`, `promotion_metric`,
-> `promotion_margin`) have no counterpart in the Rust `CentralConfig` — they are
-> read only by the Python trainer.
+Both languages parse the complete schema, including `[wandb]` and the
+solver/promotion fields. Individual processes act only on the settings in
+their responsibility, but every component still rejects malformed or unknown
+configuration before selecting a runtime profile.
 
 ### Environment Variable Format
 
-New format (preferred):
+Canonical format:
 ```bash
+CARTRIDGE_ALGORITHM_ID=alphazero_board_v1
 CARTRIDGE_COMMON_ENV_ID=connect4
 CARTRIDGE_TRAINING_ITERATIONS=50
-CARTRIDGE_MCTS_NUM_SIMULATIONS=800
+CARTRIDGE_MCTS_START_SIMS=100
+CARTRIDGE_MCTS_MAX_SIMS=800
 ```
 
-Legacy format (Python trainer only) — 11 variables are mapped, including
-`ALPHAZERO_ENV_ID`, `ALPHAZERO_ITERATIONS`, `ALPHAZERO_START_ITERATION`,
-`ALPHAZERO_EPISODES`, `ALPHAZERO_STEPS`, `ALPHAZERO_BATCH_SIZE`,
-`ALPHAZERO_LR`, `ALPHAZERO_DEVICE`, `ALPHAZERO_CHECKPOINT_INTERVAL`,
-`ALPHAZERO_EVAL_INTERVAL`, and a bare `DATA_DIR`
-(`trainer/src/trainer/central_config.py`).
-
-> **The two languages do not honour the same set.** Python parses
-> `CARTRIDGE_<SECTION>_<KEY>` generically, so any key can be overridden. Rust
-> matches against an explicit list in `engine/engine-config/src/loader.rs`, so
-> keys outside it — `logging.format`, the MCTS ramping keys, `num_actors`,
-> `allowed_origins`, `health_port` — are honoured by the trainer but **ignored
-> by the actor and web server**. Set those in `config.toml` rather than the
-> environment.
+Python derives `CARTRIDGE_<SECTION>_<KEY>` names from the typed schema; Rust
+maps the same complete set explicitly in `engine/engine-config/src/loader.rs`.
+Unknown names are errors, not ignored compatibility aliases. Lists such as
+`allowed_origins` and W&B tags use comma-separated values.
 
 ### Search Paths
 
@@ -1268,8 +1500,9 @@ Rust (`engine/engine-config/src/loader.rs`):
 3. `../config.toml`
 4. `/app/config.toml` (Docker)
 
-Python (`trainer/src/trainer/central_config.py`) differs slightly: `./config.toml`,
-`/app/config.toml`, then a project-root fallback — no `../config.toml`.
+Python (`trainer/src/trainer/central_config.py`) uses `./config.toml`,
+`/app/config.toml`, then a source-checkout project-root fallback. Installed
+wheels fall back to their packaged canonical defaults resource.
 
 ---
 
@@ -1278,69 +1511,69 @@ Python (`trainer/src/trainer/central_config.py`) differs slightly: `./config.tom
 ### Self-Play Data Flow
 
 ```
-Actor                    Storage                  Trainer
-  │                         │                        │
-  │  1. Run episode         │                        │
-  │  (MCTS + model)         │                        │
-  │                         │                        │
-  │  2. Backfill outcomes   │                        │
-  │                         │                        │
-  │  3. Store transitions ──►│                       │
-  │                         │                        │
-  │                         │◄── 4. Sample batch ────│
-  │                         │                        │
-  │                         │                        │  5. Train step
-  │                         │                        │
-  │◄───────────────────────────── 6. Export ONNX ───│
-  │  7. Hot-reload model    │                        │
-  │                         │                        │
+Orchestrator             Bounded collectors       PostgreSQL          Learner
+     │                           │                      │                 │
+     │ 1. New scope + source    │                      │                 │
+     │─────────────────────────►│                      │                 │
+     │                           │ 2. Load Latest once  │                 │
+     │                           │ 3. Complete episodes │                 │
+     │                           │ 4. Store exact rows ─►│                 │
+     │◄──────── finite exit ─────│                      │                 │
+     │ 5. Require exact distinct-episode seal          │                 │
+     │────────────────────────────────────────────────►│                 │
+     │                           │                      │◄─ 6. Sample ────│
+     │                           │                      │   exact scope   │
+     │                           │                      │                 │ 7. Train
+     │◄──────────────────────────────────────────────────────────────────│
+     │ 8. Evaluate, publish immutable evidence, CAS RunHead              │
 ```
+
+The orchestrator gives every collector and the learner the same complete
+`ReplaySelection`. Each row persists the scope and source lineage; every store
+operation applies that exact tuple, including null-exact source matching. The
+algorithm codec is the only layer that interprets `payload`. A failed attempt
+gets a new scope rather than clearing or reusing the failed one.
 
 ### Statistics Flow
 
 ```
-Trainer                 Filesystem              Web Server            Frontend
-   │                        │                       │                     │
-   │  Write stats.json ────►│                       │                     │
-   │  (atomic)              │                       │                     │
-   │                        │◄── Poll (on request) ─│                     │
-   │                        │                       │                     │
-   │                        │    Read stats.json ──►│                     │
-   │                        │                       │                     │
-   │                        │                       │◄── GET /stats ──────│
-   │                        │                       │                     │
-   │                        │                       │    JSON response ───►│
-   │                        │                       │                     │
-   │                        │                       │                     │ Render
+Trainer                    Artifact repository       Projection       Web
+   │                                │                    │             │
+   │ 1. Immutable RunCommit ───────►│                    │             │
+   │    (embeds exact stats)        │                    │             │
+   │ 2. CAS sole RunHead ──────────►│                    │             │
+   │ 3. Rebuild from selected chain ├───────────────────►│ stats.json  │
+   │                                │                    │◄── GET ─────│
 ```
 
-### Model Promotion Flow
+`stats.json`, `eval_stats.json`, `solver_stats.json`, and `loop_stats.json` are
+disposable projections. Live `stats_interval` refreshes may temporarily be
+newer than RunHead and are intentionally lost after a crash; startup rebuilds
+from the authoritative selected chain.
 
-```
-Evaluator evaluates model
-        │
-        ▼
-  promotion_metric?
-        │
-   ┌────┴─────────────────────┐
-   │                          │
-"win_rate"            "solver_optimal"  (Connect 4 only;
-   │                          │          falls back to win_rate
-   ▼                          ▼          when unavailable)
-win_rate >          solver-optimal rate >
-win_threshold       best's rate + promotion_margin
-   │                          │
-   └────────────┬─────────────┘
-                │
-           Yes  │  No
-                │   │
-                ▼   │
-        Copy to best.onnx
-                │   │
-                │   ▼
-                │  Keep previous best
-                ▼
-        Update best_model.json
+### Checkpoint Publication Flow
+
+```text
+Export validated ONNX + learner state
+                  │
+                  ▼
+Hash and materialize immutable blobs + checkpoint manifest
+                  │
+                  ▼
+Run evaluation; write immutable EvaluationArtifactV2 when scheduled
+                  │
+                  ▼
+Create canonical RunCommitV1 with checkpoint, stats, recipe, replay scope,
+evaluation/champion state, and parent lineage
+                  │
+                  ▼
+Validate complete immutable chains and prepared-run journal
+                  │
+                  ▼
+Compare-and-set sole RunHeadV2 at models/channels/current.json
+                  │
+                  ├─ Latest ───────────► learner and next bounded collectors
+                  └─ ChampionOrLatest ─► web inference
 ```
 
 ---
@@ -1360,7 +1593,7 @@ bucket initialiser that both `alphazero` and `web` wait on via
 | minio | 9000 / 9001 | S3-compatible model storage + console |
 | web | 8080 | API |
 | frontend | 80 | nginx; container listens on **8080** |
-| prometheus | 9092 | scrapes trainer:9090, actor:9091, web:8080 |
+| prometheus | 9092 | scrapes trainer:9090 and web:8080 |
 
 #### Local Development
 
@@ -1372,21 +1605,15 @@ docker compose up alphazero
 docker compose up web frontend
 # Open http://localhost
 
-# Standalone evaluation. --entrypoint is required: the image's ENTRYPOINT is
-# `python -m trainer loop`, so a bare command would be appended to it.
-docker compose run --rm --entrypoint python alphazero \
-  -m trainer evaluate --model /app/data/models/latest.onnx
+# One-off command through the image's canonical trainer entrypoint.
+docker compose run --rm alphazero \
+  --algorithm alphazero_board_v1 evaluate --env-id connect4
 ```
 
-#### Kubernetes Simulation
-
-```bash
-# Full K8s-style stack (PostgreSQL + MinIO model storage)
-docker compose -f docker-compose.yml -f docker-compose.k8s.yml up
-
-# Parallel self-play is configured via [training].num_actors in config.toml
-# (or CARTRIDGE_TRAINING_NUM_ACTORS), not by scaling containers
-```
+Compose already uses PostgreSQL and private MinIO. Kubernetes uses the
+Kustomize manifests under `k8s/`; one `job/trainer` owns the synchronized loop
+and spawns its configured bounded collectors. There is deliberately no actor
+Deployment or independently scaled collector pool.
 
 ### Dockerfiles
 
@@ -1416,35 +1643,23 @@ docker build -f Dockerfile.alphazero --build-arg CARGO_FEATURES="s3" .
 | minio | `mc ready local` | docker-compose.yml |
 | web | `curl -f http://localhost:8080/health` | `HEALTHCHECK` in web/Dockerfile |
 | frontend | `wget -q --spider http://localhost:8080/` | `HEALTHCHECK` in web/frontend/Dockerfile |
-| actor | HTTP endpoint on `actor.health_port` (default 8081) | actor/src/health.rs |
 
 ### Observability
 
-Three Prometheus scrape targets (see [`prometheus.yml`](../prometheus.yml)); the
-Prometheus UI is published on host port 9092, while the trainer and actor metrics
-ports are `expose`-only inside the compose network.
+The trainer and web process expose Prometheus scrape targets (see
+[`prometheus.yml`](../prometheus.yml)). Bounded actor children have no HTTP
+service lifecycle; they emit structured final snapshots and are supervised by
+the parent orchestrator.
 
 | Component | Port | Notable metrics |
 |-----------|------|-----------------|
-| trainer | 9090 | training step/loss counters (`trainer/src/trainer/metrics.py`) |
-| actor | 9091 | see below |
+| trainer | 9090 | training step/loss counters and `trainer_replay_record_count` (`trainer/src/trainer/metrics.py`) |
 | web | 8080 (`/metrics`) | `web_games_created_total`, `web_games_active`, `web_moves_played_total`, `web_games_completed_total`, `web_request_duration_seconds{endpoint,method}`, `web_bot_move_seconds`, `web_model_loaded`, `web_model_reloads_total` |
 
-Actor metrics (`actor/src/metrics.rs`) cover episodes
-(`actor_episodes_total`, `actor_player1_wins_total`, `actor_player2_wins_total`,
-`actor_draws_total`, `actor_episodes_per_second`, `actor_episode_duration_seconds`,
-`actor_episode_steps`), search
-(`actor_mcts_searches_total`, `actor_mcts_inference_seconds`,
-`actor_mcts_search_seconds`, `actor_mcts_simulations_per_search`), storage
-(`actor_transitions_stored_total`, `actor_db_write_seconds`, `actor_db_pool_*`),
-model reloads, `actor_memory_rss_bytes`, and `actor_info{game,actor_id}`.
-
-Two are worth watching specifically:
-
-| Metric | Why |
-|--------|-----|
-| `actor_episodes_abandoned_total{reason}` | Episodes that never reached a terminal state (`reason` is `timeout` or `max_steps`). Non-zero means self-play data is being dropped — and dropped with a bias, since it is the long episodes that run out of wall clock. |
-| `actor_transitions_discarded_total` | How many transitions went with them. |
+Bounded actor children deliberately expose no Prometheus endpoint. Their
+process-local `ActorStats`, abandonment reason, discarded-record count, and RSS
+are emitted as structured logs; the parent treats a failed child as a failed
+scope attempt instead of silently retrying within that scope.
 
 Logging is `tracing` on the Rust side and `structured_logging.py` on the Python
 side; set `logging.format = "json"` for cloud log aggregation.
@@ -1461,7 +1676,7 @@ commit and were wrong in three separate documents before this was written. Run
 
 | Component | Coverage |
 |-----------|----------|
-| engine-core | Game trait, adapter, registry, context, legal masks |
+| engine-core | Generic Environment/Timestep ABI, validation, registry, context, optional profiles |
 | engine-config | Config loading, env overrides |
 | engine-games | Registration, observation-layout invariants, manifest golden test |
 | games-* | Game logic, encode/decode round-trips |
@@ -1490,27 +1705,32 @@ first if you are developing it alongside.
 
 Two checks are worth knowing about because they guard cross-cutting invariants:
 
-- **`engine-games` manifest golden test** — fails when
-  `trainer/src/trainer/game_metadata.json` drifts from the game crates.
-  Regenerate with `make game-manifest`.
-- **Observation-layout invariants** — asserted for every registered game on both
-  the Rust side (`engine-games`) and the Python side
-  (`TestManifestIntegrity`), so a layout change has to get past both.
+- **`engine-games` environment-manifest golden test** — fails when
+  `trainer/src/trainer/environment_manifest.json` drifts from the Rust
+  environment or algorithm contracts. Regenerate with
+  `make environment-manifest`.
+- **AlphaZero board-profile invariants** — asserted by the Rust compatibility
+  guard and the strict Python catalog consumer. Generic environments without a
+  board profile are valid engine registrations but incompatible with this
+  cartridge.
 
 ### CI Pipeline
 
 GitHub Actions workflow:
-1. **rust-fmt**: Format (auto-fix committed on PRs)
+1. **rust-fmt**: Check Rust formatting
 2. **rust-clippy**: Lint with warnings as errors
 3. **rust-test**: Full test suite
 4. **rust-build**: Release build
 5. **rust-security-audit**: cargo audit (non-blocking)
-6. **python-lint**: Ruff + Black (auto-fix committed on PRs)
+6. **python-lint**: Check Ruff + Black
 7. **python-test**: Pytest
 8. **python-security-audit**: pip-audit (non-blocking)
 9. **frontend**: Svelte check + build
 10. **docker-build**: Docker image build validation
 11. **secrets-scan**: GitLeaks (non-blocking)
+
+The workflow is check-only and has read-only repository permissions; no job
+rewrites or commits to a branch.
 
 ---
 
@@ -1519,13 +1739,15 @@ GitHub Actions workflow:
 ### Type Erasure via Adapter
 
 ```
-Typed Game<State, Action, Obs>
+Typed Environment<State, Action, Observation>
         ↓
-GameAdapter<T: Game>
+private EnvironmentAdapter<E: Environment>
         ↓
-Box<dyn ErasedGame>
+private Box<dyn ErasedEnvironment>
         ↓
 Registry HashMap<String, Factory>
+        ↓
+public EngineContext
 ```
 
 ### Arena Allocation (MCTS)
@@ -1548,9 +1770,11 @@ let config = MctsConfig::for_training()
     .with_simulations(800)
     .with_temperature(1.0);
 
-let meta = GameMetadata::new("tictactoe", "Tic-Tac-Toe")
-    .with_board(3, 3)
-    .with_actions(9);
+let metadata = EnvironmentMetadata::new("tictactoe", "Tic-Tac-Toe")
+    .with_board(
+        BoardGameMetadata::new(3, 3, 9)
+            .with_observation(29, 2, 18, false),
+    );
 ```
 
 ### Atomic File Operations
@@ -1563,7 +1787,7 @@ Write-then-rename pattern:
 
 Ensures readers never see partial content.
 
-### Dual Hot-Reload Strategy
+### Web Hot-Reload Strategy
 
 ```
 inotify watcher (fast, event-based)
@@ -1573,6 +1797,10 @@ inotify watcher (fast, event-based)
 Polling timer (reliable in Docker)
 ```
 
+This applies to the web watcher. Bounded collectors resolve Latest once, verify
+the requested source checkpoint, drop the watcher, and never change evaluators
+during an attempt.
+
 ---
 
 ## Appendix: Quick Reference
@@ -1581,7 +1809,8 @@ Polling timer (reliable in Docker)
 
 ```bash
 # Local training
-python -m trainer loop --iterations 50 --episodes 500 --steps 1000
+python -m trainer --algorithm alphazero_board_v1 loop \
+  --iterations 50 --episodes 500 --steps 1000
 
 # Docker training
 docker compose up alphazero
@@ -1590,10 +1819,10 @@ docker compose up alphazero
 docker compose up web frontend
 
 # Evaluation
-python -m trainer evaluate --model ./data/models/latest.onnx --games 100
+python -m trainer --algorithm alphazero_board_v1 evaluate --games 100
 
-# Clean local artifacts (models + stats)
-rm -rf ./data/models/*.onnx ./data/stats.json ./data/loop_stats.json ./data/eval_stats.json ./data/best_model.json
+# Clean one exact runtime profile (destructive; preserve anything needed first)
+make clean ALGORITHM=alphazero_board_v1 ENV_ID=tictactoe
 
 # Clean PostgreSQL replay buffer volume (removes all compose volumes)
 docker compose down -v
@@ -1606,15 +1835,16 @@ docker compose down -v
 | `config.defaults.toml` | Checked-in defaults; source of truth for every key |
 | `config.toml` | Local overrides |
 | `sql/schema.sql` | Database schema (embedded by Rust, read by Python) |
-| `trainer/src/trainer/game_metadata.json` | **Generated** game manifest (`make game-manifest`) |
-| `data/models/latest.onnx` | Current model |
-| `data/models/best.onnx` | Best model |
-| `data/models/best_model.json` | Best-model pointer (`{step, timestamp}`) |
-| `data/stats.json` | Training statistics |
-| `data/eval_stats.json` | Evaluation history |
-| `data/solver_stats.json` | Perfect-solver eval history (Connect 4) |
-| `data/actor_stats.json` | Self-play stats (written by actor, read by web) |
-| `data/loop_stats.json` | Orchestrator history |
+| `trainer/src/trainer/environment_manifest.json` | **Generated** environment/algorithm manifest (`make environment-manifest`) |
+| `data/profiles/{algorithm}/{env}/v{contract}/models/blobs/sha256/{digest}.onnx` | Immutable inference blob |
+| `data/profiles/{algorithm}/{env}/v{contract}/models/blobs/sha256/{digest}.pt` | Immutable learner-state blob |
+| `data/profiles/{algorithm}/{env}/v{contract}/models/manifests/sha256/{checkpoint_id}.json` | Canonical immutable checkpoint manifest |
+| `data/profiles/{algorithm}/{env}/v{contract}/models/run-commits/sha256/{run_commit_id}.json` | Immutable checkpoint, statistics, evaluation/champion, replay-scope, and recipe commit |
+| `data/profiles/{algorithm}/{env}/v{contract}/models/channels/current.json` | Sole mutable `RunHeadV2` authority |
+| `data/profiles/{algorithm}/{env}/v{contract}/stats.json` | Disposable web-facing statistics projection |
+| `data/profiles/{algorithm}/{env}/v{contract}/eval_stats.json` | Disposable evaluation-history projection |
+| `data/profiles/{algorithm}/{env}/v{contract}/solver_stats.json` | Disposable solver-history projection (Connect 4) |
+| `data/profiles/{algorithm}/{env}/v{contract}/loop_stats.json` | Disposable orchestrator-history projection |
 
 ### Environment Variables
 
@@ -1622,6 +1852,8 @@ docker compose down -v
 |----------|-------------|
 | `CARTRIDGE_COMMON_ENV_ID` | Game to train |
 | `CARTRIDGE_TRAINING_DEVICE` | cpu, cuda, mps |
-| `CARTRIDGE_MCTS_NUM_SIMULATIONS` | MCTS simulations |
+| `CARTRIDGE_MCTS_START_SIMS` | First-iteration MCTS simulations |
+| `CARTRIDGE_MCTS_MAX_SIMS` | Maximum ramped MCTS simulations |
+| `CARTRIDGE_MCTS_SIM_RAMP_RATE` | Simulations added per iteration |
 | `CARTRIDGE_STORAGE_MODEL_BACKEND` | filesystem, s3 |
 | `CARTRIDGE_STORAGE_POSTGRES_URL` | PostgreSQL connection |

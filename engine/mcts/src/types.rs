@@ -3,11 +3,12 @@
 //! These are extracted from `search.rs` and re-exported there (and from the
 //! crate root) so the public API is unchanged.
 
-use engine_core::LegalMask;
+use engine_core::board_profile::LegalMask;
 use thiserror::Error;
 
 use crate::evaluator::EvaluatorError;
 use crate::node::NodeId;
+use crate::MctsConfigError;
 
 /// A leaf node waiting for neural network evaluation.
 pub(crate) struct PendingLeaf {
@@ -35,6 +36,9 @@ pub(crate) enum LeafResult {
 /// Errors that can occur during MCTS search.
 #[derive(Debug, Error)]
 pub enum SearchError {
+    #[error("Invalid MCTS configuration: {0}")]
+    InvalidConfig(#[from] MctsConfigError),
+
     #[error("Engine error: {0}")]
     EngineError(String),
 
@@ -46,6 +50,15 @@ pub enum SearchError {
 
     #[error("Invalid state: {0}")]
     InvalidState(String),
+
+    #[error("Invalid AlphaZero timestep: {0}")]
+    InvalidTimestep(String),
+
+    #[error("Environment is incompatible with AlphaZero MCTS: {0}")]
+    IncompatibleEnvironment(String),
+
+    #[error("Legal mask width mismatch: expected {expected} actions, got {actual}")]
+    LegalMaskWidthMismatch { expected: usize, actual: usize },
 
     #[error("MCTS only supports discrete action spaces")]
     UnsupportedActionSpace,

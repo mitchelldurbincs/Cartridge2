@@ -1,9 +1,9 @@
-//! Observation tensor encoding — schema `generals_obs:v1`.
+//! Observation tensor encoding — schema `generals_obs:v2`.
 //!
 //! Player-relative, full-information. Layout (all f32, flattened):
 //!
 //! ```text
-//! [ 9 spatial channels x 64 tiles = 576 ]
+//! [ 10 spatial channels x 64 tiles = 640 ]
 //!   ch0 own territory        (1.0 where owner == me)
 //!   ch1 enemy territory
 //!   ch2 neutral passable     (unowned, not mountain)
@@ -13,9 +13,11 @@
 //!   ch6 mountains
 //!   ch7 generals             (+1.0 own, -1.0 enemy)
 //!   ch8 turn progress        (constant plane: round / MAX_TURNS)
-//! [ legal-move mask: 257 ]   legal_mask_offset = 576
+//!   ch9 plies remaining      (constant plane: remaining / (2 * MAX_TURNS),
+//!                              zero after termination)
+//! [ legal-move mask: 257 ]   legal_mask_offset = 640
 //! [ current-player one-hot: 2 ]
-//! obs_size = 576 + 257 + 2 = 835
+//! obs_size = 640 + 257 + 2 = 899
 //! ```
 //!
 //! "Own"/"enemy" are relative to the player to act (`current_player`), so
@@ -23,14 +25,15 @@
 //! absent; a fog variant gets a new schema version, not a reinterpretation
 //! of this one.
 
-use engine_core::game_utils::encode_f32_slices;
+use engine_core::board_profile::encode_f32_slices;
 
-use crate::board::{Tile, TileKind};
+use crate::board::TileKind;
 use crate::params::{BOARD_SIZE, MAX_ARMY_NORM, MAX_TURNS, NUM_ACTIONS};
 use crate::rules::fill_legal_moves;
+use crate::State;
 
 /// Number of spatial channels.
-pub const NUM_CHANNELS: usize = 9;
+pub const NUM_CHANNELS: usize = 10;
 /// Flattened spatial section length.
 pub const CHANNELS_LEN: usize = NUM_CHANNELS * BOARD_SIZE;
 /// Total observation length in floats.
@@ -47,15 +50,28 @@ pub struct GeneralsObs {
 }
 
 impl GeneralsObs {
-    /// Build the observation for `player` (1 or 2) from the tile array.
-    pub fn from_tiles(tiles: &[Tile], player: u8, alive: [bool; 2], round: u32) -> Self {
+    /// Build the complete player-relative observation from authoritative state.
+    pub fn from_state(state: &State) -> Self {
         let mut channels = [0.0f32; CHANNELS_LEN];
         let norm = (1.0 + MAX_ARMY_NORM).ln();
-        let turn_progress = (round as f32 / MAX_TURNS as f32).min(1.0);
+        let turn_progress = (state.round as f32 / MAX_TURNS as f32).min(1.0);
+        let completed_plies = if state.winner == 0 {
+            state
+                .round
+                .saturating_mul(2)
+                .saturating_add(u32::from(state.current_player == 2))
+        } else {
+            state.cap_plies as u32
+        };
+        let plies_remaining = (state.cap_plies as u32).saturating_sub(completed_plies) as f32
+            / (MAX_TURNS * 2) as f32;
 
-        for (i, tile) in tiles.iter().enumerate().take(BOARD_SIZE) {
+        channels[8 * BOARD_SIZE..9 * BOARD_SIZE].fill(turn_progress);
+        channels[9 * BOARD_SIZE..10 * BOARD_SIZE].fill(plies_remaining);
+
+        for (i, tile) in state.tiles.iter().enumerate().take(BOARD_SIZE) {
             let ch = |c: usize| c * BOARD_SIZE + i;
-            let own = tile.owner == player;
+            let own = tile.owner == state.current_player;
             let enemy = !tile.is_neutral() && !own;
 
             if own {
@@ -74,15 +90,19 @@ impl GeneralsObs {
                 TileKind::General => channels[ch(7)] = if own { 1.0 } else { -1.0 },
                 TileKind::Normal => {}
             }
-            channels[ch(8)] = turn_progress;
         }
 
         let mut legal_moves = [0.0f32; NUM_ACTIONS];
-        let player_alive = alive[player as usize - 1];
-        fill_legal_moves(tiles, player, player_alive, &mut legal_moves);
+        let player_alive = state.alive[state.current_player as usize - 1];
+        fill_legal_moves(
+            &state.tiles,
+            state.current_player,
+            player_alive,
+            &mut legal_moves,
+        );
 
         let mut current_player = [0.0f32; 2];
-        current_player[player as usize - 1] = 1.0;
+        current_player[state.current_player as usize - 1] = 1.0;
 
         Self {
             channels,

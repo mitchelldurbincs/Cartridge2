@@ -1,423 +1,239 @@
-"""Abstract base classes for storage backends.
+"""Algorithm-neutral replay contracts fenced to one exact selection."""
 
-These interfaces define the contract for storage backends, allowing
-the trainer to work with SQLite locally or PostgreSQL/S3 in K8s.
-
-Also home to the serialization/naming conventions shared by all ModelStore
-backends: the checkpoint filename format and the best-model marker payload.
-"""
-
-import json
-import logging
 import re
-import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-import numpy as np
-
-logger = logging.getLogger(__name__)
-
-# Checkpoint naming convention shared by all ModelStore backends (the
-# direct-filesystem path in trainer/checkpoint.py writes the same format).
-CHECKPOINT_STEP_RE = re.compile(r"model_step_(\d+)\.onnx$")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_MAX_U32 = (1 << 32) - 1
 
 
-def checkpoint_filename(step: int) -> str:
-    """Canonical ONNX checkpoint filename for a training step."""
-    return f"model_step_{step:06d}.onnx"
+class EmptyReplaySelectionError(RuntimeError):
+    """Raised when sampling is requested from an empty exact selection."""
 
 
-def parse_checkpoint_step(name: str) -> int | None:
-    """Extract the training step from a checkpoint filename/key, or None."""
-    match = CHECKPOINT_STEP_RE.search(name)
-    return int(match.group(1)) if match else None
+def _digest(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+        raise ValueError(f"{field} must be a lowercase 64-character SHA-256 digest")
+    return value
 
 
-def encode_best_model_metadata(step: int) -> str:
-    """Serialize the best-model marker payload shared by ModelStore backends."""
-    return json.dumps({"step": step, "timestamp": time.time()})
+def _integer(
+    value: object,
+    *,
+    field: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or value > maximum
+    ):
+        raise ValueError(
+            f"{field} must be an integer in the inclusive range "
+            f"[{minimum}, {maximum}]"
+        )
+    return value
 
 
-def decode_best_model_metadata(data: str | bytes) -> int | None:
-    """Parse a payload written by encode_best_model_metadata (None if malformed)."""
-    try:
-        return json.loads(data).get("step")
-    except (ValueError, AttributeError, TypeError):
-        return None
-
-
-@dataclass
-class GameMetadata:
-    """Game metadata stored in the replay database by the actor.
-
-    This makes the database self-describing, allowing the trainer to
-    dynamically configure itself based on the game being trained.
-    """
+@dataclass(frozen=True)
+class ReplayProfile:
+    """Exact namespace shared by one collector and learner cartridge."""
 
     env_id: str
-    display_name: str
-    board_width: int
-    board_height: int
-    num_actions: int
-    obs_size: int
-    legal_mask_offset: int
-    player_count: int
+    env_contract_version: int
+    algorithm_id: str
+    experience_schema: str
 
-    @property
-    def board_size(self) -> int:
-        """Total number of board cells."""
-        return self.board_width * self.board_height
+    def __post_init__(self) -> None:
+        for field_name in ("env_id", "algorithm_id", "experience_schema"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"ReplayProfile.{field_name} cannot be empty")
+        _integer(
+            self.env_contract_version,
+            field="ReplayProfile.env_contract_version",
+            minimum=1,
+            maximum=_MAX_U32,
+        )
 
-    @property
-    def legal_mask_end(self) -> int:
-        """End index of legal mask in observation."""
-        return self.legal_mask_offset + self.num_actions
+    def matches(self, record: "ReplayRecord") -> bool:
+        """Return whether ``record`` belongs to this exact namespace."""
+        return (
+            record.env_id == self.env_id
+            and record.env_contract_version == self.env_contract_version
+            and record.algorithm_id == self.algorithm_id
+            and record.experience_schema == self.experience_schema
+        )
 
 
-@dataclass
-class Transition:
-    """A single transition from the replay buffer."""
+@dataclass(frozen=True)
+class ReplaySelection:
+    """One exact, attempt-scoped replay collection visible to a learner."""
+
+    profile: ReplayProfile
+    collection_scope_id: str
+    source_checkpoint_id: str | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.profile, ReplayProfile):
+            raise TypeError("ReplaySelection.profile must be ReplayProfile")
+        _digest(
+            self.collection_scope_id,
+            field="ReplaySelection.collection_scope_id",
+        )
+        if self.source_checkpoint_id is not None:
+            _digest(
+                self.source_checkpoint_id,
+                field="ReplaySelection.source_checkpoint_id",
+            )
+
+    def matches(self, record: "ReplayRecord") -> bool:
+        return (
+            self.profile.matches(record)
+            and record.collection_scope_id == self.collection_scope_id
+            and record.source_checkpoint_id == self.source_checkpoint_id
+        )
+
+    def record(
+        self,
+        *,
+        id: str,
+        episode_id: str,
+        step_number: int,
+        payload: bytes,
+    ) -> "ReplayRecord":
+        """Wrap algorithm-owned bytes in this exact collection selection."""
+        return ReplayRecord(
+            id=id,
+            env_id=self.profile.env_id,
+            env_contract_version=self.profile.env_contract_version,
+            algorithm_id=self.profile.algorithm_id,
+            experience_schema=self.profile.experience_schema,
+            collection_scope_id=self.collection_scope_id,
+            source_checkpoint_id=self.source_checkpoint_id,
+            episode_id=episode_id,
+            step_number=step_number,
+            payload=payload,
+        )
+
+
+@dataclass(frozen=True)
+class ReplayRecord:
+    """Immutable replay envelope with an algorithm-owned opaque payload."""
 
     id: str
     env_id: str
+    env_contract_version: int
+    algorithm_id: str
+    experience_schema: str
+    collection_scope_id: str
+    source_checkpoint_id: str | None
     episode_id: str
     step_number: int
-    state: bytes
-    action: bytes
-    next_state: bytes
-    observation: bytes
-    next_observation: bytes
-    reward: float
-    done: bool
-    timestamp: int
-    policy_probs: bytes | None  # f32[num_actions] MCTS visit distribution
-    mcts_value: float  # MCTS value estimate at this position
-    game_outcome: float | None  # Final game outcome from this player's perspective
+    payload: bytes
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "id",
+            "env_id",
+            "algorithm_id",
+            "experience_schema",
+            "episode_id",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"ReplayRecord.{field_name} cannot be empty")
+        _integer(
+            self.env_contract_version,
+            field="ReplayRecord.env_contract_version",
+            minimum=1,
+            maximum=_MAX_U32,
+        )
+        _digest(
+            self.collection_scope_id,
+            field="ReplayRecord.collection_scope_id",
+        )
+        if self.source_checkpoint_id is not None:
+            _digest(
+                self.source_checkpoint_id,
+                field="ReplayRecord.source_checkpoint_id",
+            )
+        _integer(
+            self.step_number,
+            field="ReplayRecord.step_number",
+            minimum=0,
+            maximum=_MAX_U32,
+        )
+        if not isinstance(self.payload, bytes):
+            raise TypeError("ReplayRecord.payload must be bytes")
 
 
-class ReplayBufferBase(ABC):
-    """Abstract interface for replay buffer storage.
+class ReplayStore(ABC):
+    """Algorithm-neutral persistence for one exact replay selection."""
 
-    Implementations must be thread-safe for concurrent reads.
-    Write operations may have backend-specific concurrency guarantees.
-    """
+    @property
+    @abstractmethod
+    def selection(self) -> ReplaySelection:
+        """Exact profile, collection attempt, and source checkpoint fence."""
+        raise NotImplementedError
 
     @abstractmethod
     def close(self) -> None:
-        """Close the connection and release resources."""
-        pass
+        """Close the store and release backend resources."""
+        raise NotImplementedError
 
-    def __enter__(self) -> "ReplayBufferBase":
+    def __enter__(self) -> "ReplayStore":
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
     @abstractmethod
-    def count(self, env_id: str | None = None) -> int:
-        """Get total number of transitions in the buffer.
-
-        Args:
-            env_id: Optional environment ID to filter by.
-        """
-        pass
+    def count(self) -> int:
+        """Count records in this store's exact replay selection."""
+        raise NotImplementedError
 
     @abstractmethod
-    def get_metadata(self, env_id: str | None = None) -> GameMetadata | None:
-        """Get game metadata from the database.
-
-        Args:
-            env_id: Specific game to get metadata for. If None, returns
-                    metadata for the first game found.
-        """
-        pass
+    def count_episodes(self) -> int:
+        """Count distinct episode identities in this exact replay selection."""
+        raise NotImplementedError
 
     @abstractmethod
-    def list_metadata(self) -> list[GameMetadata]:
-        """List all game metadata in the database."""
-        pass
+    def sample(self, batch_size: int) -> list[ReplayRecord]:
+        """Sample exactly ``batch_size`` records, using replacement as needed.
+
+        A positive request against a non-empty exact selection returns exactly
+        the requested number of records even when the selection is smaller
+        than the minibatch. Implementations raise
+        :class:`EmptyReplaySelectionError` when that selection is empty and
+        must never widen the selection fence to fill a batch.
+        """
+        raise NotImplementedError
 
     @abstractmethod
-    def sample(self, batch_size: int, env_id: str | None = None) -> list[Transition]:
-        """Sample random transitions for training.
-
-        Args:
-            batch_size: Number of transitions to sample.
-            env_id: Optional environment ID to filter by.
-        """
-        pass
-
-    @abstractmethod
-    def clear_transitions(self) -> int:
-        """Delete all transitions from the buffer.
-
-        Preserves game_metadata. Used for synchronized AlphaZero training.
-
-        Returns:
-            Number of deleted transitions.
-        """
-        pass
+    def clear(self) -> int:
+        """Delete every record in this store's exact replay selection."""
+        raise NotImplementedError
 
     @abstractmethod
     def cleanup(self, window_size: int) -> int:
-        """Delete old transitions to maintain a sliding window.
-
-        Args:
-            window_size: Maximum number of transitions to keep.
-
-        Returns:
-            Number of deleted transitions.
-        """
-        pass
+        """Keep only the newest records in this exact replay selection."""
+        raise NotImplementedError
 
     @abstractmethod
     def vacuum(self) -> None:
-        """Reclaim storage space after deletions.
-
-        Implementation-specific optimization (e.g., PostgreSQL VACUUM).
-        May be a no-op for some backends.
-        """
-        pass
-
-    def sample_batch_tensors(
-        self, batch_size: int, num_actions: int, env_id: str | None = None
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-        """Sample transitions and return as numpy arrays ready for training.
-
-        Default implementation uses sample() and converts to tensors.
-        Backends may override for efficiency.
-
-        Args:
-            batch_size: Number of transitions to sample.
-            num_actions: Number of actions for the game.
-            env_id: Optional environment ID to filter by.
-
-        Returns:
-            Tuple of (observations, policy_targets, value_targets) as numpy arrays,
-            or None if not enough data.
-        """
-        transitions = self.sample(batch_size, env_id=env_id)
-        if len(transitions) < batch_size:
-            return None
-
-        # Determine observation size from first transition
-        first_obs = np.frombuffer(transitions[0].observation, dtype=np.float32)
-        obs_size = len(first_obs)
-
-        # Pre-allocate arrays
-        observations = np.empty((batch_size, obs_size), dtype=np.float32)
-        policy_targets = np.empty((batch_size, num_actions), dtype=np.float32)
-        value_targets = np.empty(batch_size, dtype=np.float32)
-
-        for i, t in enumerate(transitions):
-            # Parse observation
-            observations[i] = np.frombuffer(t.observation, dtype=np.float32)
-
-            # Use MCTS policy distribution as target if available
-            if t.policy_probs is not None and len(t.policy_probs) > 0:
-                policy = np.frombuffer(t.policy_probs, dtype=np.float32)
-                if len(policy) == num_actions:
-                    policy_targets[i] = policy
-                else:
-                    # Fallback to one-hot if shape mismatch
-                    logger.warning(
-                        "Policy shape mismatch: got %d, expected %d. "
-                        "Falling back to one-hot for transition %s (episode %s, step %d). "
-                        "This degrades training quality - check actor/trainer config.",
-                        len(policy),
-                        num_actions,
-                        t.id,
-                        t.episode_id,
-                        t.step_number,
-                    )
-                    policy_targets[i] = 0.0
-                    action_idx = int.from_bytes(t.action, byteorder="little")
-                    if action_idx >= num_actions:
-                        raise ValueError(
-                            f"Action index {action_idx} out of bounds for "
-                            f"{num_actions} actions in transition {t.id}"
-                        )
-                    policy_targets[i, action_idx] = 1.0
-            else:
-                # Fallback to one-hot action if no MCTS data
-                policy_targets[i] = 0.0
-                action_idx = int.from_bytes(t.action, byteorder="little")
-                if action_idx >= num_actions:
-                    raise ValueError(
-                        f"Action index {action_idx} out of bounds for "
-                        f"{num_actions} actions in transition {t.id}"
-                    )
-                policy_targets[i, action_idx] = 1.0
-
-            # Use game_outcome as value target (required for proper AlphaZero)
-            if t.game_outcome is not None:
-                value_targets[i] = t.game_outcome
-            else:
-                logger.warning(
-                    "Missing game_outcome for transition %s (episode %s, step %d). "
-                    "Using mcts_value (%.3f) as fallback - this degrades training quality.",
-                    t.id,
-                    t.episode_id,
-                    t.step_number,
-                    t.mcts_value,
-                )
-                value_targets[i] = t.mcts_value
-
-        return observations, policy_targets, value_targets
-
-
-@dataclass
-class ModelInfo:
-    """Metadata about a stored model."""
-
-    path: str  # Backend-specific path/key (file path or S3 key)
-    step: int
-    timestamp: float
-    is_latest: bool = False
-    is_best: bool = False
-
-
-class ModelStore(ABC):
-    """Abstract interface for model storage.
-
-    Handles ONNX model checkpoints and PyTorch training state.
-    Supports atomic writes and change detection for hot-reload.
-    """
+        """Ask the backend to reclaim storage after deletions."""
+        raise NotImplementedError
 
     @abstractmethod
-    def save_onnx(
-        self,
-        model_bytes: bytes,
-        step: int,
-        is_latest: bool = True,
-    ) -> ModelInfo:
-        """Save an ONNX model checkpoint.
-
-        Args:
-            model_bytes: Serialized ONNX model.
-            step: Training step number.
-            is_latest: Whether to also update the "latest" pointer.
-
-        Returns:
-            ModelInfo with the saved location.
-        """
-        pass
+    def store(self, record: ReplayRecord) -> None:
+        """Insert one immutable replay record."""
+        raise NotImplementedError
 
     @abstractmethod
-    def save_pytorch(
-        self,
-        state_dict: dict,
-        step: int,
-    ) -> str:
-        """Save PyTorch training state (model + optimizer + scheduler).
-
-        Args:
-            state_dict: Dictionary with model_state_dict, optimizer_state_dict, etc.
-            step: Training step number.
-
-        Returns:
-            Path/key where the checkpoint was saved.
-        """
-        pass
-
-    @abstractmethod
-    def load_pytorch(self) -> tuple[dict, int] | None:
-        """Load the latest PyTorch training state.
-
-        Returns:
-            Tuple of (state_dict, step) or None if no checkpoint exists.
-        """
-        pass
-
-    @abstractmethod
-    def get_latest_info(self) -> ModelInfo | None:
-        """Get info about the latest model.
-
-        Returns:
-            ModelInfo for the latest model, or None if no model exists.
-        """
-        pass
-
-    @abstractmethod
-    def get_latest_version(self) -> int | None:
-        """Get the version/step of the latest model.
-
-        Used for change detection without downloading the full model.
-
-        Returns:
-            Step number of latest model, or None if no model exists.
-        """
-        pass
-
-    @abstractmethod
-    def load_latest_onnx(self) -> bytes | None:
-        """Load the latest ONNX model bytes.
-
-        Returns:
-            Model bytes or None if no model exists.
-        """
-        pass
-
-    @abstractmethod
-    def list_checkpoints(self) -> list[ModelInfo]:
-        """List all available model checkpoints.
-
-        Returns:
-            List of ModelInfo, sorted by step (oldest first).
-        """
-        pass
-
-    def cleanup_old_checkpoints(self, max_keep: int) -> int:
-        """Remove old checkpoints to save storage.
-
-        Deletes oldest-first via _delete_checkpoint, never deleting the
-        best model, until at most max_keep checkpoints remain.
-
-        Args:
-            max_keep: Maximum number of checkpoints to retain.
-
-        Returns:
-            Number of checkpoints deleted.
-        """
-        checkpoints = self.list_checkpoints()
-        deleted = 0
-
-        while len(checkpoints) > max_keep:
-            old_checkpoint = checkpoints.pop(0)
-            # Don't delete the best model
-            if old_checkpoint.is_best:
-                continue
-            try:
-                self._delete_checkpoint(old_checkpoint)
-                logger.debug(f"Removed old checkpoint: {old_checkpoint.path}")
-                deleted += 1
-            except Exception as e:
-                logger.warning(f"Failed to remove {old_checkpoint.path}: {e}")
-
-        return deleted
-
-    @abstractmethod
-    def _delete_checkpoint(self, checkpoint: ModelInfo) -> None:
-        """Delete a single checkpoint artifact (backend-specific)."""
-        pass
-
-    @abstractmethod
-    def mark_as_best(self, step: int) -> None:
-        """Mark a specific checkpoint as the "best" model.
-
-        Used by gatekeeper evaluation to track the best performing model.
-
-        Args:
-            step: Step number of the checkpoint to mark as best.
-        """
-        pass
-
-    @abstractmethod
-    def get_best_info(self) -> ModelInfo | None:
-        """Get info about the best model.
-
-        Returns:
-            ModelInfo for the best model, or None if not set.
-        """
-        pass
+    def store_batch(self, records: list[ReplayRecord]) -> None:
+        """Insert immutable replay records as one transaction."""
+        raise NotImplementedError

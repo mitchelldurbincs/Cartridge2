@@ -1,294 +1,92 @@
-"""CLI entrypoint for the Cartridge2 trainer.
+"""Canonical command-line entrypoint for installed algorithm cartridges.
 
-Provides subcommands for different operations:
-    python -m trainer train        - Run training loop on replay buffer
-    python -m trainer evaluate     - Evaluate model against random baseline
-    python -m trainer loop         - Run synchronized AlphaZero training
-    python -m trainer solver-eval  - Score Connect4 moves vs perfect solver
-    python -m trainer register-players - Add checkpoints to the player registry
-    python -m trainer tournament   - Round-robin the registered players, rate them
+Usage is always::
 
-For backwards compatibility, running without a subcommand defaults to 'train':
-    python -m trainer --steps 1000
+    trainer [--algorithm ALGORITHM_ID] COMMAND [COMMAND_OPTIONS]
+    python -m trainer [--algorithm ALGORITHM_ID] COMMAND [COMMAND_OPTIONS]
 
-Entry points after pip install:
-    trainer              - Same as 'python -m trainer train'
-    trainer-loop         - Same as 'python -m trainer loop'
-    trainer-evaluate     - Same as 'python -m trainer evaluate'
-    trainer-solver-eval  - Same as 'python -m trainer solver-eval'
-
-Note: Replay buffer connection is configured via CARTRIDGE_STORAGE_POSTGRES_URL
-environment variable.
+``--algorithm`` is a global option and therefore precedes the command.  The
+selected algorithm owns the command set, parser configuration, and command
+runners installed below.
 """
 
-import argparse
-import logging
-import sys
+from __future__ import annotations
 
+import argparse
+import sys
+from collections.abc import Sequence
+
+from .algorithms import get_algorithm, list_algorithms
+from .algorithms.base import Algorithm, AlgorithmCommand
+from .central_config import get_config
 from .structured_logging import setup_logging
 
 
-def cmd_train(args: argparse.Namespace) -> int:
-    """Run the training loop."""
-    from . import metrics as prom_metrics
-    from .backoff import WaitTimeout
-    from .trainer import Trainer, TrainerConfig
-
-    logger = logging.getLogger(__name__)
-    logger.info("Cartridge2 Trainer starting...")
-    logger.info(f"Config: model_dir={args.model_dir}, steps={args.steps}")
-
-    # Start Prometheus metrics server
-    metrics_port = getattr(args, "metrics_port", 9090)
-    prom_metrics.start_metrics_server(port=metrics_port)
-
-    config = TrainerConfig.from_args(args)
-
-    try:
-        trainer = Trainer(config)
-        stats = trainer.train()
-        logger.info(f"Training complete! Final loss: {stats.total_loss:.4f}")
-        logger.info(f"Last checkpoint: {stats.last_checkpoint}")
-        return 0
-    except KeyboardInterrupt:
-        logger.info("Training interrupted by user")
-        return 130
-    except WaitTimeout as e:
-        logger.error(f"Timeout: {e}")
-        return 2
-    except Exception as e:
-        logger.exception(f"Training failed: {e}")
-        return 1
-
-
-def cmd_evaluate(args: argparse.Namespace) -> int:
-    """Run model evaluation."""
-    from .evaluator import run_evaluation
-
-    return run_evaluation(args)
-
-
-def cmd_solver_eval(args: argparse.Namespace) -> int:
-    """Run solver-based move-quality evaluation."""
-    from .solver_eval import run_solver_evaluation
-
-    return run_solver_evaluation(args)
-
-
-def cmd_register_players(args: argparse.Namespace) -> int:
-    """Add checkpoints to the player registry."""
-    from .tournament_cli import run_register_players
-
-    return run_register_players(args)
-
-
-def cmd_tournament(args: argparse.Namespace) -> int:
-    """Run a round-robin tournament over registered players."""
-    from .tournament_cli import run_tournament_command
-
-    return run_tournament_command(args)
-
-
-def cmd_loop(args: argparse.Namespace) -> int:
-    """Run synchronized AlphaZero training loop."""
-    from .orchestrator import main as orchestrator_main
-
-    # orchestrator has its own arg parsing, so we need to strip the 'loop' subcommand
-    # from sys.argv before calling it
-    if len(sys.argv) >= 2 and sys.argv[1] == "loop":
-        sys.argv = [sys.argv[0]] + sys.argv[2:]
-    return orchestrator_main()
-
-
-def _add_train_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add train command arguments to a parser.
-
-    This is shared between the 'train' subcommand and backwards-compatible
-    direct invocation mode.
-    """
-    from .central_config import get_config as get_central_config
-    from .trainer import TrainerConfig
-
-    # Load central config for defaults
-    cfg = get_central_config()
-
-    # Configure parser with central config overrides for key settings
-    TrainerConfig.configure_parser(
-        parser,
-        overrides={
-            "checkpoint_interval": cfg.training.checkpoint_interval,
-            "max_checkpoints": cfg.training.max_checkpoints,
-            "batch_size": cfg.training.batch_size,
-            "learning_rate": cfg.training.learning_rate,
-            "weight_decay": cfg.training.weight_decay,
-            "grad_clip_norm": cfg.training.grad_clip_norm,
-            "device": cfg.training.device,
-            "env_id": cfg.common.env_id,
-            "model_dir": str(cfg.models_dir),
-            "stats_path": str(cfg.stats_path),
-        },
+def _select_algorithm(argv: Sequence[str]) -> Algorithm:
+    """Resolve the cartridge before building its command-specific parser."""
+    selector = argparse.ArgumentParser(add_help=False)
+    selector.add_argument(
+        "--algorithm",
+        choices=list_algorithms(),
+        default=get_config().algorithm.id,
     )
-    parser.add_argument(
-        "--log-level",
-        type=str,
-        default=cfg.common.log_level.upper(),
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level",
-    )
-    parser.add_argument(
-        "--metrics-port",
-        type=int,
-        default=9090,
-        help="Port for Prometheus metrics server",
-    )
+    selected, _ = selector.parse_known_args(argv)
+    return get_algorithm(selected.algorithm)
 
 
-def setup_train_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Set up the train subcommand parser."""
+def _install_command(
+    subparsers: argparse._SubParsersAction, command: AlgorithmCommand
+) -> None:
     parser = subparsers.add_parser(
-        "train",
-        help="Train on replay buffer data",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        command.name,
+        help=command.help,
+        description=command.description,
+        formatter_class=command.formatter_class,
     )
-    _add_train_arguments(parser)
-    parser.set_defaults(func=cmd_train)
+    command.configure_parser(parser)
+    parser.set_defaults(_command_runner=command.run)
 
 
-def setup_evaluate_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Set up the evaluate subcommand parser."""
-    from .evaluator import add_evaluate_arguments
-
-    parser = subparsers.add_parser(
-        "evaluate",
-        help="Evaluate model against random baseline",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    add_evaluate_arguments(parser)
-    parser.set_defaults(func=cmd_evaluate)
-
-
-def setup_solver_eval_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Set up the solver-eval subcommand parser."""
-    from .solver_eval import add_solver_eval_arguments
-
-    parser = subparsers.add_parser(
-        "solver-eval",
-        help="Score Connect4 model moves against a perfect solver (bitbully)",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    add_solver_eval_arguments(parser)
-    parser.set_defaults(func=cmd_solver_eval)
-
-
-def setup_register_players_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Set up the register-players subcommand parser."""
-    from .tournament_cli import add_register_players_arguments
-
-    parser = subparsers.add_parser(
-        "register-players",
-        help="Add ONNX checkpoints to the player registry",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    add_register_players_arguments(parser)
-    parser.set_defaults(func=cmd_register_players)
-
-
-def setup_tournament_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Set up the tournament subcommand parser."""
-    from .tournament_cli import add_tournament_arguments
-
-    parser = subparsers.add_parser(
-        "tournament",
-        help="Round-robin the registered players and rate them (Elo)",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    add_tournament_arguments(parser)
-    parser.set_defaults(func=cmd_tournament)
-
-
-def setup_loop_parser(subparsers: argparse._SubParsersAction) -> None:
-    """Set up the loop subcommand parser."""
-    parser = subparsers.add_parser(
-        "loop",
-        help="Run synchronized AlphaZero training (actor + trainer + eval)",
+def build_parser(algorithm: Algorithm) -> argparse.ArgumentParser:
+    """Build the canonical parser from one selected cartridge's bindings."""
+    parser = argparse.ArgumentParser(
+        description="Cartridge2 reinforcement-learning trainer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="""
-Synchronized AlphaZero training loop that coordinates:
-1. Self-play episode generation (actor)
-2. Neural network training
-3. Model evaluation against random baseline
-
-Each iteration clears the replay buffer to ensure training data
-comes only from the current model version.
-        """,
     )
-    # The loop command re-parses sys.argv via orchestrator.main()
-    # so we don't need to add arguments here
-    parser.set_defaults(func=cmd_loop)
+    parser.add_argument(
+        "--algorithm",
+        choices=list_algorithms(),
+        default=algorithm.descriptor.id,
+        help="Installed algorithm cartridge to run",
+    )
+    subparsers = parser.add_subparsers(
+        title="commands",
+        description=f"Commands provided by {algorithm.descriptor.id}",
+        dest="command",
+        required=True,
+    )
 
-
-def main() -> int:
-    """Main entry point with subcommand support."""
-    # Check if we're being called with a subcommand
-    # For backwards compatibility, default to 'train' if no subcommand given
-    if len(sys.argv) >= 2 and sys.argv[1] in (
-        "train",
-        "evaluate",
-        "loop",
-        "solver-eval",
-        "register-players",
-        "tournament",
-        "-h",
-        "--help",
-    ):
-        # Subcommand mode
-        parser = argparse.ArgumentParser(
-            description="Cartridge2 AlphaZero Trainer",
-            formatter_class=argparse.RawDescriptionHelpFormatter,
+    commands = algorithm.commands()
+    names = [command.name for command in commands]
+    if len(names) != len(set(names)):
+        raise RuntimeError(
+            f"Algorithm '{algorithm.descriptor.id}' exports duplicate CLI commands"
         )
-        subparsers = parser.add_subparsers(
-            title="commands",
-            description="Available commands",
-            dest="command",
-        )
+    for command in commands:
+        _install_command(subparsers, command)
+    return parser
 
-        setup_train_parser(subparsers)
-        setup_evaluate_parser(subparsers)
-        setup_loop_parser(subparsers)
-        setup_solver_eval_parser(subparsers)
-        setup_register_players_parser(subparsers)
-        setup_tournament_parser(subparsers)
 
-        args, remaining = parser.parse_known_args()
+def main(argv: Sequence[str] | None = None) -> int:
+    """Select an algorithm, parse its command, and hand over execution."""
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    algorithm = _select_algorithm(arguments)
+    parser = build_parser(algorithm)
+    args = parser.parse_args(arguments)
 
-        if args.command is None:
-            parser.print_help()
-            return 0
-
-        # For non-loop commands, unknown args are an error
-        if args.command != "loop" and remaining:
-            parser.error(f"unrecognized arguments: {' '.join(remaining)}")
-
-        # Configure structured logging (supports JSON for cloud deployments)
-        log_level = getattr(args, "log_level", "INFO")
-        component = "trainer" if args.command == "train" else args.command
-        setup_logging(level=log_level, component=component)
-
-        return args.func(args)
-
-    else:
-        # Backwards compatibility: treat as 'train' command
-        parser = argparse.ArgumentParser(
-            description="Cartridge2 AlphaZero-style Trainer",
-            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        )
-        _add_train_arguments(parser)
-        args = parser.parse_args()
-
-        # Configure structured logging (supports JSON for cloud deployments)
-        setup_logging(level=args.log_level, component="trainer")
-
-        return cmd_train(args)
+    log_level = getattr(args, "log_level", "INFO")
+    setup_logging(level=log_level, component=args.command)
+    return args._command_runner(args)
 
 
 if __name__ == "__main__":

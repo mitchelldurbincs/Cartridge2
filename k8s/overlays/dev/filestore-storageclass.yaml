@@ -1,0 +1,16 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: cartridge-dev-filestore-rwx
+  labels:
+    app.kubernetes.io/name: runtime-data
+    app.kubernetes.io/component: storage
+    app.kubernetes.io/part-of: cartridge2
+provisioner: filestore.csi.storage.gke.io
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+parameters:
+  tier: BASIC_HDD
+  # Must match terraform/environments/dev's fixed VPC name.
+  network: cartridge-dev-vpc

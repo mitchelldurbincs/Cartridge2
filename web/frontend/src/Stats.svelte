@@ -1,12 +1,11 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { getStats, getModelInfo, getActorStats, type TrainingStats, type ModelInfo, type ActorStats } from './lib/api';
+  import { getStats, getModelInfo, type TrainingStats, type ModelInfo, type EvalStats } from './lib/api';
   import { STATS_POLL_INTERVAL_MS, MS_PER_SECOND } from './lib/constants';
   import LossChart from './LossChart.svelte';
 
   let stats: TrainingStats | null = $state(null);
   let modelInfo: ModelInfo | null = $state(null);
-  let actorStats: ActorStats | null = $state(null);
   let error: string | null = $state(null);
   let pollInterval: number | undefined;
 
@@ -20,10 +19,9 @@
 
   async function fetchData() {
     try {
-      const [statsResult, modelResult, actorResult] = await Promise.all([
+      const [statsResult, modelResult] = await Promise.all([
         getStats(),
-        getModelInfo(),
-        getActorStats()
+        getModelInfo()
       ]);
 
       // Calculate training speed from delta
@@ -54,7 +52,6 @@
 
       stats = statsResult;
       modelInfo = modelResult;
-      actorStats = actorResult;
       error = null;
     } catch (e) {
       error = 'Failed to fetch data';
@@ -84,16 +81,6 @@
     if (!ts) return '-';
     const date = new Date(ts * MS_PER_SECOND);
     return date.toLocaleTimeString();
-  }
-
-  function formatTimeAgo(ts: number | null | undefined): string {
-    if (!ts) return '-';
-    const now = Date.now() / MS_PER_SECOND;
-    const diff = now - ts;
-    if (diff < 60) return `${Math.floor(diff)}s ago`;
-    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-    return `${Math.floor(diff / 86400)}d ago`;
   }
 
   function formatSpeed(speed: number | null): string {
@@ -127,38 +114,38 @@
     return Math.min(100, (step / total) * 100);
   }
 
-  function formatGradNorm(norm: number | null | undefined): string {
-    if (norm == null) return '-';
-    if (norm >= 100) return norm.toFixed(0);
-    if (norm >= 10) return norm.toFixed(1);
-    return norm.toFixed(2);
+  function formatDigest(digest: string | null): string {
+    if (!digest) return '-';
+    return `${digest.slice(0, 12)}…`;
   }
-
-  function getGradNormColor(norm: number | null | undefined): string {
-    if (norm == null) return '#888';
-    // Green = stable (< 1), Yellow = moderate (1-10), Red = high (> 10)
-    if (norm < 1) return '#4f4';
-    if (norm < 10) return '#fa0';
-    return '#f66';
-  }
-
-  // Get the latest gradient norm from history
-  let latestGradNorm = $derived.by(() => {
-    if (!stats?.history || stats.history.length === 0) return null;
-    // Find the most recent entry with grad_norm
-    for (let i = stats.history.length - 1; i >= 0; i--) {
-      if (stats.history[i].grad_norm != null) {
-        return stats.history[i].grad_norm;
-      }
-    }
-    return null;
-  });
 
   function getWinRateColor(winRate: number | null | undefined): string {
     if (winRate == null) return '#888';  // Gray - no data
     if (winRate >= 0.7) return '#4f4';  // Green - good
     if (winRate >= 0.5) return '#fa0';  // Orange - okay
     return '#f66';  // Red - poor
+  }
+
+  let evaluationHistory = $derived.by(() =>
+    [...(stats?.eval_history ?? [])].sort((left, right) => left.step - right.step)
+  );
+
+  function chartX(history: EvalStats[], index: number): number {
+    if (history.length < 2) return 50;
+    const firstStep = history[0].step;
+    const lastStep = history[history.length - 1].step;
+    if (firstStep === lastStep) return (index / (history.length - 1)) * 100;
+    return ((history[index].step - firstStep) / (lastStep - firstStep)) * 100;
+  }
+
+  function chartY(winRate: number): number {
+    return 60 - Math.max(0, Math.min(1, winRate)) * 60;
+  }
+
+  function chartPoints(history: EvalStats[]): string {
+    return history
+      .map((point, index) => `${chartX(history, index)},${chartY(point.win_rate)}`)
+      .join(' ');
   }
 </script>
 
@@ -172,20 +159,28 @@
     </div>
     {#if modelInfo.loaded}
       <div class="stat-grid model-grid">
-        {#if modelInfo.training_step}
+        {#if modelInfo.training_step != null}
           <div class="stat">
             <span class="label">Training Step</span>
             <span class="value">{modelInfo.training_step.toLocaleString()}</span>
           </div>
         {/if}
         <div class="stat">
-          <span class="label">Model Updated</span>
-          <span class="value">{formatTimeAgo(modelInfo.file_modified)}</span>
-        </div>
-        <div class="stat">
           <span class="label">Loaded At</span>
           <span class="value">{formatTimestamp(modelInfo.loaded_at)}</span>
         </div>
+        {#if modelInfo.checkpoint_id}
+          <div class="stat">
+            <span class="label">Checkpoint ID</span>
+            <span class="value digest" title={modelInfo.checkpoint_id}>{formatDigest(modelInfo.checkpoint_id)}</span>
+          </div>
+        {/if}
+        {#if modelInfo.model_sha256}
+          <div class="stat">
+            <span class="label">Weight Digest</span>
+            <span class="value digest" title={modelInfo.model_sha256}>{formatDigest(modelInfo.model_sha256)}</span>
+          </div>
+        {/if}
       </div>
     {/if}
   {/if}
@@ -240,12 +235,8 @@
         <span class="value">{formatNumber(stats.learning_rate)}</span>
       </div>
       <div class="stat">
-        <span class="label">Grad Norm</span>
-        <span class="value" style="color: {getGradNormColor(latestGradNorm)}">{formatGradNorm(latestGradNorm)}</span>
-      </div>
-      <div class="stat">
-        <span class="label">Replay Buffer</span>
-        <span class="value">{stats.replay_buffer_size.toLocaleString()}</span>
+        <span class="label">Replay Records</span>
+        <span class="value">{stats.replay_record_count.toLocaleString()}</span>
       </div>
       <div class="stat">
         <span class="label">Last Update</span>
@@ -263,73 +254,60 @@
       <hr class="divider" />
       <h2>Model Evaluation</h2>
 
-      <!-- Main Evaluation Display -->
-      <div class="eval-cards">
-        <!-- VS Best Model -->
-        <div class="eval-card" class:new-best={stats.last_eval.became_new_best}>
-          <div class="eval-card-header">
-            <span class="opponent-label">vs Best Model</span>
-            {#if stats.last_eval.opponent_iteration}
-              <span class="opponent-iter">(iter {stats.last_eval.opponent_iteration})</span>
-            {/if}
-          </div>
-          <div class="win-rate-value" style="color: {getWinRateColor(stats.last_eval.win_rate)}">
-            {formatPercent(stats.last_eval.win_rate)}
-          </div>
-          {#if stats.last_eval.became_new_best}
-            <div class="new-best-badge">🎉 New Best!</div>
-          {/if}
-          <div class="eval-details">
-            <span>Draw: {formatPercent(stats.last_eval.draw_rate)}</span>
-            <span>Loss: {formatPercent(stats.last_eval.loss_rate)}</span>
-          </div>
+      <div class="eval-card">
+        <div class="eval-card-header">
+          <span class="opponent-label">vs Random</span>
         </div>
-
-        <!-- VS Random (if available) -->
-        {#if stats.last_eval.vs_random_win_rate != null}
-          <div class="eval-card">
-            <div class="eval-card-header">
-              <span class="opponent-label">vs Random</span>
-            </div>
-            <div class="win-rate-value" style="color: {getWinRateColor(stats.last_eval.vs_random_win_rate)}">
-              {formatPercent(stats.last_eval.vs_random_win_rate)}
-            </div>
-            <div class="eval-details">
-              <span>Draw: {formatPercent(stats.last_eval.vs_random_draw_rate)}</span>
-            </div>
-          </div>
-        {/if}
+        <div class="win-rate-value" style="color: {getWinRateColor(stats.last_eval.win_rate)}">
+          {formatPercent(stats.last_eval.win_rate)}
+        </div>
+        <div class="eval-details">
+          <span>Draw: {formatPercent(stats.last_eval.draw_rate)}</span>
+          <span>Loss: {formatPercent(stats.last_eval.loss_rate)}</span>
+        </div>
       </div>
 
       <div class="stat-grid">
         <div class="stat">
-          <span class="label">Iteration</span>
-          <span class="value">{stats.last_eval.current_iteration || '-'}</span>
+          <span class="label">Evaluated Step</span>
+          <span class="value">{stats.last_eval.step.toLocaleString()}</span>
         </div>
         <div class="stat">
-          <span class="label">Games per Eval</span>
-          <span class="value">{stats.last_eval.games_played}</span>
+          <span class="label">Games</span>
+          <span class="value">{stats.last_eval.games_played.toLocaleString()}</span>
+        </div>
+        <div class="stat">
+          <span class="label">Average Length</span>
+          <span class="value">{stats.last_eval.avg_game_length.toFixed(1)}</span>
+        </div>
+        <div class="stat">
+          <span class="label">Evaluated At</span>
+          <span class="value">{formatTimestamp(stats.last_eval.timestamp)}</span>
         </div>
       </div>
 
-      <!-- Win Rate History Chart (vs Best) -->
-      {#if stats.eval_history && stats.eval_history.length > 1}
+      {#if evaluationHistory.length > 1}
         <div class="chart-container">
-          <h3>Win Rate vs Best Over Time</h3>
-          <div class="mini-chart">
-            {#each stats.eval_history as evalPoint}
-              <div
-                class="chart-bar"
-                class:new-best-bar={evalPoint.became_new_best}
-                style="height: {evalPoint.win_rate * 100}%; background: {evalPoint.became_new_best ? '#ffd700' : getWinRateColor(evalPoint.win_rate)}"
-                title="Iter {evalPoint.current_iteration}: {formatPercent(evalPoint.win_rate)}{evalPoint.became_new_best ? ' 🏆' : ''}"
-              ></div>
+          <h3>Win Rate by Training Step</h3>
+          <svg class="win-rate-chart" viewBox="0 0 100 60" preserveAspectRatio="none" role="img">
+            <title>Win rate against random by training step</title>
+            <line class="chart-baseline" x1="0" y1="30" x2="100" y2="30"></line>
+            <polyline class="chart-line" points={chartPoints(evaluationHistory)}></polyline>
+            {#each evaluationHistory as evalPoint, index}
+              <circle
+                class="chart-point"
+                cx={chartX(evaluationHistory, index)}
+                cy={chartY(evalPoint.win_rate)}
+                r="1.8"
+              >
+                <title>Step {evalPoint.step}: {formatPercent(evalPoint.win_rate)}</title>
+              </circle>
             {/each}
-          </div>
+          </svg>
           <div class="chart-labels">
-            <span>0%</span>
-            <span>55% threshold</span>
-            <span>100%</span>
+            <span>Step {evaluationHistory[0].step.toLocaleString()}</span>
+            <span>50% win rate</span>
+            <span>Step {evaluationHistory[evaluationHistory.length - 1].step.toLocaleString()}</span>
           </div>
         </div>
       {/if}
@@ -344,47 +322,6 @@
     <p class="hint">Start the Python trainer to see stats here.</p>
   {/if}
 
-  <!-- Actor Self-Play Stats Section -->
-  {#if actorStats && actorStats.episodes_completed > 0}
-    <hr class="divider" />
-    <h2>Self-Play Stats</h2>
-    <div class="stat-grid">
-      <div class="stat">
-        <span class="label">Episodes</span>
-        <span class="value">{actorStats.episodes_completed.toLocaleString()}</span>
-      </div>
-      <div class="stat">
-        <span class="label">Ep/sec</span>
-        <span class="value speed-value">{actorStats.episodes_per_second.toFixed(2)}</span>
-      </div>
-      <div class="stat">
-        <span class="label">Avg Length</span>
-        <span class="value">{actorStats.avg_episode_length.toFixed(1)}</span>
-      </div>
-      <div class="stat">
-        <span class="label">MCTS Inference</span>
-        <span class="value">{(actorStats.mcts_avg_inference_us / 1000).toFixed(1)}ms</span>
-      </div>
-    </div>
-
-    <!-- Outcome Distribution -->
-    {#if actorStats.player1_wins + actorStats.player2_wins + actorStats.draws > 0}
-      {@const total = actorStats.player1_wins + actorStats.player2_wins + actorStats.draws}
-      {@const p1Pct = (actorStats.player1_wins / total) * 100}
-      {@const p2Pct = (actorStats.player2_wins / total) * 100}
-      {@const drawPct = (actorStats.draws / total) * 100}
-      <div class="outcome-bar">
-        <div class="outcome-segment p1-wins" style="width: {p1Pct}%" title="P1 Wins: {actorStats.player1_wins} ({p1Pct.toFixed(1)}%)"></div>
-        <div class="outcome-segment draws" style="width: {drawPct}%" title="Draws: {actorStats.draws} ({drawPct.toFixed(1)}%)"></div>
-        <div class="outcome-segment p2-wins" style="width: {p2Pct}%" title="P2 Wins: {actorStats.player2_wins} ({p2Pct.toFixed(1)}%)"></div>
-      </div>
-    {/if}
-    <div class="outcome-legend">
-      <span class="legend-item"><span class="dot p1"></span>P1: {actorStats.player1_wins}</span>
-      <span class="legend-item"><span class="dot draw"></span>Draw: {actorStats.draws}</span>
-      <span class="legend-item"><span class="dot p2"></span>P2: {actorStats.player2_wins}</span>
-    </div>
-  {/if}
 </div>
 
 <style>
@@ -509,6 +446,13 @@
     color: #fff;
   }
 
+  .value.digest {
+    display: block;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.9rem;
+    overflow-wrap: anywhere;
+  }
+
   .error {
     color: #f66;
   }
@@ -524,23 +468,12 @@
   }
 
   /* Evaluation styles */
-  .eval-cards {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 0.75rem;
-    margin-bottom: 1rem;
-  }
-
   .eval-card {
     background: #3a3a5a;
     padding: 1rem;
     border-radius: 8px;
     text-align: center;
-  }
-
-  .eval-card.new-best {
-    background: linear-gradient(135deg, #2a4a2a, #3a5a3a);
-    border: 1px solid #4f4;
+    margin-bottom: 1rem;
   }
 
   .eval-card-header {
@@ -553,23 +486,11 @@
     font-weight: bold;
   }
 
-  .opponent-iter {
-    font-size: 0.75rem;
-    color: #888;
-    margin-left: 0.25rem;
-  }
-
   .win-rate-value {
     font-size: 2rem;
     font-weight: bold;
     line-height: 1;
     margin: 0.5rem 0;
-  }
-
-  .new-best-badge {
-    font-size: 0.85rem;
-    color: #4f4;
-    margin-bottom: 0.5rem;
   }
 
   .eval-details {
@@ -580,11 +501,7 @@
     color: #888;
   }
 
-  .new-best-bar {
-    border: 1px solid #ffd700;
-  }
-
-  /* Mini chart styles */
+  /* Evaluation history chart */
   .chart-container {
     margin-top: 1rem;
   }
@@ -596,22 +513,33 @@
     font-weight: normal;
   }
 
-  .mini-chart {
-    display: flex;
-    align-items: flex-end;
-    gap: 2px;
-    height: 60px;
-    padding: 0.5rem;
+  .win-rate-chart {
+    display: block;
+    width: 100%;
+    height: 90px;
     background: #3a3a5a;
     border-radius: 8px;
+    overflow: visible;
   }
 
-  .chart-bar {
-    flex: 1;
-    min-width: 4px;
-    max-width: 20px;
-    border-radius: 2px 2px 0 0;
-    transition: height 0.3s ease;
+  .chart-baseline {
+    stroke: #666;
+    stroke-width: 0.5;
+    stroke-dasharray: 2 2;
+  }
+
+  .chart-line {
+    fill: none;
+    stroke: #00d9ff;
+    stroke-width: 1.5;
+    vector-effect: non-scaling-stroke;
+  }
+
+  .chart-point {
+    fill: #00ff88;
+    stroke: #1a1a2e;
+    stroke-width: 0.75;
+    vector-effect: non-scaling-stroke;
   }
 
   .chart-labels {
@@ -622,62 +550,4 @@
     margin-top: 0.25rem;
   }
 
-  /* Actor stats outcome bar */
-  .outcome-bar {
-    display: flex;
-    height: 12px;
-    border-radius: 6px;
-    overflow: hidden;
-    background: #3a3a5a;
-    margin-top: 1rem;
-  }
-
-  .outcome-segment {
-    transition: width 0.3s ease;
-  }
-
-  .outcome-segment.p1-wins {
-    background: #4f4;
-  }
-
-  .outcome-segment.draws {
-    background: #888;
-  }
-
-  .outcome-segment.p2-wins {
-    background: #f66;
-  }
-
-  .outcome-legend {
-    display: flex;
-    justify-content: center;
-    gap: 1.5rem;
-    margin-top: 0.5rem;
-    font-size: 0.8rem;
-    color: #aaa;
-  }
-
-  .legend-item {
-    display: flex;
-    align-items: center;
-    gap: 0.3rem;
-  }
-
-  .dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-  }
-
-  .dot.p1 {
-    background: #4f4;
-  }
-
-  .dot.draw {
-    background: #888;
-  }
-
-  .dot.p2 {
-    background: #f66;
-  }
 </style>

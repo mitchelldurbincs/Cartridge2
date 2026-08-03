@@ -1,12 +1,9 @@
 //! Dynamic-width legal action mask.
 //!
-//! Replaces the `u64` legal-move bitmasks that capped games at 64 actions
-//! (and silently collided with the player/winner fields packed into
-//! `info_bits` beyond 16 actions). A `LegalMask` holds one bit per action
-//! for any action-space size.
+//! A `LegalMask` holds one bit per action for any action-space size.
 //!
 //! The authoritative source of legality is the observation: every game
-//! writes a 0.0/1.0 legal-move plane at `GameMetadata::legal_mask_offset`.
+//! writes a 0.0/1.0 legal-move plane at the board profile's declared offset.
 //! Use [`LegalMask::from_obs`] to read it.
 
 /// Bit mask of legal actions with no fixed width limit.
@@ -39,7 +36,7 @@ impl LegalMask {
         mask
     }
 
-    /// Create from a legacy `u64` bitmask. Only the low `num_actions` bits
+    /// Create from a compact `u64` bitmask. Only the low `num_actions` bits
     /// are used; `num_actions` must be at most 64.
     pub fn from_u64(bits: u64, num_actions: usize) -> Self {
         assert!(num_actions <= 64, "from_u64 requires num_actions <= 64");
@@ -57,26 +54,43 @@ impl LegalMask {
 
     /// Read the legal-move plane out of an encoded observation.
     ///
-    /// The observation is f32 little-endian; values `> 0.5` starting at float
-    /// index `legal_mask_offset` mark legal actions. If the buffer is too
-    /// short, all actions are treated as legal (mirrors the fallback of
-    /// `GameMetadata::extract_legal_mask`).
-    pub fn from_obs(obs: &[u8], legal_mask_offset: usize, num_actions: usize) -> Self {
-        let start = legal_mask_offset * 4;
-        let end = start + num_actions * 4;
+    /// The observation is f32 little-endian; exact `0.0`/`1.0` values starting
+    /// at float index `legal_mask_offset` mark illegal/legal actions. Truncated
+    /// or malformed observations are contract errors, never an all-legal mask.
+    pub fn from_obs(
+        obs: &[u8],
+        legal_mask_offset: usize,
+        num_actions: usize,
+    ) -> Result<Self, LegalMaskError> {
+        let start = legal_mask_offset
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or(LegalMaskError::LayoutOverflow)?;
+        let mask_bytes = num_actions
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or(LegalMaskError::LayoutOverflow)?;
+        let end = start
+            .checked_add(mask_bytes)
+            .ok_or(LegalMaskError::LayoutOverflow)?;
         if obs.len() < end {
-            return Self::all_legal(num_actions);
+            return Err(LegalMaskError::ObservationTooShort {
+                expected_at_least: end,
+                actual: obs.len(),
+            });
         }
 
         let mut mask = Self::new(num_actions);
-        for action in 0..num_actions {
-            let at = start + action * 4;
-            let value = f32::from_le_bytes([obs[at], obs[at + 1], obs[at + 2], obs[at + 3]]);
-            if value > 0.5 {
-                mask.set(action);
+        for (action, chunk) in obs[start..end]
+            .chunks_exact(std::mem::size_of::<f32>())
+            .enumerate()
+        {
+            let value = f32::from_le_bytes(chunk.try_into().expect("four-byte chunk"));
+            match value {
+                0.0 => {}
+                1.0 => mask.set(action),
+                _ => return Err(LegalMaskError::InvalidValue { action, value }),
             }
         }
-        mask
+        Ok(mask)
     }
 
     /// Mark an action as legal.
@@ -122,6 +136,21 @@ impl LegalMask {
             .map(move |w| base + w.trailing_zeros() as usize)
         })
     }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum LegalMaskError {
+    #[error("legal mask observation layout overflows the platform size")]
+    LayoutOverflow,
+    #[error(
+        "observation is too short for legal mask: need at least {expected_at_least} bytes, got {actual}"
+    )]
+    ObservationTooShort {
+        expected_at_least: usize,
+        actual: usize,
+    },
+    #[error("legal mask action {action} must be encoded as exactly 0.0 or 1.0, got {value}")]
+    InvalidValue { action: usize, value: f32 },
 }
 
 #[cfg(test)]
@@ -187,6 +216,18 @@ mod tests {
     }
 
     #[test]
+    fn from_obs_rejects_overflowing_layout_before_allocation() {
+        assert_eq!(
+            LegalMask::from_obs(&[], usize::MAX, 1),
+            Err(LegalMaskError::LayoutOverflow)
+        );
+        assert_eq!(
+            LegalMask::from_obs(&[], 0, usize::MAX),
+            Err(LegalMaskError::LayoutOverflow)
+        );
+    }
+
+    #[test]
     fn test_iter_ones() {
         let mut mask = LegalMask::new(257);
         let expected = [0usize, 3, 63, 64, 200, 256];
@@ -211,7 +252,7 @@ mod tests {
             let at = (3 + action) * 4;
             obs[at..at + 4].copy_from_slice(&1.0f32.to_le_bytes());
         }
-        let mask = LegalMask::from_obs(&obs, 3, 5);
+        let mask = LegalMask::from_obs(&obs, 3, 5).unwrap();
         assert_eq!(mask.count_ones(), 2);
         assert!(mask.is_legal(1));
         assert!(mask.is_legal(4));
@@ -219,10 +260,25 @@ mod tests {
     }
 
     #[test]
-    fn test_from_obs_short_buffer_falls_back_to_all_legal() {
+    fn test_from_obs_short_buffer_is_rejected() {
         let obs = vec![0u8; 8];
-        let mask = LegalMask::from_obs(&obs, 3, 5);
-        assert_eq!(mask.count_ones(), 5);
+        assert!(matches!(
+            LegalMask::from_obs(&obs, 3, 5),
+            Err(LegalMaskError::ObservationTooShort { .. })
+        ));
+    }
+
+    #[test]
+    fn test_from_obs_non_binary_value_is_rejected() {
+        let mut obs = vec![0u8; 4];
+        obs.copy_from_slice(&0.75f32.to_le_bytes());
+        assert_eq!(
+            LegalMask::from_obs(&obs, 0, 1),
+            Err(LegalMaskError::InvalidValue {
+                action: 0,
+                value: 0.75
+            })
+        );
     }
 
     #[test]

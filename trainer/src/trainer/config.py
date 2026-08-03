@@ -1,18 +1,55 @@
-"""Trainer configuration and CLI argument helpers.
+"""AlphaZero learner configuration and CLI argument helpers.
 
 This module provides:
-- TrainerConfig dataclass with all training parameters
+- AlphaZeroLearnerConfig dataclass with AlphaZero training parameters
 - CLI field metadata for automatic argparse integration
 - Methods to build and parse CLI arguments
 """
 
 import dataclasses
+import math
 from dataclasses import dataclass, field, fields
 from typing import Any, Callable
 
-from .backoff import DEFAULT_MAX_WAIT, DEFAULT_WAIT_INTERVAL
+from crucible.backoff import DEFAULT_MAX_WAIT, DEFAULT_WAIT_INTERVAL
 
-__all__ = ["TrainerConfig", "cli_field"]
+from .storage.base import ReplaySelection
+
+__all__ = ["AlphaZeroLearnerConfig", "cli_field"]
+
+
+def _strict_integer(value: object, *, name: str, minimum: int) -> int:
+    if type(value) is not int or value < minimum:
+        qualifier = "positive" if minimum == 1 else "nonnegative"
+        raise ValueError(f"{name} must be a {qualifier} integer")
+    return value
+
+
+def _finite_number(
+    value: object,
+    *,
+    name: str,
+    minimum: float,
+    maximum: float | None = None,
+    minimum_inclusive: bool = True,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite number")
+    normalized = float(value)
+    minimum_ok = normalized >= minimum if minimum_inclusive else normalized > minimum
+    if (
+        not math.isfinite(normalized)
+        or not minimum_ok
+        or (maximum is not None and normalized > maximum)
+    ):
+        if maximum is not None:
+            constraint = f"in [{minimum}, {maximum}]"
+        elif minimum_inclusive:
+            constraint = f">= {minimum}"
+        else:
+            constraint = f"> {minimum}"
+        raise ValueError(f"{name} must be a finite number {constraint}")
+    return 0.0 if normalized == 0.0 else normalized
 
 
 def cli_field(
@@ -48,8 +85,8 @@ def cli_field(
 
 
 @dataclass
-class TrainerConfig:
-    """Configuration for the trainer.
+class AlphaZeroLearnerConfig:
+    """Configuration for the AlphaZero learner.
 
     Note: Replay buffer connection is configured via CARTRIDGE_STORAGE_POSTGRES_URL
     environment variable, not a config field.
@@ -114,11 +151,6 @@ class TrainerConfig:
         10, cli="--log-interval", help="Steps between log messages"
     )
 
-    # Checkpoint management
-    max_checkpoints: int = cli_field(
-        10, cli="--max-checkpoints", help="Maximum number of checkpoints to keep"
-    )
-
     # Wait/backoff settings
     wait_interval: float = cli_field(
         DEFAULT_WAIT_INTERVAL,
@@ -130,23 +162,18 @@ class TrainerConfig:
         cli="--max-wait",
         help="Max seconds to wait for DB/data (0 = wait forever)",
     )
-    max_consecutive_empty_batches: int = cli_field(
-        500,
-        cli="--max-empty-batches",
-        help="Max consecutive empty batches before raising an error (0 = unlimited)",
-    )
 
-    # Replay buffer management
+    # Replay-store management
     clear_replay_on_start: bool = cli_field(
         False,
         cli="--clear-replay",
         action="store_true",
-        help="Delete all transitions before training (synchronized AlphaZero)",
+        help="Delete records in the exact replay selection before standalone training",
     )
     replay_window: int = cli_field(
         0,
         cli="--replay-window",
-        help="Keep only the most recent N transitions (0 = disable cleanup)",
+        help="Keep only the most recent N replay records (0 disables cleanup)",
     )
     replay_cleanup_interval: int = cli_field(
         0,
@@ -156,24 +183,12 @@ class TrainerConfig:
             "0 = align with stats-interval)"
         ),
     )
+    # Operational fencing is intentionally excluded from the learner recipe.
+    # A learner cannot start until its caller supplies one exact collection.
+    replay_selection: ReplaySelection | None = field(default=None, repr=False)
 
-    # Step offset for continuous training (checkpoint naming)
-    start_step: int = cli_field(
-        0, cli="--start-step", help="Starting step number for checkpoint naming"
-    )
-
-    # Evaluation settings
-    eval_interval: int = cli_field(
-        100, cli="--eval-interval", help="Steps between evaluations (0 to disable)"
-    )
-    eval_games: int = cli_field(
-        50, cli="--eval-games", help="Number of games per evaluation"
-    )
-
-    # Stats history settings
-    # Should be large enough to hold recent entries (1 per stats_interval steps)
-    # plus downsampled entries from older iterations (~10 per 1000 steps)
-    max_history_length: int = 1000
+    # Internal step offset derived from RunHead or supplied by loop composition.
+    start_step: int = field(default=0)
 
     # Environment
     env_id: str = cli_field("tictactoe", cli="--env-id", help="Environment ID")
@@ -192,6 +207,127 @@ class TrainerConfig:
     # Called as metrics_hook(payload, global_step) at stats_interval cadence;
     # the orchestrator uses it to forward training metrics to W&B.
     metrics_hook: Callable[[dict, int], None] | None = field(default=None, repr=False)
+
+    # Synchronized orchestration stages one final checkpoint/stats pair and
+    # commits it only after parent-owned evaluation. Standalone learners commit
+    # their own RunCommitV1/RunHeadV2 updates.
+    defer_run_commit: bool = field(default=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """Reject malformed or operationally ineffective learner settings."""
+        for name, minimum in (
+            ("batch_size", 1),
+            ("lr_warmup_steps", 0),
+            ("lr_total_steps", 0),
+            ("total_steps", 1),
+            ("checkpoint_interval", 1),
+            ("stats_interval", 1),
+            ("log_interval", 1),
+            ("replay_window", 0),
+            ("replay_cleanup_interval", 0),
+            ("start_step", 0),
+        ):
+            _strict_integer(getattr(self, name), name=name, minimum=minimum)
+
+        for name, minimum, minimum_inclusive, maximum in (
+            ("learning_rate", 0.0, False, None),
+            ("weight_decay", 0.0, True, None),
+            ("value_loss_weight", 0.0, True, None),
+            ("policy_loss_weight", 0.0, True, None),
+            ("grad_clip_norm", 0.0, True, None),
+            ("lr_min_ratio", 0.0, True, 1.0),
+            ("lr_warmup_start_ratio", 0.0, True, 1.0),
+            ("wait_interval", 0.0, False, None),
+            ("max_wait", 0.0, True, None),
+        ):
+            setattr(
+                self,
+                name,
+                _finite_number(
+                    getattr(self, name),
+                    name=name,
+                    minimum=minimum,
+                    maximum=maximum,
+                    minimum_inclusive=minimum_inclusive,
+                ),
+            )
+
+        if self.value_loss_weight == 0.0 and self.policy_loss_weight == 0.0:
+            raise ValueError(
+                "value_loss_weight and policy_loss_weight cannot both be zero"
+            )
+        if self.lr_total_steps and self.lr_total_steps < self.total_steps:
+            raise ValueError("lr_total_steps cannot be less than total_steps")
+        if self.replay_window == 0 and self.replay_cleanup_interval != 0:
+            raise ValueError("replay_cleanup_interval requires a nonzero replay_window")
+
+        for name in ("use_lr_scheduler", "clear_replay_on_start", "defer_run_commit"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a boolean")
+        for name in ("model_dir", "stats_path", "env_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string")
+        if not isinstance(self.device, str) or self.device not in {
+            "auto",
+            "cpu",
+            "cuda",
+            "mps",
+        }:
+            raise ValueError("device must be one of: auto, cpu, cuda, mps")
+        if self.replay_selection is not None and not isinstance(
+            self.replay_selection, ReplaySelection
+        ):
+            raise ValueError("replay_selection must be a ReplaySelection or None")
+        for name in ("shutdown_check", "metrics_hook"):
+            callback = getattr(self, name)
+            if callback is not None and not callable(callback):
+                raise ValueError(f"{name} must be callable or None")
+
+    def learner_recipe(self) -> dict[str, object]:
+        """Return only settings that change AlphaZero learning semantics."""
+        from .algorithms.alphazero_board_v1 import get_game_config
+
+        game = get_game_config(self.env_id)
+        lr_horizon = self.lr_total_steps or self.total_steps
+        cleanup_cadence = (
+            (self.replay_cleanup_interval or self.stats_interval)
+            if self.replay_window > 0
+            else 0
+        )
+        return {
+            "schema_version": 1,
+            "batch_size": self.batch_size,
+            "learning_rate": self.learning_rate,
+            "weight_decay": self.weight_decay,
+            "value_loss_weight": self.value_loss_weight,
+            "policy_loss_weight": self.policy_loss_weight,
+            "grad_clip_norm": self.grad_clip_norm,
+            "use_lr_scheduler": self.use_lr_scheduler,
+            "lr_min_ratio": self.lr_min_ratio,
+            "lr_warmup_steps": self.lr_warmup_steps,
+            "lr_warmup_start_ratio": self.lr_warmup_start_ratio,
+            "lr_horizon_steps": lr_horizon,
+            "training_steps": self.total_steps,
+            "clear_replay_on_start": self.clear_replay_on_start,
+            "replay_window": self.replay_window,
+            "replay_cleanup_cadence": cleanup_cadence,
+            "model_architecture": {
+                "schema_version": 1,
+                "implementation": "alphazero_policy_value_network_v1",
+                "network_type": game.network_type,
+                "observation_elements": game.obs_size,
+                "action_count": game.num_actions,
+                "hidden_size": game.hidden_size,
+                "board_width": game.board_width,
+                "board_height": game.board_height,
+                "observation_spatial_channels": game.obs_channels,
+                "legal_actions_offset": game.legal_mask_offset,
+                "player_relative_observation": game.player_relative_obs,
+                "residual_blocks": game.num_res_blocks,
+                "residual_filters": game.num_filters,
+            },
+        }
 
     def resolve_device(self) -> str:
         """Resolve 'auto' device to the best available: cuda > mps > cpu."""
@@ -250,14 +386,14 @@ class TrainerConfig:
             parser.add_argument(cli_flag, **kwargs)
 
     @classmethod
-    def from_args(cls, args: Any) -> "TrainerConfig":
-        """Construct a TrainerConfig from parsed argparse args.
+    def from_args(cls, args: Any) -> "AlphaZeroLearnerConfig":
+        """Construct an AlphaZeroLearnerConfig from parsed argparse args.
 
         Args:
             args: Parsed argparse namespace.
 
         Returns:
-            TrainerConfig with values from CLI arguments.
+            AlphaZeroLearnerConfig with values from CLI arguments.
         """
         config_kwargs: dict[str, object] = {}
         for f in fields(cls):

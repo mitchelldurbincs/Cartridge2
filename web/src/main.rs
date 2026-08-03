@@ -9,7 +9,6 @@
 //! - GET  /game/state    - Get current game state
 //! - POST /move          - Make a move (player action + bot response)
 //! - GET  /stats         - Read training stats from data/stats.json
-//! - GET  /actor-stats   - Read actor self-play stats from data/actor_stats.json
 //! - GET  /model         - Get info about currently loaded model
 
 use std::sync::Arc;
@@ -25,20 +24,118 @@ mod types;
 
 use engine_config::load_config;
 use game::GameSession;
+#[cfg(all(feature = "onnx", feature = "s3"))]
+use model_watcher::s3::{S3Config, S3ModelWatcher};
 #[cfg(feature = "onnx")]
-use model_watcher::ModelWatcher;
+use model_watcher::{ModelLoadSpec, ModelSelection, ModelWatcher};
 
-use startup::shutdown_signal;
-// Re-export server plumbing so the public paths (`crate::AppState`,
-// `crate::create_app`, `crate::ModelInfo`, ...) stay stable for handlers and tests.
+use algorithm_core::RuntimeProfile;
+
+use startup::{resolve_startup_profile, shutdown_signal};
+// Re-export the server plumbing used by handlers and route tests.
 #[cfg(test)]
 pub use startup::create_test_state;
 pub use startup::{create_app, create_app_with_cors, AppState, ModelInfo, OnnxEvaluator};
 
+#[cfg(feature = "onnx")]
+async fn initialize_model_watcher(
+    storage: &engine_config::StorageConfig,
+    profile: &RuntimeProfile,
+    data_root: &str,
+    startup_profile: &startup::StartupProfile,
+    evaluator: Arc<StdRwLock<Option<OnnxEvaluator>>>,
+) -> anyhow::Result<Arc<StdRwLock<ModelInfo>>> {
+    let obs_size = startup_profile.obs_size;
+    let num_actions = startup_profile.num_actions;
+    let identity = startup_profile.model_contract.clone();
+    let model_spec = ModelLoadSpec::new(
+        obs_size,
+        num_actions,
+        1,
+        startup_profile.max_horizon,
+        identity,
+    )?;
+
+    let (model_info, mut updates) = match storage.model_backend.as_str() {
+        "filesystem" => {
+            let model_dir = profile.model_dir(data_root);
+            tokio::fs::create_dir_all(&model_dir).await?;
+            let watcher = ModelWatcher::new(
+                &model_dir,
+                model_spec,
+                ModelSelection::ChampionOrLatest,
+                evaluator,
+            );
+            let loaded = watcher.try_load_existing()?;
+            info!(
+                component = "web",
+                event = if loaded { "model_loaded" } else { "model_not_found" },
+                channel = %model_dir.join("channels/current.json").display(),
+                "Filesystem model startup check complete"
+            );
+            let model_info = watcher.model_info();
+            let updates = watcher.start_watching().await?;
+            (model_info, updates)
+        }
+        "s3" => {
+            #[cfg(feature = "s3")]
+            {
+                let bucket = storage.s3_bucket.clone().ok_or_else(|| {
+                    anyhow::anyhow!("storage.s3_bucket is required for S3 model watching")
+                })?;
+                let prefix = profile.model_prefix();
+                let watcher = S3ModelWatcher::new(
+                    S3Config {
+                        bucket: bucket.clone(),
+                        prefix: prefix.clone(),
+                        endpoint_url: storage.s3_endpoint.clone(),
+                        region: None,
+                        cache_dir: std::env::temp_dir()
+                            .join("cartridge-model-cache")
+                            .join(profile.storage_prefix()),
+                    },
+                    model_spec,
+                    ModelSelection::ChampionOrLatest,
+                    evaluator,
+                )
+                .await?;
+                let loaded = watcher.try_load_existing().await?;
+                info!(
+                    component = "web",
+                    event = if loaded { "model_loaded" } else { "model_not_found" },
+                    channel = %format!("s3://{bucket}/{prefix}/channels/current.json"),
+                    "S3 model startup check complete"
+                );
+                let model_info = watcher.model_info();
+                let updates = watcher.start_watching().await?;
+                (model_info, updates)
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                anyhow::bail!(
+                    "storage.model_backend is 's3' but the web binary was built without the s3 feature"
+                )
+            }
+        }
+        backend => anyhow::bail!("unsupported model storage backend '{backend}'"),
+    };
+
+    tokio::spawn(async move {
+        while updates.recv().await.is_some() {
+            info!(
+                component = "web",
+                event = "model_updated",
+                "Model updated - future games will use the new model"
+            );
+        }
+    });
+    Ok(model_info)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Load configuration first (needed for logging config)
-    let config = load_config();
+    let config = load_config()?;
 
     // Initialize tracing with JSON support for cloud deployments
     engine_config::init_tracing("info", &["web=info"], &config.logging);
@@ -48,15 +145,29 @@ async fn main() -> anyhow::Result<()> {
     info!(component = "web", "Prometheus metrics initialized");
 
     // Register all games
-    engine_games::register_all_games();
+    engine_games::register_all_environments();
     info!(component = "web", "Registered all games");
 
-    let data_dir = config.common.data_dir.clone();
+    let data_root = config.common.data_dir.clone();
     let default_game = config.common.env_id.clone();
+    let startup_profile = resolve_startup_profile(&config.algorithm.id, &default_game)?;
+    let algorithm = startup_profile.algorithm.descriptor();
+    let runtime_profile = RuntimeProfile::new(
+        algorithm.id,
+        default_game.clone(),
+        startup_profile.env_contract_version,
+    )?;
+    let data_dir = runtime_profile.data_dir(&data_root).display().to_string();
     info!(
         component = "web",
+        data_root = %data_root,
         data_dir = %data_dir,
         default_game = %default_game,
+        algorithm = algorithm.id,
+        model_contract = %startup_profile.model_contract.model_contract,
+        observation_elements = startup_profile.obs_size,
+        action_count = startup_profile.num_actions,
+        max_horizon = startup_profile.max_horizon,
         host = %config.web.host,
         port = config.web.port,
         "Web server configuration loaded"
@@ -67,81 +178,14 @@ async fn main() -> anyhow::Result<()> {
     let evaluator: Arc<StdRwLock<Option<OnnxEvaluator>>> = Arc::new(StdRwLock::new(None));
 
     #[cfg(feature = "onnx")]
-    let model_info = {
-        use engine_core::EngineContext;
-        use tracing::warn;
-        let model_dir = format!("{}/models", data_dir);
-        // Get obs_size from the configured game, falling back to tictactoe if not found
-        let obs_size = EngineContext::new(&default_game)
-            .or_else(|| {
-                warn!(
-                    component = "web",
-                    game = %default_game,
-                    "Game not found, falling back to tictactoe for obs_size"
-                );
-                EngineContext::new("tictactoe")
-            })
-            .map(|ctx| ctx.metadata().obs_size)
-            .expect("At least tictactoe should be registered");
-        info!(
-            component = "web",
-            obs_size = obs_size,
-            game = %default_game,
-            "Model watcher initialized"
-        );
-
-        // Create model watcher with metadata tracking for the web UI
-        // Use 1 intra-op thread since web server does single-threaded inference for play
-        let model_watcher = ModelWatcher::new(
-            &model_dir,
-            "latest.onnx",
-            obs_size,
-            1,
-            Arc::clone(&evaluator),
-        )
-        .with_metadata();
-
-        // Try to load existing model
-        match model_watcher.try_load_existing() {
-            Ok(true) => info!(
-                component = "web",
-                event = "model_loaded",
-                model_path = %format!("{}/latest.onnx", model_dir),
-                "Loaded existing model"
-            ),
-            Ok(false) => info!(
-                component = "web",
-                event = "model_not_found",
-                model_path = %format!("{}/latest.onnx", model_dir),
-                "No model found - bot will play randomly"
-            ),
-            Err(e) => warn!(
-                component = "web",
-                event = "model_load_error",
-                error = %e,
-                "Failed to load existing model - bot will play randomly"
-            ),
-        }
-
-        // Get model info reference before moving watcher
-        let model_info = model_watcher.model_info();
-
-        // Start watching for model updates
-        let mut model_rx = model_watcher.start_watching().await?;
-
-        // Spawn task to log model updates
-        tokio::spawn(async move {
-            while model_rx.recv().await.is_some() {
-                info!(
-                    component = "web",
-                    event = "model_updated",
-                    "Model updated - bot will use new model for future games"
-                );
-            }
-        });
-
-        model_info
-    };
+    let model_info = initialize_model_watcher(
+        &config.storage,
+        &runtime_profile,
+        &data_root,
+        &startup_profile,
+        Arc::clone(&evaluator),
+    )
+    .await?;
 
     #[cfg(not(feature = "onnx"))]
     let model_info = Arc::new(StdRwLock::new(ModelInfo::default()));
@@ -158,7 +202,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Build router with CORS configuration
-    let app = create_app_with_cors(state, &config.web.allowed_origins);
+    let app = create_app_with_cors(state, &config.web.allowed_origins)?;
 
     let addr = format!("{}:{}", config.web.host, config.web.port);
     info!(

@@ -1,10 +1,16 @@
-//! Actor implementation using engine-core library directly
+//! AlphaZero self-play collector using engine-core directly.
 
+use algorithm_core::{resolve_algorithm, RuntimeProfile};
 use anyhow::{anyhow, Result};
-use engine_core::EngineContext;
+use engine_core::board_profile::BoardGameMetadata;
+use engine_core::{
+    AgentId, Capabilities, Decision, EngineContext, EpisodeStatus, ErasedTimestep, TransitionSource,
+};
 use indicatif::{ProgressBar, ProgressStyle};
 use mcts::{MctsConfig, SearchStats};
-use model_watcher::ModelWatcher;
+#[cfg(feature = "s3")]
+use model_watcher::s3::{S3Config, S3ModelWatcher};
+use model_watcher::{ModelInfo, ModelLoadSpec, ModelSelection, ModelWatcher};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Mutex, MutexGuard,
@@ -12,13 +18,14 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
+use crate::algorithms::encode_experience;
 use crate::config::Config;
-use crate::game_config::{get_config, GameConfig};
-use crate::health::HealthState;
 use crate::mcts_policy::MctsPolicy;
-use crate::metrics;
+use crate::resources::rss_mb;
 use crate::stats::ActorStats;
-use crate::storage::{create_replay_store, ReplayStore, StorageConfig, Transition};
+use crate::storage::{
+    create_replay_store, ReplayProfile, ReplaySelection, ReplayStore, StorageConfig,
+};
 
 /// Context for a single episode, containing metadata and timing information.
 struct EpisodeContext {
@@ -102,30 +109,6 @@ impl EpisodeStats {
     }
 }
 
-/// Wall-clock seconds granted per move of a game's horizon when deriving the
-/// floor for an episode's timeout.
-///
-/// `episode_timeout_secs` is a single global setting, but episode cost scales
-/// with game length: a generals episode runs ~400 plies to connect4's ~25, at
-/// the same simulation count per ply. A timeout tuned for a short game turns
-/// into a data filter on a long one — and a biased filter, because the
-/// episodes it kills are the long ones. Treat the configured value as a floor
-/// and guarantee every game at least this much per move of its horizon. This
-/// only ever raises the budget, never lowers an explicitly configured one.
-const TIMEOUT_SECS_PER_MOVE: u64 = 1;
-
-/// The wall-clock budget a single episode actually gets, after the horizon
-/// floor is applied to the configured value.
-///
-/// Shared with the liveness probe: the health check must never be tighter than
-/// the budget an episode is legitimately allowed to use, or a long-but-healthy
-/// episode gets the process killed before it can finish. Deriving both from
-/// this one function is what keeps them consistent.
-pub(crate) fn effective_episode_timeout_secs(timeout_secs: u64, max_horizon: u32) -> u64 {
-    let horizon_floor = (max_horizon.max(1) as u64).saturating_mul(TIMEOUT_SECS_PER_MOVE);
-    timeout_secs.max(horizon_floor)
-}
-
 impl EpisodeContext {
     /// Create a new episode context with generated ID and timing.
     fn new(
@@ -136,8 +119,9 @@ impl EpisodeContext {
     ) -> Result<Self> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
         let id = format!("{}-ep-{}-{}", actor_id, episode_count, now.as_secs());
-        let timeout =
-            Duration::from_secs(effective_episode_timeout_secs(timeout_secs, max_horizon));
+        // This value is part of the authenticated RunRecipe and is therefore
+        // the exact terminal bound, never an input to a hidden derived floor.
+        let timeout = Duration::from_secs(timeout_secs);
         // Use 10x max_horizon as generous upper bound to protect against infinite loops
         let max_steps = max_horizon.saturating_mul(10).max(1000);
 
@@ -171,8 +155,11 @@ impl EpisodeContext {
 pub(crate) enum AbandonReason {
     /// The wall-clock budget ran out.
     Timeout,
-    /// The step guard tripped: the game never reported `done`.
+    /// The step guard tripped before the environment terminated.
     MaxSteps,
+    /// The environment ended without a terminal outcome, so AlphaZero value
+    /// targets cannot be constructed.
+    EnvironmentTruncated,
 }
 
 impl AbandonReason {
@@ -180,6 +167,21 @@ impl AbandonReason {
         match self {
             AbandonReason::Timeout => "timeout",
             AbandonReason::MaxSteps => "max_steps",
+            AbandonReason::EnvironmentTruncated => "environment_truncated",
+        }
+    }
+
+    fn guidance(self) -> &'static str {
+        match self {
+            AbandonReason::Timeout => {
+                "increase actor.episode_timeout_secs if timeouts persist"
+            }
+            AbandonReason::MaxSteps => {
+                "fix the environment termination contract or increase its declared horizon"
+            }
+            AbandonReason::EnvironmentTruncated => {
+                "AlphaZero requires terminal outcomes; use a cartridge that supports truncation or change the environment contract"
+            }
         }
     }
 }
@@ -187,19 +189,18 @@ impl AbandonReason {
 /// Result of one self-play episode attempt.
 #[derive(Debug)]
 pub(crate) enum EpisodeOutcome {
-    /// Reached a terminal state; its transitions were stored.
+    /// Reached a terminal state; its training experiences were stored.
     Completed {
         steps: u32,
-        total_reward: f32,
+        player_one_outcome: f32,
         stats: EpisodeStats,
     },
-    /// Ended early, so its transitions were **discarded**.
+    /// Ended early, so its pending experiences were **discarded**.
     ///
     /// Without a terminal state there is no game outcome to backfill, and
-    /// value targets are the game outcome. Storing the episode anyway would
-    /// push the trainer onto its `mcts_value` fallback, which degrades
-    /// training quietly rather than loudly. Dropping it is correct — but the
-    /// caller must account for the loss so it can never pass unnoticed.
+    /// value targets are the game outcome. The AlphaZero v1 payload requires a
+    /// terminal target, so no valid record exists for this episode. The caller
+    /// must account for the loss so it can never pass unnoticed.
     Abandoned {
         reason: AbandonReason,
         steps: u32,
@@ -210,128 +211,453 @@ pub(crate) enum EpisodeOutcome {
     },
 }
 
-pub struct Actor {
+pub struct AlphaZeroCollector {
     config: Config,
-    game_config: GameConfig,
+    replay_selection: ReplaySelection,
+    board_metadata: BoardGameMetadata,
     engine: Mutex<EngineContext>,
     mcts_policy: Mutex<MctsPolicy>,
     replay: Arc<dyn ReplayStore>,
     episode_count: AtomicU32,
     shutdown_signal: AtomicBool,
-    model_watcher: Option<ModelWatcher>,
     stats: ActorStats,
 }
 
-impl Actor {
-    pub async fn new(config: Config) -> Result<Self> {
-        // Register all games
-        engine_games::register_all_games();
+/// One transition retained in memory until a terminal outcome is available.
+///
+/// The acting agent is part of the AlphaZero cartridge's target semantics,
+/// not the storage envelope, so it is kept alongside the row only while the
+/// episode is being assembled.
+struct PendingExperience {
+    actor: AgentId,
+    step_number: u32,
+    observation: Vec<u8>,
+    policy_target: Vec<f32>,
+}
 
-        // Get game configuration from registry
-        let game_config = get_config(&config.env_id)?;
-        info!(
-            "Loaded game config for {}: {} actions, {} obs size",
-            config.env_id, game_config.num_actions, game_config.obs_size
-        );
+fn require_max_horizon(capabilities: &Capabilities) -> Result<u32> {
+    capabilities
+        .max_horizon
+        .filter(|horizon| *horizon > 0)
+        .ok_or_else(|| {
+            anyhow!(
+                "AlphaZero environment '{}' must declare a finite non-zero max_horizon",
+                capabilities.id.env_id
+            )
+        })
+}
+
+fn require_reachable_temperature_threshold(temp_threshold: u32, max_horizon: u32) -> Result<()> {
+    if temp_threshold > 0 && temp_threshold >= max_horizon {
+        return Err(anyhow!(
+            "temp_threshold {temp_threshold} must be zero or less than environment max_horizon {max_horizon}; otherwise late_temperature is unreachable"
+        ));
+    }
+    Ok(())
+}
+
+fn require_two_player_outcomes(timestep: &ErasedTimestep) -> Result<()> {
+    if timestep.outcomes.len() != 2 {
+        return Err(anyhow!(
+            "AlphaZero timestep must contain exactly two agent outcomes, got {}",
+            timestep.outcomes.len()
+        ));
+    }
+
+    for agent_id in [AgentId(1), AgentId(2)] {
+        let matching = timestep
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome.agent_id == agent_id)
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Err(anyhow!(
+                "AlphaZero timestep must contain exactly one outcome for agent {}, got {}",
+                agent_id.0,
+                matching.len()
+            ));
+        }
+        let outcome = matching[0];
+        if !outcome.reward.is_finite() {
+            return Err(anyhow!(
+                "AlphaZero timestep contains non-finite reward for agent {}",
+                agent_id.0
+            ));
+        }
+        let expected_flags = match timestep.episode {
+            EpisodeStatus::Running => !outcome.terminated && !outcome.truncated,
+            EpisodeStatus::Terminated => outcome.terminated && !outcome.truncated,
+            EpisodeStatus::Truncated => !outcome.terminated && outcome.truncated,
+        };
+        if !expected_flags {
+            return Err(anyhow!(
+                "outcome flags for agent {} disagree with episode status {:?}",
+                agent_id.0,
+                timestep.episode
+            ));
+        }
+    }
+
+    let player_one = timestep
+        .reward_for(AgentId(1))
+        .expect("validated outcome for agent 1");
+    let player_two = timestep
+        .reward_for(AgentId(2))
+        .expect("validated outcome for agent 2");
+    match timestep.episode {
+        EpisodeStatus::Running | EpisodeStatus::Truncated
+            if player_one != 0.0 || player_two != 0.0 =>
+        {
+            Err(anyhow!(
+                "AlphaZero terminal-only reward contract emitted rewards ({player_one}, {player_two}) for {:?} episode",
+                timestep.episode
+            ))
+        }
+        EpisodeStatus::Terminated if (player_one + player_two).abs() > 1e-6 => Err(anyhow!(
+            "AlphaZero terminal rewards must be zero-sum, got ({player_one}, {player_two})"
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn require_active_position(timestep: &ErasedTimestep) -> Result<(AgentId, &[u8])> {
+    if timestep.episode != EpisodeStatus::Running {
+        return Err(anyhow!(
+            "AlphaZero action selection requires a running episode, got {:?}",
+            timestep.episode
+        ));
+    }
+    let active_agent = match &timestep.decision {
+        Decision::Agents { agent_ids } if agent_ids.len() == 1 => agent_ids[0],
+        decision => {
+            return Err(anyhow!(
+                "AlphaZero requires exactly one acting agent, got {decision:?}"
+            ))
+        }
+    };
+    if !matches!(active_agent, AgentId(1) | AgentId(2)) {
+        return Err(anyhow!(
+            "AlphaZero active agent must be seat 1 or 2, got {}",
+            active_agent.0
+        ));
+    }
+    let observation = timestep.sole_observation()?;
+    if observation.agent_id != active_agent {
+        return Err(anyhow!(
+            "AlphaZero observation belongs to agent {}, but decision belongs to agent {}",
+            observation.agent_id.0,
+            active_agent.0
+        ));
+    }
+    Ok((active_agent, observation.data.as_slice()))
+}
+
+fn require_reset_timestep(timestep: &ErasedTimestep) -> Result<(AgentId, &[u8])> {
+    if timestep.source != TransitionSource::Reset {
+        return Err(anyhow!(
+            "environment reset returned non-reset transition source {:?}",
+            timestep.source
+        ));
+    }
+    require_two_player_outcomes(timestep)?;
+    require_active_position(timestep)
+}
+
+fn require_step_timestep(timestep: &ErasedTimestep, expected_actor: AgentId) -> Result<f32> {
+    let actor = match &timestep.source {
+        TransitionSource::Agents { agent_ids } if agent_ids.len() == 1 => agent_ids[0],
+        source => {
+            return Err(anyhow!(
+                "AlphaZero step must report exactly one acting agent, got {source:?}"
+            ))
+        }
+    };
+    if actor != expected_actor {
+        return Err(anyhow!(
+            "environment reported acting agent {}, expected {}",
+            actor.0,
+            expected_actor.0
+        ));
+    }
+
+    require_two_player_outcomes(timestep)?;
+    let actor_reward = timestep
+        .reward_for(actor)
+        .ok_or_else(|| anyhow!("missing reward for acting agent {}", actor.0))?;
+    let observation = timestep.sole_observation()?;
+
+    match timestep.episode {
+        EpisodeStatus::Running => {
+            let (next_actor, _) = require_active_position(timestep)?;
+            if next_actor == actor {
+                return Err(anyhow!(
+                    "AlphaZero alternating-turn contract kept agent {} active after its step",
+                    actor.0
+                ));
+            }
+        }
+        EpisodeStatus::Terminated | EpisodeStatus::Truncated => {
+            if timestep.decision != Decision::None {
+                return Err(anyhow!(
+                    "completed AlphaZero timestep must have no next decision, got {:?}",
+                    timestep.decision
+                ));
+            }
+            if !matches!(observation.agent_id, AgentId(1) | AgentId(2)) {
+                return Err(anyhow!(
+                    "terminal AlphaZero observation has unknown agent {}",
+                    observation.agent_id.0
+                ));
+            }
+        }
+    }
+
+    Ok(actor_reward)
+}
+
+enum RuntimeModelWatcher {
+    Filesystem(ModelWatcher),
+    #[cfg(feature = "s3")]
+    S3(S3ModelWatcher),
+}
+
+impl RuntimeModelWatcher {
+    async fn try_load_existing(&self) -> Result<bool> {
+        match self {
+            Self::Filesystem(watcher) => watcher.try_load_existing(),
+            #[cfg(feature = "s3")]
+            Self::S3(watcher) => watcher.try_load_existing().await,
+        }
+    }
+
+    fn model_info(&self) -> Arc<std::sync::RwLock<ModelInfo>> {
+        match self {
+            Self::Filesystem(watcher) => watcher.model_info(),
+            #[cfg(feature = "s3")]
+            Self::S3(watcher) => watcher.model_info(),
+        }
+    }
+}
+
+fn require_source_checkpoint(
+    expected_source_checkpoint_id: Option<&str>,
+    loaded: bool,
+    model_info: &ModelInfo,
+) -> Result<()> {
+    match expected_source_checkpoint_id {
+        None if loaded || model_info.loaded || model_info.checkpoint_id.is_some() => Err(anyhow!(
+            "root collection requires an absent RunHead, but checkpoint '{}' was loaded",
+            model_info.checkpoint_id.as_deref().unwrap_or("unknown")
+        )),
+        None => Ok(()),
+        Some(expected) if !loaded || !model_info.loaded => Err(anyhow!(
+            "collection requires source checkpoint '{expected}', but no RunHead model was loaded"
+        )),
+        Some(expected) if model_info.checkpoint_id.as_deref() != Some(expected) => Err(anyhow!(
+            "loaded RunHead checkpoint '{}' does not match required source checkpoint '{expected}'",
+            model_info.checkpoint_id.as_deref().unwrap_or("unknown")
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+impl AlphaZeroCollector {
+    pub async fn new(config: Config) -> Result<Self> {
+        config.validate()?;
+        let eval_batch_size = usize::try_from(config.eval_batch_size)
+            .map_err(|_| anyhow!("eval_batch_size does not fit this platform's usize"))?;
+        let onnx_intra_threads = usize::try_from(config.onnx_intra_threads)
+            .map_err(|_| anyhow!("onnx_intra_threads does not fit this platform's usize"))?;
+
+        // Register all games
+        engine_games::register_all_environments();
 
         // Create engine context for the specified game
         let engine = EngineContext::new(&config.env_id)
-            .ok_or_else(|| anyhow!("Game '{}' not registered", config.env_id))?;
+            .map_err(|error| anyhow!("Environment '{}' is unavailable: {error}", config.env_id))?;
+
+        let algorithm = resolve_algorithm(&config.algorithm_id)?;
+        let compatibility = algorithm.compatibility(&engine);
+        compatibility.require_compatible()?;
+        let algorithm = algorithm.descriptor();
+        info!(
+            algorithm = algorithm.id,
+            env_id = %config.env_id,
+            model_contract = algorithm.components.model_contract,
+            experience_schema = algorithm.components.experience_schema,
+            "Algorithm compatibility validated"
+        );
+        debug!(
+            algorithm = algorithm.id,
+            assumptions = ?compatibility.unverified_assumptions,
+            "Environment semantics not yet machine-verifiable"
+        );
 
         let caps = engine.capabilities();
+        let max_horizon = require_max_horizon(&caps)?;
+        require_reachable_temperature_threshold(config.temp_threshold, max_horizon)?;
+        let environment_metadata = engine.metadata();
+        let board_metadata = environment_metadata.require_board()?.clone();
         info!(
             "Actor {} initialized for environment {}",
             config.actor_id, caps.id.env_id
         );
         info!(
             "Game capabilities: max_horizon={}, preferred_batch={}",
-            caps.max_horizon, caps.preferred_batch
+            max_horizon, caps.preferred_batch
         );
 
-        let num_actions = game_config.num_actions;
-        let obs_size = game_config.obs_size;
+        let num_actions = board_metadata.action_count;
+        let obs_size = board_metadata.observation.elements;
 
-        // Create MCTS policy with training configuration
-        // num_simulations, eval_batch_size, temp_threshold are configurable via CLI/env for orchestrator control
-        let mcts_config = MctsConfig::for_training()
+        // Virtual loss remains owned by the versioned MCTS component. Every
+        // run-varying collector search setting is supplied by the authenticated
+        // run recipe and reaches this exact configuration.
+        let mut mcts_config = MctsConfig::for_training()
             .with_simulations(config.num_simulations)
-            .with_eval_batch_size(config.eval_batch_size)
-            .with_temperature(1.0); // Base exploration temperature
+            .with_eval_batch_size(eval_batch_size)
+            .with_c_puct(config.c_puct)
+            .with_temperature(config.temperature);
+        mcts_config.dirichlet_alpha = config.dirichlet_alpha;
+        mcts_config.dirichlet_epsilon = config.dirichlet_weight;
+        mcts_config
+            .validate()
+            .map_err(|error| anyhow!("invalid authenticated MCTS configuration: {error}"))?;
+        let virtual_loss = mcts_config.virtual_loss;
 
         let mcts_policy = MctsPolicy::new(config.env_id.clone(), num_actions, obs_size)
             .with_config(mcts_config)
-            .with_temp_schedule(config.temp_threshold, 0.1); // Late-game temp
+            .with_temp_schedule(config.temp_threshold, config.late_temperature);
 
         info!(
-            "MCTS config: {} simulations, eval_batch_size={}, temp_threshold={} (0=disabled)",
-            config.num_simulations, config.eval_batch_size, config.temp_threshold
+            num_simulations = config.num_simulations,
+            c_puct = config.c_puct,
+            temperature = config.temperature,
+            late_temperature = config.late_temperature,
+            temp_threshold = config.temp_threshold,
+            dirichlet_alpha = config.dirichlet_alpha,
+            dirichlet_weight = config.dirichlet_weight,
+            eval_batch_size = config.eval_batch_size,
+            virtual_loss,
+            "Authenticated collector MCTS configuration"
         );
 
-        // Create model watcher and try to load existing model
-        let model_dir = format!("{}/models", config.data_dir);
-        let watcher = ModelWatcher::new(
-            &model_dir,
-            "latest.onnx",
+        let runtime_profile =
+            RuntimeProfile::new(algorithm.id, config.env_id.clone(), caps.contract_version)?;
+
+        // Create the exact profile-bound model watcher and try to load once.
+        let model_contract =
+            algorithm.model_artifact_contract(config.env_id.clone(), caps.contract_version);
+        let model_spec = ModelLoadSpec::new(
             obs_size,
-            config.onnx_intra_threads,
-            mcts_policy.evaluator_ref(),
-        );
-        let mode_label = if config.no_watch {
-            "no-watch mode"
-        } else {
-            "watch mode"
+            num_actions,
+            onnx_intra_threads,
+            max_horizon,
+            model_contract,
+        )?;
+        let watcher = match crate::config::central_config()
+            .storage
+            .model_backend
+            .as_str()
+        {
+            "filesystem" => {
+                let model_dir = runtime_profile.model_dir(&config.data_dir);
+                std::fs::create_dir_all(&model_dir)?;
+                RuntimeModelWatcher::Filesystem(ModelWatcher::new(
+                    model_dir,
+                    model_spec,
+                    ModelSelection::Latest,
+                    mcts_policy.evaluator_ref(),
+                ))
+            }
+            "s3" => {
+                #[cfg(feature = "s3")]
+                {
+                    let storage = &crate::config::central_config().storage;
+                    let profile_data_dir = runtime_profile.data_dir(&config.data_dir);
+                    let bucket = storage.s3_bucket.clone().ok_or_else(|| {
+                        anyhow!("storage.s3_bucket is required for S3 model watching")
+                    })?;
+                    RuntimeModelWatcher::S3(
+                        S3ModelWatcher::new(
+                            S3Config {
+                                bucket,
+                                prefix: runtime_profile.model_prefix(),
+                                endpoint_url: storage.s3_endpoint.clone(),
+                                region: None,
+                                cache_dir: profile_data_dir.join("model-cache"),
+                            },
+                            model_spec,
+                            ModelSelection::Latest,
+                            mcts_policy.evaluator_ref(),
+                        )
+                        .await?,
+                    )
+                }
+                #[cfg(not(feature = "s3"))]
+                {
+                    return Err(anyhow!(
+                        "storage.model_backend is 's3' but the actor binary was built without the s3 feature"
+                    ));
+                }
+            }
+            backend => return Err(anyhow!("unsupported model storage backend '{backend}'")),
         };
-        match watcher.try_load_existing() {
-            Ok(true) => {
-                info!("Loaded existing model ({})", mode_label);
-                metrics::MODEL_LOADED.set(1);
-                metrics::MODEL_RELOADS.inc();
-            }
-            Ok(false) => {
-                info!(
-                    "No existing model found, will use random policy ({})",
-                    mode_label
-                );
-                metrics::MODEL_LOADED.set(0);
-            }
-            Err(e) => {
-                warn!("Failed to load existing model: {}", e);
-                metrics::MODEL_LOADED.set(0);
-            }
+        let loaded = watcher.try_load_existing().await?;
+        let model_info = watcher.model_info();
+        let model_info = model_info
+            .read()
+            .map_err(|error| anyhow!("failed to read loaded model identity: {error}"))?
+            .clone();
+        require_source_checkpoint(config.source_checkpoint_id.as_deref(), loaded, &model_info)?;
+        if loaded {
+            info!(
+                checkpoint_id = model_info.checkpoint_id.as_deref().unwrap_or("unknown"),
+                "Pinned required source model for this one-shot collection"
+            );
+        } else {
+            info!("Confirmed root collection has no RunHead; using uniform evaluator");
         }
-        // In no-watch mode, discard the watcher (model loaded once at startup)
-        let model_watcher = if config.no_watch { None } else { Some(watcher) };
+        // Dropping the watcher freezes the evaluator selected above. The
+        // process never subscribes to RunHead updates mid-collection.
+        drop(watcher);
 
-        // Initialize replay buffer (PostgreSQL with connection pooling)
+        // Open replay only after the exact model generation has been pinned.
+        let replay_profile = ReplayProfile {
+            env_id: config.env_id.clone(),
+            env_contract_version: caps.contract_version,
+            algorithm_id: algorithm.id.to_string(),
+            experience_schema: algorithm.components.experience_schema.to_string(),
+        };
+        let replay_selection = ReplaySelection {
+            profile: replay_profile,
+            collection_scope_id: config.collection_scope_id.clone(),
+            source_checkpoint_id: config.source_checkpoint_id.clone(),
+        };
         let storage_config = StorageConfig {
             postgres_url: config.postgres_url.clone(),
             pool_config: config.pool_config(),
+            selection: replay_selection.clone(),
         };
 
         let replay = create_replay_store(&storage_config).await?;
-        info!("Replay buffer initialized (PostgreSQL)");
-
-        // Store game metadata in database (makes it self-describing for trainer)
-        let metadata = engine.metadata();
-        replay.store_metadata(&metadata).await?;
         info!(
-            "Stored game metadata: {} actions, {} obs_size, legal_mask_offset={}",
-            metadata.num_actions, metadata.obs_size, metadata.legal_mask_offset
+            selection = ?replay_selection,
+            "Opaque replay record store initialized (PostgreSQL)"
         );
 
         // Initialize stats tracking
-        let stats = ActorStats::new(&config.data_dir, &config.env_id);
-        info!("Actor stats will be written to {}", stats.stats_path());
+        let stats = ActorStats::new(&config.env_id);
 
         Ok(Self {
             config,
-            game_config,
+            replay_selection,
+            board_metadata,
             engine: Mutex::new(engine),
             mcts_policy: Mutex::new(mcts_policy),
             replay: Arc::from(replay),
             episode_count: AtomicU32::new(0),
             shutdown_signal: AtomicBool::new(false),
-            model_watcher,
             stats,
         })
     }
@@ -341,35 +667,20 @@ impl Actor {
         info!("Shutdown signal set");
     }
 
-    /// Run the actor main loop with health state tracking for Kubernetes probes.
-    /// Records episode completions to the health state for liveness tracking.
-    pub async fn run(&self, health: &HealthState) -> Result<()> {
-        // Size the liveness window from the same episode budget the episodes
-        // themselves use. Liveness measures progress in completed episodes, so
-        // a window shorter than one episode's budget would restart the process
-        // mid-episode — and for a game whose episodes always exceed it, would
-        // restart forever without a single episode completing.
-        {
-            let max_horizon = self.lock_engine()?.capabilities().max_horizon;
-            health.set_episode_budget_secs(effective_episode_timeout_secs(
-                self.config.episode_timeout_secs,
-                max_horizon,
-            ));
-        }
-
-        let initial_rss = metrics::rss_mb().unwrap_or(0.0);
+    /// Run exactly the configured episode quota or fail the scoped attempt.
+    pub async fn run(&self) -> Result<()> {
+        let initial_rss = rss_mb().unwrap_or(0.0);
         info!(
             actor_id = %self.config.actor_id,
             max_episodes = self.config.max_episodes,
-            no_watch = self.config.no_watch,
+            collection_scope_id = %self.config.collection_scope_id,
+            source_checkpoint_id = self.config.source_checkpoint_id.as_deref().unwrap_or("root"),
             initial_rss_mb = format!("{:.1}", initial_rss),
-            "Actor starting main loop (with health tracking)"
+            "Actor starting bounded one-shot collection"
         );
 
-        // Create progress bar for bounded episode runs (only when stderr is a TTY)
-        let progress = if self.config.max_episodes > 0
-            && std::io::IsTerminal::is_terminal(&std::io::stderr())
-        {
+        // Create progress bar when stderr is a TTY.
+        let progress = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
             let pb = ProgressBar::new(self.config.max_episodes as u64);
             pb.set_style(
                 ProgressStyle::default_bar()
@@ -382,65 +693,22 @@ impl Actor {
             None
         };
 
-        // Start model watcher (only if not in no-watch mode)
-        let mut model_updates = if let Some(ref watcher) = self.model_watcher {
-            Some(watcher.start_watching().await?)
-        } else {
-            info!("Running in no-watch mode, model will not be reloaded");
-            None
-        };
-
-        // Setup flush timer for periodic database commits
-        let mut flush_timer = tokio::time::interval(self.config.flush_interval());
-
-        info!("Entering main event loop");
+        info!("Entering one-shot episode loop");
 
         loop {
-            // Check shutdown signal
-            if self.shutdown_signal.load(Ordering::Relaxed) {
-                info!("Shutdown signal received, stopping actor");
-                break;
-            }
-
-            // Check episode limit first (non-blocking)
             let current_episode_count = self.episode_count.load(Ordering::Relaxed);
-            if self.config.max_episodes > 0
-                && current_episode_count >= self.config.max_episodes as u32
-            {
+            if current_episode_count >= self.config.max_episodes {
                 info!(
                     "Reached maximum episodes ({}), stopping",
                     self.config.max_episodes
                 );
                 break;
             }
-
-            // In no-watch mode the model-update branch never fires
-            let model_update = async {
-                match model_updates.as_mut() {
-                    Some(updates) => updates.recv().await,
-                    None => std::future::pending().await,
-                }
-            };
-
-            tokio::select! {
-                biased;  // Prioritize model updates and flush over episodes
-
-                Some(()) = model_update => {
-                    info!("Model updated, next episode will use new model");
-                    // Record model reload in Prometheus
-                    metrics::MODEL_RELOADS.inc();
-                    metrics::MODEL_LOADED.set(1);
-                    continue;
-                }
-
-                _ = flush_timer.tick() => {
-                    debug!("Periodic flush tick");
-                    continue;
-                }
-
-                _ = tokio::time::sleep(Duration::from_millis(1)) => {
-                    // Run episode below
-                }
+            if self.shutdown_signal.load(Ordering::Relaxed) {
+                return Err(anyhow!(
+                    "shutdown interrupted bounded collection after {current_episode_count}/{} completed episodes",
+                    self.config.max_episodes
+                ));
             }
 
             // Run an episode
@@ -453,11 +721,6 @@ impl Actor {
                     timeout_secs,
                 }) => {
                     let abandoned = self.stats.record_abandoned_episode(discarded);
-                    metrics::EPISODES_ABANDONED
-                        .with_label_values(&[reason.as_str()])
-                        .inc();
-                    metrics::TRANSITIONS_DISCARDED.inc_by(discarded as u64);
-
                     // Report the running rate, not just this one episode: a
                     // stray drop is noise, a steady stream means the replay
                     // buffer is quietly losing its longest games.
@@ -470,42 +733,30 @@ impl Actor {
                         timeout_secs,
                         abandoned_total = abandoned,
                         attempted,
+                        guidance = reason.guidance(),
                         abandoned_pct =
                             format!("{:.1}", 100.0 * abandoned as f64 / attempted.max(1) as f64),
-                        "Episode abandoned before terminal state; its transitions were discarded. \
-                         Raise actor.episode_timeout_secs if this persists."
+                        "Episode abandoned before terminal state; its replay records were discarded"
                     );
-
-                    self.stats.write_stats();
+                    return Err(anyhow!(
+                        "bounded collection abandoned episode after {steps} steps ({})",
+                        reason.as_str()
+                    ));
                 }
                 Ok(EpisodeOutcome::Completed {
                     steps,
-                    total_reward,
+                    player_one_outcome,
                     stats: episode_stats,
                 }) => {
                     let new_count = self.episode_count.fetch_add(1, Ordering::Relaxed) + 1;
                     let duration = episode_start.elapsed().as_secs_f64();
                     debug!(
                         episode = new_count,
-                        steps, total_reward, duration, "Episode completed"
+                        steps, player_one_outcome, duration, "Episode completed"
                     );
 
-                    // Record Prometheus metrics for this episode
-                    metrics::EPISODES_TOTAL.inc();
-                    metrics::EPISODE_DURATION.observe(duration);
-                    metrics::EPISODE_STEPS.observe(steps as f64);
-                    metrics::record_outcome(total_reward);
-
-                    // Update throughput gauge (episodes per second based on last episode duration)
-                    if duration > 0.0 {
-                        metrics::EPISODES_PER_SECOND.set(1.0 / duration);
-                    }
-
-                    // Record episode completion for health tracking
-                    health.record_episode_complete();
-
                     // Record episode in stats tracker
-                    self.stats.record_episode(steps, total_reward);
+                    self.stats.record_episode(steps, player_one_outcome);
                     self.stats.record_mcts_stats(
                         episode_stats.search_count,
                         episode_stats.inference_time_us,
@@ -520,7 +771,7 @@ impl Actor {
                         && new_count.is_multiple_of(self.config.log_interval)
                     {
                         // Include memory diagnostics in periodic logging
-                        let rss_info = metrics::rss_mb()
+                        let rss_info = rss_mb()
                             .map(|mb| format!(", RSS: {:.1} MB", mb))
                             .unwrap_or_default();
 
@@ -538,15 +789,14 @@ impl Actor {
                             Some(pb) => pb.suspend(log_progress),
                             None => log_progress(),
                         }
-
-                        // Write stats to file for web frontend
-                        self.stats.write_stats();
                     }
                 }
                 Err(e) => {
                     let count = self.episode_count.load(Ordering::Relaxed);
-                    error!("Episode {} failed: {}", count + 1, e);
-                    // Continue with next episode rather than stopping
+                    return Err(anyhow!(
+                        "bounded collection episode {} failed: {e}",
+                        count + 1
+                    ));
                 }
             }
         }
@@ -556,15 +806,27 @@ impl Actor {
             pb.finish_with_message("done");
         }
 
-        // Write final stats
-        self.stats.write_stats();
-
         // Report final memory usage
-        let final_rss = metrics::rss_mb().unwrap_or(0.0);
+        let final_rss = rss_mb().unwrap_or(0.0);
         let rss_growth = final_rss - initial_rss;
+        let final_stats = self.stats.snapshot();
         info!(
-            "Actor stopped gracefully (final RSS: {:.1} MB, growth: {:.1} MB)",
-            final_rss, rss_growth
+            env_id = %final_stats.env_id,
+            episodes_completed = final_stats.episodes_completed,
+            total_steps = final_stats.total_steps,
+            player1_wins = final_stats.player1_wins,
+            player2_wins = final_stats.player2_wins,
+            draws = final_stats.draws,
+            episodes_abandoned = final_stats.episodes_abandoned,
+            replay_records_discarded = final_stats.replay_records_discarded,
+            avg_episode_length = final_stats.avg_episode_length,
+            episodes_per_second = final_stats.episodes_per_second,
+            runtime_seconds = final_stats.runtime_seconds,
+            mcts_avg_inference_us = final_stats.mcts_avg_inference_us,
+            snapshot_timestamp = final_stats.timestamp,
+            final_rss_mb = format!("{:.1}", final_rss),
+            rss_growth_mb = format!("{:.1}", rss_growth),
+            "Actor completed bounded collection"
         );
         Ok(())
     }
@@ -583,41 +845,70 @@ impl Actor {
             .map_err(|e| anyhow!("MCTS policy lock poisoned: {}", e))
     }
 
-    /// Backfill game outcomes and store transitions.
+    /// Encode terminal value targets and store immutable replay records.
     async fn finalize_episode(
         &self,
-        mut transitions: Vec<Transition>,
-        final_reward: f32,
+        pending_experiences: Vec<PendingExperience>,
+        terminal_timestep: &ErasedTimestep,
         episode_id: &str,
-    ) -> Result<()> {
-        let total_steps = transitions.len() as u32;
-
-        // Backfill game outcomes for all transitions
-        // The final reward indicates the outcome from the last mover's perspective:
-        // +1 = win, -1 = loss, 0 = draw
-        for t in &mut transitions {
-            let steps_from_end = total_steps.saturating_sub(1).saturating_sub(t.step_number);
-            let sign = if steps_from_end % 2 == 0 { 1.0 } else { -1.0 };
-            t.game_outcome = Some(final_reward * sign);
+    ) -> Result<f32> {
+        if terminal_timestep.episode != EpisodeStatus::Terminated {
+            return Err(anyhow!(
+                "cannot finalize AlphaZero replay from {:?} episode",
+                terminal_timestep.episode
+            ));
         }
+        require_two_player_outcomes(terminal_timestep)?;
 
-        // Batch store all transitions in a single transaction
-        self.replay.store_batch(&transitions).await.map_err(|e| {
-            error!(
-                "Failed to store transitions for episode {}: {}",
-                episode_id, e
-            );
-            e
-        })?;
+        let replay_records = pending_experiences
+            .into_iter()
+            .map(|pending| {
+                let value_target =
+                    terminal_timestep.reward_for(pending.actor).ok_or_else(|| {
+                        anyhow!(
+                            "terminal timestep has no outcome for experience actor {}",
+                            pending.actor.0
+                        )
+                    })?;
+                let payload = encode_experience(
+                    &pending.observation,
+                    self.board_metadata.observation.elements,
+                    &pending.policy_target,
+                    self.board_metadata.action_count,
+                    value_target,
+                )?;
+                Ok(self.replay_selection.record(
+                    format!("{episode_id}-step-{}", pending.step_number),
+                    episode_id,
+                    pending.step_number,
+                    payload,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let player_one_outcome = terminal_timestep
+            .reward_for(AgentId(1))
+            .expect("validated terminal outcome for player one");
+
+        self.replay
+            .store_batch(&replay_records)
+            .await
+            .map_err(|e| {
+                error!(
+                    "Failed to store replay records for episode {}: {}",
+                    episode_id, e
+                );
+                e
+            })?;
 
         debug!(
-            "Stored {} transitions with game_outcome={} for episode {}",
-            transitions.len(),
-            final_reward,
+            "Stored {} replay records with player_one_outcome={} for episode {}",
+            replay_records.len(),
+            player_one_outcome,
             episode_id
         );
 
-        Ok(())
+        Ok(player_one_outcome)
     }
 
     async fn run_episode(&self) -> Result<EpisodeOutcome> {
@@ -629,7 +920,7 @@ impl Actor {
             let caps = engine.capabilities();
             let seed = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
             let reset = engine.reset(seed, &[])?;
-            (reset, caps.max_horizon)
+            (reset, require_max_horizon(&caps)?)
         };
 
         // Create episode context with timing and limits
@@ -651,12 +942,13 @@ impl Actor {
 
         // Episode state
         let mut current_state = reset_result.state;
-        let mut current_obs = reset_result.obs;
-        let mut current_legal_mask = self.game_config.legal_mask_from_obs(&current_obs);
+        let mut current_timestep = reset_result.timestep;
+        let (mut current_agent, reset_observation) = require_reset_timestep(&current_timestep)?;
+        let mut current_obs = reset_observation.to_vec();
+        let mut current_legal_mask = self.board_metadata.legal_mask_from_obs(&current_obs)?;
         let mut step_number = 0u32;
         let mut steps_taken = 0u32;
-        let mut total_reward = 0.0f32;
-        let mut transitions: Vec<Transition> = Vec::with_capacity(12);
+        let mut pending_experiences: Vec<PendingExperience> = Vec::with_capacity(12);
         let mut episode_stats = EpisodeStats::default();
 
         loop {
@@ -664,7 +956,7 @@ impl Actor {
                 return Ok(EpisodeOutcome::Abandoned {
                     reason,
                     steps: steps_taken,
-                    discarded: transitions.len(),
+                    discarded: pending_experiences.len(),
                     timeout_secs: ctx.timeout.as_secs(),
                 });
             }
@@ -674,7 +966,7 @@ impl Actor {
                 let mut policy = self.lock_mcts_policy()?;
                 policy.select_action(
                     &current_state,
-                    &current_obs,
+                    &current_timestep,
                     &current_legal_mask,
                     step_number,
                 )?
@@ -683,69 +975,58 @@ impl Actor {
             // Accumulate MCTS performance stats
             episode_stats.add(&policy_result.stats);
 
-            // Record Prometheus metrics for this MCTS search
-            metrics::MCTS_SEARCHES_TOTAL.inc();
-            metrics::MCTS_INFERENCE_SECONDS
-                .observe(policy_result.stats.inference_time_us as f64 / 1_000_000.0);
-            metrics::MCTS_SEARCH_SECONDS
-                .observe(policy_result.stats.total_time_us as f64 / 1_000_000.0);
-
             // Take step in environment
             let step_result = {
                 let mut engine = self.lock_engine()?;
                 engine.step(&current_state, &policy_result.action)?
             };
 
-            total_reward += step_result.reward;
+            require_step_timestep(&step_result.timestep, current_agent)?;
             steps_taken += 1;
 
-            // Create transition (moves current_state/obs to avoid cloning)
-            let policy_bytes: Vec<u8> = policy_result
-                .policy
-                .iter()
-                .flat_map(|f| f.to_le_bytes())
-                .collect();
-
-            transitions.push(Transition {
-                id: format!("{}-step-{}", ctx.id, step_number),
-                env_id: self.config.env_id.clone(),
-                episode_id: ctx.id.clone(),
+            pending_experiences.push(PendingExperience {
+                actor: current_agent,
                 step_number,
-                state: std::mem::take(&mut current_state),
-                action: policy_result.action,
-                next_state: step_result.state.clone(),
                 observation: std::mem::take(&mut current_obs),
-                next_observation: step_result.obs.clone(),
-                reward: step_result.reward,
-                done: step_result.done,
-                timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-                policy_probs: policy_bytes,
-                mcts_value: policy_result.value,
-                game_outcome: None,
+                policy_target: policy_result.policy,
             });
 
-            if step_result.done {
-                debug!(
-                    "Episode {} completed in {} steps, total reward: {:.2}",
-                    ctx.id,
-                    step_number + 1,
-                    total_reward
-                );
-                self.finalize_episode(transitions, step_result.reward, &ctx.id)
-                    .await?;
-                return Ok(EpisodeOutcome::Completed {
-                    steps: steps_taken,
-                    total_reward,
-                    stats: episode_stats,
-                });
+            match step_result.timestep.episode {
+                EpisodeStatus::Terminated => {
+                    let player_one_outcome = self
+                        .finalize_episode(pending_experiences, &step_result.timestep, &ctx.id)
+                        .await?;
+                    debug!(
+                        "Episode {} completed in {} steps, player-one outcome: {:.2}",
+                        ctx.id,
+                        step_number + 1,
+                        player_one_outcome
+                    );
+                    return Ok(EpisodeOutcome::Completed {
+                        steps: steps_taken,
+                        player_one_outcome,
+                        stats: episode_stats,
+                    });
+                }
+                EpisodeStatus::Truncated => {
+                    return Ok(EpisodeOutcome::Abandoned {
+                        reason: AbandonReason::EnvironmentTruncated,
+                        steps: steps_taken,
+                        discarded: pending_experiences.len(),
+                        timeout_secs: ctx.timeout.as_secs(),
+                    });
+                }
+                EpisodeStatus::Running => {}
             }
 
             // Update state for next step
             current_state = step_result.state;
-            current_obs = step_result.obs;
-            // Read the mask from the obs, not info bits: info collides with the
-            // player/winner fields past 16 actions and cannot hold >64 actions.
-            current_legal_mask = self.game_config.legal_mask_from_obs(&current_obs);
+            current_timestep = step_result.timestep;
+            let (next_agent, observation) = require_active_position(&current_timestep)?;
+            current_agent = next_agent;
+            current_obs = observation.to_vec();
+            // Read the next legal-action mask from its authoritative observation.
+            current_legal_mask = self.board_metadata.legal_mask_from_obs(&current_obs)?;
             step_number += 1;
         }
     }
@@ -755,28 +1036,70 @@ impl Actor {
 mod tests {
     use super::*;
 
+    fn loaded_model(checkpoint_id: &str) -> ModelInfo {
+        ModelInfo {
+            loaded: true,
+            checkpoint_id: Some(checkpoint_id.to_string()),
+            model_sha256: Some("c".repeat(64)),
+            path: Some("model.onnx".into()),
+            loaded_at: Some(1),
+            training_step: Some(1),
+        }
+    }
+
+    #[test]
+    fn root_collection_requires_an_absent_run_head() {
+        assert!(require_source_checkpoint(None, false, &ModelInfo::default()).is_ok());
+        let error = require_source_checkpoint(None, true, &loaded_model(&"a".repeat(64)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("root collection requires an absent RunHead"));
+    }
+
+    #[test]
+    fn descendant_collection_requires_the_exact_loaded_source() {
+        let expected = "a".repeat(64);
+        assert!(require_source_checkpoint(Some(&expected), true, &loaded_model(&expected)).is_ok());
+
+        let absent = require_source_checkpoint(Some(&expected), false, &ModelInfo::default())
+            .unwrap_err()
+            .to_string();
+        assert!(absent.contains("no RunHead model was loaded"));
+
+        let mismatch =
+            require_source_checkpoint(Some(&expected), true, &loaded_model(&"b".repeat(64)))
+                .unwrap_err()
+                .to_string();
+        assert!(mismatch.contains("does not match required source checkpoint"));
+    }
+
     // ========================================
     // Episode limit / abandonment tests
     // ========================================
 
     #[test]
-    fn test_timeout_floor_scales_with_game_horizon() {
-        // A connect4-sized timeout must not silently truncate a long game.
-        // generals_8x8 has max_horizon 402, so a 180s config value is raised
-        // to the horizon floor rather than acting as a length filter.
-        let ctx = EpisodeContext::new("a", 0, 180, 402).unwrap();
-        assert_eq!(ctx.timeout, Duration::from_secs(402));
+    fn temperature_threshold_must_be_reachable_within_environment_horizon() {
+        assert!(require_reachable_temperature_threshold(0, 9).is_ok());
+        assert!(require_reachable_temperature_threshold(8, 9).is_ok());
+
+        for threshold in [9, 10] {
+            let error = require_reachable_temperature_threshold(threshold, 9)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("late_temperature is unreachable"), "{error}");
+        }
     }
 
     #[test]
-    fn test_timeout_floor_never_lowers_configured_value() {
-        // Short games keep the configured budget: the floor only raises.
+    fn test_episode_timeout_is_exact_for_long_horizon() {
+        let ctx = EpisodeContext::new("a", 0, 180, 402).unwrap();
+        assert_eq!(ctx.timeout, Duration::from_secs(180));
+    }
+
+    #[test]
+    fn test_episode_timeout_is_exact_for_short_horizon() {
         let ctx = EpisodeContext::new("a", 0, 180, 42).unwrap();
         assert_eq!(ctx.timeout, Duration::from_secs(180));
-
-        // ...including when the operator sets a very generous timeout.
-        let ctx = EpisodeContext::new("a", 0, 3600, 402).unwrap();
-        assert_eq!(ctx.timeout, Duration::from_secs(3600));
     }
 
     #[test]
@@ -797,55 +1120,93 @@ mod tests {
 
     #[test]
     fn test_limit_exceeded_reports_timeout() {
-        // Zero-second budget with a 1-move horizon: the floor is 1s, so sleep
-        // past it and confirm timeout wins over the (untripped) step guard.
+        // Config validation rejects zero, but the internal context still obeys
+        // the exact value and reports timeout before the step guard.
         let ctx = EpisodeContext::new("a", 0, 0, 1).unwrap();
-        assert_eq!(ctx.timeout, Duration::from_secs(1));
-        std::thread::sleep(Duration::from_millis(1100));
+        assert_eq!(ctx.timeout, Duration::ZERO);
         assert_eq!(ctx.limit_exceeded(0), Some(AbandonReason::Timeout));
     }
 
     #[test]
-    fn test_liveness_window_is_never_tighter_than_an_episode_budget() {
-        // Regression test: the liveness probe measures progress in *completed
-        // episodes*, so a window shorter than one episode's budget kills the
-        // process mid-episode. For a game whose episodes always exceed it,
-        // that is an unbreakable restart loop in which no episode ever
-        // completes. generals_8x8 (horizon 402) against the old fixed 300s
-        // window was exactly that case.
-        for (configured, horizon) in [
-            (180, 402), // generals: horizon floor raises the budget past 300s
-            (180, 42),  // connect4: configured value wins
-            (3600, 402),
-            (30, 9),
-        ] {
-            let budget = effective_episode_timeout_secs(configured, horizon);
-            let health = HealthState::new();
-            health.set_episode_budget_secs(budget);
+    fn test_abandon_reason_strings_are_stable() {
+        // These values are part of the structured-log schema used by queries.
+        assert_eq!(AbandonReason::Timeout.as_str(), "timeout");
+        assert_eq!(AbandonReason::MaxSteps.as_str(), "max_steps");
+        assert_eq!(
+            AbandonReason::EnvironmentTruncated.as_str(),
+            "environment_truncated"
+        );
+    }
 
-            assert!(
-                health.progress_timeout_secs() > budget,
-                "liveness window {} must exceed the {}s episode budget \
-                 (configured={configured}, horizon={horizon})",
-                health.progress_timeout_secs(),
-                budget,
-            );
+    #[test]
+    fn alphazero_reset_requires_one_matching_decision_and_observation() {
+        engine_games::register_all_environments();
+        let mut engine = EngineContext::new("tictactoe").unwrap();
+        let reset = engine.reset(42, &[]).unwrap();
+
+        let (agent, observation) = require_reset_timestep(&reset.timestep).unwrap();
+        assert_eq!(agent, AgentId(1));
+        assert_eq!(observation.len(), 29 * std::mem::size_of::<f32>());
+
+        let mut multiple_decisions = reset.timestep.clone();
+        multiple_decisions.decision = Decision::Agents {
+            agent_ids: vec![AgentId(1), AgentId(2)],
+        };
+        assert!(require_reset_timestep(&multiple_decisions)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one acting agent"));
+
+        let mut mismatched_observation = reset.timestep;
+        mismatched_observation.observations[0].agent_id = AgentId(2);
+        assert!(require_reset_timestep(&mismatched_observation)
+            .unwrap_err()
+            .to_string()
+            .contains("observation belongs to agent 2"));
+    }
+
+    #[test]
+    fn alphazero_step_maps_reward_from_transition_source_agent() {
+        engine_games::register_all_environments();
+        let mut engine = EngineContext::new("tictactoe").unwrap();
+        let reset = engine.reset(42, &[]).unwrap();
+        let mut state = reset.state;
+        let mut timestep = reset.timestep;
+
+        // Player one wins across the top row. Each reward is read using the
+        // acting AgentId reported by TransitionSource, never by ply parity.
+        for (index, action) in [0u32, 3, 1, 4, 2].into_iter().enumerate() {
+            let (actor, _) = require_active_position(&timestep).unwrap();
+            let step = engine.step(&state, &action.to_le_bytes()).unwrap();
+            let actor_reward = require_step_timestep(&step.timestep, actor).unwrap();
+
+            if index == 4 {
+                assert_eq!(step.timestep.episode, EpisodeStatus::Terminated);
+                assert_eq!(actor, AgentId(1));
+                assert_eq!(actor_reward, 1.0);
+                assert_eq!(step.timestep.reward_for(AgentId(1)), Some(1.0));
+                assert_eq!(step.timestep.reward_for(AgentId(2)), Some(-1.0));
+            } else {
+                assert_eq!(step.timestep.episode, EpisodeStatus::Running);
+                assert_eq!(actor_reward, 0.0);
+            }
+
+            state = step.state;
+            timestep = step.timestep;
         }
     }
 
     #[test]
-    fn test_liveness_window_never_drops_below_the_default() {
-        let health = HealthState::new();
-        assert_eq!(health.progress_timeout_secs(), 300);
-        health.set_episode_budget_secs(1);
-        assert_eq!(health.progress_timeout_secs(), 300);
-    }
+    fn alphazero_step_rejects_wrong_transition_source_actor() {
+        engine_games::register_all_environments();
+        let mut engine = EngineContext::new("tictactoe").unwrap();
+        let reset = engine.reset(42, &[]).unwrap();
+        let step = engine.step(&reset.state, &0u32.to_le_bytes()).unwrap();
 
-    #[test]
-    fn test_abandon_reason_labels_are_stable() {
-        // These are Prometheus label values; changing them breaks dashboards.
-        assert_eq!(AbandonReason::Timeout.as_str(), "timeout");
-        assert_eq!(AbandonReason::MaxSteps.as_str(), "max_steps");
+        let error = require_step_timestep(&step.timestep, AgentId(2))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reported acting agent 1, expected 2"));
     }
 
     fn test_config() -> Config {
@@ -854,21 +1215,26 @@ mod tests {
         Config {
             actor_id: "test-actor".into(),
             env_id: "tictactoe".into(),
+            algorithm_id: algorithm_core::ALPHAZERO_BOARD_V1_ID.into(),
             max_episodes: 1,
+            collection_scope_id: "a".repeat(64),
+            source_checkpoint_id: None,
             episode_timeout_secs: 30,
-            flush_interval_secs: 5,
             log_level: "info".into(),
             log_interval: 10,
             data_dir: "./data".into(),
             num_simulations: 50, // Fewer for tests
-            temp_threshold: 0,   // Disabled for tests
+            c_puct: 1.4,
+            temperature: 1.0,
+            late_temperature: 1.0,
+            temp_threshold: 0, // Disabled for tests
+            dirichlet_alpha: 0.3,
+            dirichlet_weight: 0.25,
             eval_batch_size: 32,
             onnx_intra_threads: 1,
             postgres_url: std::env::var("CARTRIDGE_STORAGE_POSTGRES_URL").unwrap_or_else(|_| {
                 "postgresql://cartridge:cartridge@localhost:5432/cartridge".into()
             }),
-            no_watch: true, // Tests don't need model watching
-            health_port: 8081,
         }
     }
 
@@ -877,7 +1243,7 @@ mod tests {
     async fn test_actor_creation() {
         let config = test_config();
 
-        let actor = Actor::new(config).await;
+        let actor = AlphaZeroCollector::new(config).await;
         assert!(actor.is_ok());
     }
 
@@ -886,7 +1252,7 @@ mod tests {
     async fn test_actor_run_single_episode() {
         let config = test_config();
 
-        let actor = Actor::new(config).await.unwrap();
+        let actor = AlphaZeroCollector::new(config).await.unwrap();
 
         // Run a single episode
         let result = actor.run_episode().await;
@@ -895,12 +1261,12 @@ mod tests {
         match result.unwrap() {
             EpisodeOutcome::Completed {
                 steps,
-                total_reward,
+                player_one_outcome,
                 ..
             } => {
                 assert!(steps > 0, "Episode should have at least one step");
                 // TicTacToe gives reward at end of game
-                debug!(steps, total_reward, "Episode completed");
+                debug!(steps, player_one_outcome, "Episode completed");
             }
             EpisodeOutcome::Abandoned { reason, steps, .. } => {
                 panic!("TicTacToe episode abandoned ({reason:?}) after {steps} steps");
@@ -914,30 +1280,25 @@ mod tests {
         let mut config = test_config();
         config.env_id = "nonexistent_game".into();
 
-        let result = Actor::new(config).await;
+        let result = AlphaZeroCollector::new(config).await;
         assert!(result.is_err());
         let err = result.err().unwrap();
-        // Could fail at game_config lookup or engine context creation
         let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("Unknown game") || err_msg.contains("not registered"),
-            "Expected error about unknown/unregistered game, got: {}",
-            err_msg
-        );
+        assert!(err_msg.contains("not registered"));
     }
 
     #[tokio::test]
     #[ignore] // Requires running PostgreSQL: docker compose up postgres
-    async fn test_actor_stores_transitions() {
+    async fn test_actor_stores_replay_records() {
         let config = test_config();
 
-        let actor = Actor::new(config).await.unwrap();
+        let actor = AlphaZeroCollector::new(config).await.unwrap();
 
         // Run an episode
         actor.run_episode().await.unwrap();
 
-        // Check that transitions were stored
+        // Check that replay records were stored
         let count = actor.replay.count().await.unwrap();
-        assert!(count > 0, "Should have stored some transitions");
+        assert!(count > 0, "Should have stored some replay records");
     }
 }

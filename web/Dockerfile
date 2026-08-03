@@ -53,20 +53,20 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user for security
-RUN useradd -m cartridge
+# Keep the serving image on the same explicit non-root identity as the trainer;
+# both processes read the shared profile projection volume in Kubernetes.
+RUN useradd --create-home --uid 1000 --user-group cartridge
 
 WORKDIR /app
 
 # Copy the compiled binary from builder
 COPY --from=builder /app/web/target/release/web /app/web
 
-# Create data directory with correct permissions
-RUN mkdir -p /app/data/models && chown -R cartridge:cartridge /app
+# Create the root used for profile-scoped stats:
+# profiles/{algorithm_id}/{env_id}/v{env_contract_version}.
+RUN mkdir -p /app/data && chown -R cartridge:cartridge /app
 
-# Environment variables with defaults
-ENV DATA_DIR="/app/data"
-ENV DEFAULT_GAME="tictactoe"
+ENV CARTRIDGE_COMMON_DATA_DIR="/app/data"
 ENV RUST_LOG="info"
 
 # Expose the web server port

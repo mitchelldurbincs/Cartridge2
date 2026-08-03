@@ -1,115 +1,323 @@
-"""The player registry: which players exist and how to instantiate them.
+"""Strict registry of immutable players available to evaluation workflows.
 
-A *player* is anything that can occupy a seat in a game — the random baseline,
-an AlphaZero checkpoint, the same checkpoint given a search budget, later a PPO
-checkpoint. Training produces players; evaluation, tournaments and the web UI
-consume them.
-
-Until now players were implicit, identified by filename convention
-(``latest.onnx``, ``best.onnx``). That is enough to ask "is the candidate better
-than the champion" and not enough to ask "how do all of these compare", which is
-what a tournament needs. This module makes them explicit and durable.
-
-The registry is a JSON file written atomically, like ``stats.json`` and
-``best_model.json`` — not a database table. There is no concurrent writer yet,
-and a file is inspectable and diffable.
+A model player is the combination of one content-addressed checkpoint and one
+versioned gameplay-adapter configuration.  Registry IDs therefore never depend
+on filenames and never change meaning when a serving channel advances.
 """
 
 from __future__ import annotations
 
 import json
-import logging
-import re
-from dataclasses import asdict, dataclass, fields
+import math
+import struct
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .atomic_io import atomic_write
+from crucible.atomic_io import atomic_write
+
 from .players import ModelPlayer, RandomPlayer
+from .storage.publisher import (
+    ArtifactValidationError,
+    CheckpointPublisher,
+    CheckpointRef,
+    OnnxArtifactContract,
+    canonical_json_bytes,
+    create_checkpoint_publisher,
+    sha256_bytes,
+    validate_sha256_digest,
+)
 
-logger = logging.getLogger(__name__)
+SCHEMA_VERSION = 5
+PLAYER_ADAPTER_SCHEMA_VERSION = 1
 
-SCHEMA_VERSION = 1
-
-#: The id reserved for the uniform-random baseline. Tournaments anchor their
-#: rating scale to it, so every rating reads as "Elo above random".
-RANDOM_PLAYER_ID = "random"
-
-#: Default sampling temperature for a registered player.
-#:
-#: Deliberately not 0. Two greedy models on a deterministic opening replay the
-#: same game every time, so a 20-game match is one game counted 20 times — the
-#: rating fit then reads 20 correlated samples as 20 independent ones and
-#: reports a confident, meaningless spread. Measured on the Connect 4
-#: checkpoints: every model-vs-model pairing came out 0-20, 10-10 or 20-0.
-#: crucible's EVAL_TEMPERATURE exists for the same reason.
+# A little exploration is important in a repeated match between deterministic
+# policies; otherwise every scheduled game per seat is the same sample.
 DEFAULT_PLAY_TEMPERATURE = 0.2
-
-# Checkpoints are named model_step_016000.onnx. Deliberately a local copy of
-# this pattern rather than an import: solver_eval owns a Connect 4-specific one,
-# and checkpoint.py — the other plausible home — pulls in torch and onnx, which
-# this module has no reason to load.
-_CHECKPOINT_STEP = re.compile(r"model_step_(\d+)\.onnx")
+_MAX_U32 = (1 << 32) - 1
+_MAX_U64 = (1 << 64) - 1
+_MAX_F32 = float.fromhex("0x1.fffffep+127")
 
 
-def infer_step(path: str | Path) -> int | None:
-    """Training step from a checkpoint filename, if it encodes one."""
-    match = _CHECKPOINT_STEP.fullmatch(Path(path).name)
-    return int(match.group(1)) if match else None
+def _json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Reject duplicate JSON keys instead of accepting the last value."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Player registry contains duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Player registry contains non-finite number {value}")
+
+
+def _validate_adapter_settings(simulations: int, temperature: float) -> float:
+    if (
+        isinstance(simulations, bool)
+        or not isinstance(simulations, int)
+        or not 0 <= simulations <= _MAX_U32
+    ):
+        raise ValueError("simulations must be a nonnegative u32 integer")
+    if (
+        isinstance(temperature, bool)
+        or not isinstance(temperature, (int, float))
+        or not math.isfinite(temperature)
+        or not 0.0 <= temperature <= _MAX_F32
+    ):
+        raise ValueError("temperature must be a finite nonnegative f32")
+    narrowed = float(struct.unpack("!f", struct.pack("!f", float(temperature)))[0])
+    return 0.0 if narrowed == 0.0 else narrowed
+
+
+def artifact_contract_for(env_id: str, algorithm_id: str) -> OnnxArtifactContract:
+    """Return the exact ONNX contract authorized by the engine manifest."""
+    from .algorithms import get_algorithm
+    from .environment_catalog import get_environment
+
+    algorithm = get_algorithm(algorithm_id)
+    environment = get_environment(env_id)
+    algorithm.compatibility(environment).require_compatible()
+    board = environment.require_board()
+    descriptor = algorithm.descriptor
+    return OnnxArtifactContract(
+        algorithm_id=descriptor.id,
+        env_id=environment.env_id,
+        env_contract_version=environment.contract_version,
+        model_artifact_schema_version=descriptor.model_artifact_schema_version,
+        model_contract=descriptor.components.model_contract,
+        obs_size=board.observation.elements,
+        num_actions=board.action_count,
+    )
+
+
+def random_player_id(
+    *, env_id: str, env_contract_version: int, algorithm_id: str
+) -> str:
+    """Globally unique identity for one profile's random baseline."""
+    return f"{algorithm_id}:{env_id}:v{env_contract_version}:random"
+
+
+def checkpoint_player_id(
+    *,
+    env_id: str,
+    env_contract_version: int,
+    algorithm_id: str,
+    checkpoint_id: str,
+    simulations: int = 0,
+    temperature: float = DEFAULT_PLAY_TEMPERATURE,
+) -> str:
+    """Canonical identity for checkpoint weights plus gameplay adapter config."""
+    validate_sha256_digest(checkpoint_id, field="checkpoint_id")
+    canonical_temperature = _validate_adapter_settings(simulations, temperature)
+    adapter = {
+        "schema_version": PLAYER_ADAPTER_SCHEMA_VERSION,
+        "simulations": simulations,
+        "temperature": canonical_temperature,
+    }
+    adapter_id = sha256_bytes(canonical_json_bytes(adapter))
+    return (
+        f"{algorithm_id}:{env_id}:v{env_contract_version}:"
+        f"checkpoint:{checkpoint_id}:adapter:{adapter_id}"
+    )
+
+
+def _model_root_from_blob(path: Path) -> Path:
+    """Recover and validate the repository root encoded by an immutable blob path."""
+    if (
+        path.suffix != ".onnx"
+        or path.parent.name != "sha256"
+        or path.parent.parent.name != "blobs"
+    ):
+        raise ArtifactValidationError(
+            "Registered ONNX path must use " "<model-root>/blobs/sha256/<digest>.onnx"
+        )
+    validate_sha256_digest(path.stem, field="onnx_path digest")
+    return path.parents[2]
+
+
+def _resolve_registered_checkpoint(
+    *,
+    checkpoint_id: str,
+    onnx_path: str,
+    contract: OnnxArtifactContract,
+) -> CheckpointRef:
+    """Resolve a registry entry through the strict local artifact repository."""
+    path = Path(onnx_path)
+    model_root = _model_root_from_blob(path)
+    repository = create_checkpoint_publisher(contract, model_root)
+    checkpoint = repository.resolve_checkpoint(checkpoint_id)
+    if checkpoint.onnx_path != path:
+        raise ArtifactValidationError(
+            f"Registered ONNX path {path} does not match checkpoint "
+            f"{checkpoint_id}: {checkpoint.onnx_path}"
+        )
+    return checkpoint
 
 
 @dataclass(frozen=True)
 class PlayerRecord:
-    """One registered player.
-
-    ``kind`` is ``"model"`` or ``"random"``. ``algorithm`` is free-form and
-    exists so a tournament table can say where a player came from — it is a
-    label, not a dispatch key; nothing branches on it.
-    """
+    """One random baseline or immutable model plus its play configuration."""
 
     id: str
     env_id: str
+    env_contract_version: int
+    algorithm_id: str
+    model_contract: str
+    model_artifact_schema_version: int
     kind: str
-    checkpoint: str | None = None
+    registered_at: str
+    checkpoint_id: str | None = None
+    onnx_path: str | None = None
     simulations: int = 0
     temperature: float = 0.0
-    algorithm: str = "unknown"
     step: int | None = None
-    registered_at: str = ""
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "id",
+            "env_id",
+            "algorithm_id",
+            "model_contract",
+            "registered_at",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(
+                    f"PlayerRecord.{field_name} must be a non-empty string"
+                )
+        for field_name in (
+            "env_contract_version",
+            "model_artifact_schema_version",
+        ):
+            value = getattr(self, field_name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 1 <= value <= _MAX_U32
+            ):
+                raise ValueError(
+                    f"PlayerRecord.{field_name} must be a positive u32 integer"
+                )
+        if self.kind not in {"model", "random"}:
+            raise ValueError(f"Player '{self.id}' has unknown kind '{self.kind}'")
+        canonical_temperature = _validate_adapter_settings(
+            self.simulations, self.temperature
+        )
+        object.__setattr__(self, "temperature", canonical_temperature)
+        if self.step is not None and (
+            isinstance(self.step, bool)
+            or not isinstance(self.step, int)
+            or not 0 <= self.step <= _MAX_U64
+        ):
+            raise ValueError(
+                "PlayerRecord.step must be a nonnegative u64 integer or null"
+            )
+        try:
+            datetime.fromisoformat(self.registered_at)
+        except ValueError as exc:
+            raise ValueError(
+                "PlayerRecord.registered_at must be an ISO-8601 timestamp"
+            ) from exc
+
+        if self.kind == "random":
+            if self.checkpoint_id is not None or self.onnx_path is not None:
+                raise ValueError(
+                    "Random players cannot declare a checkpoint or ONNX blob"
+                )
+            if self.step is not None:
+                raise ValueError("Random players cannot declare a training step")
+            if self.simulations != 0 or self.temperature != 0.0:
+                raise ValueError(
+                    "Random players cannot declare search or sampling settings"
+                )
+        else:
+            validate_sha256_digest(self.checkpoint_id, field="checkpoint_id")
+            if not isinstance(self.onnx_path, str) or not self.onnx_path:
+                raise ValueError(f"Player '{self.id}' is a model with no ONNX path")
+            if self.step is None:
+                raise ValueError(f"Player '{self.id}' is a model with no training step")
+
+    def artifact_contract(self) -> OnnxArtifactContract:
+        """Validate profile lineage and canonical player identity."""
+        contract = artifact_contract_for(self.env_id, self.algorithm_id)
+        expected = {
+            "env_contract_version": contract.env_contract_version,
+            "model_contract": contract.model_contract,
+            "model_artifact_schema_version": contract.model_artifact_schema_version,
+        }
+        mismatches = [
+            f"{field_name}={getattr(self, field_name)!r} (expected {value!r})"
+            for field_name, value in expected.items()
+            if getattr(self, field_name) != value
+        ]
+        if mismatches:
+            raise ValueError(
+                f"Player '{self.id}' does not match the engine profile: "
+                + "; ".join(mismatches)
+            )
+
+        expected_id = (
+            random_player_id(
+                env_id=self.env_id,
+                env_contract_version=self.env_contract_version,
+                algorithm_id=self.algorithm_id,
+            )
+            if self.kind == "random"
+            else checkpoint_player_id(
+                env_id=self.env_id,
+                env_contract_version=self.env_contract_version,
+                algorithm_id=self.algorithm_id,
+                checkpoint_id=self.checkpoint_id or "",
+                simulations=self.simulations,
+                temperature=self.temperature,
+            )
+        )
+        if self.id != expected_id:
+            raise ValueError(
+                f"Player id {self.id!r} is not canonical for its profile; "
+                f"expected {expected_id!r}"
+            )
+        return contract
+
+    def validate_artifact(self) -> CheckpointRef | None:
+        """Require the referenced immutable checkpoint to be complete and valid."""
+        contract = self.artifact_contract()
+        if self.kind == "random":
+            return None
+        checkpoint = _resolve_registered_checkpoint(
+            checkpoint_id=self.checkpoint_id or "",
+            onnx_path=self.onnx_path or "",
+            contract=contract,
+        )
+        if checkpoint.manifest.step != self.step:
+            raise ArtifactValidationError(
+                f"Player '{self.id}' step {self.step} does not match checkpoint "
+                f"step {checkpoint.manifest.step}"
+            )
+        return checkpoint
 
     def to_player(self) -> ModelPlayer | RandomPlayer:
-        """Build the spec that ``cartridge-eval`` consumes."""
+        """Build the seat specification consumed by ``cartridge-eval``."""
+        checkpoint = self.validate_artifact()
         if self.kind == "random":
             return RandomPlayer()
-        if self.kind == "model":
-            if not self.checkpoint:
-                raise ValueError(f"Player '{self.id}' is a model with no checkpoint")
-            return ModelPlayer(
-                model_path=self.checkpoint,
-                temperature=self.temperature,
-                simulations=self.simulations,
-            )
-        raise ValueError(f"Player '{self.id}' has unknown kind '{self.kind}'")
-
-    def is_playable(self) -> bool:
-        """Whether this player can actually be instantiated right now.
-
-        A registry entry outlives the file it points at — checkpoint rotation
-        deletes old models. Callers skip unplayable entries rather than failing
-        a whole tournament over one deleted checkpoint.
-        """
-        if self.kind == "random":
-            return True
-        return bool(self.checkpoint) and Path(self.checkpoint).exists()
+        assert checkpoint is not None
+        return ModelPlayer(
+            model_path=str(checkpoint.onnx_path),
+            temperature=float(self.temperature),
+            simulations=self.simulations,
+        )
 
 
 class PlayerRegistry:
-    """A collection of players, persisted as JSON."""
+    """A strict collection of players persisted as one versioned JSON file."""
 
     def __init__(self, players: list[PlayerRecord] | None = None):
         self._players: dict[str, PlayerRecord] = {}
         for player in players or []:
-            self._players[player.id] = player
+            self.add(player)
 
     def __len__(self) -> int:
         return len(self._players)
@@ -128,127 +336,212 @@ class PlayerRegistry:
             raise KeyError(f"No player '{player_id}'. Registered: {known}") from exc
 
     def add(self, player: PlayerRecord, replace: bool = False) -> None:
-        """Register a player.
-
-        Raises on a duplicate id unless ``replace`` — silently overwriting would
-        make a tournament's ratings refer to a player that no longer means what
-        the results say it did.
-        """
+        """Add a validated player without silently changing an existing ID."""
+        player.validate_artifact()
         if player.id in self._players and not replace:
             raise ValueError(f"Player '{player.id}' is already registered")
         self._players[player.id] = player
 
-    def for_env(self, env_id: str) -> list[PlayerRecord]:
-        """Registered players for one game, ordered by step then id.
-
-        Step order is what makes a rating table read as a training curve.
-        Players without a step (``random``, ``best``) sort first.
-        """
+    def for_profile(
+        self,
+        *,
+        env_id: str,
+        env_contract_version: int,
+        algorithm_id: str,
+    ) -> list[PlayerRecord]:
+        """Return one profile's players in training order."""
+        contract = artifact_contract_for(env_id, algorithm_id)
+        if env_contract_version != contract.env_contract_version:
+            raise ValueError(
+                f"Environment '{env_id}' contract version is "
+                f"{contract.env_contract_version}, not {env_contract_version}"
+            )
         return sorted(
-            (p for p in self._players.values() if p.env_id == env_id),
-            key=lambda p: (0 if p.step is None else 1, p.step or 0, p.id),
+            (
+                player
+                for player in self._players.values()
+                if player.env_id == env_id
+                and player.env_contract_version == env_contract_version
+                and player.algorithm_id == algorithm_id
+                and player.model_contract == contract.model_contract
+                and player.model_artifact_schema_version
+                == contract.model_artifact_schema_version
+            ),
+            key=lambda player: (
+                0 if player.step is None else 1,
+                player.step or 0,
+                player.id,
+            ),
         )
-
-    # --- persistence ---
 
     @classmethod
     def load(cls, path: Path) -> PlayerRegistry:
-        """Read a registry, or return an empty one if the file does not exist."""
+        """Read a registry; a missing path denotes an empty registry."""
         if not path.exists():
             return cls()
-        raw = json.loads(path.read_text())
-        known = {f.name for f in fields(PlayerRecord)}
-        players = [
-            PlayerRecord(**{k: v for k, v in entry.items() if k in known})
-            for entry in raw.get("players", [])
-        ]
+        if not path.is_file():
+            raise ValueError(f"Player registry path is not a regular file: {path}")
+        raw = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_json_object,
+            parse_constant=_reject_json_constant,
+        )
+        if not isinstance(raw, dict) or set(raw) != {"schema_version", "players"}:
+            raise ValueError(
+                "Player registry must contain exactly 'schema_version' and 'players'"
+            )
+        schema_version = raw["schema_version"]
+        if (
+            isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+            or schema_version != SCHEMA_VERSION
+        ):
+            raise ValueError(
+                f"Unsupported player registry schema {schema_version!r}; "
+                f"expected {SCHEMA_VERSION}"
+            )
+        entries = raw["players"]
+        if not isinstance(entries, list):
+            raise ValueError("Player registry 'players' must be an array")
+        fields = set(PlayerRecord.__dataclass_fields__)
+        players = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict) or not all(
+                isinstance(key, str) for key in entry
+            ):
+                raise ValueError(f"Player registry entry {index} must be an object")
+            if set(entry) != fields:
+                missing = sorted(fields - set(entry))
+                extra = sorted(set(entry) - fields)
+                details = []
+                if missing:
+                    details.append("missing " + ", ".join(missing))
+                if extra:
+                    details.append("unknown " + ", ".join(extra))
+                raise ValueError(
+                    f"Player registry entry {index} has invalid fields: "
+                    + "; ".join(details)
+                )
+            players.append(PlayerRecord(**entry))
         return cls(players)
 
     def save(self, path: Path) -> None:
-        """Write the registry atomically, sorted for stable diffs."""
+        """Write the validated registry atomically with stable ordering."""
+        for player in self._players.values():
+            player.validate_artifact()
         payload = {
             "schema_version": SCHEMA_VERSION,
             "players": [
-                asdict(p) for p in sorted(self._players.values(), key=lambda p: p.id)
+                asdict(player)
+                for player in sorted(self._players.values(), key=lambda item: item.id)
             ],
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write(
-            path, lambda tmp: Path(tmp).write_text(json.dumps(payload, indent=2) + "\n")
+            path,
+            lambda temporary: Path(temporary).write_text(
+                json.dumps(payload, indent=2) + "\n"
+            ),
         )
 
 
-def make_random_player(env_id: str) -> PlayerRecord:
-    """The baseline every rating scale is anchored to."""
+def make_random_player(env_id: str, algorithm_id: str) -> PlayerRecord:
+    """Build the baseline that anchors this profile's rating scale."""
+    contract = artifact_contract_for(env_id, algorithm_id)
     return PlayerRecord(
-        id=RANDOM_PLAYER_ID,
+        id=random_player_id(
+            env_id=env_id,
+            env_contract_version=contract.env_contract_version,
+            algorithm_id=algorithm_id,
+        ),
         env_id=env_id,
+        env_contract_version=contract.env_contract_version,
+        algorithm_id=algorithm_id,
+        model_contract=contract.model_contract,
+        model_artifact_schema_version=contract.model_artifact_schema_version,
         kind="random",
-        algorithm="baseline",
         registered_at=datetime.now().isoformat(),
     )
 
 
-def discover_checkpoints(models_dir: Path) -> list[Path]:
-    """Every ONNX checkpoint in a models directory, in training order.
-
-    Step checkpoints first (numerically, not lexically), then ``best.onnx`` and
-    ``latest.onnx`` if present — those are aliases of some step, so they are
-    registered under their own ids and compared like anything else.
-    """
-    stepped = sorted(
-        (p for p in models_dir.glob("model_step_*.onnx")),
-        key=lambda p: infer_step(p) or 0,
+def discover_checkpoints(repository: CheckpointPublisher) -> list[CheckpointRef]:
+    """Return all fully verified immutable checkpoints in manifest step order."""
+    checkpoints = repository.list_checkpoints()
+    checkpoint_ids = [checkpoint.checkpoint_id for checkpoint in checkpoints]
+    if len(checkpoint_ids) != len(set(checkpoint_ids)):
+        raise ArtifactValidationError(
+            "Checkpoint repository returned a duplicate manifest ID"
+        )
+    ordered = sorted(
+        checkpoints,
+        key=lambda checkpoint: (checkpoint.manifest.step, checkpoint.checkpoint_id),
     )
-    aliases = [models_dir / name for name in ("best.onnx", "latest.onnx")]
-    return stepped + [p for p in aliases if p.exists()]
+    if checkpoints != ordered:
+        raise ArtifactValidationError(
+            "Checkpoint repository returned a non-canonical discovery order"
+        )
+    return checkpoints
 
 
 def register_checkpoints(
     registry: PlayerRegistry,
     env_id: str,
-    models_dir: Path,
+    model_root: Path,
     *,
-    algorithm: str = "alphazero",
+    algorithm_id: str,
     simulations: int = 0,
     temperature: float = DEFAULT_PLAY_TEMPERATURE,
     replace: bool = False,
+    repository: CheckpointPublisher | None = None,
 ) -> list[PlayerRecord]:
-    """Register every checkpoint in ``models_dir``, plus the random baseline.
+    """Register every immutable checkpoint plus the profile's random baseline."""
+    canonical_temperature = _validate_adapter_settings(simulations, temperature)
+    contract = artifact_contract_for(env_id, algorithm_id)
+    if repository is None:
+        repository = create_checkpoint_publisher(contract, model_root)
 
-    Ids are the checkpoint stem, suffixed with the search budget when there is
-    one — the same weights at 0 and 100 simulations are genuinely different
-    players and must not collide.
-
-    Returns the records that were newly added; already-registered players are
-    skipped rather than replaced, so re-running this after more training only
-    adds the new checkpoints.
-    """
     added: list[PlayerRecord] = []
     now = datetime.now().isoformat()
+    candidates = []
+    for checkpoint in discover_checkpoints(repository):
+        if checkpoint.manifest.profile != contract.profile:
+            raise ArtifactValidationError(
+                f"Checkpoint {checkpoint.checkpoint_id} profile does not match "
+                f"{algorithm_id}/{env_id}/v{contract.env_contract_version}"
+            )
+        record = PlayerRecord(
+            id=checkpoint_player_id(
+                env_id=env_id,
+                env_contract_version=contract.env_contract_version,
+                algorithm_id=algorithm_id,
+                checkpoint_id=checkpoint.checkpoint_id,
+                simulations=simulations,
+                temperature=canonical_temperature,
+            ),
+            env_id=env_id,
+            env_contract_version=contract.env_contract_version,
+            algorithm_id=algorithm_id,
+            model_contract=contract.model_contract,
+            model_artifact_schema_version=contract.model_artifact_schema_version,
+            kind="model",
+            registered_at=now,
+            checkpoint_id=checkpoint.checkpoint_id,
+            onnx_path=str(checkpoint.onnx_path),
+            simulations=simulations,
+            temperature=canonical_temperature,
+            step=checkpoint.manifest.step,
+        )
+        record.validate_artifact()
+        candidates.append(record)
 
-    if RANDOM_PLAYER_ID not in registry:
-        baseline = make_random_player(env_id)
+    baseline = make_random_player(env_id, algorithm_id)
+    if baseline.id not in registry:
         registry.add(baseline)
         added.append(baseline)
 
-    for checkpoint in discover_checkpoints(models_dir):
-        suffix = f"-s{simulations}" if simulations else ""
-        player_id = f"{checkpoint.stem}{suffix}"
-        if player_id in registry and not replace:
+    for record in candidates:
+        if record.id in registry and not replace:
             continue
-        record = PlayerRecord(
-            id=player_id,
-            env_id=env_id,
-            kind="model",
-            checkpoint=str(checkpoint),
-            simulations=simulations,
-            temperature=temperature,
-            algorithm=algorithm,
-            step=infer_step(checkpoint),
-            registered_at=now,
-        )
         registry.add(record, replace=replace)
         added.append(record)
-
     return added

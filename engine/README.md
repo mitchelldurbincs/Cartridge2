@@ -1,31 +1,37 @@
 # Engine
 
-Rust workspace containing the core game engine, game implementations, and MCTS search.
+Rust workspace containing generic environment contracts, installed games,
+algorithm descriptors, AlphaZero search, model loading, and evaluation.
 
 ## Crates
 
 | Crate | Description |
 |-------|-------------|
-| `engine-core` | Game trait, type erasure, registry, EngineContext API, GameMetadata (77 tests) |
-| `engine-config` | Centralized configuration loading from config.toml (19 tests) |
-| `engine-games` | Registers all games via `register_all_games()` (2 tests) |
-| `games-tictactoe` | TicTacToe reference implementation (26 tests) |
-| `games-connect4` | Connect 4 implementation (21 tests) |
-| `games-othello` | Othello (Reversi) implementation (27 tests) |
-| `mcts` | Monte Carlo Tree Search for AlphaZero-style play (22 tests, +3 with `onnx`) |
-| `model-watcher` | Shared model hot-reload utilities (5 tests) |
+| `algorithm-core` | Canonical algorithm descriptors, compatibility checks, artifact identity, runtime profiles |
+| `engine-core` | Generic Environment ABI, wire/semantic capabilities, validated type erasure, registry, EngineContext |
+| `engine-config` | Strict cross-language configuration schema and loading |
+| `engine-games` | Bundled registration and generated environment/algorithm manifest |
+| `envs-counter` | Non-board, single-agent reference environment and generic-contract canary |
+| `evaluator` | Algorithm-dispatched `cartridge-eval` binary |
+| `games-tictactoe` | TicTacToe reference implementation |
+| `games-connect4` | Connect 4 implementation |
+| `games-othello` | Othello (Reversi) implementation |
+| `games-generals` | Full-information Generals 8x8 implementation |
+| `mcts` | Search component for `alphazero_board_v1` |
+| `model-watcher` | Strict filesystem/S3 artifact hot reload |
+| `metrics-common` | Shared Prometheus helpers |
 
 ## Quick Start
 
 ```bash
 # Build all crates
-cargo build --release
+cargo build --release --manifest-path engine/Cargo.toml
 
 # Run all tests
-cargo test
+cargo test --manifest-path engine/Cargo.toml
 
 # Run with ONNX support
-cargo build --release --features mcts/onnx
+cargo build --release --manifest-path engine/Cargo.toml --features mcts/onnx
 ```
 
 ## Architecture
@@ -52,10 +58,12 @@ cargo build --release --features mcts/onnx
 +------------------+
 ```
 
-All game implementations depend on `engine-core` for the Game trait.
-MCTS uses `engine-core` for game simulation via EngineContext.
-`engine-games` bundles the three game crates behind a single
-`register_all_games()` entry point.
+The bundled board games depend on `engine-core` for the narrow `BoardGame`
+profile and its adapter into the generic `Environment` ABI. MCTS uses
+`EngineContext`, but its compatibility guard accepts only environments that
+meet the `alphazero_board_v1` board-game contract.
+`engine-games` bundles the game crates behind a single
+`register_all_environments()` entry point.
 
 ## Workspace Dependencies
 
@@ -68,45 +76,56 @@ Shared dependencies are defined in the root `Cargo.toml`:
 - `tracing` - Logging
 - `criterion` / `proptest` - Testing and benchmarks
 
-## Adding a New Game
+## Adding a New Environment
 
-1. Create crate: `cargo new games-{name} --lib`
+1. Create an `envs-{name}` crate (use `games-{name}` only when the domain is
+   specifically a game)
 2. Add to workspace members in `Cargo.toml`
-3. Implement the `Game` trait from `engine-core`
-4. Add a `register_{name}()` function
-5. Write tests for game logic and encoding
+3. Implement `Environment` directly, or implement `BoardGame` only when the
+   environment genuinely belongs to the bundled deterministic two-seat board
+   family
+4. Register it with `register_environment::<YourEnvironment>()`, or
+   `board_profile::register_board_game::<YourBoardGame>()` for the narrow board profile
+5. Declare an immutable contract version, exact wire encodings, agents and
+   action spaces, turn/information/planning/chance/transition/reward semantics,
+   and optional presentation metadata
+6. Write tests for game logic and strict encoding round trips
+7. Regenerate the manifest with `make environment-manifest` from the repository root
+   and inspect each algorithm compatibility report
 
-See `games-tictactoe` or `games-connect4` for reference implementations.
+See `envs-counter` for the generic contract and `games-tictactoe` for the
+optional board profile.
 
 ## Testing
 
 ```bash
-# All tests (202 unit tests + doc-tests; the workspace build enables the
-# mcts `onnx` feature via model-watcher, adding 3 tests over `-p mcts`)
-cargo test
+# All tests and doc-tests
+cargo test --manifest-path engine/Cargo.toml
 
 # Specific crate
-cargo test -p engine-core      # 77 tests
-cargo test -p engine-config    # 19 tests
-cargo test -p engine-games     # 2 tests
-cargo test -p games-tictactoe  # 26 tests
-cargo test -p games-connect4   # 21 tests
-cargo test -p games-othello    # 27 tests
-cargo test -p mcts             # 22 tests
-cargo test -p model-watcher    # 5 tests
+cargo test --manifest-path engine/Cargo.toml -p algorithm-core
+cargo test --manifest-path engine/Cargo.toml -p engine-core
+cargo test --manifest-path engine/Cargo.toml -p engine-config
+cargo test --manifest-path engine/Cargo.toml -p engine-games
+cargo test --manifest-path engine/Cargo.toml -p games-tictactoe
+cargo test --manifest-path engine/Cargo.toml -p games-connect4
+cargo test --manifest-path engine/Cargo.toml -p games-othello
+cargo test --manifest-path engine/Cargo.toml -p games-generals
+cargo test --manifest-path engine/Cargo.toml -p mcts
+cargo test --manifest-path engine/Cargo.toml -p model-watcher --all-features
 
 # With output
-cargo test -- --nocapture
+cargo test --manifest-path engine/Cargo.toml -- --nocapture
 ```
 
 ## Benchmarks
 
 ```bash
 # Run benchmarks
-cargo bench -p games-tictactoe
+cargo bench --manifest-path engine/Cargo.toml -p games-tictactoe
 
 # MCTS microbenchmarks (Criterion)
-cargo bench -p mcts --bench mcts
+cargo bench --manifest-path engine/Cargo.toml -p mcts --bench mcts
 ```
 
 Recent run (devcontainer, plotters backend) highlights:

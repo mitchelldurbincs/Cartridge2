@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use engine_core::Game;
+use engine_core::board_profile::BoardGame;
 use games_connect4::{observation_from_state, Connect4, State, COLS, ROWS};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -26,7 +26,7 @@ fn bench_step(c: &mut Criterion) {
     group.bench_function("step_center", |b| {
         let mut game = Connect4::new();
         let mut rng = ChaCha20Rng::seed_from_u64(7);
-        let (base_state, _) = game.reset(&mut rng, &[]);
+        let (base_state, _) = game.reset(&mut rng, &[]).unwrap();
         b.iter_batched(
             || base_state.clone(),
             |mut state| {
@@ -41,7 +41,7 @@ fn bench_step(c: &mut Criterion) {
     group.bench_function("step_midgame", |b| {
         let mut game = Connect4::new();
         let mut rng = ChaCha20Rng::seed_from_u64(7);
-        let (mut state, _) = game.reset(&mut rng, &[]);
+        let (mut state, _) = game.reset(&mut rng, &[]).unwrap();
 
         // Play several moves to reach mid-game
         let moves = [3u8, 3, 4, 4, 2, 2, 5, 5, 1, 1];
@@ -157,11 +157,11 @@ fn bench_encode_decode(c: &mut Criterion) {
     });
 
     group.bench_function("observation_encode", |b| {
-        let obs = observation_from_state(&State::new());
+        let obs = observation_from_state(&State::new()).unwrap();
         b.iter_batched(
             || Vec::with_capacity(512),
             |mut buffer| {
-                Connect4::encode_obs(&obs, &mut buffer).unwrap();
+                Connect4::encode_observation(&obs, &mut buffer).unwrap();
                 buffer
             },
             BatchSize::SmallInput,

@@ -1,11 +1,15 @@
 //! The two things a seat can be: a random baseline, or a model.
 
+use algorithm_core::{BuiltinAlgorithm, ModelArtifactContract};
 use anyhow::{anyhow, Result};
-use engine_core::{EngineContext, LegalMask};
+use engine_core::board_profile::{BoardGameMetadata, LegalMask};
+use engine_core::{Decision, EngineContext, EpisodeStatus, ErasedTimestep};
 use mcts::{run_mcts, Evaluator, MctsConfig, OnnxEvaluator};
 use rand::Rng;
 use rand_chacha::ChaCha20Rng;
 use std::path::Path;
+
+use crate::{canonical_evaluation_temperature, validate_onnx_intra_threads};
 
 /// How a model picks moves.
 ///
@@ -22,7 +26,79 @@ pub struct ModelPlayer {
     /// MCTS needs a context of its own for rollouts, separate from the one
     /// stepping the real game.
     sim_ctx: EngineContext,
+    model_contract: ModelArtifactContract,
     label: String,
+}
+
+/// Fully validated AlphaZero decision input.
+///
+/// Keeping the complete timestep here is intentional: MCTS owns extraction of
+/// its root observation and legal mask from the environment transition. The
+/// direct-policy and random paths use the same validated observation rather
+/// than accepting the removed scalar/observation result fields as arguments.
+pub(crate) struct AlphaZeroPosition<'a> {
+    pub state: &'a [u8],
+    pub timestep: &'a ErasedTimestep,
+    pub agent_id: engine_core::AgentId,
+    pub observation: &'a [u8],
+    pub legal_mask: LegalMask,
+    pub action_count: usize,
+}
+
+impl<'a> AlphaZeroPosition<'a> {
+    pub fn new(
+        state: &'a [u8],
+        timestep: &'a ErasedTimestep,
+        board: &BoardGameMetadata,
+    ) -> Result<Self> {
+        if timestep.episode != EpisodeStatus::Running {
+            return Err(anyhow!(
+                "AlphaZero can only select an action from a running timestep, got {:?}",
+                timestep.episode
+            ));
+        }
+
+        let agent_id = match &timestep.decision {
+            Decision::Agents { agent_ids } if agent_ids.len() == 1 => agent_ids[0],
+            decision => {
+                return Err(anyhow!(
+                    "AlphaZero requires exactly one active decision agent, got {decision:?}"
+                ))
+            }
+        };
+        let encoded = timestep.sole_observation()?;
+        if encoded.agent_id != agent_id {
+            return Err(anyhow!(
+                "AlphaZero observation belongs to agent {}, but active agent is {}",
+                encoded.agent_id.0,
+                agent_id.0
+            ));
+        }
+
+        let legal_mask = board.legal_mask_from_obs(&encoded.data)?;
+        if legal_mask.num_actions() != board.action_count {
+            return Err(anyhow!(
+                "AlphaZero legal mask has {} actions, board profile declares {}",
+                legal_mask.num_actions(),
+                board.action_count
+            ));
+        }
+        if legal_mask.count_ones() == 0 {
+            return Err(anyhow!(
+                "AlphaZero running timestep for agent {} has no legal actions",
+                agent_id.0
+            ));
+        }
+
+        Ok(Self {
+            state,
+            timestep,
+            agent_id,
+            observation: &encoded.data,
+            legal_mask,
+            action_count: board.action_count,
+        })
+    }
 }
 
 /// A seat in an evaluation match.
@@ -32,25 +108,56 @@ pub enum Player {
 }
 
 impl Player {
-    /// Load a model player for `env_id`.
+    /// Load a model player only after its artifact identity is validated.
     pub fn model(
-        env_id: &str,
+        model_contract: &ModelArtifactContract,
         model_path: &str,
         temperature: f32,
         simulations: u32,
         intra_threads: usize,
     ) -> Result<Self> {
-        let ctx =
-            EngineContext::new(env_id).ok_or_else(|| anyhow!("Game '{env_id}' not registered"))?;
-        let obs_size = ctx.metadata().obs_size;
-        let evaluator = OnnxEvaluator::load(model_path, obs_size, intra_threads)
-            .map_err(|e| anyhow!("Failed to load model '{model_path}': {e}"))?;
+        let temperature = canonical_evaluation_temperature(temperature)?;
+        validate_onnx_intra_threads(intra_threads)?;
+        let descriptor = BuiltinAlgorithm::AlphaZeroBoardV1.descriptor();
+        if model_contract.schema_version != descriptor.model_artifact_schema_version
+            || model_contract.algorithm_id != descriptor.id
+            || model_contract.model_contract != descriptor.components.model_contract
+        {
+            return Err(anyhow!(
+                "Model identity is not the '{}' AlphaZero artifact contract",
+                descriptor.id
+            ));
+        }
+
+        let env_id = &model_contract.env_id;
+        let ctx = EngineContext::new(env_id)
+            .map_err(|error| anyhow!("Environment '{env_id}' is unavailable: {error}"))?;
+        let capabilities = ctx.capabilities();
+        if capabilities.contract_version != model_contract.env_contract_version {
+            return Err(anyhow!(
+                "Model targets environment '{}' contract v{}, but the registered environment is v{}",
+                env_id,
+                model_contract.env_contract_version,
+                capabilities.contract_version
+            ));
+        }
+        let metadata = ctx.metadata();
+        let board = metadata.require_board()?;
+        let evaluator = OnnxEvaluator::load_from_file(
+            model_path,
+            board.observation.elements,
+            board.action_count,
+            intra_threads,
+            model_contract,
+        )
+        .map_err(|e| anyhow!("Failed to load model '{model_path}': {e}"))?;
 
         Ok(Player::Model(Box::new(ModelPlayer {
             evaluator,
             temperature,
             simulations,
             sim_ctx: ctx,
+            model_contract: model_contract.clone(),
             // Matches Python's ModelPlayer.name. Eval records and W&B runs key
             // off these strings, so the two must not drift.
             label: format!(
@@ -63,8 +170,7 @@ impl Player {
         })))
     }
 
-    /// Name reported in the results, mirroring the Python policy names so
-    /// eval records stay comparable across the migration.
+    /// Canonical policy name reported consistently by Rust and Python evaluators.
     pub fn name(&self) -> String {
         match self {
             Player::Random => "Random".to_string(),
@@ -72,26 +178,48 @@ impl Player {
         }
     }
 
+    /// Reject a model loaded for a different immutable environment profile.
+    pub(crate) fn require_environment_profile(
+        &self,
+        env_id: &str,
+        env_contract_version: u32,
+    ) -> Result<()> {
+        let Player::Model(model) = self else {
+            return Ok(());
+        };
+        if model.model_contract.env_id != env_id
+            || model.model_contract.env_contract_version != env_contract_version
+        {
+            return Err(anyhow!(
+                "Player '{}' targets environment '{}' contract v{}, not '{}' contract v{}",
+                model.label,
+                model.model_contract.env_id,
+                model.model_contract.env_contract_version,
+                env_id,
+                env_contract_version
+            ));
+        }
+        Ok(())
+    }
+
     /// Choose an action for the current position.
-    pub fn select_action(
+    pub(crate) fn select_action(
         &mut self,
-        state: &[u8],
-        obs: &[u8],
-        mask: &LegalMask,
-        num_actions: usize,
+        position: &AlphaZeroPosition<'_>,
         rng: &mut ChaCha20Rng,
     ) -> Result<u32> {
-        let legal: Vec<u32> = mask.iter_ones().map(|i| i as u32).collect();
-        if legal.is_empty() {
-            return Err(anyhow!("No legal moves available"));
-        }
+        let legal: Vec<u32> = position.legal_mask.iter_ones().map(|i| i as u32).collect();
 
         match self {
             Player::Random => Ok(legal[rng.gen_range(0..legal.len())]),
             Player::Model(m) if m.simulations == 0 => {
                 let result = m
                     .evaluator
-                    .evaluate(obs, mask, num_actions)
+                    .evaluate(
+                        position.observation,
+                        &position.legal_mask,
+                        position.action_count,
+                    )
                     .map_err(|e| anyhow!("Model evaluation failed: {e}"))?;
                 Ok(sample_policy(&result.policy, &legal, m.temperature, rng))
             }
@@ -108,9 +236,8 @@ impl Player {
                     &mut m.sim_ctx,
                     &m.evaluator,
                     config,
-                    state.to_vec(),
-                    obs.to_vec(),
-                    mask.clone(),
+                    position.state.to_vec(),
+                    position.timestep.clone(),
                     rng,
                 )?;
                 Ok(result.action)

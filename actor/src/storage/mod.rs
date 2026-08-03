@@ -1,243 +1,279 @@
-//! Storage backend for replay buffer (PostgreSQL).
+//! Selection-bound, algorithm-neutral replay storage.
 //!
-//! This module provides the PostgreSQL storage backend for the replay buffer.
-//!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use actor::storage::{create_replay_store, ReplayStore};
-//!
-//! let store = create_replay_store(&config).await?;
-//!
-//! // Store transitions
-//! store.store_batch(&transitions).await?;
-//! ```
+//! PostgreSQL stores an immutable envelope plus opaque experience bytes. The
+//! selected algorithm cartridge owns the payload codec named by
+//! [`ReplayProfile::experience_schema`]. Storage never interprets observations,
+//! actions, rewards, policies, board layouts, or any other algorithm detail.
+//! Every operation is fenced to one exact [`ReplaySelection`], so records from
+//! stale or concurrent collection attempts are never visible to its learner.
 
 mod postgres;
 
 pub use postgres::{PoolConfig, PostgresReplayStore};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use async_trait::async_trait;
-use engine_core::GameMetadata;
 
-/// A single transition from one game state to the next
-#[derive(Debug, Clone)]
-pub struct Transition {
-    pub id: String,
-    pub env_id: String,
-    pub episode_id: String,
-    pub step_number: u32,
-    pub state: Vec<u8>,
-    pub action: Vec<u8>,
-    pub next_state: Vec<u8>,
-    pub observation: Vec<u8>,
-    pub next_observation: Vec<u8>,
-    pub reward: f32,
-    pub done: bool,
-    pub timestamp: u64,
-    /// MCTS policy probabilities for training (stored as f32 bytes)
-    pub policy_probs: Vec<u8>,
-    /// MCTS value estimate from root
-    pub mcts_value: f32,
-    /// Final game outcome from this player's perspective (+1 win, -1 loss, 0 draw)
-    /// This is backfilled after the episode ends
-    pub game_outcome: Option<f32>,
+const SHA256_HEX_LENGTH: usize = 64;
+
+pub(crate) fn validate_replay_digest(value: &str, field: &str) -> Result<()> {
+    if value.len() != SHA256_HEX_LENGTH
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("{field} must be exactly 64 lowercase hexadecimal characters");
+    }
+    Ok(())
 }
 
-/// Abstract interface for replay buffer storage.
+/// Exact namespace owned by one collector/learner pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayProfile {
+    pub env_id: String,
+    /// Immutable revision of the environment state/action/observation contract.
+    pub env_contract_version: u32,
+    pub algorithm_id: String,
+    /// Language-neutral payload codec owned by the algorithm cartridge.
+    pub experience_schema: String,
+}
+
+impl ReplayProfile {
+    pub fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            ("env_id", self.env_id.as_str()),
+            ("algorithm_id", self.algorithm_id.as_str()),
+            ("experience_schema", self.experience_schema.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("replay profile {name} cannot be empty");
+            }
+        }
+        if self.env_contract_version == 0 {
+            bail!("replay profile env_contract_version must be positive");
+        }
+        Ok(())
+    }
+
+    fn matches(&self, record: &ReplayRecord) -> bool {
+        record.env_id == self.env_id
+            && record.env_contract_version == self.env_contract_version
+            && record.algorithm_id == self.algorithm_id
+            && record.experience_schema == self.experience_schema
+    }
+}
+
+/// Exact replay collection selected by one synchronized iteration attempt.
 ///
-/// Implementations must be thread-safe and support concurrent writes
-/// from multiple actor instances.
+/// `collection_scope_id` is a new random SHA-256-shaped identity for every
+/// attempt. `source_checkpoint_id` binds the collected experience to the model
+/// generation that produced it; it is null only for a run's initial root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplaySelection {
+    pub profile: ReplayProfile,
+    pub collection_scope_id: String,
+    pub source_checkpoint_id: Option<String>,
+}
+
+impl ReplaySelection {
+    pub fn validate(&self) -> Result<()> {
+        self.profile.validate()?;
+        validate_replay_digest(&self.collection_scope_id, "collection_scope_id")?;
+        if let Some(source_checkpoint_id) = &self.source_checkpoint_id {
+            validate_replay_digest(source_checkpoint_id, "source_checkpoint_id")?;
+        }
+        Ok(())
+    }
+
+    fn matches(&self, record: &ReplayRecord) -> bool {
+        self.profile.matches(record)
+            && record.collection_scope_id == self.collection_scope_id
+            && record.source_checkpoint_id == self.source_checkpoint_id
+    }
+
+    /// Wrap an algorithm-owned payload in this exact replay selection.
+    pub fn record(
+        &self,
+        id: impl Into<String>,
+        episode_id: impl Into<String>,
+        step_number: u32,
+        payload: Vec<u8>,
+    ) -> ReplayRecord {
+        ReplayRecord {
+            id: id.into(),
+            env_id: self.profile.env_id.clone(),
+            env_contract_version: self.profile.env_contract_version,
+            algorithm_id: self.profile.algorithm_id.clone(),
+            experience_schema: self.profile.experience_schema.clone(),
+            collection_scope_id: self.collection_scope_id.clone(),
+            source_checkpoint_id: self.source_checkpoint_id.clone(),
+            episode_id: episode_id.into(),
+            step_number,
+            payload,
+        }
+    }
+}
+
+/// Immutable replay envelope.
+///
+/// `payload` is opaque to this module. Its exact meaning is selected by the
+/// `(algorithm_id, experience_schema)` pair in the profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayRecord {
+    pub id: String,
+    pub env_id: String,
+    pub env_contract_version: u32,
+    pub algorithm_id: String,
+    pub experience_schema: String,
+    pub collection_scope_id: String,
+    pub source_checkpoint_id: Option<String>,
+    pub episode_id: String,
+    pub step_number: u32,
+    pub payload: Vec<u8>,
+}
+
+/// Algorithm-neutral replay persistence.
 #[async_trait]
 #[allow(dead_code)]
 pub trait ReplayStore: Send + Sync {
-    /// Store a single transition in the replay buffer
-    async fn store(&self, transition: &Transition) -> Result<()>;
-
-    /// Store multiple transitions in a batch (more efficient)
-    async fn store_batch(&self, transitions: &[Transition]) -> Result<()>;
-
-    /// Get the total number of transitions in the buffer
+    async fn store(&self, record: &ReplayRecord) -> Result<()>;
+    async fn store_batch(&self, records: &[ReplayRecord]) -> Result<()>;
     async fn count(&self) -> Result<usize>;
+    async fn count_episodes(&self) -> Result<usize>;
 
-    /// Store or update game metadata (upsert)
-    async fn store_metadata(&self, metadata: &GameMetadata) -> Result<()>;
-
-    /// Clear all transitions (preserves metadata)
+    /// Clear only this store's exact selection; every other scope is kept.
     async fn clear(&self) -> Result<()>;
 }
 
-/// Configuration for creating a replay store.
-///
-/// Built from [`crate::config::Config`], which resolves the connection URL
-/// and pool settings from CLI/env/config.toml.
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
-    /// PostgreSQL connection string
     pub postgres_url: String,
-    /// Connection pool configuration
     pub pool_config: PoolConfig,
+    pub selection: ReplaySelection,
 }
 
-/// Create a replay store based on configuration
 pub async fn create_replay_store(config: &StorageConfig) -> Result<Box<dyn ReplayStore>> {
-    let store =
-        PostgresReplayStore::with_pool_config(&config.postgres_url, config.pool_config.clone())
-            .await?;
+    config.selection.validate()?;
+    let store = PostgresReplayStore::with_pool_config(
+        &config.postgres_url,
+        config.pool_config.clone(),
+        config.selection.clone(),
+    )
+    .await?;
     Ok(Box::new(store))
 }
 
-/// Mock replay store for testing without database dependencies.
-///
-/// Stores transitions in memory and tracks all operations for verification.
 #[cfg(test)]
 pub mod mock {
     use super::*;
     use std::sync::Mutex;
 
-    /// In-memory mock implementation of ReplayStore for testing.
-    ///
-    /// This mock stores all transitions in memory and provides helper methods
-    /// for test assertions. It can also be configured to fail on specific
-    /// operations to test error handling.
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     pub struct MockReplayStore {
-        /// Stored transitions (in order of insertion)
-        transitions: Mutex<Vec<Transition>>,
-        /// Stored game metadata
-        metadata: Mutex<Option<GameMetadata>>,
-        /// Flag to simulate store failures
+        selection: ReplaySelection,
+        records: Mutex<Vec<ReplayRecord>>,
         fail_store: Mutex<bool>,
-        /// Flag to simulate count failures
         fail_count: Mutex<bool>,
     }
 
     impl MockReplayStore {
-        /// Create a new empty mock store.
-        pub fn new() -> Self {
-            Self::default()
-        }
-
-        /// Create a mock store that fails on store operations.
-        pub fn failing_store() -> Self {
+        pub fn new(selection: ReplaySelection) -> Self {
+            selection.validate().expect("valid mock replay selection");
             Self {
-                fail_store: Mutex::new(true),
-                ..Default::default()
+                selection,
+                records: Mutex::new(Vec::new()),
+                fail_store: Mutex::new(false),
+                fail_count: Mutex::new(false),
             }
         }
 
-        /// Get all stored transitions.
-        pub fn get_transitions(&self) -> Vec<Transition> {
-            self.transitions.lock().unwrap().clone()
+        pub fn failing_store(selection: ReplaySelection) -> Self {
+            let store = Self::new(selection);
+            *store.fail_store.lock().unwrap() = true;
+            store
         }
 
-        /// Get the stored metadata.
-        pub fn get_metadata(&self) -> Option<GameMetadata> {
-            self.metadata.lock().unwrap().clone()
+        pub fn get_records(&self) -> Vec<ReplayRecord> {
+            self.records.lock().unwrap().clone()
         }
 
-        /// Set whether store operations should fail.
         #[allow(dead_code)]
         pub fn set_fail_store(&self, fail: bool) {
             *self.fail_store.lock().unwrap() = fail;
         }
 
-        /// Set whether count operations should fail.
         #[allow(dead_code)]
         pub fn set_fail_count(&self, fail: bool) {
             *self.fail_count.lock().unwrap() = fail;
         }
 
-        /// Get transitions for a specific episode.
-        pub fn get_episode_transitions(&self, episode_id: &str) -> Vec<Transition> {
-            self.transitions
+        pub fn get_episode_records(&self, episode_id: &str) -> Vec<ReplayRecord> {
+            self.records
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|t| t.episode_id == episode_id)
+                .filter(|record| record.episode_id == episode_id)
                 .cloned()
                 .collect()
         }
 
-        /// Verify all transitions have game outcomes set.
-        #[allow(dead_code)]
-        pub fn all_have_outcomes(&self) -> bool {
-            self.transitions
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|t| t.game_outcome.is_some())
-        }
-
-        /// Verify game outcomes are correctly backfilled (alternating signs).
-        pub fn verify_outcome_backfill(&self, episode_id: &str) -> bool {
-            let transitions = self.get_episode_transitions(episode_id);
-            if transitions.is_empty() {
-                return true;
+        fn require_selection(&self, record: &ReplayRecord) -> Result<()> {
+            if !self.selection.matches(record) {
+                bail!(
+                    "replay record '{}' does not match replay selection {:?}",
+                    record.id,
+                    self.selection
+                );
             }
-
-            // Get the final outcome (from the perspective of the last mover)
-            let last = transitions.last().unwrap();
-            let final_outcome = match last.game_outcome {
-                Some(o) => o,
-                None => return false,
-            };
-
-            // Verify each transition has correctly signed outcome
-            let total_steps = transitions.len() as u32;
-            for t in &transitions {
-                let steps_from_end = total_steps.saturating_sub(1).saturating_sub(t.step_number);
-                let expected_sign = if steps_from_end % 2 == 0 { 1.0 } else { -1.0 };
-                let expected = final_outcome * expected_sign;
-
-                match t.game_outcome {
-                    Some(actual) if (actual - expected).abs() < 1e-6 => {}
-                    _ => return false,
-                }
-            }
-            true
+            Ok(())
         }
     }
 
     #[async_trait]
     impl ReplayStore for MockReplayStore {
-        async fn store(&self, transition: &Transition) -> Result<()> {
+        async fn store(&self, record: &ReplayRecord) -> Result<()> {
             if *self.fail_store.lock().unwrap() {
-                return Err(anyhow::anyhow!("Mock store failure"));
+                bail!("Mock store failure");
             }
-            self.transitions.lock().unwrap().push(transition.clone());
+            self.require_selection(record)?;
+            self.records.lock().unwrap().push(record.clone());
             Ok(())
         }
 
-        async fn store_batch(&self, transitions: &[Transition]) -> Result<()> {
+        async fn store_batch(&self, records: &[ReplayRecord]) -> Result<()> {
             if *self.fail_store.lock().unwrap() {
-                return Err(anyhow::anyhow!("Mock batch store failure"));
+                bail!("Mock batch store failure");
             }
-            self.transitions
-                .lock()
-                .unwrap()
-                .extend(transitions.iter().cloned());
+            for record in records {
+                self.require_selection(record)?;
+            }
+            self.records.lock().unwrap().extend(records.iter().cloned());
             Ok(())
         }
 
         async fn count(&self) -> Result<usize> {
             if *self.fail_count.lock().unwrap() {
-                return Err(anyhow::anyhow!("Mock count failure"));
+                bail!("Mock count failure");
             }
-            Ok(self.transitions.lock().unwrap().len())
+            Ok(self.records.lock().unwrap().len())
         }
 
-        async fn store_metadata(&self, metadata: &GameMetadata) -> Result<()> {
-            if *self.fail_store.lock().unwrap() {
-                return Err(anyhow::anyhow!("Mock metadata store failure"));
+        async fn count_episodes(&self) -> Result<usize> {
+            if *self.fail_count.lock().unwrap() {
+                bail!("Mock count failure");
             }
-            *self.metadata.lock().unwrap() = Some(metadata.clone());
-            Ok(())
+            Ok(self
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|record| record.episode_id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len())
         }
 
         async fn clear(&self) -> Result<()> {
-            self.transitions.lock().unwrap().clear();
+            self.records.lock().unwrap().clear();
             Ok(())
         }
     }
@@ -246,132 +282,107 @@ pub mod mock {
     mod tests {
         use super::*;
 
-        fn sample_transition(id: &str, episode_id: &str, step: u32) -> Transition {
-            Transition {
-                id: id.to_string(),
-                env_id: "tictactoe".to_string(),
-                episode_id: episode_id.to_string(),
-                step_number: step,
-                state: vec![0u8; 10],
-                action: vec![4, 0, 0, 0], // Action 4
-                next_state: vec![1u8; 10],
-                observation: vec![0u8; 116],
-                next_observation: vec![1u8; 116],
-                reward: 0.0,
-                done: false,
-                timestamp: 1234567890,
-                policy_probs: vec![0u8; 36], // 9 f32s
-                mcts_value: 0.5,
-                game_outcome: None,
+        fn profile() -> ReplayProfile {
+            ReplayProfile {
+                env_id: "tictactoe".into(),
+                env_contract_version: 1,
+                algorithm_id: algorithm_core::ALPHAZERO_BOARD_V1_ID.into(),
+                experience_schema: "alphazero_transition_v1".into(),
             }
         }
 
-        #[tokio::test]
-        async fn test_mock_store_single() {
-            let store = MockReplayStore::new();
-            let t = sample_transition("t1", "ep1", 0);
+        fn selection() -> ReplaySelection {
+            ReplaySelection {
+                profile: profile(),
+                collection_scope_id: "a".repeat(64),
+                source_checkpoint_id: Some("b".repeat(64)),
+            }
+        }
 
-            store.store(&t).await.unwrap();
+        fn record(id: &str, episode_id: &str, step: u32) -> ReplayRecord {
+            selection().record(id, episode_id, step, vec![step as u8])
+        }
 
-            assert_eq!(store.count().await.unwrap(), 1);
-            let stored = store.get_transitions();
-            assert_eq!(stored[0].id, "t1");
+        #[test]
+        fn profile_rejects_empty_or_unversioned_namespaces() {
+            let mut value = profile();
+            value.algorithm_id.clear();
+            assert!(value
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("algorithm_id"));
+
+            let mut value = profile();
+            value.env_contract_version = 0;
+            assert!(value
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must be positive"));
+        }
+
+        #[test]
+        fn selection_requires_exact_lowercase_digests() {
+            assert!(selection().validate().is_ok());
+
+            let mut value = selection();
+            value.collection_scope_id = "A".repeat(64);
+            assert!(value
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("collection_scope_id"));
+
+            let mut value = selection();
+            value.source_checkpoint_id = Some("f".repeat(63));
+            assert!(value
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("source_checkpoint_id"));
+
+            let mut root = selection();
+            root.source_checkpoint_id = None;
+            assert!(root.validate().is_ok());
         }
 
         #[tokio::test]
-        async fn test_mock_store_batch() {
-            let store = MockReplayStore::new();
-            let transitions = vec![
-                sample_transition("t1", "ep1", 0),
-                sample_transition("t2", "ep1", 1),
-                sample_transition("t3", "ep1", 2),
-            ];
-
-            store.store_batch(&transitions).await.unwrap();
-
-            assert_eq!(store.count().await.unwrap(), 3);
-        }
-
-        #[tokio::test]
-        async fn test_mock_clear() {
-            let store = MockReplayStore::new();
+        async fn mock_stores_and_clears_profile_records() {
+            let store = MockReplayStore::new(selection());
             store
-                .store_batch(&[sample_transition("t1", "ep1", 0)])
+                .store_batch(&[record("one", "episode", 0), record("two", "episode", 1)])
                 .await
                 .unwrap();
 
-            store.clear().await.unwrap();
+            assert_eq!(store.count().await.unwrap(), 2);
+            assert_eq!(store.count_episodes().await.unwrap(), 1);
+            assert_eq!(store.get_episode_records("episode").len(), 2);
+            assert_eq!(store.get_records()[1].payload, vec![1]);
 
+            store.clear().await.unwrap();
             assert_eq!(store.count().await.unwrap(), 0);
         }
 
         #[tokio::test]
-        async fn test_mock_metadata() {
-            let store = MockReplayStore::new();
-            let metadata = GameMetadata::new("tictactoe", "Tic-Tac-Toe")
-                .with_board(3, 3)
-                .with_actions(9)
-                .with_observation(29, 18)
-                .with_players(2, vec!["X".to_string(), "O".to_string()], vec!['X', 'O']);
+        async fn mock_rejects_cross_selection_records() {
+            let store = MockReplayStore::new(selection());
+            let mut wrong = record("one", "episode", 0);
+            wrong.collection_scope_id = "c".repeat(64);
 
-            store.store_metadata(&metadata).await.unwrap();
+            let error = store.store(&wrong).await.unwrap_err().to_string();
+            assert!(error.contains("does not match replay selection"));
 
-            let stored = store.get_metadata().unwrap();
-            assert_eq!(stored.env_id, "tictactoe");
-            assert_eq!(stored.num_actions, 9);
+            let mut wrong_source = record("two", "episode", 0);
+            wrong_source.source_checkpoint_id = None;
+            let error = store.store(&wrong_source).await.unwrap_err().to_string();
+            assert!(error.contains("does not match replay selection"));
         }
 
         #[tokio::test]
-        async fn test_mock_failure_mode() {
-            let store = MockReplayStore::failing_store();
-
-            let result = store.store(&sample_transition("t1", "ep1", 0)).await;
-            assert!(result.is_err());
-
-            let result = store
-                .store_batch(&[sample_transition("t2", "ep1", 1)])
-                .await;
-            assert!(result.is_err());
-        }
-
-        #[tokio::test]
-        async fn test_get_episode_transitions() {
-            let store = MockReplayStore::new();
-            store
-                .store_batch(&[
-                    sample_transition("t1", "ep1", 0),
-                    sample_transition("t2", "ep2", 0),
-                    sample_transition("t3", "ep1", 1),
-                ])
-                .await
-                .unwrap();
-
-            let ep1 = store.get_episode_transitions("ep1");
-            assert_eq!(ep1.len(), 2);
-
-            let ep2 = store.get_episode_transitions("ep2");
-            assert_eq!(ep2.len(), 1);
-        }
-
-        #[tokio::test]
-        async fn test_outcome_backfill_verification() {
-            let store = MockReplayStore::new();
-
-            // Create transitions with properly backfilled outcomes
-            // 3-step game ending in P1 win (+1)
-            // Step 0: P1 moves, outcome should be +1 (0 steps from end, even)
-            // Step 1: P2 moves, outcome should be -1 (1 step from end, odd)
-            // Step 2: P1 moves, outcome should be +1 (2 steps from end, even) - WINNER
-            let mut t0 = sample_transition("t0", "ep1", 0);
-            t0.game_outcome = Some(1.0);
-            let mut t1 = sample_transition("t1", "ep1", 1);
-            t1.game_outcome = Some(-1.0);
-            let mut t2 = sample_transition("t2", "ep1", 2);
-            t2.game_outcome = Some(1.0);
-
-            store.store_batch(&[t0, t1, t2]).await.unwrap();
-
-            assert!(store.verify_outcome_backfill("ep1"));
+        async fn mock_failure_is_propagated() {
+            let store = MockReplayStore::failing_store(selection());
+            assert!(store.store(&record("one", "episode", 0)).await.is_err());
         }
     }
 }

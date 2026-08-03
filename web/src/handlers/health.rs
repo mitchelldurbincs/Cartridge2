@@ -16,9 +16,7 @@ pub async fn health() -> Json<HealthResponse> {
     })
 }
 
-/// Prometheus metrics handler.
-/// Sibling: actor/src/health.rs::metrics_handler (actor also refreshes its
-/// memory gauge before encoding).
+/// Prometheus metrics handler for the long-running web service.
 pub async fn metrics_handler() -> (StatusCode, [(header::HeaderName, &'static str); 1], String) {
     (
         StatusCode::OK,

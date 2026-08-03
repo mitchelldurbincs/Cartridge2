@@ -10,7 +10,7 @@ Settings are loaded with the following priority (highest to lowest):
 1. **CLI arguments** - Direct command-line flags
 2. **Environment variables** - `CARTRIDGE_<SECTION>_<KEY>`
 3. **config.toml** - Central configuration file
-4. **Built-in defaults** - Hardcoded fallbacks in engine-config
+4. **`config.defaults.toml`** - Embedded by Rust and loaded by Python
 
 ## Sections
 
@@ -20,9 +20,19 @@ Shared configuration across all components.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `data_dir` | string | `"./data"` | Base data directory for models, stats, replay buffer |
+| `data_dir` | string | `"./data"` | Runtime root; components append `profiles/{algorithm}/{env}/v{contract}` |
 | `env_id` | string | `"tictactoe"` | Default game environment ID |
 | `log_level` | string | `"info"` | Log level: trace, debug, info, warn, error |
+
+### [algorithm]
+
+Selects the algorithm cartridge used by collectors, learners, model adapters,
+and evaluation. Registration and compatibility are separate: an installed
+algorithm still rejects environments that do not satisfy its requirements.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `id` | string | `"alphazero_board_v1"` | Canonical algorithm cartridge ID |
 
 ### [training]
 
@@ -30,18 +40,16 @@ Training loop configuration (used by trainer).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `iterations` | i32 | `100` | Number of training iterations |
-| `start_iteration` | i32 | `1` | Starting iteration (for resume) |
-| `episodes_per_iteration` | i32 | `500` | Self-play episodes per iteration |
-| `steps_per_iteration` | i32 | `1000` | Training steps per iteration |
-| `batch_size` | i32 | `64` | Training batch size |
+| `iterations` | u64 | `100` | Number of training iterations |
+| `episodes_per_iteration` | u32 | `500` | Self-play episodes per iteration |
+| `steps_per_iteration` | u64 | `1000` | Training steps per iteration |
+| `batch_size` | u64 | `64` | Training batch size |
 | `learning_rate` | f64 | `0.001` | Initial learning rate |
 | `weight_decay` | f64 | `0.0001` | L2 regularization weight decay |
 | `grad_clip_norm` | f64 | `1.0` | Gradient clipping norm |
 | `device` | string | `"cpu"` | Device: auto, cpu, cuda, mps |
-| `checkpoint_interval` | i32 | `100` | Steps between checkpoints |
-| `max_checkpoints` | i32 | `10` | Maximum checkpoints to keep |
-| `num_actors` | i32 | `6` | Parallel actor processes for self-play |
+| `checkpoint_interval` | u64 | `100` | Steps between checkpoints |
+| `num_actors` | u32 | `1` | Parallel actor processes for self-play |
 
 ### [evaluation]
 
@@ -49,10 +57,16 @@ Model evaluation configuration.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `interval` | i32 | `1` | Evaluate every N iterations (0 = disable) |
-| `games` | i32 | `50` | Games per evaluation |
-| `win_threshold` | f64 | `0.55` | Win rate to become new best model |
+| `interval` | u64 | `1` | Evaluate every N iterations (0 = disable) |
+| `games` | u32 | `50` | Games per evaluation |
+| `win_threshold` | f64 | `0.55` | Win rate required for champion promotion |
 | `eval_vs_random` | bool | `true` | Also evaluate against random baseline |
+| `simulations` | u32 | `0` | MCTS simulations per evaluation move; 0 uses policy only |
+| `temperature` | f32 | `0.2` | Action-selection temperature for evaluation games |
+| `solver_games` | u32 | `0` | Connect4 perfect-solver games; nonzero values are rejected for other environments |
+| `evaluation_seed` | u64 | `42` | Stable seed for every evaluation game family |
+| `promotion_metric` | string | `"win_rate"` | `win_rate` or `solver_optimal` |
+| `promotion_margin` | f64 | `0.0` | Required solver-optimal improvement; canonical zero while `promotion_metric = "win_rate"` |
 
 ### [actor]
 
@@ -61,9 +75,7 @@ Self-play actor configuration.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `actor_id` | string | `"actor-1"` | Unique identifier for this actor |
-| `max_episodes` | i32 | `-1` | Maximum episodes (-1 = unlimited) |
 | `episode_timeout_secs` | u64 | `30` | Timeout per episode in seconds |
-| `flush_interval_secs` | u64 | `5` | Interval to flush replay buffer |
 | `log_interval` | u32 | `50` | Episodes between log messages |
 
 ### [web]
@@ -74,6 +86,7 @@ Web server configuration.
 |-------|------|---------|-------------|
 | `host` | string | `"0.0.0.0"` | Server bind address |
 | `port` | u16 | `8080` | Server port |
+| `allowed_origins` | string[] | `[]` | Explicit CORS origins; empty selects the localhost-only allowlist |
 
 ### [mcts]
 
@@ -82,16 +95,16 @@ Monte Carlo Tree Search configuration.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `start_sims` | u32 | `50` | Simulations for first iteration (ramping start) |
-| `max_sims` | u32 | `250` | Maximum simulations after ramping completes |
-| `sim_ramp_rate` | u32 | `10` | Simulations added per iteration |
-| `num_simulations` | u32 | `800` | Legacy: MCTS simulations per move (used if ramping not configured) |
-| `c_puct` | f64 | `1.4` | Exploration constant |
-| `temperature` | f64 | `1.0` | Action selection temperature |
-| `temp_threshold` | u32 | `15` | Move number after which to reduce temperature (0 = disabled) |
-| `dirichlet_alpha` | f64 | `0.3` | Dirichlet noise alpha |
-| `dirichlet_weight` | f64 | `0.25` | Dirichlet noise weight |
-| `eval_batch_size` | usize | `32` | Batch size for ONNX evaluation during MCTS |
-| `onnx_intra_threads` | usize | `1` | ONNX intra-op parallelism threads |
+| `max_sims` | u32 | `400` | Maximum simulations after ramping completes |
+| `sim_ramp_rate` | u32 | `20` | Simulations added per iteration |
+| `c_puct` | f32 | `1.4` | Exploration constant |
+| `temperature` | f32 | `1.0` | Action selection temperature |
+| `late_temperature` | f32 | `1.0` | Action selection temperature at/after `temp_threshold`; must equal base temperature when threshold is 0 |
+| `temp_threshold` | u32 | `0` | Move number after which to reduce temperature (0 = disabled) |
+| `dirichlet_alpha` | f32 | `0.3` | Dirichlet noise alpha; alpha and weight must both be 0 to disable |
+| `dirichlet_weight` | f32 | `0.25` | Dirichlet noise weight; alpha and weight must both be 0 to disable |
+| `eval_batch_size` | u32 | `32` | Batch size for ONNX evaluation during MCTS |
+| `onnx_intra_threads` | u32 | `1` | ONNX intra-op parallelism threads |
 
 ### [logging]
 
@@ -117,13 +130,32 @@ Storage backend configuration.
 | `pool_connect_timeout` | u64 | `30` | Pool connection timeout (seconds) |
 | `pool_idle_timeout` | u64? | `300` | Pool idle timeout (seconds) |
 
+### [wandb]
+
+Trainer-only Weights & Biases integration.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable W&B logging |
+| `required` | bool | `false` | Fail instead of using a no-op logger when W&B is unavailable |
+| `project` | string | `"cartridge2"` | W&B project |
+| `entity` | string | `""` | W&B entity; empty uses the logged-in default |
+| `group` | string | `""` | Optional run group |
+| `tags` | string[] | `[]` | Run tags |
+| `init_timeout_seconds` | f64 | `30.0` | W&B initialization timeout |
+
 ## Environment Variable Overrides
 
-All configuration values can be overridden via environment variables using the pattern:
+Both implementations accept the environment-variable pattern:
 
 ```
 CARTRIDGE_<SECTION>_<KEY>=value
 ```
+
+Rust maps every declared field explicitly in
+`engine/engine-config/src/loader.rs`; Python derives the mapping from its typed
+schema. Unknown keys are rejected rather than treated as compatibility aliases.
+List values such as `allowed_origins` and W&B tags are comma-separated.
 
 ### Examples
 
@@ -132,6 +164,9 @@ CARTRIDGE_<SECTION>_<KEY>=value
 CARTRIDGE_COMMON_ENV_ID=connect4
 CARTRIDGE_COMMON_DATA_DIR=/data
 CARTRIDGE_COMMON_LOG_LEVEL=debug
+
+# Algorithm
+CARTRIDGE_ALGORITHM_ID=alphazero_board_v1
 
 # Training
 CARTRIDGE_TRAINING_ITERATIONS=50
@@ -142,17 +177,20 @@ CARTRIDGE_TRAINING_DEVICE=cuda
 # Evaluation
 CARTRIDGE_EVALUATION_INTERVAL=5
 CARTRIDGE_EVALUATION_GAMES=100
+CARTRIDGE_EVALUATION_EVALUATION_SEED=42
 
 # Actor
 CARTRIDGE_ACTOR_ACTOR_ID=actor-2
-CARTRIDGE_ACTOR_MAX_EPISODES=1000
+CARTRIDGE_ACTOR_EPISODE_TIMEOUT_SECS=60
 
 # Web
 CARTRIDGE_WEB_HOST=127.0.0.1
 CARTRIDGE_WEB_PORT=3000
 
 # MCTS
-CARTRIDGE_MCTS_NUM_SIMULATIONS=1600
+CARTRIDGE_MCTS_START_SIMS=100
+CARTRIDGE_MCTS_MAX_SIMS=1600
+CARTRIDGE_MCTS_SIM_RAMP_RATE=20
 CARTRIDGE_MCTS_C_PUCT=2.0
 
 # Storage
@@ -170,7 +208,10 @@ Configuration is searched in the following order:
 3. `../config.toml` (parent directory)
 4. `/app/config.toml` (Docker container)
 
-If no config file is found, built-in defaults are used.
+If no config file is found, Rust uses its embedded `config.defaults.toml`.
+Python uses the repository copy in a source checkout and a byte-identical
+package resource from an installed wheel. A checkout with divergent copies, or
+an installation without complete canonical defaults, fails closed.
 
 ## Python Trainer Alignment
 
@@ -194,5 +235,6 @@ When adding new fields to the Rust schema:
 | `usize` | `int` | integer |
 | `u16` | `int` | integer |
 | `f64` | `float` | float |
+| `Vec<String>` | `list[str]` | string array |
 | `Option<String>` | `Optional[str]` | string or absent |
 | `Option<u64>` | `Optional[int]` | integer or absent |

@@ -3,6 +3,7 @@
 use super::*;
 use crate::types::{
     GameInfoResponse, GameStateResponse, GamesListResponse, HealthResponse, MoveResponse,
+    TrainingStats,
 };
 use axum::{
     body::Body,
@@ -58,6 +59,102 @@ async fn test_health_endpoint() {
     assert_eq!(status, StatusCode::OK);
     let response: HealthResponse = serde_json::from_str(&body).unwrap();
     assert_eq!(response.status, "ok");
+}
+
+#[tokio::test]
+async fn test_stats_endpoint_returns_default_only_when_projection_is_absent() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut state = create_test_state();
+    Arc::get_mut(&mut state).unwrap().data_dir = directory.path().display().to_string();
+
+    let (status, body) = get(create_app(state), "/stats").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let stats: TrainingStats = serde_json::from_str(&body).unwrap();
+    assert_eq!(stats.step, 0);
+    assert_eq!(stats.samples_seen, 0);
+    assert!(stats.last_checkpoint.is_empty());
+}
+
+#[tokio::test]
+async fn test_stats_endpoint_accepts_the_exact_projection_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let expected = TrainingStats {
+        step: 12,
+        total_steps: 12,
+        samples_seen: 768,
+        last_checkpoint: "a".repeat(64),
+        env_id: "tictactoe".to_string(),
+        ..TrainingStats::default()
+    };
+    tokio::fs::write(
+        directory.path().join("stats.json"),
+        serde_json::to_vec(&expected).unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut state = create_test_state();
+    Arc::get_mut(&mut state).unwrap().data_dir = directory.path().display().to_string();
+
+    let (status, body) = get(create_app(state), "/stats").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let stats: TrainingStats = serde_json::from_str(&body).unwrap();
+    assert_eq!(stats.step, expected.step);
+    assert_eq!(stats.samples_seen, expected.samples_seen);
+    assert_eq!(stats.last_checkpoint, expected.last_checkpoint);
+}
+
+#[tokio::test]
+async fn test_stats_endpoint_rejects_malformed_or_legacy_projection() {
+    for contents in [
+        b"{not-json".as_slice(),
+        br#"{"step": 12, "replay_buffer_size": 99}"#,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        tokio::fs::write(directory.path().join("stats.json"), contents)
+            .await
+            .unwrap();
+        let mut state = create_test_state();
+        Arc::get_mut(&mut state).unwrap().data_dir = directory.path().display().to_string();
+
+        let (status, body) = get(create_app(state), "/stats").await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("Training stats projection"));
+        assert!(body.contains("invalid"));
+    }
+}
+
+#[tokio::test]
+async fn test_stats_endpoint_rejects_non_regular_projection() {
+    let directory = tempfile::tempdir().unwrap();
+    tokio::fs::create_dir(directory.path().join("stats.json"))
+        .await
+        .unwrap();
+    let mut state = create_test_state();
+    Arc::get_mut(&mut state).unwrap().data_dir = directory.path().display().to_string();
+
+    let (status, body) = get(create_app(state), "/stats").await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body.contains("not a regular file"));
+}
+
+#[tokio::test]
+async fn test_model_endpoint_does_not_hide_a_poisoned_model_state() {
+    let state = create_test_state();
+    let model_info = Arc::clone(&state.model_info);
+    let _ = std::thread::spawn(move || {
+        let _guard = model_info.write().unwrap();
+        panic!("poison model information for the route test");
+    })
+    .join();
+
+    let (status, body) = get(create_app(state), "/model").await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body.contains("Model information is unavailable"));
 }
 
 #[tokio::test]
@@ -464,7 +561,7 @@ async fn test_get_game_info_not_found_for_invalid_game() {
 async fn test_cors_allows_configured_origin() {
     let state = create_test_state();
     let allowed = vec!["https://allowed.example.com".to_string()];
-    let app = create_app_with_cors(state, &allowed);
+    let app = create_app_with_cors(state, &allowed).unwrap();
 
     let response = app
         .oneshot(
@@ -491,7 +588,7 @@ async fn test_cors_allows_configured_origin() {
 async fn test_cors_rejects_unknown_origin_in_production() {
     let state = create_test_state();
     let allowed = vec!["https://allowed.example.com".to_string()];
-    let app = create_app_with_cors(state, &allowed);
+    let app = create_app_with_cors(state, &allowed).unwrap();
 
     let response = app
         .oneshot(
@@ -517,7 +614,7 @@ async fn test_cors_allows_localhost_in_development_mode() {
     let state = create_test_state();
     // Empty allowed_origins = development mode (localhost only)
     let allowed: Vec<String> = vec![];
-    let app = create_app_with_cors(state, &allowed);
+    let app = create_app_with_cors(state, &allowed).unwrap();
 
     let response = app
         .oneshot(
@@ -545,7 +642,7 @@ async fn test_cors_allows_localhost_in_development_mode() {
 async fn test_cors_preflight_request() {
     let state = create_test_state();
     let allowed = vec!["https://allowed.example.com".to_string()];
-    let app = create_app_with_cors(state, &allowed);
+    let app = create_app_with_cors(state, &allowed).unwrap();
 
     let response = app
         .oneshot(
@@ -566,4 +663,19 @@ async fn test_cors_preflight_request() {
         .headers()
         .get("access-control-allow-methods")
         .is_some());
+}
+
+#[test]
+fn test_cors_rejects_an_invalid_configured_origin() {
+    let state = create_test_state();
+    let error = match create_app_with_cors(
+        state,
+        &["https://valid.example\r\nmalicious: value".to_string()],
+    ) {
+        Ok(_) => panic!("invalid configured origin must fail startup"),
+        Err(error) => error.to_string(),
+    };
+
+    assert!(error.contains("web.allowed_origins"));
+    assert!(error.contains("invalid HTTP origin"));
 }

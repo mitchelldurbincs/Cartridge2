@@ -6,10 +6,10 @@ these metrics have a fixed, objective yardstick, so they are comparable across
 checkpoints.
 """
 
-import re
+import math
 from dataclasses import dataclass, field
-from pathlib import Path
 
+from ..storage.publisher import validate_sha256_digest
 from .judgment import (
     BLUNDER_DRAW_TO_LOSS,
     BLUNDER_WIN_TO_DRAW,
@@ -18,17 +18,6 @@ from .judgment import (
     SEATS,
     MoveJudgment,
 )
-
-CHECKPOINT_PATTERN = re.compile(r"model_step_(\d+)\.onnx")
-
-
-def infer_step_from_filename(path: str | Path) -> int | None:
-    """Extract the training step from a checkpoint filename, if present.
-
-    model_step_016000.onnx -> 16000; latest.onnx / best.onnx -> None.
-    """
-    match = CHECKPOINT_PATTERN.fullmatch(Path(path).name)
-    return int(match.group(1)) if match else None
 
 
 @dataclass
@@ -105,6 +94,7 @@ class SolverEvalResults:
     env_id: str
     model_name: str
     model_path: str
+    checkpoint_id: str | None
     step: int | None
     opponent_name: str
     games: int
@@ -128,6 +118,27 @@ class SolverEvalResults:
     bitbully_version: str | None = None
     timestamp: str = ""
 
+    def __post_init__(self) -> None:
+        if (self.checkpoint_id is None) != (self.step is None):
+            raise ValueError(
+                "checkpoint_id and step must either both be present or both be null"
+            )
+        if self.checkpoint_id is not None:
+            validate_sha256_digest(self.checkpoint_id, field="checkpoint_id")
+        if self.step is not None and (
+            isinstance(self.step, bool)
+            or not isinstance(self.step, int)
+            or self.step < 0
+        ):
+            raise ValueError("step must be a non-negative integer or null")
+        if (
+            isinstance(self.temperature, bool)
+            or not isinstance(self.temperature, (int, float))
+            or not math.isfinite(self.temperature)
+            or self.temperature < 0.0
+        ):
+            raise ValueError("temperature must be a finite non-negative number")
+
     def to_dict(self) -> dict:
         cache_hit_rate = (
             self.solver_cache_hits / self.solver_queries if self.solver_queries else 0.0
@@ -135,6 +146,7 @@ class SolverEvalResults:
         return {
             "model": self.model_name,
             "model_path": self.model_path,
+            "checkpoint_id": self.checkpoint_id,
             "step": self.step,
             "env_id": self.env_id,
             "opponent": self.opponent_name,

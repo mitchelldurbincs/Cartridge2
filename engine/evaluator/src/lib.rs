@@ -13,13 +13,53 @@
 pub mod player;
 pub mod results;
 
+use algorithm_core::{resolve_algorithm, BuiltinAlgorithm};
 use anyhow::{anyhow, Result};
-use engine_core::EngineContext;
+use engine_core::board_profile::{BoardGameMetadata, BoardView};
+use engine_core::{
+    AgentId, AgentOutcome, Decision, EngineContext, EpisodeStatus, ErasedTimestep, Presentation,
+};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
+use player::AlphaZeroPosition;
+
 pub use player::Player;
 pub use results::{EvalSummary, PositionRecord};
+
+/// Validate and canonicalize the play temperature stored by a model player.
+///
+/// Evaluation evidence records this as an exact f32. Signed zero has the same
+/// play semantics as positive zero, so collapse it before it reaches either
+/// direct-policy sampling or MCTS.
+pub fn canonical_evaluation_temperature(temperature: f32) -> Result<f32> {
+    if !temperature.is_finite() || temperature < 0.0 {
+        return Err(anyhow!(
+            "evaluation temperature must be a finite nonnegative f32"
+        ));
+    }
+    Ok(if temperature == 0.0 { 0.0 } else { temperature })
+}
+
+/// Require an explicit, nonempty game schedule whose per-game seeds fit u64.
+pub fn validate_evaluation_schedule(games: u32, seed: u64) -> Result<()> {
+    if games == 0 {
+        return Err(anyhow!("evaluation games must be greater than zero"));
+    }
+    seed.checked_add(u64::from(games - 1))
+        .ok_or_else(|| anyhow!("evaluation seed plus game index exceeds u64"))?;
+    Ok(())
+}
+
+/// ONNX thread selection is explicit in the clean evaluator contract.
+pub fn validate_onnx_intra_threads(intra_threads: usize) -> Result<()> {
+    if intra_threads == 0 {
+        return Err(anyhow!(
+            "evaluation ONNX intra-op threads must be greater than zero"
+        ));
+    }
+    Ok(())
+}
 
 /// Hard stop on game length.
 ///
@@ -29,15 +69,52 @@ pub use results::{EvalSummary, PositionRecord};
 /// diagnostic, which is far worse than a failed iteration.
 const MAX_PLIES: u32 = 10_000;
 
+fn resolve_compatible_algorithm(algorithm_id: &str, env_id: &str) -> Result<BuiltinAlgorithm> {
+    let algorithm = resolve_algorithm(algorithm_id)?;
+    engine_games::register_all_environments();
+    let context = EngineContext::new(env_id)
+        .map_err(|error| anyhow!("Environment '{env_id}' is unavailable: {error}"))?;
+    context.metadata().require_board()?;
+    algorithm.compatibility(&context).require_compatible()?;
+    Ok(algorithm)
+}
+
+/// Validate an algorithm/environment pair before loading model players or
+/// creating evaluation output files.
+pub fn preflight_evaluation(algorithm_id: &str, env_id: &str) -> Result<BuiltinAlgorithm> {
+    resolve_compatible_algorithm(algorithm_id, env_id)
+}
+
+/// Dispatch to the evaluation suite owned by `algorithm_id` after validating
+/// that the environment satisfies its machine-checkable contract.
+pub fn run_evaluation(
+    algorithm_id: &str,
+    env_id: &str,
+    player1: &mut Player,
+    player2: &mut Player,
+    games: u32,
+    seed: u64,
+    positions: Option<&mut Vec<PositionRecord>>,
+) -> Result<EvalSummary> {
+    validate_evaluation_schedule(games, seed)?;
+    let algorithm = resolve_compatible_algorithm(algorithm_id, env_id)?;
+
+    match algorithm {
+        BuiltinAlgorithm::AlphaZeroBoardV1 => {
+            run_alphazero_evaluation(env_id, player1, player2, games, seed, positions)
+        }
+    }
+}
+
 /// Play `games` matches between two players and summarize the result.
 ///
-/// Players alternate seats: player 1 takes the first seat for the first half of
-/// the games and the second seat for the rest — the same split the Python
-/// evaluator used, so numbers stay comparable across the migration.
+/// Seats alternate deterministically: player 1 takes seat 1 on even game
+/// indices and seat 2 on odd game indices, controlling for first-player
+/// advantage while preserving stable per-game seeds.
 ///
 /// Each game is reset and played with `seed + game index`, so a run is
 /// reproducible and two models face identical conditions.
-pub fn run_evaluation(
+fn run_alphazero_evaluation(
     env_id: &str,
     player1: &mut Player,
     player2: &mut Player,
@@ -45,9 +122,13 @@ pub fn run_evaluation(
     seed: u64,
     mut positions: Option<&mut Vec<PositionRecord>>,
 ) -> Result<EvalSummary> {
-    let mut ctx =
-        EngineContext::new(env_id).ok_or_else(|| anyhow!("Game '{env_id}' not registered"))?;
+    let mut ctx = EngineContext::new(env_id)
+        .map_err(|error| anyhow!("Environment '{env_id}' is unavailable: {error}"))?;
     let metadata = ctx.metadata();
+    let board = metadata.require_board()?;
+    let env_contract_version = ctx.capabilities().contract_version;
+    player1.require_environment_profile(env_id, env_contract_version)?;
+    player2.require_environment_profile(env_id, env_contract_version)?;
 
     let mut summary = EvalSummary {
         env_id: env_id.to_string(),
@@ -56,58 +137,80 @@ pub fn run_evaluation(
         ..Default::default()
     };
 
-    let games_as_first = games / 2;
     let mut total_plies: u64 = 0;
 
     for game in 0..games {
-        let player1_first = game < games_as_first;
+        let player1_first = game % 2 == 0;
         let game_seed = seed.wrapping_add(u64::from(game));
         let mut rng = ChaCha20Rng::seed_from_u64(game_seed);
 
         let reset = ctx.reset(game_seed, &[])?;
         let mut state = reset.state;
-        let mut obs = reset.obs;
+        let mut timestep = reset.timestep;
         let mut ply = 0u32;
 
         let winner = loop {
-            let view = ctx.view(&state)?;
-            if view.game_over() {
-                break view.winner;
-            }
-            if ply >= MAX_PLIES {
-                return Err(anyhow!(
-                    "Game {game} of '{env_id}' did not terminate within {MAX_PLIES} plies"
-                ));
-            }
+            let view = require_board_presentation(&ctx, &state, board)?;
+            match timestep.episode {
+                EpisodeStatus::Running => {
+                    if view.game_over() {
+                        return Err(anyhow!(
+                            "Environment '{env_id}' reports a running episode with a terminal board presentation"
+                        ));
+                    }
+                    if ply >= MAX_PLIES {
+                        return Err(anyhow!(
+                            "Game {game} of '{env_id}' did not terminate within {MAX_PLIES} plies"
+                        ));
+                    }
 
-            // Player 1 acts on seat 1 when it went first, seat 2 otherwise.
-            let seat = view.current_player;
-            let is_player1 = (seat == 1) == player1_first;
-            let mask = metadata.legal_mask_from_obs(&obs);
-            let acting = if is_player1 {
-                &mut *player1
-            } else {
-                &mut *player2
-            };
-            let action =
-                acting.select_action(&state, &obs, &mask, metadata.num_actions, &mut rng)?;
+                    let position = AlphaZeroPosition::new(&state, &timestep, board)?;
+                    validate_running_outcomes(&timestep)?;
+                    let seat = require_board_seat(position.agent_id)?;
+                    if view.current_player != seat {
+                        return Err(anyhow!(
+                            "Board presentation says seat {} acts, timestep says agent {}",
+                            view.current_player,
+                            position.agent_id.0
+                        ));
+                    }
 
-            if let Some(positions) = positions.as_deref_mut() {
-                positions.push(PositionRecord {
-                    game,
-                    ply,
-                    player: seat,
-                    by: if is_player1 { "p1" } else { "p2" }.to_string(),
-                    action,
-                    board: view.owners(),
-                    legal: mask.iter_ones().map(|i| i as u32).collect(),
-                });
+                    // Player 1 alternates seats by game index while remaining
+                    // logical player 1 for result attribution.
+                    let is_player1 = (position.agent_id == AgentId(1)) == player1_first;
+                    let acting = if is_player1 {
+                        &mut *player1
+                    } else {
+                        &mut *player2
+                    };
+                    let action = acting.select_action(&position, &mut rng)?;
+
+                    if let Some(positions) = positions.as_deref_mut() {
+                        positions.push(PositionRecord {
+                            game,
+                            ply,
+                            player: seat,
+                            by: if is_player1 { "p1" } else { "p2" }.to_string(),
+                            action,
+                            board: view.owners(),
+                            legal: position.legal_mask.iter_ones().map(|i| i as u32).collect(),
+                        });
+                    }
+
+                    let step = ctx.step(&state, &action.to_le_bytes())?;
+                    state = step.state;
+                    timestep = step.timestep;
+                    ply += 1;
+                }
+                EpisodeStatus::Terminated => {
+                    break terminal_winner(&timestep, &view)?;
+                }
+                EpisodeStatus::Truncated => {
+                    return Err(anyhow!(
+                        "Game {game} of '{env_id}' was truncated after {ply} plies; the AlphaZero evaluation suite requires a terminal winner or draw"
+                    ));
+                }
             }
-
-            let step = ctx.step(&state, &action.to_le_bytes())?;
-            state = step.state;
-            obs = step.obs;
-            ply += 1;
         };
 
         total_plies += u64::from(ply);
@@ -121,6 +224,155 @@ pub fn run_evaluation(
     };
 
     Ok(summary)
+}
+
+fn require_board_presentation(
+    ctx: &EngineContext,
+    state: &[u8],
+    board: &BoardGameMetadata,
+) -> Result<BoardView> {
+    let view = match ctx.presentation(state)? {
+        Some(Presentation::Board { view }) => view,
+        Some(Presentation::Custom { contract, .. }) => {
+            return Err(anyhow!(
+                "AlphaZero board evaluation requires a board presentation, got custom contract '{contract}'"
+            ))
+        }
+        None => {
+            return Err(anyhow!(
+                "AlphaZero board evaluation requires the environment to expose a board presentation"
+            ))
+        }
+    };
+    let expected_cells = board.board_size()?;
+    if view.cells.len() != expected_cells {
+        return Err(anyhow!(
+            "Board presentation has {} cells, metadata declares {}x{} ({expected_cells} cells)",
+            view.cells.len(),
+            board.width,
+            board.height
+        ));
+    }
+    Ok(view)
+}
+
+fn require_board_seat(agent_id: AgentId) -> Result<u8> {
+    match agent_id {
+        AgentId(1) => Ok(1),
+        AgentId(2) => Ok(2),
+        other => Err(anyhow!(
+            "AlphaZero seat-balanced evaluation requires agent 1 or 2, got {}",
+            other.0
+        )),
+    }
+}
+
+fn outcome_for(timestep: &ErasedTimestep, agent_id: AgentId) -> Result<&AgentOutcome> {
+    let mut matching = timestep
+        .outcomes
+        .iter()
+        .filter(|outcome| outcome.agent_id == agent_id);
+    let outcome = matching
+        .next()
+        .ok_or_else(|| anyhow!("Timestep is missing outcome for agent {}", agent_id.0))?;
+    if matching.next().is_some() {
+        return Err(anyhow!(
+            "Timestep contains duplicate outcomes for agent {}",
+            agent_id.0
+        ));
+    }
+    Ok(outcome)
+}
+
+fn validate_running_outcomes(timestep: &ErasedTimestep) -> Result<()> {
+    if timestep.outcomes.len() != 2 {
+        return Err(anyhow!(
+            "AlphaZero requires one outcome for each of two seats, got {}",
+            timestep.outcomes.len()
+        ));
+    }
+    for agent_id in [AgentId(1), AgentId(2)] {
+        let outcome = outcome_for(timestep, agent_id)?;
+        if outcome.reward != 0.0 || outcome.terminated || outcome.truncated {
+            return Err(anyhow!(
+                "Running AlphaZero timestep has invalid outcome for agent {}: reward={}, terminated={}, truncated={}",
+                agent_id.0,
+                outcome.reward,
+                outcome.terminated,
+                outcome.truncated
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Determine the absolute winning seat from per-agent terminal outcomes and
+/// require the board presentation to agree. The presentation remains a display
+/// projection; rewards are the authoritative environment result.
+fn terminal_winner(timestep: &ErasedTimestep, view: &BoardView) -> Result<u8> {
+    if timestep.episode != EpisodeStatus::Terminated {
+        return Err(anyhow!(
+            "Expected a terminated timestep, got {:?}",
+            timestep.episode
+        ));
+    }
+    if timestep.decision != Decision::None {
+        return Err(anyhow!(
+            "Terminated AlphaZero timestep must have no next decision, got {:?}",
+            timestep.decision
+        ));
+    }
+    if timestep.outcomes.len() != 2 {
+        return Err(anyhow!(
+            "Terminated AlphaZero timestep requires two agent outcomes, got {}",
+            timestep.outcomes.len()
+        ));
+    }
+
+    let seat1 = outcome_for(timestep, AgentId(1))?;
+    let seat2 = outcome_for(timestep, AgentId(2))?;
+    for outcome in [seat1, seat2] {
+        if !outcome.reward.is_finite()
+            || !(-1.0..=1.0).contains(&outcome.reward)
+            || !outcome.terminated
+            || outcome.truncated
+        {
+            return Err(anyhow!(
+                "Invalid terminal outcome for agent {}: reward={}, terminated={}, truncated={}",
+                outcome.agent_id.0,
+                outcome.reward,
+                outcome.terminated,
+                outcome.truncated
+            ));
+        }
+    }
+    if (seat1.reward + seat2.reward).abs() > f32::EPSILON {
+        return Err(anyhow!(
+            "AlphaZero terminal rewards must be zero-sum, got {} and {}",
+            seat1.reward,
+            seat2.reward
+        ));
+    }
+
+    let winner = if (seat1.reward - seat2.reward).abs() <= f32::EPSILON {
+        3
+    } else if seat1.reward > seat2.reward {
+        1
+    } else {
+        2
+    };
+    if !view.game_over() {
+        return Err(anyhow!(
+            "Terminated timestep has a non-terminal board presentation"
+        ));
+    }
+    if view.winner != winner {
+        return Err(anyhow!(
+            "Terminal outcomes identify winner {winner}, board presentation reports {}",
+            view.winner
+        ));
+    }
+    Ok(winner)
 }
 
 /// Translate the engine's absolute winner byte (0=ongoing, 1/2=seat, 3=draw)
@@ -139,12 +391,47 @@ fn winner_from_player1(winner: u8, player1_first: bool) -> Option<u8> {
 mod tests {
     use super::*;
 
+    fn terminal_timestep(seat1_reward: f32, seat2_reward: f32) -> ErasedTimestep {
+        ErasedTimestep {
+            agents: vec![AgentId(1), AgentId(2)],
+            observations: Vec::new(),
+            outcomes: vec![
+                AgentOutcome {
+                    agent_id: AgentId(1),
+                    reward: seat1_reward,
+                    terminated: true,
+                    truncated: false,
+                },
+                AgentOutcome {
+                    agent_id: AgentId(2),
+                    reward: seat2_reward,
+                    terminated: true,
+                    truncated: false,
+                },
+            ],
+            decision: Decision::None,
+            episode: EpisodeStatus::Terminated,
+            source: engine_core::TransitionSource::Agents {
+                agent_ids: vec![AgentId(2)],
+            },
+            info: Vec::new(),
+        }
+    }
+
     fn eval(env_id: &str, games: u32) -> EvalSummary {
-        engine_games::register_all_games();
+        engine_games::register_all_environments();
         let mut p1 = Player::Random;
         let mut p2 = Player::Random;
-        run_evaluation(env_id, &mut p1, &mut p2, games, 42, None)
-            .expect("random-vs-random evaluation")
+        run_evaluation(
+            algorithm_core::ALPHAZERO_BOARD_V1_ID,
+            env_id,
+            &mut p1,
+            &mut p2,
+            games,
+            42,
+            None,
+        )
+        .expect("random-vs-random evaluation")
     }
 
     #[test]
@@ -155,6 +442,32 @@ mod tests {
         assert_eq!(winner_from_player1(2, false), Some(1));
         assert_eq!(winner_from_player1(3, true), None);
         assert_eq!(winner_from_player1(0, true), None);
+    }
+
+    #[test]
+    fn terminal_result_comes_from_per_agent_outcomes() {
+        let seat1_win = BoardView::from_owners(&[1], 2, 1);
+        let draw = BoardView::from_owners(&[0], 1, 3);
+
+        assert_eq!(
+            terminal_winner(&terminal_timestep(1.0, -1.0), &seat1_win).unwrap(),
+            1
+        );
+        assert_eq!(
+            terminal_winner(&terminal_timestep(0.0, 0.0), &draw).unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn terminal_result_rejects_presentation_disagreement() {
+        let wrong_view = BoardView::from_owners(&[2], 1, 2);
+        let error = terminal_winner(&terminal_timestep(1.0, -1.0), &wrong_view)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("outcomes identify winner 1"));
+        assert!(error.contains("reports 2"));
     }
 
     #[test]
@@ -180,9 +493,9 @@ mod tests {
     }
 
     #[test]
-    fn seats_alternate_at_the_halfway_point() {
-        // TicTacToe is decisive enough from random play that both halves
-        // produce wins; the point is that they are attributed to both seats.
+    fn wins_remain_attributed_to_logical_players_across_alternating_seats() {
+        // TicTacToe is decisive enough from random play that both seat
+        // assignments produce wins for logical player 1.
         let summary = eval("tictactoe", 20);
         assert_eq!(
             summary.player1_wins,
@@ -196,12 +509,20 @@ mod tests {
 
     #[test]
     fn dumped_positions_track_the_game_that_was_played() {
-        engine_games::register_all_games();
+        engine_games::register_all_environments();
         let mut p1 = Player::Random;
         let mut p2 = Player::Random;
         let mut positions = Vec::new();
-        let summary = run_evaluation("connect4", &mut p1, &mut p2, 2, 7, Some(&mut positions))
-            .expect("evaluation");
+        let summary = run_evaluation(
+            algorithm_core::ALPHAZERO_BOARD_V1_ID,
+            "connect4",
+            &mut p1,
+            &mut p2,
+            3,
+            7,
+            Some(&mut positions),
+        )
+        .expect("evaluation");
 
         assert!(!positions.is_empty());
         assert_eq!(
@@ -218,21 +539,88 @@ mod tests {
             );
             assert!(record.player == 1 || record.player == 2);
             assert!(record.by == "p1" || record.by == "p2");
+            let player1_first = record.game % 2 == 0;
+            let expected_player = if (record.player == 1) == player1_first {
+                "p1"
+            } else {
+                "p2"
+            };
+            assert_eq!(record.by, expected_player);
         }
 
         // Plies restart per game and the first position of each is empty.
         let openers: Vec<&PositionRecord> = positions.iter().filter(|r| r.ply == 0).collect();
-        assert_eq!(openers.len(), 2, "one opening position per game");
+        assert_eq!(openers.len(), 3, "one opening position per game");
+        assert_eq!(openers[0].game, 0);
+        assert_eq!(openers[0].player, 1);
+        assert_eq!(openers[0].by, "p1");
+        assert_eq!(openers[1].game, 1);
+        assert_eq!(openers[1].player, 1);
+        assert_eq!(openers[1].by, "p2");
+        assert_eq!(openers[2].game, 2);
+        assert_eq!(openers[2].player, 1);
+        assert_eq!(openers[2].by, "p1");
         for opener in openers {
             assert!(opener.board.iter().all(|&owner| owner == 0));
         }
     }
 
     #[test]
-    fn no_games_yields_an_empty_but_valid_summary() {
-        let summary = eval("tictactoe", 0);
-        assert_eq!(summary.games_played, 0);
-        assert_eq!(summary.avg_game_length, 0.0);
-        assert_eq!(summary.player1_win_rate(), 0.0);
+    fn empty_or_overflowing_evaluation_schedules_are_rejected() {
+        engine_games::register_all_environments();
+        let mut p1 = Player::Random;
+        let mut p2 = Player::Random;
+        let empty = run_evaluation(
+            algorithm_core::ALPHAZERO_BOARD_V1_ID,
+            "tictactoe",
+            &mut p1,
+            &mut p2,
+            0,
+            42,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(empty.contains("greater than zero"));
+
+        let overflow = validate_evaluation_schedule(2, u64::MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(overflow.contains("exceeds u64"));
+    }
+
+    #[test]
+    fn evaluator_numeric_settings_fail_closed_and_canonicalize_zero() {
+        assert_eq!(canonical_evaluation_temperature(-0.0).unwrap().to_bits(), 0);
+        assert_eq!(canonical_evaluation_temperature(0.25).unwrap(), 0.25);
+        for invalid in [f32::NAN, f32::INFINITY, -0.25] {
+            assert!(canonical_evaluation_temperature(invalid).is_err());
+        }
+        assert!(validate_onnx_intra_threads(0).is_err());
+        assert!(validate_onnx_intra_threads(1).is_ok());
+    }
+
+    #[test]
+    fn algorithm_dispatch_rejects_unknown_ids_before_playing() {
+        engine_games::register_all_environments();
+        let mut p1 = Player::Random;
+        let mut p2 = Player::Random;
+        let error = run_evaluation("ppo", "tictactoe", &mut p1, &mut p2, 1, 42, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("ppo"));
+        assert!(error.contains(algorithm_core::ALPHAZERO_BOARD_V1_ID));
+    }
+
+    #[test]
+    fn preflight_rejects_unknown_environments() {
+        let error =
+            preflight_evaluation(algorithm_core::ALPHAZERO_BOARD_V1_ID, "missing_environment")
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("missing_environment"));
+        assert!(error.contains("not registered"));
     }
 }

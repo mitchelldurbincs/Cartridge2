@@ -5,7 +5,7 @@
 //! and referenced by NodeId indices.
 
 use crate::node::{MctsNode, NodeId};
-use engine_core::LegalMask;
+use engine_core::board_profile::LegalMask;
 
 /// MCTS tree with arena-based node storage.
 #[derive(Debug)]

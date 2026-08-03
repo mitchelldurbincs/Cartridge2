@@ -1,0 +1,485 @@
+{
+  "schema_version": 4,
+  "generated_by": "make environment-manifest",
+  "algorithms": [
+    {
+      "id": "alphazero_board_v1",
+      "version": 1,
+      "model_artifact_schema_version": 1,
+      "display_name": "AlphaZero board-game profile",
+      "components": {
+        "collector": "alphazero_mcts_self_play_v1",
+        "learner": "alphazero_policy_value_v1",
+        "orchestration": "synchronized_alphazero_v1",
+        "experience_schema": "alphazero_transition_v1",
+        "model_contract": "onnx_policy_value_v1",
+        "evaluation_suite": "two_player_seat_balanced_v1",
+        "serving": "alphazero_mcts_web_v1"
+      },
+      "requirements": [
+        "two fixed players",
+        "one active player at a time with alternating turns",
+        "canonical little-endian u32 discrete actions",
+        "fixed-size little-endian f32 spatial observations with an embedded legal mask and two-element player indicator",
+        "complete deterministic planning snapshots after reset",
+        "perfect-information Markov observations",
+        "terminal-only zero-sum rewards emitted for every agent"
+      ]
+    }
+  ],
+  "environments": [
+    {
+      "metadata": {
+        "id": "connect4",
+        "display_name": "Connect 4",
+        "description": "Drop discs to connect four in a row!",
+        "board": {
+          "width": 7,
+          "height": 6,
+          "action_count": 7,
+          "observation": {
+            "elements": 93,
+            "spatial_channels": 2,
+            "legal_actions_offset": 84,
+            "player_relative": false
+          },
+          "players": [
+            {
+              "name": "Red",
+              "symbol": "🔴"
+            },
+            {
+              "name": "Yellow",
+              "symbol": "🟡"
+            }
+          ],
+          "renderer": "drop_column"
+        }
+      },
+      "capabilities": {
+        "id": {
+          "env_id": "connect4",
+          "build_id": "0.1.0"
+        },
+        "contract_version": 1,
+        "encoding": {
+          "state": "connect4_state:v1",
+          "action": {
+            "kind": "discrete_u32_little_endian"
+          },
+          "observation": {
+            "kind": "f32_little_endian",
+            "elements": 93
+          },
+          "schema_version": 1
+        },
+        "semantics": {
+          "turn_model": {
+            "kind": "sequential",
+            "order": "alternating"
+          },
+          "information_model": "perfect_information_markov",
+          "planning_state_model": "complete_snapshot",
+          "transition_dynamics": "deterministic",
+          "chance_model": "none",
+          "reward_model": "terminal_zero_sum"
+        },
+        "max_horizon": 42,
+        "agents": {
+          "kind": "fixed",
+          "agents": [
+            {
+              "id": 1,
+              "action_space": {
+                "kind": "discrete",
+                "size": 7
+              }
+            },
+            {
+              "id": 2,
+              "action_space": {
+                "kind": "discrete",
+                "size": 7
+              }
+            }
+          ]
+        },
+        "preferred_batch": 64
+      },
+      "algorithm_profiles": {
+        "alphazero_board_v1": {
+          "algorithm_id": "alphazero_board_v1",
+          "env_id": "connect4",
+          "compatible": true,
+          "issues": [],
+          "unverified_assumptions": [
+            "state encoding is a complete round-trippable planning snapshot",
+            "observations are Markov and reveal all strategically relevant state",
+            "running transitions alternate seats 1 and 2",
+            "the embedded legal mask exactly matches actions accepted by the environment"
+          ]
+        }
+      }
+    },
+    {
+      "metadata": {
+        "id": "counter",
+        "display_name": "Counter",
+        "description": "Move a scalar counter to the target before the horizon",
+        "board": null
+      },
+      "capabilities": {
+        "id": {
+          "env_id": "counter",
+          "build_id": "0.1.0"
+        },
+        "contract_version": 1,
+        "encoding": {
+          "state": "counter-state:v1",
+          "action": {
+            "kind": "discrete_u32_little_endian"
+          },
+          "observation": {
+            "kind": "f32_little_endian",
+            "elements": 2
+          },
+          "schema_version": 1
+        },
+        "semantics": {
+          "turn_model": {
+            "kind": "single_agent"
+          },
+          "information_model": "perfect_information_markov",
+          "planning_state_model": "complete_snapshot",
+          "transition_dynamics": "deterministic",
+          "chance_model": "none",
+          "reward_model": "general"
+        },
+        "max_horizon": 8,
+        "agents": {
+          "kind": "fixed",
+          "agents": [
+            {
+              "id": 0,
+              "action_space": {
+                "kind": "discrete",
+                "size": 2
+              }
+            }
+          ]
+        },
+        "preferred_batch": 32
+      },
+      "algorithm_profiles": {
+        "alphazero_board_v1": {
+          "algorithm_id": "alphazero_board_v1",
+          "env_id": "counter",
+          "compatible": false,
+          "issues": [
+            {
+              "code": "agents.fixed_seats",
+              "message": "requires fixed seats [1, 2], got [AgentId(0)]"
+            },
+            {
+              "code": "profile.board_missing",
+              "message": "environment does not expose the board-game profile"
+            },
+            {
+              "code": "semantics.turn_model",
+              "message": "requires alternating sequential turns, got SingleAgent"
+            },
+            {
+              "code": "semantics.reward_model",
+              "message": "requires terminal zero-sum per-agent rewards, got General"
+            }
+          ],
+          "unverified_assumptions": [
+            "state encoding is a complete round-trippable planning snapshot",
+            "observations are Markov and reveal all strategically relevant state",
+            "running transitions alternate seats 1 and 2",
+            "the embedded legal mask exactly matches actions accepted by the environment"
+          ]
+        }
+      }
+    },
+    {
+      "metadata": {
+        "id": "generals_8x8",
+        "display_name": "Generals 8×8",
+        "description": "Capture the enemy general! Full-information turn-based Generals: move armies, take cities, and grow your territory.",
+        "board": {
+          "width": 8,
+          "height": 8,
+          "action_count": 257,
+          "observation": {
+            "elements": 899,
+            "spatial_channels": 10,
+            "legal_actions_offset": 640,
+            "player_relative": true
+          },
+          "players": [
+            {
+              "name": "Red",
+              "symbol": "R"
+            },
+            {
+              "name": "Blue",
+              "symbol": "B"
+            }
+          ],
+          "renderer": "generals"
+        }
+      },
+      "capabilities": {
+        "id": {
+          "env_id": "generals_8x8",
+          "build_id": "0.1.0"
+        },
+        "contract_version": 2,
+        "encoding": {
+          "state": "generals_state:v1",
+          "action": {
+            "kind": "discrete_u32_little_endian"
+          },
+          "observation": {
+            "kind": "f32_little_endian",
+            "elements": 899
+          },
+          "schema_version": 1
+        },
+        "semantics": {
+          "turn_model": {
+            "kind": "sequential",
+            "order": "alternating"
+          },
+          "information_model": "perfect_information_markov",
+          "planning_state_model": "complete_snapshot",
+          "transition_dynamics": "deterministic",
+          "chance_model": "none",
+          "reward_model": "terminal_zero_sum"
+        },
+        "max_horizon": 400,
+        "agents": {
+          "kind": "fixed",
+          "agents": [
+            {
+              "id": 1,
+              "action_space": {
+                "kind": "discrete",
+                "size": 257
+              }
+            },
+            {
+              "id": 2,
+              "action_space": {
+                "kind": "discrete",
+                "size": 257
+              }
+            }
+          ]
+        },
+        "preferred_batch": 64
+      },
+      "algorithm_profiles": {
+        "alphazero_board_v1": {
+          "algorithm_id": "alphazero_board_v1",
+          "env_id": "generals_8x8",
+          "compatible": true,
+          "issues": [],
+          "unverified_assumptions": [
+            "state encoding is a complete round-trippable planning snapshot",
+            "observations are Markov and reveal all strategically relevant state",
+            "running transitions alternate seats 1 and 2",
+            "the embedded legal mask exactly matches actions accepted by the environment"
+          ]
+        }
+      }
+    },
+    {
+      "metadata": {
+        "id": "othello",
+        "display_name": "Othello",
+        "description": "Flip opponent pieces to dominate the board!",
+        "board": {
+          "width": 8,
+          "height": 8,
+          "action_count": 65,
+          "observation": {
+            "elements": 195,
+            "spatial_channels": 2,
+            "legal_actions_offset": 128,
+            "player_relative": false
+          },
+          "players": [
+            {
+              "name": "Black",
+              "symbol": "⚫"
+            },
+            {
+              "name": "White",
+              "symbol": "⚪"
+            }
+          ],
+          "renderer": "grid"
+        }
+      },
+      "capabilities": {
+        "id": {
+          "env_id": "othello",
+          "build_id": "0.1.0"
+        },
+        "contract_version": 1,
+        "encoding": {
+          "state": "othello_state:v1",
+          "action": {
+            "kind": "discrete_u32_little_endian"
+          },
+          "observation": {
+            "kind": "f32_little_endian",
+            "elements": 195
+          },
+          "schema_version": 1
+        },
+        "semantics": {
+          "turn_model": {
+            "kind": "sequential",
+            "order": "alternating"
+          },
+          "information_model": "perfect_information_markov",
+          "planning_state_model": "complete_snapshot",
+          "transition_dynamics": "deterministic",
+          "chance_model": "none",
+          "reward_model": "terminal_zero_sum"
+        },
+        "max_horizon": 64,
+        "agents": {
+          "kind": "fixed",
+          "agents": [
+            {
+              "id": 1,
+              "action_space": {
+                "kind": "discrete",
+                "size": 65
+              }
+            },
+            {
+              "id": 2,
+              "action_space": {
+                "kind": "discrete",
+                "size": 65
+              }
+            }
+          ]
+        },
+        "preferred_batch": 64
+      },
+      "algorithm_profiles": {
+        "alphazero_board_v1": {
+          "algorithm_id": "alphazero_board_v1",
+          "env_id": "othello",
+          "compatible": true,
+          "issues": [],
+          "unverified_assumptions": [
+            "state encoding is a complete round-trippable planning snapshot",
+            "observations are Markov and reveal all strategically relevant state",
+            "running transitions alternate seats 1 and 2",
+            "the embedded legal mask exactly matches actions accepted by the environment"
+          ]
+        }
+      }
+    },
+    {
+      "metadata": {
+        "id": "tictactoe",
+        "display_name": "Tic-Tac-Toe",
+        "description": "Get three in a row to win!",
+        "board": {
+          "width": 3,
+          "height": 3,
+          "action_count": 9,
+          "observation": {
+            "elements": 29,
+            "spatial_channels": 2,
+            "legal_actions_offset": 18,
+            "player_relative": false
+          },
+          "players": [
+            {
+              "name": "X",
+              "symbol": "X"
+            },
+            {
+              "name": "O",
+              "symbol": "O"
+            }
+          ],
+          "renderer": "grid"
+        }
+      },
+      "capabilities": {
+        "id": {
+          "env_id": "tictactoe",
+          "build_id": "0.1.0"
+        },
+        "contract_version": 1,
+        "encoding": {
+          "state": "tictactoe_state:v1",
+          "action": {
+            "kind": "discrete_u32_little_endian"
+          },
+          "observation": {
+            "kind": "f32_little_endian",
+            "elements": 29
+          },
+          "schema_version": 1
+        },
+        "semantics": {
+          "turn_model": {
+            "kind": "sequential",
+            "order": "alternating"
+          },
+          "information_model": "perfect_information_markov",
+          "planning_state_model": "complete_snapshot",
+          "transition_dynamics": "deterministic",
+          "chance_model": "none",
+          "reward_model": "terminal_zero_sum"
+        },
+        "max_horizon": 9,
+        "agents": {
+          "kind": "fixed",
+          "agents": [
+            {
+              "id": 1,
+              "action_space": {
+                "kind": "discrete",
+                "size": 9
+              }
+            },
+            {
+              "id": 2,
+              "action_space": {
+                "kind": "discrete",
+                "size": 9
+              }
+            }
+          ]
+        },
+        "preferred_batch": 64
+      },
+      "algorithm_profiles": {
+        "alphazero_board_v1": {
+          "algorithm_id": "alphazero_board_v1",
+          "env_id": "tictactoe",
+          "compatible": true,
+          "issues": [],
+          "unverified_assumptions": [
+            "state encoding is a complete round-trippable planning snapshot",
+            "observations are Markov and reveal all strategically relevant state",
+            "running transitions alternate seats 1 and 2",
+            "the embedded legal mask exactly matches actions accepted by the environment"
+          ]
+        }
+      }
+    }
+  ]
+}

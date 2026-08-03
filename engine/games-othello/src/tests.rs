@@ -47,6 +47,51 @@ fn test_initial_legal_moves() {
 }
 
 #[test]
+fn test_observation_legal_mask_exactly_matches_step_acceptance() {
+    let mut state = State::new();
+
+    for ply in 0..32 {
+        let observation = observation_from_state(&state).unwrap();
+        for action in 0..NUM_ACTIONS as u32 {
+            let mut candidate = state.clone();
+            let before = candidate.clone();
+            let accepted = Othello::new()
+                .step(&mut candidate, action, &mut ChaCha20Rng::seed_from_u64(1))
+                .is_ok();
+            assert_eq!(
+                accepted,
+                observation.legal_moves[action as usize] == 1.0,
+                "ply {ply}, action {action} disagrees with the observation mask"
+            );
+            if !accepted {
+                assert_eq!(candidate, before, "rejected action mutated the state");
+            }
+        }
+
+        if state.is_done() {
+            break;
+        }
+        let action = state.legal_moves()[0];
+        Othello::new()
+            .step(&mut state, action, &mut ChaCha20Rng::seed_from_u64(2))
+            .unwrap();
+    }
+
+    // A terminal marker closes the action set even if the underlying board
+    // shape would otherwise admit flips.
+    state.winner = 1;
+    let observation = observation_from_state(&state).unwrap();
+    for action in 0..NUM_ACTIONS as u32 {
+        let mut candidate = state.clone();
+        assert_eq!(observation.legal_moves[action as usize], 0.0);
+        assert!(Othello::new()
+            .step(&mut candidate, action, &mut ChaCha20Rng::seed_from_u64(3),)
+            .is_err());
+        assert_eq!(candidate, state, "rejected terminal action mutated state");
+    }
+}
+
+#[test]
 fn test_make_move_and_flip() {
     let state = State::new();
 
@@ -190,7 +235,7 @@ fn test_game_continues_when_one_player_has_moves() {
 
     let mut game = Othello::new();
     let mut rng = ChaCha20Rng::seed_from_u64(42);
-    let (state, _) = game.reset(&mut rng, &[]);
+    let (state, _) = game.reset(&mut rng, &[]).unwrap();
 
     // Verify initial state has moves for both players
     assert!(!state.is_done());
@@ -210,7 +255,7 @@ fn test_game_continues_when_one_player_has_moves() {
     assert!(!legal_moves.is_empty());
     let action = legal_moves[0];
     let mut new_state = state.clone();
-    let (_, _, _, _) = game.step(&mut new_state, action, &mut rng);
+    let _transition = game.step(&mut new_state, action, &mut rng).unwrap();
     assert_eq!(
         new_state.pass_count, 0,
         "Pass count should reset after board move"
@@ -389,14 +434,18 @@ fn test_game_metadata() {
     let game = Othello::new();
     let metadata = game.metadata();
 
-    assert_eq!(metadata.env_id, "othello");
-    assert_eq!(metadata.board_width, 8);
-    assert_eq!(metadata.board_height, 8);
-    assert_eq!(metadata.num_actions, 65);
-    assert_eq!(metadata.obs_size, 195); // 128 + 65 + 2
-    assert_eq!(metadata.legal_mask_offset, 128); // After board views
-    assert_eq!(metadata.player_count, 2);
-    assert_eq!(metadata.board_type, "grid");
+    assert_eq!(metadata.id, "othello");
+    let board = metadata.require_board().unwrap();
+    assert_eq!(board.width, 8);
+    assert_eq!(board.height, 8);
+    assert_eq!(board.action_count, 65);
+    assert_eq!(board.observation.elements, 195); // 128 + 65 + 2
+    assert_eq!(board.observation.legal_actions_offset, 128); // After board views
+    assert_eq!(board.players.len(), 2);
+    assert_eq!(
+        board.renderer,
+        engine_core::board_profile::BoardRenderer::Grid
+    );
 }
 
 #[test]
@@ -413,8 +462,11 @@ fn test_capabilities() {
     let game = Othello::new();
     let caps = game.capabilities();
 
-    assert_eq!(caps.action_space, ActionSpace::Discrete(65));
-    assert_eq!(caps.max_horizon, 64);
+    assert_eq!(
+        caps.action_space(AgentId(1)),
+        Some(&ActionSpace::Discrete { size: 65 })
+    );
+    assert_eq!(caps.max_horizon, Some(64));
 }
 
 #[test]
@@ -422,7 +474,7 @@ fn test_reset_and_step() {
     let mut game = Othello::new();
     let mut rng = ChaCha20Rng::seed_from_u64(42);
 
-    let (mut state, _obs) = game.reset(&mut rng, &[]);
+    let (mut state, _obs) = game.reset(&mut rng, &[]).unwrap();
 
     assert_eq!(state.current_player, 1);
     assert!(!state.is_done());
@@ -432,12 +484,12 @@ fn test_reset_and_step() {
     assert!(!legal.is_empty());
     let action = legal[0];
 
-    let (new_obs, reward, done, _info) = game.step(&mut state, action, &mut rng);
+    let transition = game.step(&mut state, action, &mut rng).unwrap();
 
     // The position we moved to should now show as occupied (not legal)
-    assert!(new_obs.legal_moves[action as usize] == 0.0);
-    assert_eq!(reward, 0.0); // No winner yet
-    assert!(!done);
+    assert!(transition.observation.legal_moves[action as usize] == 0.0);
+    assert_eq!(transition.actor_reward, 0.0); // No winner yet
+    assert!(!transition.terminated);
     assert_eq!(state.current_player, 2); // Turn switched
 }
 
@@ -446,7 +498,7 @@ fn test_full_game() {
     let mut game = Othello::new();
     let mut rng = ChaCha20Rng::seed_from_u64(42);
 
-    let (state, _) = game.reset(&mut rng, &[]);
+    let (state, _) = game.reset(&mut rng, &[]).unwrap();
 
     // Play random moves until game ends
     let mut move_count = 0;
@@ -459,10 +511,10 @@ fn test_full_game() {
 
         // Pick first legal move
         let action = legal[0];
-        let (_, _, done, _) = game.step(&mut current_state, action, &mut rng);
+        let transition = game.step(&mut current_state, action, &mut rng).unwrap();
         move_count += 1;
 
-        if done {
+        if transition.terminated {
             break;
         }
     }
@@ -477,10 +529,10 @@ fn test_full_game() {
 #[test]
 fn test_observation_encoding() {
     let state = State::new();
-    let obs = observation_from_state(&state);
+    let obs = observation_from_state(&state).unwrap();
 
     let mut encoded = Vec::new();
-    Othello::encode_obs(&obs, &mut encoded).unwrap();
+    Othello::encode_observation(&obs, &mut encoded).unwrap();
 
     // Observation should be 195 * 4 bytes (f32)
     assert_eq!(encoded.len(), 195 * 4);
@@ -527,7 +579,9 @@ fn test_random_games_invariants() {
 
     for _ in 0..100 {
         let mut game = Othello::new();
-        let (mut state, _) = game.reset(&mut ChaCha20Rng::seed_from_u64(rng.gen()), &[]);
+        let (mut state, _) = game
+            .reset(&mut ChaCha20Rng::seed_from_u64(rng.gen()), &[])
+            .unwrap();
 
         // Play random game
         for _ in 0..200 {
@@ -541,9 +595,11 @@ fn test_random_games_invariants() {
             }
 
             let action = legal[rng.gen::<usize>() % legal.len()];
-            let (_, _, done, _) = game.step(&mut state, action, &mut ChaCha20Rng::seed_from_u64(0));
+            let transition = game
+                .step(&mut state, action, &mut ChaCha20Rng::seed_from_u64(0))
+                .unwrap();
 
-            if done {
+            if transition.terminated {
                 break;
             }
         }
@@ -563,19 +619,6 @@ fn test_random_games_invariants() {
         // 4. Current player is valid
         assert!(state.current_player == 1 || state.current_player == 2);
     }
-}
-
-#[test]
-fn test_info_bits_computation() {
-    let mut game = Othello::new();
-    let mut rng = ChaCha20Rng::seed_from_u64(42);
-
-    let (state, _) = game.reset(&mut rng, &[]);
-    let info = Othello::compute_info_bits(&state);
-
-    // Check that legal moves are encoded
-    let legal_mask = state.legal_moves_mask();
-    assert_eq!(info & legal_mask, legal_mask); // Legal moves should be set
 }
 
 /// State encoding must roundtrip at every point of a game, not just the

@@ -1,33 +1,204 @@
-//! Typed Game trait providing ergonomic interface for game developers
+//! Typed, algorithm-neutral environment contract.
 //!
-//! This trait allows game implementations to work with strongly-typed state,
-//! action, and observation types while maintaining compile-time type safety.
+//! The contract models per-agent observations and outcomes, simultaneous or
+//! chance decisions, and termination separately from truncation. Narrow game
+//! families (such as the bundled two-player board games) adapt into this ABI;
+//! they do not define it.
 
-use crate::board_view::BoardView;
-use crate::metadata::GameMetadata;
+use crate::board_view::Presentation;
+use crate::metadata::EnvironmentMetadata;
 use rand_chacha::ChaCha20Rng;
+use serde::{Deserialize, Serialize};
 
-/// Engine identification information
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EngineId {
     pub env_id: String,
     pub build_id: String,
 }
 
-/// Encoding format specifications
-#[derive(Debug, Clone, PartialEq)]
+pub const WIRE_ENCODING_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ActionEncoding {
+    /// Exactly one unsigned 32-bit action index in little-endian byte order.
+    DiscreteU32LittleEndian,
+    /// One unsigned 32-bit index per declared dimension, in declaration order.
+    MultiDiscreteU32LittleEndian,
+    /// One IEEE-754 `f32` per flattened action element, in row-major order.
+    ContinuousF32LittleEndian,
+    /// Environment-defined bytes identified by a stable, non-empty codec ID.
+    Custom { id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ObservationEncoding {
+    F32LittleEndian { elements: usize },
+    Custom { id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Encoding {
     pub state: String,
-    pub action: String,
-    pub obs: String,
+    pub action: ActionEncoding,
+    /// Codec for one [`AgentObservation`], not for the timestep envelope.
+    pub observation: ObservationEncoding,
     pub schema_version: u32,
 }
 
-/// Action space variants
-#[derive(Debug, Clone, PartialEq)]
+impl Encoding {
+    pub fn discrete_u32_le_f32_le(state: impl Into<String>, observation_elements: usize) -> Self {
+        Self {
+            state: state.into(),
+            action: ActionEncoding::DiscreteU32LittleEndian,
+            observation: ObservationEncoding::F32LittleEndian {
+                elements: observation_elements,
+            },
+            schema_version: WIRE_ENCODING_SCHEMA_VERSION,
+        }
+    }
+
+    pub fn multi_discrete_u32_le_f32_le(
+        state: impl Into<String>,
+        observation_elements: usize,
+    ) -> Self {
+        Self {
+            action: ActionEncoding::MultiDiscreteU32LittleEndian,
+            ..Self::discrete_u32_le_f32_le(state, observation_elements)
+        }
+    }
+
+    pub fn continuous_f32_le_f32_le(state: impl Into<String>, observation_elements: usize) -> Self {
+        Self {
+            action: ActionEncoding::ContinuousF32LittleEndian,
+            ..Self::discrete_u32_le_f32_le(state, observation_elements)
+        }
+    }
+
+    pub fn custom(
+        state: impl Into<String>,
+        action: impl Into<String>,
+        observation: impl Into<String>,
+    ) -> Self {
+        Self {
+            state: state.into(),
+            action: ActionEncoding::Custom { id: action.into() },
+            observation: ObservationEncoding::Custom {
+                id: observation.into(),
+            },
+            schema_version: WIRE_ENCODING_SCHEMA_VERSION,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SequentialTurnOrder {
+    Alternating,
+    EnvironmentDefined,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TurnModel {
+    SingleAgent,
+    Sequential { order: SequentialTurnOrder },
+    Simultaneous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InformationModel {
+    PerfectInformationMarkov,
+    PartiallyObserved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningStateModel {
+    /// Encoded state contains everything needed to reproduce future
+    /// transitions. A step must not depend on hidden mutable state.
+    CompleteSnapshot,
+    /// Transition-relevant state exists outside the encoded state bytes, so
+    /// callers cannot branch or replay solely from a saved snapshot.
+    ExternalState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionDynamics {
+    Deterministic,
+    Stochastic,
+}
+
+/// How stochastic chance is exposed at the decision boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChanceModel {
+    None,
+    /// Chance appears as [`Decision::Chance`] and is resolved explicitly.
+    Explicit,
+    /// The environment samples chance internally during reset or step.
+    EnvironmentSampled,
+}
+
+/// Reward semantics. Rewards themselves are always emitted per agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewardModel {
+    /// Rewards are zero before global termination and sum to zero on the
+    /// terminal timestep. The runtime validates both invariants.
+    TerminalZeroSum,
+    /// Finite per-agent rewards with no additional structural restriction.
+    General,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentSemantics {
+    pub turn_model: TurnModel,
+    pub information_model: InformationModel,
+    pub planning_state_model: PlanningStateModel,
+    pub transition_dynamics: TransitionDynamics,
+    pub chance_model: ChanceModel,
+    pub reward_model: RewardModel,
+}
+
+impl EnvironmentSemantics {
+    pub const fn deterministic_alternating_perfect_information_terminal_zero_sum() -> Self {
+        Self {
+            turn_model: TurnModel::Sequential {
+                order: SequentialTurnOrder::Alternating,
+            },
+            information_model: InformationModel::PerfectInformationMarkov,
+            planning_state_model: PlanningStateModel::CompleteSnapshot,
+            transition_dynamics: TransitionDynamics::Deterministic,
+            chance_model: ChanceModel::None,
+            reward_model: RewardModel::TerminalZeroSum,
+        }
+    }
+
+    pub const fn deterministic_single_agent_general_reward() -> Self {
+        Self {
+            turn_model: TurnModel::SingleAgent,
+            information_model: InformationModel::PerfectInformationMarkov,
+            planning_state_model: PlanningStateModel::CompleteSnapshot,
+            transition_dynamics: TransitionDynamics::Deterministic,
+            chance_model: ChanceModel::None,
+            reward_model: RewardModel::General,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ActionSpace {
-    Discrete(u32),
-    MultiDiscrete(Vec<u32>),
+    Discrete {
+        size: u32,
+    },
+    MultiDiscrete {
+        dimensions: Vec<u32>,
+    },
     Continuous {
         low: Vec<f32>,
         high: Vec<f32>,
@@ -35,180 +206,265 @@ pub enum ActionSpace {
     },
 }
 
-/// Game capabilities and configuration
-#[derive(Debug, Clone, PartialEq)]
+impl ActionSpace {
+    pub const fn discrete(size: u32) -> Self {
+        Self::Discrete { size }
+    }
+}
+
+/// Stable ID assigned by an environment to one participant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AgentId(pub u32);
+
+impl From<u8> for AgentId {
+    fn from(value: u8) -> Self {
+        Self(u32::from(value))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentSpec {
+    pub id: AgentId,
+    pub action_space: ActionSpace,
+}
+
+/// Agent population and action spaces for an environment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentModel {
+    Fixed {
+        agents: Vec<AgentSpec>,
+    },
+    /// Dynamic agents share one action-space contract.
+    Dynamic {
+        action_space: ActionSpace,
+    },
+}
+
+impl AgentModel {
+    pub fn fixed_homogeneous(
+        ids: impl IntoIterator<Item = AgentId>,
+        action_space: ActionSpace,
+    ) -> Self {
+        Self::Fixed {
+            agents: ids
+                .into_iter()
+                .map(|id| AgentSpec {
+                    id,
+                    action_space: action_space.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn action_space(&self, agent_id: AgentId) -> Option<&ActionSpace> {
+        match self {
+            Self::Fixed { agents } => agents
+                .iter()
+                .find(|agent| agent.id == agent_id)
+                .map(|agent| &agent.action_space),
+            Self::Dynamic { action_space } => Some(action_space),
+        }
+    }
+
+    pub fn fixed_agents(&self) -> Option<&[AgentSpec]> {
+        match self {
+            Self::Fixed { agents } => Some(agents),
+            Self::Dynamic { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Capabilities {
     pub id: EngineId,
+    /// Immutable environment-contract revision under `id.env_id`.
+    pub contract_version: u32,
     pub encoding: Encoding,
-    pub max_horizon: u32,
-    pub action_space: ActionSpace,
+    pub semantics: EnvironmentSemantics,
+    /// `None` represents a continuing environment with no declared horizon.
+    pub max_horizon: Option<u32>,
+    pub agents: AgentModel,
     pub preferred_batch: u32,
 }
 
-/// Main trait for game implementations
+impl Capabilities {
+    pub fn action_space(&self, agent_id: AgentId) -> Option<&ActionSpace> {
+        self.agents.action_space(agent_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentObservation<O> {
+    pub agent_id: AgentId,
+    pub observation: O,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentOutcome {
+    pub agent_id: AgentId,
+    pub reward: f32,
+    pub terminated: bool,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodeStatus {
+    Running,
+    Terminated,
+    Truncated,
+}
+
+impl EpisodeStatus {
+    pub const fn is_done(self) -> bool {
+        !matches!(self, Self::Running)
+    }
+}
+
+/// Who must supply the next action. `Agents` may contain more than one ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Decision {
+    Agents { agent_ids: Vec<AgentId> },
+    Chance,
+    None,
+}
+
+/// Provenance of the transition that produced a timestep.
 ///
-/// Games should implement this trait with their specific types for State, Action, and Obs.
-/// The trait provides compile-time type safety while allowing conversion to the erased
-/// interface for runtime polymorphism.
-///
-/// # Type Parameters
-///
-/// * `State` - Game state type, should be POD-like for efficient copying
-/// * `Action` - Action type, should be small and Copy or compact
-/// * `Obs` - Observation type, often contiguous arrays of f32
-///
-/// # Example
-///
-/// ```rust
-/// # use engine_core::typed::*;
-/// # use rand_chacha::ChaCha20Rng;
-///
-/// #[derive(Debug, Clone, Copy)]
-/// struct TicTacToeState {
-///     board: [u8; 9],
-///     current_player: u8,
-/// }
-///
-/// #[derive(Debug, Clone, Copy)]
-/// enum TicTacToeAction {
-///     Place(u8),
-/// }
-///
-/// #[derive(Debug, Clone)]
-/// struct TicTacToeObs {
-///     board_view: [f32; 18],
-///     legal_moves: [f32; 9],
-/// }
-///
-/// #[derive(Debug)]
-/// struct TicTacToe;
-///
-/// impl Game for TicTacToe {
-///     type State = TicTacToeState;
-///     type Action = TicTacToeAction;
-///     type Obs = TicTacToeObs;
-///     
-///     // Implementation methods...
-/// #   fn engine_id(&self) -> EngineId { todo!() }
-/// #   fn capabilities(&self) -> Capabilities { todo!() }
-/// #   fn metadata(&self) -> engine_core::GameMetadata { todo!() }
-/// #   fn reset(&mut self, rng: &mut ChaCha20Rng, hint: &[u8]) -> (Self::State, Self::Obs) { todo!() }
-/// #   fn step(
-/// #       &mut self,
-/// #       state: &mut Self::State,
-/// #       action: Self::Action,
-/// #       rng: &mut ChaCha20Rng,
-/// #   ) -> (Self::Obs, f32, bool, u64) { todo!() }
-/// #   fn encode_state(state: &Self::State, out: &mut Vec<u8>) -> Result<(), EncodeError> { todo!() }
-/// #   fn decode_state(buf: &[u8]) -> Result<Self::State, DecodeError> { todo!() }
-/// #   fn encode_action(action: &Self::Action, out: &mut Vec<u8>) -> Result<(), EncodeError> { todo!() }
-/// #   fn decode_action(buf: &[u8]) -> Result<Self::Action, DecodeError> { todo!() }
-/// #   fn encode_obs(obs: &Self::Obs, out: &mut Vec<u8>) -> Result<(), EncodeError> { todo!() }
-/// #   fn view(state: &Self::State) -> engine_core::BoardView { todo!() }
-/// }
-/// ```
-pub trait Game: Send + Sync + std::fmt::Debug + 'static {
-    /// Game state type - should be efficiently copyable
+/// In a dynamic environment, a departing source agent remains in the
+/// resulting [`Timestep::agents`] transition roster so its final outcome and
+/// provenance stay locally valid. It must not appear in the next decision and
+/// is omitted from the following timestep.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TransitionSource {
+    Reset,
+    Agents { agent_ids: Vec<AgentId> },
+    Chance,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Timestep<O> {
+    /// Agent population represented by this transition envelope.
+    ///
+    /// Fixed environments emit their declared population. Dynamic
+    /// environments emit newly/currently active agents plus any departing
+    /// agent on the transition that terminates or truncates it. A departing
+    /// agent is excluded from [`Self::decision`] immediately, then omitted from
+    /// the following timestep. This is deliberately a transition roster, not
+    /// only the post-step live roster.
+    pub agents: Vec<AgentId>,
+    pub observations: Vec<AgentObservation<O>>,
+    pub outcomes: Vec<AgentOutcome>,
+    pub decision: Decision,
+    pub episode: EpisodeStatus,
+    pub source: TransitionSource,
+    pub info: Vec<u8>,
+}
+
+impl<O> Timestep<O> {
+    pub fn reward_for(&self, agent_id: AgentId) -> Option<f32> {
+        self.outcomes
+            .iter()
+            .find(|outcome| outcome.agent_id == agent_id)
+            .map(|outcome| outcome.reward)
+    }
+
+    pub fn observation_for(&self, agent_id: AgentId) -> Option<&O> {
+        self.observations
+            .iter()
+            .find(|observation| observation.agent_id == agent_id)
+            .map(|observation| &observation.observation)
+    }
+
+    pub fn sole_observation(&self) -> Result<&AgentObservation<O>, TimestepAccessError> {
+        match self.observations.as_slice() {
+            [observation] => Ok(observation),
+            observations => Err(TimestepAccessError::ExpectedOneObservation {
+                actual: observations.len(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TimestepAccessError {
+    #[error("expected exactly one observation, got {actual}")]
+    ExpectedOneObservation { actual: usize },
+}
+
+/// Main typed interface implemented by general environments.
+pub trait Environment: Send + Sync + std::fmt::Debug + 'static {
     type State: Send + Sync + 'static;
-
-    /// Action type - should be small and Copy or compact
+    /// May be a joint action when [`TurnModel::Simultaneous`] is declared.
     type Action: Send + Sync + 'static;
+    type Observation: Send + Sync + 'static;
 
-    /// Observation type - often contiguous arrays of f32
-    type Obs: Send + Sync + 'static;
-
-    /// Get engine identification information
     fn engine_id(&self) -> EngineId;
-
-    /// Get game capabilities and configuration
     fn capabilities(&self) -> Capabilities;
+    fn metadata(&self) -> EnvironmentMetadata;
 
-    /// Get game metadata for UI and configuration
-    ///
-    /// Returns display-oriented metadata about the game including board dimensions,
-    /// player information, and observation format details needed by actors and trainers.
-    fn metadata(&self) -> GameMetadata;
+    fn reset(
+        &mut self,
+        rng: &mut ChaCha20Rng,
+        hint: &[u8],
+    ) -> Result<(Self::State, Timestep<Self::Observation>), EnvironmentError>;
 
-    /// Reset the game to initial state
-    ///
-    /// # Arguments
-    ///
-    /// * `rng` - Deterministic random number generator for reproducible resets
-    /// * `hint` - Optional hint data for environment setup
-    ///
-    /// # Returns
-    ///
-    /// A tuple of (initial_state, initial_observation)
-    fn reset(&mut self, rng: &mut ChaCha20Rng, hint: &[u8]) -> (Self::State, Self::Obs);
-
-    /// Perform one simulation step
-    ///
-    /// # Arguments
-    ///
-    /// * `state` - Current game state (mutable for in-place updates)
-    /// * `action` - Action to take
-    /// * `rng` - Random number generator for stochastic elements
-    ///
-    /// # Returns
-    ///
-    /// A tuple of (observation, reward, done, info)
     fn step(
         &mut self,
         state: &mut Self::State,
         action: Self::Action,
         rng: &mut ChaCha20Rng,
-    ) -> (Self::Obs, f32, bool, u64);
+    ) -> Result<Timestep<Self::Observation>, EnvironmentError>;
 
-    // Encoding/Decoding hooks for serialization
-
-    /// Encode state to bytes
     fn encode_state(state: &Self::State, out: &mut Vec<u8>) -> Result<(), EncodeError>;
-
-    /// Decode state from bytes
     fn decode_state(buf: &[u8]) -> Result<Self::State, DecodeError>;
-
-    /// Encode action to bytes
     fn encode_action(action: &Self::Action, out: &mut Vec<u8>) -> Result<(), EncodeError>;
-
-    /// Decode action from bytes
     fn decode_action(buf: &[u8]) -> Result<Self::Action, DecodeError>;
+    fn encode_observation(
+        observation: &Self::Observation,
+        out: &mut Vec<u8>,
+    ) -> Result<(), EncodeError>;
 
-    /// Encode observation to bytes
-    fn encode_obs(obs: &Self::Obs, out: &mut Vec<u8>) -> Result<(), EncodeError>;
-
-    /// Project the state for display.
-    ///
-    /// This is how anything outside the engine learns what is on the board.
-    /// It is deliberately required rather than defaulted: the alternative is
-    /// callers decoding `encode_state` bytes themselves, which is what this
-    /// replaces.
-    ///
-    /// Games with one owner byte per cell can build the result with
-    /// [`BoardView::from_owners`].
-    fn view(state: &Self::State) -> BoardView;
+    fn presentation(_state: &Self::State) -> Option<Presentation> {
+        None
+    }
 }
 
-/// Error type for encoding operations
+#[derive(Debug, thiserror::Error)]
+pub enum EnvironmentError {
+    #[error("invalid reset hint: {0}")]
+    InvalidHint(String),
+    #[error("invalid environment state: {0}")]
+    InvalidState(String),
+    #[error("invalid environment action: {0}")]
+    InvalidAction(String),
+    #[error("environment transition failed: {0}")]
+    Transition(String),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EncodeError {
-    #[error("Failed to encode data: {0}")]
+    #[error("failed to encode data: {0}")]
     SerializationError(String),
-    #[error("Buffer too small, needed {needed} bytes but got {available}")]
+    #[error("buffer too small, needed {needed} bytes but got {available}")]
     BufferTooSmall { needed: usize, available: usize },
-    #[error("Invalid data: {0}")]
+    #[error("invalid data: {0}")]
     InvalidData(String),
 }
 
-/// Error type for decoding operations  
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
-    #[error("Failed to decode data: {0}")]
+    #[error("failed to decode data: {0}")]
     DeserializationError(String),
-    #[error("Invalid buffer length: expected {expected} but got {actual}")]
+    #[error("invalid buffer length: expected {expected} but got {actual}")]
     InvalidLength { expected: usize, actual: usize },
-    #[error("Corrupted data: {0}")]
+    #[error("corrupted data: {0}")]
     CorruptedData(String),
-    #[error("Unsupported version: {version}")]
+    #[error("unsupported version: {version}")]
     UnsupportedVersion { version: u32 },
 }
 

@@ -1,60 +1,83 @@
-"""Command-line entry point and stats I/O for solver evaluation.
-
-Handles checkpoint discovery, appending results to data/solver_stats.json,
-progression tables across checkpoints, argument parsing, and the run driver.
-"""
+"""Diagnostic command-line entry point for standalone solver evaluation."""
 
 import argparse
-import json
 import logging
-import sys
+import math
+import struct
 from collections.abc import Iterable
 from pathlib import Path
 
-from ..logging_utils import silence_noisy_loggers
 from ..players import ModelPlayer, RandomPlayer
-from .results import CHECKPOINT_PATTERN, SolverEvalResults, infer_step_from_filename
+from ..registry import artifact_contract_for, discover_checkpoints
+from ..storage.publisher import create_checkpoint_publisher
+from .results import SolverEvalResults
 from .scorer import SolverScorer, solver_evaluate
 
 logger = logging.getLogger(__name__)
 
-
-def discover_checkpoints(models_dir: Path) -> list[Path]:
-    """All step checkpoints (numerically sorted) plus latest/best if present."""
-    checkpoints = sorted(
-        (
-            p
-            for p in models_dir.glob("model_step_*.onnx")
-            if CHECKPOINT_PATTERN.fullmatch(p.name)
-        ),
-        key=lambda p: infer_step_from_filename(p) or 0,
-    )
-    for name in ("latest.onnx", "best.onnx"):
-        candidate = models_dir / name
-        if candidate.exists():
-            checkpoints.append(candidate)
-    return checkpoints
+_MAX_U32 = (1 << 32) - 1
+_MAX_U64 = (1 << 64) - 1
+_MAX_F32 = float.fromhex("0x1.fffffep+127")
 
 
-def append_solver_stats(entry: dict, output_path: Path) -> None:
-    """Append one evaluation entry to the solver stats JSON file."""
-    stats = {"solver_evaluations": []}
-    if output_path.exists():
-        try:
-            with open(output_path) as f:
-                loaded = json.load(f)
-            if isinstance(loaded.get("solver_evaluations"), list):
-                stats = loaded
-            else:
-                logger.warning(f"Unexpected structure in {output_path}, starting fresh")
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning(f"Could not read {output_path} ({e}), starting fresh")
+def _positive_u32_argument(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a positive u32 integer") from exc
+    if parsed <= 0 or parsed > _MAX_U32:
+        raise argparse.ArgumentTypeError("expected a positive u32 integer")
+    return parsed
 
-    stats["solver_evaluations"].append(entry)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w") as f:
-        json.dump(stats, f, indent=2)
-    logger.info(f"Solver stats appended to {output_path}")
+
+def _u64_argument(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a nonnegative u64 integer") from exc
+    if parsed < 0 or parsed > _MAX_U64:
+        raise argparse.ArgumentTypeError("expected a nonnegative u64 integer")
+    return parsed
+
+
+def _nonnegative_f32_argument(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a finite nonnegative f32") from exc
+    if not math.isfinite(parsed) or parsed < 0.0 or parsed > _MAX_F32:
+        raise argparse.ArgumentTypeError("expected a finite nonnegative f32")
+    narrowed = float(struct.unpack("!f", struct.pack("!f", parsed))[0])
+    return 0.0 if narrowed == 0.0 else narrowed
+
+
+def _validate_solver_eval_request(args: argparse.Namespace) -> None:
+    """Validate programmatic callers as strictly as the public parser."""
+    if args.all_checkpoints and hasattr(args, "model"):
+        raise ValueError("--model and --all-checkpoints are mutually exclusive")
+    if (
+        isinstance(args.games, bool)
+        or not isinstance(args.games, int)
+        or not 1 <= args.games <= _MAX_U32
+    ):
+        raise ValueError("--games must be a positive u32 integer")
+    if (
+        isinstance(args.seed, bool)
+        or not isinstance(args.seed, int)
+        or not 0 <= args.seed <= _MAX_U64
+    ):
+        raise ValueError("--seed must be a nonnegative u64 integer")
+    if args.seed > _MAX_U64 - (args.games - 1):
+        raise ValueError("--seed plus the game index exceeds u64")
+    if isinstance(args.temperature, bool) or not isinstance(
+        args.temperature, (int, float)
+    ):
+        raise ValueError("--temperature must be a finite nonnegative f32")
+    temperature = float(args.temperature)
+    if not math.isfinite(temperature) or temperature < 0.0 or temperature > _MAX_F32:
+        raise ValueError("--temperature must be a finite nonnegative f32")
+    narrowed = float(struct.unpack("!f", struct.pack("!f", temperature))[0])
+    args.temperature = 0.0 if narrowed == 0.0 else narrowed
 
 
 def format_progression_table(results: Iterable[SolverEvalResults]) -> str:
@@ -78,53 +101,49 @@ def format_progression_table(results: Iterable[SolverEvalResults]) -> str:
 
 def add_solver_eval_arguments(parser: argparse.ArgumentParser) -> None:
     """Add solver-eval arguments to a parser."""
-    parser.add_argument(
+    model_selection = parser.add_mutually_exclusive_group()
+    model_selection.add_argument(
         "--model",
         type=str,
-        default="./data/models/latest.onnx",
-        help="Path to ONNX model file (ignored with --all-checkpoints)",
+        default=argparse.SUPPRESS,
+        help="One-off ONNX file. If omitted, resolve the latest checkpoint "
+        "selected by RunHead",
     )
-    parser.add_argument(
+    model_selection.add_argument(
         "--all-checkpoints",
         action="store_true",
-        help="Evaluate every model_step_*.onnx plus latest/best in --models-dir",
+        help="Evaluate every immutable manifest in the checkpoint repository",
     )
     parser.add_argument(
         "--models-dir",
         type=str,
-        default="./data/models",
-        help="Directory scanned by --all-checkpoints",
+        default=argparse.SUPPRESS,
+        help="Checkpoint repository root (default: selected runtime profile)",
     )
     parser.add_argument(
         "--env-id",
         type=str,
         default="connect4",
-        choices=["tictactoe", "connect4"],
+        choices=["connect4"],
         help="Game environment (only connect4 has a solver)",
     )
     parser.add_argument(
         "--games",
-        type=int,
+        type=_positive_u32_argument,
         default=50,
         help="Number of games to play per model",
     )
     parser.add_argument(
         "--seed",
-        type=int,
+        type=_u64_argument,
         default=42,
         help="Base RNG seed (per-game seed is seed + game index)",
     )
     parser.add_argument(
         "--temperature",
-        type=float,
+        type=_nonnegative_f32_argument,
         default=0.0,
         help="Model sampling temperature (0 = greedy)",
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="./data/solver_stats.json",
-        help="JSON file to append results to",
     )
     parser.add_argument(
         "--verbose",
@@ -150,19 +169,54 @@ def run_solver_evaluation(args: argparse.Namespace) -> int:
         )
         return 1
 
-    if args.all_checkpoints:
-        models_dir = Path(args.models_dir)
-        model_paths = discover_checkpoints(models_dir)
-        if not model_paths:
-            logger.error(f"No checkpoints found in {models_dir}")
-            return 1
-        logger.info(f"Evaluating {len(model_paths)} checkpoints from {models_dir}")
-    else:
-        model_path = Path(args.model)
-        if not model_path.exists():
-            logger.error(f"Model not found: {model_path}")
-            return 1
-        model_paths = [model_path]
+    try:
+        _validate_solver_eval_request(args)
+    except ValueError as exc:
+        logger.error(str(exc))
+        return 1
+
+    try:
+        if args.all_checkpoints or not hasattr(args, "model"):
+            model_root = Path(args.models_dir)
+            contract = artifact_contract_for(args.env_id, args.algorithm)
+            repository = create_checkpoint_publisher(contract, model_root)
+            if args.all_checkpoints:
+                checkpoints = discover_checkpoints(repository)
+                if not checkpoints:
+                    logger.error(f"No checkpoints found in {model_root}")
+                    return 1
+                model_jobs = [
+                    (
+                        checkpoint.onnx_path,
+                        checkpoint.checkpoint_id,
+                        checkpoint.manifest.step,
+                    )
+                    for checkpoint in checkpoints
+                ]
+                logger.info(
+                    f"Evaluating {len(model_jobs)} checkpoints from {model_root}"
+                )
+            else:
+                checkpoint = repository.resolve_head()
+                if checkpoint is None:
+                    logger.error(f"Checkpoint repository has no RunHead: {model_root}")
+                    return 1
+                model_jobs = [
+                    (
+                        checkpoint.onnx_path,
+                        checkpoint.checkpoint_id,
+                        checkpoint.manifest.step,
+                    )
+                ]
+        else:
+            model_path = Path(args.model)
+            if not model_path.is_file():
+                logger.error(f"Model not found: {model_path}")
+                return 1
+            model_jobs = [(model_path, None, None)]
+    except (ImportError, OSError, ValueError) as exc:
+        logger.error(f"Could not resolve checkpoints: {exc}")
+        return 1
 
     try:
         scorer = SolverScorer()
@@ -178,7 +232,7 @@ def run_solver_evaluation(args: argparse.Namespace) -> int:
         bitbully_version = None
 
     all_results = []
-    for model_path in model_paths:
+    for model_path, checkpoint_id, checkpoint_step in model_jobs:
         model = ModelPlayer(str(model_path), temperature=args.temperature)
 
         logger.info(f"Evaluating {model.name} over {args.games} games vs random")
@@ -186,41 +240,21 @@ def run_solver_evaluation(args: argparse.Namespace) -> int:
             model=model,
             opponent=RandomPlayer(),
             scorer=scorer,
+            algorithm_id=args.algorithm,
             env_id=args.env_id,
             num_games=args.games,
             seed=args.seed,
             verbose=args.verbose,
+            checkpoint_id=checkpoint_id,
+            checkpoint_step=checkpoint_step,
         )
         results.bitbully_version = bitbully_version
         all_results.append(results)
 
         print(results.summary())
-        append_solver_stats(results.to_dict(), Path(args.output))
 
     if len(all_results) > 1:
         print("\nProgression across checkpoints:")
         print(format_progression_table(all_results))
 
     return 0
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Score Connect4 model moves against a perfect solver (bitbully)",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    add_solver_eval_arguments(parser)
-    args = parser.parse_args()
-
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    silence_noisy_loggers()
-
-    return run_solver_evaluation(args)
-
-
-if __name__ == "__main__":
-    sys.exit(main())

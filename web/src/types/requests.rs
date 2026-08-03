@@ -2,23 +2,30 @@
 
 use serde::Deserialize;
 
+/// Which side makes the first move in an interactive game.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FirstPlayer {
+    #[default]
+    Player,
+    Bot,
+}
+
 /// Request to start a new game.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NewGameRequest {
     /// Who plays first: "player" or "bot"
-    #[serde(default = "default_first")]
-    pub first: String,
+    #[serde(default)]
+    pub first: FirstPlayer,
     /// Game to play (e.g., "tictactoe", "connect4")
     #[serde(default)]
     pub game: Option<String>,
 }
 
-fn default_first() -> String {
-    "player".to_string()
-}
-
 /// Request to make a move.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MoveRequest {
     /// Action index to play (game-specific: 0-8 for TicTacToe, 0-6 for
     /// Connect4, 0-256 for Generals — which is why this is not a u8)
@@ -39,8 +46,7 @@ mod tests {
 
     #[test]
     fn test_new_game_request_default_first() {
-        // The default_first function should return "player"
-        assert_eq!(default_first(), "player");
+        assert_eq!(FirstPlayer::default(), FirstPlayer::Player);
     }
 
     #[test]
@@ -49,7 +55,7 @@ mod tests {
         let request: NewGameRequest = serde_json::from_str(json).unwrap();
 
         // Should use defaults
-        assert_eq!(request.first, "player");
+        assert_eq!(request.first, FirstPlayer::Player);
         assert!(request.game.is_none());
     }
 
@@ -58,7 +64,7 @@ mod tests {
         let json = r#"{"first": "bot"}"#;
         let request: NewGameRequest = serde_json::from_str(json).unwrap();
 
-        assert_eq!(request.first, "bot");
+        assert_eq!(request.first, FirstPlayer::Bot);
         assert!(request.game.is_none());
     }
 
@@ -67,7 +73,7 @@ mod tests {
         let json = r#"{"first": "player", "game": "tictactoe"}"#;
         let request: NewGameRequest = serde_json::from_str(json).unwrap();
 
-        assert_eq!(request.first, "player");
+        assert_eq!(request.first, FirstPlayer::Player);
         assert_eq!(request.game, Some("tictactoe".to_string()));
     }
 
@@ -76,7 +82,7 @@ mod tests {
         let json = r#"{"first": "bot", "game": "connect4"}"#;
         let request: NewGameRequest = serde_json::from_str(json).unwrap();
 
-        assert_eq!(request.first, "bot");
+        assert_eq!(request.first, FirstPlayer::Bot);
         assert_eq!(request.game, Some("connect4".to_string()));
     }
 
@@ -85,17 +91,15 @@ mod tests {
         // Test that "player" is valid
         let json = r#"{"first": "player"}"#;
         let request: NewGameRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(request.first, "player");
+        assert_eq!(request.first, FirstPlayer::Player);
 
         // Test that "bot" is valid
         let json = r#"{"first": "bot"}"#;
         let request: NewGameRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(request.first, "bot");
+        assert_eq!(request.first, FirstPlayer::Bot);
 
-        // Any string value is technically valid (validation happens elsewhere)
         let json = r#"{"first": "invalid"}"#;
-        let request: NewGameRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(request.first, "invalid");
+        assert!(serde_json::from_str::<NewGameRequest>(json).is_err());
     }
 
     // ========================================
@@ -149,20 +153,15 @@ mod tests {
     // ========================================
 
     #[test]
-    fn test_new_game_request_extra_fields_ignored() {
-        // Serde ignores unknown fields by default
+    fn test_new_game_request_rejects_extra_fields() {
         let json = r#"{"first": "player", "unknown_field": "value"}"#;
-        let request: NewGameRequest = serde_json::from_str(json).unwrap();
-
-        assert_eq!(request.first, "player");
+        assert!(serde_json::from_str::<NewGameRequest>(json).is_err());
     }
 
     #[test]
-    fn test_move_request_extra_fields_ignored() {
+    fn test_move_request_rejects_extra_fields() {
         let json = r#"{"position": 4, "extra": "ignored"}"#;
-        let request: MoveRequest = serde_json::from_str(json).unwrap();
-
-        assert_eq!(request.position, 4);
+        assert!(serde_json::from_str::<MoveRequest>(json).is_err());
     }
 
     #[test]
@@ -171,7 +170,7 @@ mod tests {
         let json = r#"{"first": "bot", "game": null}"#;
         let request: NewGameRequest = serde_json::from_str(json).unwrap();
 
-        assert_eq!(request.first, "bot");
+        assert_eq!(request.first, FirstPlayer::Bot);
         assert!(request.game.is_none());
     }
 

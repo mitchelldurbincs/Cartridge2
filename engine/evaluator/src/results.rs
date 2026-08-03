@@ -41,13 +41,11 @@ impl EvalSummary {
             }
             Some(_) => {
                 self.player2_wins += 1;
-                // Seats are from player 1's point of view, matching the Python
-                // implementation: these count games player 2 won while player 1
-                // was first/second, not the seat player 2 itself held.
+                // These fields name the seat player 2 actually held.
                 if player1_first {
-                    self.player2_wins_as_first += 1;
-                } else {
                     self.player2_wins_as_second += 1;
+                } else {
+                    self.player2_wins_as_first += 1;
                 }
             }
             None => self.draws += 1,
@@ -102,19 +100,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn record_splits_wins_by_the_seat_player_one_held() {
+    fn record_splits_each_players_wins_by_their_actual_seat() {
         let mut s = EvalSummary::default();
         s.record(Some(1), true);
         s.record(Some(1), false);
         s.record(Some(2), true);
+        s.record(Some(2), false);
         s.record(None, false);
 
-        assert_eq!(s.games_played, 4);
+        assert_eq!(s.games_played, 5);
         assert_eq!(s.player1_wins, 2);
         assert_eq!(s.player1_wins_as_first, 1);
         assert_eq!(s.player1_wins_as_second, 1);
-        assert_eq!(s.player2_wins, 1);
+        assert_eq!(s.player2_wins, 2);
         assert_eq!(s.player2_wins_as_first, 1);
+        assert_eq!(s.player2_wins_as_second, 1);
         assert_eq!(s.draws, 1);
     }
 

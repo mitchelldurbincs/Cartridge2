@@ -7,10 +7,31 @@
 //! Run: cargo run -p mcts --features onnx --example generals_strength_probe \
 //!        --release -- <model.onnx> [games] [sims]
 
-use engine_core::EngineContext;
+use algorithm_core::{resolve_algorithm, ALPHAZERO_BOARD_V1_ID};
+use engine_core::{Decision, EngineContext, EpisodeStatus, ErasedTimestep};
 use mcts::{run_mcts, MctsConfig, OnnxEvaluator};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
+
+fn active_agent_and_observation(timestep: &ErasedTimestep) -> (u8, &[u8]) {
+    let agent = match &timestep.decision {
+        Decision::Agents { agent_ids } if agent_ids.len() == 1 => agent_ids[0],
+        decision => panic!("expected one agent, got {decision:?}"),
+    };
+    (
+        u8::try_from(agent.0).expect("board seat fits u8"),
+        timestep.observation_for(agent).unwrap(),
+    )
+}
+
+fn terminal_winner(timestep: &ErasedTimestep) -> u8 {
+    timestep
+        .outcomes
+        .iter()
+        .find(|outcome| outcome.reward > 0.0)
+        .map(|outcome| u8::try_from(outcome.agent_id.0).unwrap())
+        .unwrap_or(3)
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -20,10 +41,22 @@ fn main() {
     let games: u64 = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(20);
     let sims: u32 = args.get(3).map(|s| s.parse().unwrap()).unwrap_or(50);
 
-    engine_games::register_all_games();
+    engine_games::register_all_environments();
     let mut ctx = EngineContext::new("generals_8x8").unwrap();
     let meta = ctx.metadata();
-    let evaluator = OnnxEvaluator::load(model_path, meta.obs_size, 1).unwrap();
+    let board = meta.require_board().unwrap();
+    let model_contract = resolve_algorithm(ALPHAZERO_BOARD_V1_ID)
+        .unwrap()
+        .descriptor()
+        .model_artifact_contract("generals_8x8", ctx.capabilities().contract_version);
+    let evaluator = OnnxEvaluator::load_from_file(
+        model_path,
+        board.observation.elements,
+        board.action_count,
+        1,
+        &model_contract,
+    )
+    .unwrap();
 
     // Evaluation config: greedy, no exploration noise
     let config = MctsConfig::for_evaluation()
@@ -40,12 +73,12 @@ fn main() {
         let model_seat: u8 = if game_idx % 2 == 0 { 1 } else { 2 };
         let reset = ctx.reset(1000 + game_idx, &[]).unwrap();
         let mut state = reset.state;
-        let mut obs = reset.obs;
+        let mut timestep = reset.timestep;
         let mut rng = ChaCha20Rng::seed_from_u64(game_idx);
-        let mut current: u8 = 1;
 
         loop {
-            let mask = meta.legal_mask_from_obs(&obs);
+            let (current, observation) = active_agent_and_observation(&timestep);
+            let mask = board.legal_mask_from_obs(observation).unwrap();
             let action: u32 = if current == model_seat {
                 let mut search_rng = ChaCha20Rng::seed_from_u64(game_idx * 10_000);
                 run_mcts(
@@ -53,8 +86,7 @@ fn main() {
                     &evaluator,
                     config.clone(),
                     state.clone(),
-                    obs.clone(),
-                    mask,
+                    timestep.clone(),
                     &mut search_rng,
                 )
                 .unwrap()
@@ -66,11 +98,10 @@ fn main() {
 
             let step = ctx.step(&state, &action.to_le_bytes()).unwrap();
             state = step.state;
-            obs = step.obs;
+            timestep = step.timestep;
 
-            if step.done {
-                // Winner from info bits (mask field unused for generals)
-                let winner = engine_core::game_utils::info_bits::extract_winner(step.info);
+            if timestep.episode != EpisodeStatus::Running {
+                let winner = terminal_winner(&timestep);
                 if winner == model_seat {
                     model_wins += 1;
                 } else if winner == 3 || winner == 0 {
@@ -80,7 +111,6 @@ fn main() {
                 }
                 break;
             }
-            current = if current == 1 { 2 } else { 1 };
         }
         println!(
             "game {game_idx}: model as P{model_seat} -> running score model={model_wins} random={random_wins} draws={draws}"

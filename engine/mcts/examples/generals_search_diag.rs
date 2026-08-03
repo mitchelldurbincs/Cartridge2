@@ -11,12 +11,29 @@
 //!
 //! Run: cargo run -p mcts --example generals_search_diag --release
 
-use engine_core::EngineContext;
+use engine_core::{Decision, EngineContext, EpisodeStatus, ErasedTimestep};
 use mcts::{run_mcts, MctsConfig, UniformEvaluator};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
 const CAP_PLIES: u32 = 400; // 2 * MAX_TURNS
+
+fn active_observation(timestep: &ErasedTimestep) -> &[u8] {
+    let agent = match &timestep.decision {
+        Decision::Agents { agent_ids } if agent_ids.len() == 1 => agent_ids[0],
+        decision => panic!("expected one active agent, got {decision:?}"),
+    };
+    timestep.observation_for(agent).unwrap()
+}
+
+fn terminal_winner(timestep: &ErasedTimestep) -> usize {
+    timestep
+        .outcomes
+        .iter()
+        .find(|outcome| outcome.reward > 0.0)
+        .map(|outcome| outcome.agent_id.0 as usize)
+        .unwrap_or(3)
+}
 
 fn percentile(sorted: &[u32], p: f64) -> u32 {
     if sorted.is_empty() {
@@ -57,9 +74,10 @@ fn normalize(visits: &[f64]) -> Vec<f64> {
 }
 
 fn main() {
-    engine_games::register_all_games();
+    engine_games::register_all_environments();
     let mut ctx = EngineContext::new("generals_8x8").unwrap();
     let meta = ctx.metadata().clone();
+    let board = meta.require_board().unwrap();
 
     // ---------------- Part A: game shape under random play ----------------
     let games = 200u64;
@@ -73,12 +91,14 @@ fn main() {
     for seed in 0..games {
         let reset = ctx.reset(seed, &[]).unwrap();
         let mut state = reset.state;
-        let mut obs = reset.obs;
+        let mut timestep = reset.timestep;
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
         let mut plies = 0u32;
 
         loop {
-            let mask = meta.legal_mask_from_obs(&obs);
+            let mask = board
+                .legal_mask_from_obs(active_observation(&timestep))
+                .unwrap();
             let legal: Vec<usize> = mask.iter_ones().collect();
             legal_counts.push(legal.len() as u32);
             if legal.len() == 1 {
@@ -87,12 +107,11 @@ fn main() {
             let action = legal[rng.gen_range(0..legal.len())] as u32;
             let step = ctx.step(&state, &action.to_le_bytes()).unwrap();
             state = step.state;
-            obs = step.obs;
+            timestep = step.timestep;
             plies += 1;
             total_plies += 1;
-            if step.done {
-                let w = engine_core::game_utils::info_bits::extract_winner(step.info);
-                winners[(w as usize).min(3)] += 1;
+            if timestep.episode != EpisodeStatus::Running {
+                winners[terminal_winner(&timestep).min(3)] += 1;
                 if plies >= CAP_PLIES - 1 {
                     adjudicated += 1;
                 }
@@ -151,17 +170,19 @@ fn main() {
         // Replay a fixed random rollout to the probe ply.
         let reset = ctx.reset(7, &[]).unwrap();
         let mut state = reset.state;
-        let mut obs = reset.obs;
+        let mut timestep = reset.timestep;
         let mut rng = ChaCha20Rng::seed_from_u64(7);
         let mut reached = true;
         for _ in 0..probe {
-            let mask = meta.legal_mask_from_obs(&obs);
+            let mask = board
+                .legal_mask_from_obs(active_observation(&timestep))
+                .unwrap();
             let legal: Vec<usize> = mask.iter_ones().collect();
             let action = legal[rng.gen_range(0..legal.len())] as u32;
             let step = ctx.step(&state, &action.to_le_bytes()).unwrap();
             state = step.state;
-            obs = step.obs;
-            if step.done {
+            timestep = step.timestep;
+            if timestep.episode != EpisodeStatus::Running {
                 reached = false;
                 break;
             }
@@ -170,7 +191,9 @@ fn main() {
             continue;
         }
 
-        let mask = meta.legal_mask_from_obs(&obs);
+        let mask = board
+            .legal_mask_from_obs(active_observation(&timestep))
+            .unwrap();
         let n_legal = mask.count_ones();
 
         for &sims in &sim_budgets {
@@ -187,8 +210,7 @@ fn main() {
                 &evaluator,
                 config,
                 state.clone(),
-                obs.clone(),
-                mask.clone(),
+                timestep.clone(),
                 &mut search_rng,
             )
             .unwrap();

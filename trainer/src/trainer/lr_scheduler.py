@@ -46,6 +46,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 __all__ = ["LRConfig", "WarmupCosineScheduler"]
 
 logger = logging.getLogger(__name__)
+SCHEDULER_STATE_SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -200,6 +201,7 @@ class WarmupCosineScheduler:
         allowing proper restoration even mid-warmup.
         """
         state = {
+            "schema_version": SCHEDULER_STATE_SCHEMA_VERSION,
             "current_step": self._current_step,
             "warmup_steps": self._warmup_steps,
             "config_warmup_steps": self.config.warmup_steps,  # Original config value
@@ -219,16 +221,19 @@ class WarmupCosineScheduler:
         - base_lrs is reset to target_lr (may have been saved during warmup)
 
         Args:
-            state: State dictionary from a previous state_dict() call,
-                  or a raw CosineAnnealingLR state dict for backwards compatibility.
+            state: State dictionary from :meth:`state_dict`.
         """
-        # Handle legacy format (just the cosine scheduler state)
-        if "cosine_scheduler" not in state and "last_epoch" in state:
-            cosine_state = state
-            self._current_step = state.get("last_epoch", 0)
-        else:
-            cosine_state = state.get("cosine_scheduler")
-            self._current_step = state.get("current_step", 0)
+        schema_version = state.get("schema_version")
+        if schema_version != SCHEDULER_STATE_SCHEMA_VERSION:
+            raise ValueError(
+                f"Unsupported scheduler state schema {schema_version!r}; expected "
+                f"{SCHEDULER_STATE_SCHEMA_VERSION}"
+            )
+        if "current_step" not in state:
+            raise ValueError("Scheduler state is missing required field 'current_step'")
+
+        cosine_state = state.get("cosine_scheduler")
+        self._current_step = state["current_step"]
 
         # Always disable warmup when loading from checkpoint
         if self._warmup_steps > 0:

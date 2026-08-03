@@ -6,6 +6,3 @@ project_id = "your-project-id"
 
 # Optional: GCP region (defaults to us-central1)
 region = "us-central1"
-
-# Optional: Environment name (defaults to dev)
-environment = "dev"

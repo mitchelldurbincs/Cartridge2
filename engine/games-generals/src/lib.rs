@@ -15,9 +15,8 @@
 //! - **No half-moves**: every move sends `army - 1`. This halves the action
 //!   space (4 directions per tile + wait = 257 actions).
 //!
-//! Illegal actions submitted to `step()` are treated as `wait`, mirroring
-//! the Go server's auto-wait on rejected moves; MCTS/actors never send them
-//! because the obs carries the legal mask.
+//! Illegal actions submitted to `step()` are rejected without mutating the
+//! state. The observation's legal mask is the exact accepted action set.
 //!
 //! Board mechanics preserved from the Go engine: combat (larger army wins,
 //! difference remains), city/general production of 1 per round, normal-tile
@@ -30,11 +29,16 @@
 //! (zero value signal); territory adjudication keeps the game zero-sum
 //! while making almost every game decisive.
 
-use engine_core::game_utils::{calculate_reward, decode_action_u32, info_bits, opponent};
-use engine_core::typed::{
-    ActionSpace, Capabilities, DecodeError, EncodeError, Encoding, EngineId, Game,
+use engine_core::board_profile::{
+    calculate_reward, decode_action_u32, opponent, register_board_game, BoardGame,
+    BoardGameMetadata, BoardPlayerMetadata, BoardRenderer, BoardTransition, BoardView, CellKind,
+    CellView,
 };
-use engine_core::{register_game, BoardView, CellKind, CellView, GameAdapter, GameMetadata};
+use engine_core::typed::{
+    ActionSpace, AgentId, AgentModel, Capabilities, DecodeError, EncodeError, Encoding, EngineId,
+    EnvironmentSemantics,
+};
+use engine_core::{EnvironmentError, EnvironmentMetadata};
 use rand_chacha::ChaCha20Rng;
 
 pub mod action;
@@ -52,14 +56,16 @@ use obs::{GeneralsObs, LEGAL_MASK_OFFSET, OBS_SIZE};
 use params::{BOARD_SIZE, MAX_TURNS, NUM_ACTIONS};
 use rules::{adjudicate_at_cap, apply_production, check_winner};
 
+/// Immutable environment contract revision for wire formats and semantics.
+pub const ENV_CONTRACT_VERSION: u32 = 2;
+
 /// Sentinel for an eliminated player's general index.
 const NO_GENERAL: u8 = u8::MAX;
 
 /// Register Generals with the global game registry as `generals_8x8`.
 pub fn register_generals() {
-    register_game("generals_8x8".to_string(), || {
-        Box::new(GameAdapter::new(Generals::new()))
-    });
+    register_board_game::<Generals>()
+        .expect("generals_8x8 environment must only be registered once");
 }
 
 /// Complete game state.
@@ -79,10 +85,8 @@ pub struct State {
     pub winner: u8,
     /// Ply count at which the game is adjudicated: `2 * MAX_TURNS` or one
     /// less, coin-flipped at reset so each seat gets the final move in
-    /// half of all games. Deliberately absent from the observation: with a
-    /// fixed even cap, player 2 always owns the pre-adjudication move,
-    /// wins nearly every near-symmetric game, and the value net degenerates
-    /// into a seat detector instead of learning positions.
+    /// half of all games. The authoritative observation exposes the exact
+    /// remaining-ply countdown so this sampled rule state is Markov-visible.
     pub cap_plies: u16,
 }
 
@@ -102,26 +106,14 @@ impl Generals {
     }
 
     fn observation(state: &State) -> GeneralsObs {
-        GeneralsObs::from_tiles(&state.tiles, state.current_player, state.alive, state.round)
-    }
-
-    /// Info bits carry only the player/winner/round fields. The legal mask
-    /// is deliberately omitted (257 actions cannot fit; the obs is the
-    /// authoritative mask source).
-    fn compute_info_bits(state: &State) -> u64 {
-        info_bits::compute_info_bits(
-            0,
-            state.current_player,
-            state.winner,
-            (state.round as u64).min(0xFF),
-        )
+        GeneralsObs::from_state(state)
     }
 }
 
-impl Game for Generals {
+impl BoardGame for Generals {
     type State = State;
     type Action = u32;
-    type Obs = GeneralsObs;
+    type Observation = GeneralsObs;
 
     fn engine_id(&self) -> EngineId {
         EngineId {
@@ -133,42 +125,43 @@ impl Game for Generals {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             id: self.engine_id(),
-            encoding: Encoding {
-                state: "generals_state:v1".to_string(),
-                action: "discrete_move_dir:v1".to_string(),
-                obs: format!("f32x{}:v1", OBS_SIZE),
-                schema_version: 1,
-            },
-            // Two plies per round, plus the terminal round's plies.
-            max_horizon: MAX_TURNS * 2 + 2,
-            action_space: ActionSpace::Discrete(NUM_ACTIONS as u32),
+            contract_version: ENV_CONTRACT_VERSION,
+            encoding: Encoding::discrete_u32_le_f32_le("generals_state:v1", OBS_SIZE),
+            semantics:
+                EnvironmentSemantics::deterministic_alternating_perfect_information_terminal_zero_sum(),
+            // The sampled cap is either this exact bound or one ply earlier.
+            max_horizon: Some(MAX_TURNS * 2),
+            agents: AgentModel::fixed_homogeneous(
+                [AgentId(1), AgentId(2)],
+                ActionSpace::discrete(NUM_ACTIONS as u32),
+            ),
             preferred_batch: 64,
         }
     }
 
-    fn metadata(&self) -> GameMetadata {
-        GameMetadata::new("generals_8x8", "Generals 8×8")
-            .with_board(params::WIDTH, params::HEIGHT)
-            .with_actions(NUM_ACTIONS)
-            .with_observation(OBS_SIZE, LEGAL_MASK_OFFSET)
-            // generals_obs:v1 planes are own/enemy relative to the player to
-            // act, so the network must not also get the player indicator.
-            .with_obs_encoding(obs::NUM_CHANNELS, true)
-            .with_players(
-                2,
-                vec!["Red".to_string(), "Blue".to_string()],
-                vec!['R', 'B'],
-            )
+    fn metadata(&self) -> EnvironmentMetadata {
+        EnvironmentMetadata::new("generals_8x8", "Generals 8×8")
             .with_description(
                 "Capture the enemy general! Full-information turn-based Generals: \
                  move armies, take cities, and grow your territory.",
             )
-            // Not "grid": a cell here carries terrain and an army count, and a
-            // click is a (tile, direction) move rather than a placement.
-            .with_board_type("generals")
+            .with_board(
+                BoardGameMetadata::new(params::WIDTH, params::HEIGHT, NUM_ACTIONS)
+                    // Planes are own/enemy relative to the actor.
+                    .with_observation(OBS_SIZE, obs::NUM_CHANNELS, LEGAL_MASK_OFFSET, true)
+                    .with_players(vec![
+                        BoardPlayerMetadata::new("Red", "R"),
+                        BoardPlayerMetadata::new("Blue", "B"),
+                    ])
+                    .with_renderer(BoardRenderer::Generals),
+            )
     }
 
-    fn reset(&mut self, rng: &mut ChaCha20Rng, _hint: &[u8]) -> (Self::State, Self::Obs) {
+    fn reset(
+        &mut self,
+        rng: &mut ChaCha20Rng,
+        _hint: &[u8],
+    ) -> Result<(Self::State, Self::Observation), EnvironmentError> {
         use rand::Rng;
         let map = mapgen::generate_map(rng);
         let state = State {
@@ -181,7 +174,7 @@ impl Game for Generals {
             cap_plies: (MAX_TURNS * 2 - rng.gen_range(0..=1)) as u16,
         };
         let obs = Self::observation(&state);
-        (state, obs)
+        Ok((state, obs))
     }
 
     fn step(
@@ -189,11 +182,20 @@ impl Game for Generals {
         state: &mut Self::State,
         action: Self::Action,
         _rng: &mut ChaCha20Rng,
-    ) -> (Self::Obs, f32, bool, u64) {
+    ) -> Result<BoardTransition<Self::Observation>, EnvironmentError> {
         let previous_player = state.current_player;
 
+        if state.is_done()
+            || !state.alive[previous_player as usize - 1]
+            || !rules::is_action_legal(&state.tiles, previous_player, action)
+        {
+            return Err(EnvironmentError::InvalidAction(format!(
+                "action {action} is not legal for player {previous_player} in the current Generals state"
+            )));
+        }
+
         if !state.is_done() {
-            // Resolve the ply. Illegal or malformed actions degrade to wait.
+            // Resolve the already-validated ply.
             if let Some(Move::Step { from, dir }) = decode_move(action) {
                 if let Some(to) = valid_move_target(&state.tiles, previous_player, from, dir) {
                     if let Some(capture) = apply_move(&mut state.tiles, previous_player, from, to) {
@@ -231,9 +233,11 @@ impl Game for Generals {
         let obs = Self::observation(state);
         let reward = calculate_reward(state.winner, previous_player);
         let done = state.is_done();
-        let info = Self::compute_info_bits(state);
-
-        (obs, reward, done, info)
+        Ok(BoardTransition {
+            observation: obs,
+            actor_reward: reward,
+            terminated: done,
+        })
     }
 
     fn encode_state(state: &Self::State, out: &mut Vec<u8>) -> Result<(), EncodeError> {
@@ -345,7 +349,7 @@ impl Game for Generals {
         Ok(action)
     }
 
-    fn encode_obs(obs: &Self::Obs, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn encode_observation(obs: &Self::Observation, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         obs.encode(out);
         Ok(())
     }

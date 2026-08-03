@@ -1,215 +1,150 @@
-//! Static game registry for compile-time game registration
-//!
-//! This module provides a thread-safe registry system that allows games to be
-//! registered at compile-time and looked up at runtime by their env_id.
+//! Process-local registry of validated typed environments.
 
-use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use tracing::warn;
+use once_cell::sync::Lazy;
 
-use crate::erased::ErasedGame;
+use crate::adapter::EnvironmentAdapter;
+use crate::board_game::{BoardGame, BoardGameEnvironment};
+use crate::contract;
+use crate::erased::{ErasedEnvironment, ErasedEnvironmentError};
+use crate::metadata::EnvironmentMetadata;
+use crate::typed::{Capabilities, EngineId, Environment};
 
-/// Factory function type for creating game instances
-pub type GameFactory = fn() -> Box<dyn ErasedGame>;
+type EnvironmentFactory = fn() -> Result<Box<dyn ErasedEnvironment>, ErasedEnvironmentError>;
 
-/// Thread-safe registry mapping env_id to game factory functions
-static REGISTRY: Lazy<Mutex<HashMap<String, GameFactory>>> =
+#[derive(Clone)]
+struct RegisteredEnvironment {
+    factory: EnvironmentFactory,
+    id: EngineId,
+    capabilities: Capabilities,
+    metadata: EnvironmentMetadata,
+}
+
+static REGISTRY: Lazy<Mutex<HashMap<String, RegisteredEnvironment>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// Register a game with the global registry
-///
-/// This function should typically be called from game crate initialization
-/// or using the `register_game!` macro.
-///
-/// # Arguments
-///
-/// * `env_id` - Unique environment identifier (e.g., "tictactoe")
-/// * `factory` - Function that creates new instances of the game
-///
-/// # Example
-///
-/// ```rust
-/// # use engine_core::adapter::GameAdapter;
-/// # use engine_core::erased::ErasedGame;
-/// # use engine_core::registry::*;
-/// # use engine_core::typed::{self, ActionSpace, Capabilities, DecodeError, EncodeError, EngineId, Game};
-/// # use rand_chacha::ChaCha20Rng;
-/// #
-/// # #[derive(Debug)]
-/// # struct MyGame;
-/// # impl Game for MyGame {
-/// #     type State = ();
-/// #     type Action = ();
-/// #     type Obs = ();
-/// #
-/// #     fn engine_id(&self) -> EngineId {
-/// #         EngineId {
-/// #             env_id: "example".into(),
-/// #             build_id: "test".into(),
-/// #         }
-/// #     }
-/// #
-/// #     fn capabilities(&self) -> Capabilities {
-/// #         Capabilities {
-/// #             id: self.engine_id(),
-/// #             encoding: typed::Encoding {
-/// #                 state: "state".into(),
-/// #                 action: "action".into(),
-/// #                 obs: "obs".into(),
-/// #                 schema_version: 1,
-/// #             },
-/// #             max_horizon: 1,
-/// #             action_space: ActionSpace::Discrete(1),
-/// #             preferred_batch: 1,
-/// #         }
-/// #     }
-/// #
-/// #     fn metadata(&self) -> engine_core::GameMetadata {
-/// #         engine_core::GameMetadata::new("example", "Example")
-/// #     }
-/// #
-/// #     fn reset(&mut self, _rng: &mut ChaCha20Rng, _hint: &[u8]) -> (Self::State, Self::Obs) {
-/// #         ((), ())
-/// #     }
-/// #
-/// #     fn step(
-/// #         &mut self,
-/// #         _state: &mut Self::State,
-/// #         _action: Self::Action,
-/// #         _rng: &mut ChaCha20Rng,
-/// #     ) -> (Self::Obs, f32, bool, u64) {
-/// #         ((), 0.0, true, 0)
-/// #     }
-/// #
-/// #     fn encode_state(_state: &Self::State, _out: &mut Vec<u8>) -> Result<(), EncodeError> {
-/// #         Ok(())
-/// #     }
-/// #
-/// #     fn decode_state(_buf: &[u8]) -> Result<Self::State, DecodeError> {
-/// #         Ok(())
-/// #     }
-/// #
-/// #     fn encode_action(_action: &Self::Action, _out: &mut Vec<u8>) -> Result<(), EncodeError> {
-/// #         Ok(())
-/// #     }
-/// #
-/// #     fn decode_action(_buf: &[u8]) -> Result<Self::Action, DecodeError> {
-/// #         Ok(())
-/// #     }
-/// #
-/// #     fn encode_obs(_obs: &Self::Obs, _out: &mut Vec<u8>) -> Result<(), EncodeError> {
-/// #         Ok(())
-/// #     }
-/// #
-/// #     fn view(_state: &Self::State) -> engine_core::BoardView {
-/// #         engine_core::BoardView::from_owners(&[], 1, 0)
-/// #     }
-/// # }
-///
-/// fn my_game_factory() -> Box<dyn ErasedGame> {
-///     Box::new(GameAdapter::new(MyGame))
-/// }
-///
-/// register_game("my_game".to_string(), my_game_factory);
-/// ```
-pub fn register_game(env_id: String, factory: GameFactory) {
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RegistryError {
+    #[error("environment '{env_id}' is already registered")]
+    AlreadyRegistered { env_id: String },
+    #[error("environment '{env_id}' is not registered")]
+    NotRegistered { env_id: String },
+    #[error("invalid environment factory: {message}")]
+    InvalidEnvironment { message: String },
+    #[error(
+        "environment factory for '{env_id}' produced descriptors that differ from registration"
+    )]
+    FactoryDescriptorsChanged { env_id: String },
+}
+
+fn typed_factory<E>() -> Result<Box<dyn ErasedEnvironment>, ErasedEnvironmentError>
+where
+    E: Environment + Default,
+{
+    Ok(Box::new(EnvironmentAdapter::try_new(E::default())?))
+}
+
+fn board_game_factory<G>() -> Result<Box<dyn ErasedEnvironment>, ErasedEnvironmentError>
+where
+    G: BoardGame + Default,
+{
+    let environment = BoardGameEnvironment::new(G::default());
+    if environment.metadata().board.is_none() {
+        return Err(ErasedEnvironmentError::ContractViolation(
+            "BoardGame implementation must publish board metadata".to_string(),
+        ));
+    }
+    Ok(Box::new(EnvironmentAdapter::try_new(environment)?))
+}
+
+fn validate_factory(
+    factory: EnvironmentFactory,
+) -> Result<(RegisteredEnvironment, Box<dyn ErasedEnvironment>), RegistryError> {
+    let environment = factory().map_err(|error| RegistryError::InvalidEnvironment {
+        message: error.to_string(),
+    })?;
+    let id = environment.engine_id();
+    let capabilities = environment.capabilities();
+    let metadata = environment.metadata();
+    contract::validate_descriptors(&id, &capabilities, &metadata).map_err(|error| {
+        RegistryError::InvalidEnvironment {
+            message: error.to_string(),
+        }
+    })?;
+    Ok((
+        RegisteredEnvironment {
+            factory,
+            id,
+            capabilities,
+            metadata,
+        },
+        environment,
+    ))
+}
+
+fn register_factory(factory: EnvironmentFactory) -> Result<(), RegistryError> {
+    let (registered, _) = validate_factory(factory)?;
+    let env_id = registered.id.env_id.clone();
     let mut registry = REGISTRY.lock().unwrap();
     if registry.contains_key(&env_id) {
-        warn!(env_id = %env_id, "Overriding existing game registration");
+        return Err(RegistryError::AlreadyRegistered { env_id });
     }
-    registry.insert(env_id, factory);
+    registry.insert(env_id, registered);
+    Ok(())
 }
 
-/// Create a new game instance by env_id
-///
-/// # Arguments
-///
-/// * `env_id` - Environment identifier to look up
-///
-/// # Returns
-///
-/// Returns `Some(game)` if the env_id is registered, `None` otherwise.
-///
-/// # Example
-///
-/// ```rust
-/// # use engine_core::registry::*;
-///
-/// match create_game("tictactoe") {
-///     Some(game) => {
-///         println!("Created game: {}", game.engine_id().env_id);
-///     }
-///     None => {
-///         println!("Game 'tictactoe' not found");
-///     }
-/// }
-/// ```
-pub fn create_game(env_id: &str) -> Option<Box<dyn ErasedGame>> {
-    let registry = REGISTRY.lock().unwrap();
-    match registry.get(env_id) {
-        Some(factory) => Some(factory()),
-        None => {
-            warn!(env_id = %env_id, "Attempted to create unregistered game");
-            None
-        }
+/// Register a typed environment. Its own validated descriptor is its registry key.
+pub fn register_environment<E>() -> Result<(), RegistryError>
+where
+    E: Environment + Default,
+{
+    register_factory(typed_factory::<E>)
+}
+
+/// Register an implementation of the explicitly narrow board-game profile.
+pub fn register_board_game<G>() -> Result<(), RegistryError>
+where
+    G: BoardGame + Default,
+{
+    register_factory(board_game_factory::<G>)
+}
+
+pub(crate) fn create_environment(
+    env_id: &str,
+) -> Result<Box<dyn ErasedEnvironment>, RegistryError> {
+    let registered = REGISTRY
+        .lock()
+        .unwrap()
+        .get(env_id)
+        .cloned()
+        .ok_or_else(|| RegistryError::NotRegistered {
+            env_id: env_id.to_string(),
+        })?;
+    let (actual, environment) = validate_factory(registered.factory)?;
+    if actual.id != registered.id
+        || actual.capabilities != registered.capabilities
+        || actual.metadata != registered.metadata
+    {
+        return Err(RegistryError::FactoryDescriptorsChanged {
+            env_id: env_id.to_string(),
+        });
     }
+    Ok(environment)
 }
 
-/// Get list of all registered environment IDs
-///
-/// This is useful for debugging and listing available games.
-///
-/// # Returns
-///
-/// A vector of all registered env_id strings.
-pub fn list_registered_games() -> Vec<String> {
-    let registry = REGISTRY.lock().unwrap();
-    registry.keys().cloned().collect()
+pub fn list_registered_environments() -> Vec<String> {
+    REGISTRY.lock().unwrap().keys().cloned().collect()
 }
 
-/// Check if a game is registered
-///
-/// # Arguments
-///
-/// * `env_id` - Environment identifier to check
-///
-/// # Returns
-///
-/// `true` if the game is registered, `false` otherwise.
 pub fn is_registered(env_id: &str) -> bool {
-    let registry = REGISTRY.lock().unwrap();
-    registry.contains_key(env_id)
+    REGISTRY.lock().unwrap().contains_key(env_id)
 }
 
-/// Clear all registered games (mainly for testing)
-///
-/// This function removes all registered games from the registry.
-/// It should primarily be used in test scenarios.
-pub fn clear_registry() {
-    let mut registry = REGISTRY.lock().unwrap();
-    registry.clear();
-}
-
-/// Convenience macro for registering games
-///
-/// This macro simplifies the registration process by automatically creating
-/// the factory function and calling register_game.
-///
-/// # Example
-///
-/// ```ignore
-/// register_game!(TicTacToe, "tictactoe");
-/// ```
-#[macro_export]
-macro_rules! register_game {
-    ($game_type:ty, $env_id:expr) => {{
-        fn factory() -> Box<dyn $crate::erased::ErasedGame> {
-            Box::new($crate::adapter::GameAdapter::new(<$game_type>::default()))
-        }
-        $crate::registry::register_game($env_id.to_string(), factory);
-    }};
+#[cfg(test)]
+pub(crate) fn clear_registry() {
+    REGISTRY.lock().unwrap().clear();
 }
 
 #[cfg(test)]

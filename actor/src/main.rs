@@ -1,10 +1,9 @@
 //! Actor - Self-play episode runner for Cartridge2
 //!
-//! A long-running process that:
-//! 1. Watches `./data/models/latest.onnx` for updates
+//! A bounded one-shot process that:
+//! 1. Pins the profile's exact source model from the content-addressed RunHead
 //! 2. Runs MCTS self-play loops using the Engine library
-//! 3. Saves completed games to the PostgreSQL replay buffer
-//! 4. Exposes a health check HTTP server for Kubernetes probes
+//! 3. Saves opaque cartridge records to one exact PostgreSQL replay selection
 
 use anyhow::Result;
 use clap::Parser;
@@ -13,17 +12,15 @@ use tokio::signal;
 use tracing::{error, info};
 
 mod actor;
+mod algorithms;
 mod config;
-mod game_config;
-mod health;
 mod mcts_policy;
-mod metrics;
+mod resources;
 mod stats;
 mod storage;
 
-use crate::actor::Actor;
+use crate::algorithms::build_collector;
 use crate::config::Config;
-use crate::health::{start_health_server, HealthState};
 
 /// Get trace context from environment variables for distributed tracing.
 ///
@@ -61,49 +58,40 @@ async fn main() -> Result<()> {
         log_level = %config.log_level,
         component = "actor",
         env_id = %config.env_id,
+        algorithm = %config.algorithm_id,
         actor_id = %config.actor_id,
+        collection_scope_id = %config.collection_scope_id,
+        source_checkpoint_id = config.source_checkpoint_id.as_deref().unwrap_or("root"),
         trace_id = trace_id.as_deref().unwrap_or("none"),
         span_id = %span_id,
         parent_span = parent_span.as_deref().unwrap_or("none"),
-        "Actor service starting"
+        "Actor worker starting"
     );
-
-    // Initialize Prometheus metrics
-    metrics::init_metrics();
-    metrics::set_actor_info(&config.env_id, &config.actor_id);
-    info!(component = "actor", "Prometheus metrics initialized");
 
     // Log the max_episodes setting
     info!(
         component = "actor",
         max_episodes = config.max_episodes,
         env_id = %config.env_id,
+        algorithm = %config.algorithm_id,
         actor_id = %config.actor_id,
+        collection_scope_id = %config.collection_scope_id,
+        source_checkpoint_id = config.source_checkpoint_id.as_deref().unwrap_or("root"),
         num_simulations = config.num_simulations,
+        c_puct = config.c_puct,
+        temperature = config.temperature,
+        late_temperature = config.late_temperature,
         temp_threshold = config.temp_threshold,
+        dirichlet_alpha = config.dirichlet_alpha,
+        dirichlet_weight = config.dirichlet_weight,
+        eval_batch_size = config.eval_batch_size,
+        onnx_intra_threads = config.onnx_intra_threads,
         "Actor configuration loaded"
     );
 
-    // Create shared health state for Kubernetes probes
-    let health_state = HealthState::new();
-
-    // Start health server in background
-    let health_port = config.health_port;
-    let health_handle = {
-        let state = health_state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = start_health_server(health_port, state).await {
-                error!(component = "actor", port = health_port, error = %e, "Health server error");
-            }
-        })
-    };
-
     // Create actor instance
-    let actor = Actor::new(config).await?;
+    let actor = build_collector(config).await?;
     let actor = Arc::new(actor);
-
-    // Mark as ready once initialization is complete
-    health_state.set_ready();
 
     // Setup graceful shutdown
     let shutdown_actor = Arc::clone(&actor);
@@ -121,11 +109,10 @@ async fn main() -> Result<()> {
     });
 
     // Run the actor
-    let run_result = actor.run(&health_state).await;
+    let run_result = actor.run().await;
 
     // Wait for shutdown to complete
     shutdown_handle.abort();
-    health_handle.abort();
 
     match run_result {
         Ok(_) => {

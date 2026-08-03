@@ -1,36 +1,19 @@
-"""Synchronized AlphaZero Training Loop Orchestrator (composition root).
+"""Synchronized training-loop composition root.
 
-The loop coordinator and its components live in the crucible package
-and take every backend through injected seams; this package composes them
-with Cartridge2's concrete pieces:
+Crucible supplies the loop coordinator. The selected algorithm cartridge
+supplies collector, learner, and evaluator factories after compatibility is
+validated against the selected environment.
 
-- orchestrator.py binds the factories (storage.create_replay_buffer,
-  Trainer/TrainerConfig via TrainSpec, the shim ActorRunner/EvalRunner
-  subclasses, structured_logging tracing) into an Orchestrator subclass
-  whose ``Orchestrator(config)`` signature keeps cli.py and the console
-  entry points untouched.
-- config.py, actor_runner.py, eval_runner.py, and eval_reporting.py
-  restore this repo's defaults on top of the core classes;
-  stats_manager.py re-exports unchanged. (Promotion has no shim: its
-  logic lives in crucible.orchestrator.promotion and is consumed
-  there by the core eval_runner.)
-- cli.py stays host-side: its argument defaults come from this repo's
-  central config, and it calls setup_logging() process-wide before
-  constructing the Orchestrator.
-
-The loop implements the classic AlphaZero iteration pattern:
-1. Clear replay buffer (start fresh with current model)
-2. Run actor for N episodes (self-play data generation)
-3. Train for M steps on the generated data
-4. Evaluate the new model (gatekeeper vs best, optional random baseline)
-5. Export new model, repeat
+The currently installed ``alphazero_board_v1`` recipe runs this iteration:
+1. Allocate a fresh replay collection scope bound to the current checkpoint
+2. Run bounded collectors until exactly N complete episodes are sealed
+3. Train for M steps from that exact scope
+4. Evaluate the candidate against the champion and optional random baseline
+5. Publish immutable evidence and advance the sole RunHead, then repeat
 
 Usage:
-    # As a subcommand
-    python -m trainer loop --iterations 100 --episodes 500 --steps 1000
-
-    # Via console entry point
-    trainer-loop --iterations 100 --episodes 500 --steps 1000
+    python -m trainer --algorithm alphazero_board_v1 loop \
+        --iterations 100 --episodes 500 --steps 1000
 
     # Programmatic usage
     from trainer.orchestrator import Orchestrator, LoopConfig
@@ -40,23 +23,10 @@ Usage:
     orchestrator.run()
 """
 
-# Re-export components for advanced usage
-from .actor_runner import ActorRunner
-from .cli import main, parse_args
-from .config import IterationStats, LoopConfig
-from .eval_runner import EvalRunner
+from .config import LoopConfig
 from .orchestrator import Orchestrator
-from .stats_manager import StatsManager
 
 __all__ = [
-    # Main API
     "Orchestrator",
     "LoopConfig",
-    "IterationStats",
-    "main",
-    "parse_args",
-    # Components (for advanced usage)
-    "ActorRunner",
-    "EvalRunner",
-    "StatsManager",
 ]

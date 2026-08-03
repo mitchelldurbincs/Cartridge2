@@ -1,66 +1,63 @@
-//! Game-metadata manifest generation.
-//!
-//! The engine is the single source of truth for game facts (board dimensions,
-//! action count, observation layout). The Python trainer needs the same facts,
-//! but CI runs Rust and Python as separate jobs with no artifact passing and no
-//! Rust toolchain on the Python side, so it cannot read them live.
-//!
-//! Instead this module renders every registered game's [`GameMetadata`] to a
-//! JSON manifest that is checked in at
-//! `trainer/src/trainer/game_metadata.json` and shipped inside the Python
-//! package. `tests/manifest_golden.rs` fails if the checked-in copy drifts from
-//! what the engine would generate, which turns "the trainer and the engine
-//! disagree about obs_size" from a silent mistraining bug into a test failure.
-//!
-//! Regenerate with `make game-manifest`.
+//! Generate the checked-in environment and algorithm contract catalog.
 
-use engine_core::{create_game, list_registered_games, GameMetadata};
+use std::collections::BTreeMap;
+
+use algorithm_core::{algorithm_descriptors, compatibility_reports, AlgorithmDescriptor};
+use engine_core::{list_registered_environments, Capabilities, EngineContext, EnvironmentMetadata};
 use serde::Serialize;
 
-use crate::register_all_games;
+use crate::register_all_environments;
 
-/// Bumped when the manifest's own shape changes (not when a game changes).
-pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
-
-/// The command that regenerates the manifest, embedded so anyone who opens the
-/// file knows not to hand-edit it.
-pub const REGENERATE_COMMAND: &str = "make game-manifest";
+/// Bumped only when this document's shape changes.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 4;
+pub const REGENERATE_COMMAND: &str = "make environment-manifest";
 
 #[derive(Serialize)]
 struct Manifest {
     schema_version: u32,
     generated_by: String,
-    games: Vec<GameMetadata>,
+    algorithms: Vec<&'static AlgorithmDescriptor>,
+    environments: Vec<ManifestEnvironment>,
 }
 
-/// Render the manifest for every registered game.
-///
-/// Games are sorted by `env_id` — the registry is a `HashMap`, so iteration
-/// order is otherwise unstable and the file would churn between runs. Sorted
-/// and pretty-printed also keeps a two-branch merge conflict to a single
-/// contiguous hunk.
-pub fn manifest_json() -> String {
-    register_all_games();
+#[derive(Serialize)]
+struct ManifestEnvironment {
+    metadata: EnvironmentMetadata,
+    capabilities: Capabilities,
+    algorithm_profiles: BTreeMap<&'static str, algorithm_core::CompatibilityReport>,
+}
 
-    let mut env_ids = list_registered_games();
+pub fn manifest_json() -> String {
+    register_all_environments();
+    let mut env_ids = list_registered_environments();
     env_ids.sort();
 
-    let games: Vec<GameMetadata> = env_ids
+    let environments = env_ids
         .iter()
         .map(|env_id| {
-            create_game(env_id)
-                .unwrap_or_else(|| panic!("game '{env_id}' is registered but not constructible"))
-                .metadata()
+            let context = EngineContext::new(env_id).unwrap_or_else(|error| {
+                panic!("environment '{env_id}' is not constructible: {error}")
+            });
+            let algorithm_profiles = compatibility_reports(&context)
+                .into_iter()
+                .map(|report| (report.algorithm_id, report))
+                .collect();
+            ManifestEnvironment {
+                metadata: context.metadata(),
+                capabilities: context.capabilities(),
+                algorithm_profiles,
+            }
         })
         .collect();
 
     let manifest = Manifest {
         schema_version: MANIFEST_SCHEMA_VERSION,
         generated_by: REGENERATE_COMMAND.to_string(),
-        games,
+        algorithms: algorithm_descriptors(),
+        environments,
     };
-
-    let mut json = serde_json::to_string_pretty(&manifest).expect("GameMetadata is serializable");
+    let mut json =
+        serde_json::to_string_pretty(&manifest).expect("environment manifest must be serializable");
     json.push('\n');
     json
 }
@@ -70,41 +67,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manifest_is_deterministic() {
-        assert_eq!(manifest_json(), manifest_json());
-    }
-
-    #[test]
-    fn manifest_lists_games_sorted_by_env_id() {
-        let json: serde_json::Value = serde_json::from_str(&manifest_json()).unwrap();
-        let ids: Vec<&str> = json["games"]
-            .as_array()
-            .unwrap()
+    fn manifest_is_deterministic_and_environment_shaped() {
+        let rendered = manifest_json();
+        assert_eq!(rendered, manifest_json());
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["schema_version"], 4);
+        assert!(value.get("games").is_none());
+        let environments = value["environments"].as_array().unwrap();
+        let ids = environments
             .iter()
-            .map(|g| g["env_id"].as_str().unwrap())
-            .collect();
-
+            .map(|environment| environment["metadata"]["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
-        assert_eq!(ids, sorted, "games must be sorted for stable diffs");
-        assert!(ids.contains(&"generals_8x8"));
+        assert_eq!(ids, sorted);
     }
 
     #[test]
-    fn manifest_carries_the_obs_encoding_fields() {
-        // These two are the whole reason the manifest exists: they are engine
-        // facts the trainer previously hardcoded.
-        let json: serde_json::Value = serde_json::from_str(&manifest_json()).unwrap();
-        let generals = json["games"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|g| g["env_id"] == "generals_8x8")
-            .expect("generals_8x8 in manifest");
+    fn board_profile_is_nested_and_algorithm_compatibility_is_explicit() {
+        let value: serde_json::Value = serde_json::from_str(&manifest_json()).unwrap();
+        let mut saw_non_board = false;
+        for environment in value["environments"].as_array().unwrap() {
+            let metadata = &environment["metadata"];
+            assert!(metadata.get("board_width").is_none());
+            assert_eq!(environment["capabilities"]["id"]["env_id"], metadata["id"]);
+            let profile = &environment["algorithm_profiles"]["alphazero_board_v1"];
+            if profile["compatible"].as_bool().unwrap() {
+                let board = &metadata["board"];
+                assert!(board["width"].as_u64().unwrap() > 0);
+                assert!(board["observation"]["spatial_channels"].as_u64().unwrap() > 0);
+            } else if metadata["board"].is_null() {
+                saw_non_board = true;
+            }
+        }
+        assert!(
+            saw_non_board,
+            "catalog must exercise a non-board environment"
+        );
+    }
 
-        assert_eq!(generals["obs_channels"], 9);
-        assert_eq!(generals["player_relative_obs"], true);
-        assert_eq!(generals["obs_size"], 835);
-        assert_eq!(generals["legal_mask_offset"], 576);
+    #[test]
+    fn alphazero_compatible_agent_and_chance_contracts_are_machine_readable() {
+        let value: serde_json::Value = serde_json::from_str(&manifest_json()).unwrap();
+        for environment in value["environments"].as_array().unwrap() {
+            if !environment["algorithm_profiles"]["alphazero_board_v1"]["compatible"]
+                .as_bool()
+                .unwrap()
+            {
+                continue;
+            }
+            let capabilities = &environment["capabilities"];
+            assert_eq!(capabilities["agents"]["kind"], "fixed");
+            assert_eq!(
+                capabilities["agents"]["agents"].as_array().unwrap().len(),
+                2
+            );
+            assert_eq!(capabilities["semantics"]["chance_model"], "none");
+            assert_eq!(
+                capabilities["semantics"]["reward_model"],
+                "terminal_zero_sum"
+            );
+        }
     }
 }

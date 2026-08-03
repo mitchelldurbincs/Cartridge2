@@ -1,345 +1,57 @@
-//! Tests for the GameAdapter type
+use rand_chacha::ChaCha20Rng;
 
 use super::*;
-use crate::typed::{ActionSpace, DecodeError, EncodeError, Encoding};
-use rand::RngCore;
-
-// Test game implementation
-#[derive(Debug, PartialEq)]
-struct TestGame {
-    id: String,
-    reset_count: u32,
-    step_count: u32,
-}
-
-impl TestGame {
-    fn new(id: String) -> Self {
-        Self {
-            id,
-            reset_count: 0,
-            step_count: 0,
-        }
-    }
-}
-
-impl Game for TestGame {
-    type State = u32;
-    type Action = u8;
-    type Obs = Vec<f32>;
-
-    fn engine_id(&self) -> EngineId {
-        EngineId {
-            env_id: self.id.clone(),
-            build_id: "0.1.0".to_string(),
-        }
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            id: self.engine_id(),
-            encoding: Encoding {
-                state: "u32:v1".to_string(),
-                action: "u8:v1".to_string(),
-                obs: "f32_vec:v1".to_string(),
-                schema_version: 1,
-            },
-            max_horizon: 100,
-            action_space: ActionSpace::Discrete(4),
-            preferred_batch: 32,
-        }
-    }
-
-    fn metadata(&self) -> GameMetadata {
-        GameMetadata::new("test", "Test Game")
-            .with_board(2, 2)
-            .with_actions(4)
-            .with_observation(2, 0)
-    }
-
-    fn reset(&mut self, rng: &mut ChaCha20Rng, _hint: &[u8]) -> (Self::State, Self::Obs) {
-        self.reset_count += 1;
-        self.step_count = 0;
-
-        // Use RNG to ensure it's properly seeded
-        use rand::Rng;
-        let random_val = rng.gen::<u32>() % 100;
-
-        (random_val, vec![random_val as f32])
-    }
-
-    fn step(
-        &mut self,
-        state: &mut Self::State,
-        action: Self::Action,
-        _rng: &mut ChaCha20Rng,
-    ) -> (Self::Obs, f32, bool, u64) {
-        self.step_count += 1;
-        *state += action as u32;
-
-        let obs = vec![*state as f32, self.step_count as f32];
-        let reward = action as f32;
-        let done = *state >= 20 || self.step_count >= 10;
-
-        let info = ((*state as u64) << 32) | self.step_count as u64;
-
-        (obs, reward, done, info)
-    }
-
-    fn encode_state(state: &Self::State, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        out.extend_from_slice(&state.to_le_bytes());
-        Ok(())
-    }
-
-    fn decode_state(buf: &[u8]) -> Result<Self::State, DecodeError> {
-        if buf.len() != 4 {
-            return Err(DecodeError::InvalidLength {
-                expected: 4,
-                actual: buf.len(),
-            });
-        }
-        Ok(u32::from_le_bytes(buf.try_into().unwrap()))
-    }
-
-    fn encode_action(action: &Self::Action, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        out.push(*action);
-        Ok(())
-    }
-
-    fn decode_action(buf: &[u8]) -> Result<Self::Action, DecodeError> {
-        if buf.len() != 1 {
-            return Err(DecodeError::InvalidLength {
-                expected: 1,
-                actual: buf.len(),
-            });
-        }
-        Ok(buf[0])
-    }
-
-    fn encode_obs(obs: &Self::Obs, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        // Encode length first, then values
-        let len = obs.len() as u32;
-        out.extend_from_slice(&len.to_le_bytes());
-        for &value in obs {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-        Ok(())
-    }
-
-    fn view(_state: &Self::State) -> crate::BoardView {
-        // Test double: no board to project.
-        crate::BoardView::from_owners(&[], 1, 0)
-    }
-}
-
-#[test]
-fn test_adapter_basic_functionality() {
-    let game = TestGame::new("test".to_string());
-    let adapter = GameAdapter::new(game);
-
-    // Test engine_id passthrough
-    let id = adapter.engine_id();
-    assert_eq!(id.env_id, "test");
-
-    // Test capabilities passthrough
-    let caps = adapter.capabilities();
-    assert_eq!(caps.id.env_id, "test");
-    assert_eq!(caps.max_horizon, 100);
-}
-
-#[test]
-fn test_adapter_reset() {
-    let game = TestGame::new("test".to_string());
-    let mut adapter = GameAdapter::new(game);
-
-    let mut state_buf = Vec::new();
-    let mut obs_buf = Vec::new();
-
-    adapter
-        .reset(42, &[], &mut state_buf, &mut obs_buf)
-        .unwrap();
-
-    // State should be encoded as 4 bytes (u32)
-    assert_eq!(state_buf.len(), 4);
-    let state_value = u32::from_le_bytes(state_buf.try_into().unwrap());
-
-    // Obs should be encoded as length + values
-    assert!(obs_buf.len() >= 4); // At least length header
-    let obs_len = u32::from_le_bytes(obs_buf[0..4].try_into().unwrap());
-    assert_eq!(obs_len, 1); // One f32 value
-    assert_eq!(obs_buf.len(), 4 + 4); // Length + one f32
-
-    // Verify the observation value matches the state
-    let obs_value = f32::from_le_bytes(obs_buf[4..8].try_into().unwrap());
-    assert_eq!(obs_value, state_value as f32);
-}
-
-#[test]
-fn test_adapter_step() {
-    let game = TestGame::new("test".to_string());
-    let mut adapter = GameAdapter::new(game);
-
-    // Reset first
-    let mut state_buf = Vec::new();
-    let mut obs_buf = Vec::new();
-    adapter
-        .reset(42, &[], &mut state_buf, &mut obs_buf)
-        .unwrap();
-
-    // Prepare action
-    let action_bytes = vec![3u8];
-
-    // Take a step
-    let mut new_state_buf = Vec::new();
-    let mut new_obs_buf = Vec::new();
-    let (reward, _done, info) = adapter
-        .step(
-            &state_buf,
-            &action_bytes,
-            &mut new_state_buf,
-            &mut new_obs_buf,
-        )
-        .unwrap();
-
-    // Verify reward
-    assert_eq!(reward, 3.0);
-    assert!(info > 0);
-
-    // Decode new state
-    let new_state = u32::from_le_bytes(new_state_buf.try_into().unwrap());
-    let old_state = u32::from_le_bytes(state_buf.try_into().unwrap());
-    assert_eq!(new_state, old_state + 3);
-
-    // Verify obs structure
-    assert!(new_obs_buf.len() >= 4);
-    let obs_len = u32::from_le_bytes(new_obs_buf[0..4].try_into().unwrap());
-    assert_eq!(obs_len, 2); // Two f32 values (state and step_count)
-}
-
-#[test]
-fn test_adapter_deterministic_reset() {
-    let game1 = TestGame::new("test".to_string());
-    let mut adapter1 = GameAdapter::new(game1);
-
-    let game2 = TestGame::new("test".to_string());
-    let mut adapter2 = GameAdapter::new(game2);
-
-    // Reset with same seed
-    let mut state1 = Vec::new();
-    let mut obs1 = Vec::new();
-    adapter1.reset(12345, &[], &mut state1, &mut obs1).unwrap();
-
-    let mut state2 = Vec::new();
-    let mut obs2 = Vec::new();
-    adapter2.reset(12345, &[], &mut state2, &mut obs2).unwrap();
-
-    // Results should be identical
-    assert_eq!(state1, state2);
-    assert_eq!(obs1, obs2);
-}
-
-#[test]
-fn test_adapter_different_seeds() {
-    let game1 = TestGame::new("test".to_string());
-    let mut adapter1 = GameAdapter::new(game1);
-
-    let game2 = TestGame::new("test".to_string());
-    let mut adapter2 = GameAdapter::new(game2);
-
-    // Reset with different seeds
-    let mut state1 = Vec::new();
-    let mut obs1 = Vec::new();
-    adapter1.reset(12345, &[], &mut state1, &mut obs1).unwrap();
-
-    let mut state2 = Vec::new();
-    let mut obs2 = Vec::new();
-    adapter2.reset(54321, &[], &mut state2, &mut obs2).unwrap();
-
-    // Results should be different (with very high probability)
-    // Note: There's a tiny chance they could be the same due to randomness
-    assert!(state1 != state2 || obs1 != obs2);
-}
-
-#[test]
-fn test_adapter_inner_access() {
-    let game = TestGame::new("test".to_string());
-    let mut adapter = GameAdapter::new(game);
-
-    // Test mutable access
-    adapter.game_mut().id = "modified".to_string();
-    assert_eq!(adapter.game().id, "modified");
-
-    // Test into_inner
-    let inner_game = adapter.into_inner();
-    assert_eq!(inner_game.id, "modified");
-}
-
-#[test]
-fn test_adapter_invalid_action_decoding() {
-    let game = TestGame::new("test".to_string());
-    let mut adapter = GameAdapter::new(game);
-
-    // Reset first
-    let mut state_buf = Vec::new();
-    let mut obs_buf = Vec::new();
-    adapter
-        .reset(42, &[], &mut state_buf, &mut obs_buf)
-        .unwrap();
-
-    // Try step with invalid action (wrong length)
-    let invalid_action = vec![1, 2, 3]; // Should be 1 byte
-    let mut new_state_buf = Vec::new();
-    let mut new_obs_buf = Vec::new();
-
-    let result = adapter.step(
-        &state_buf,
-        &invalid_action,
-        &mut new_state_buf,
-        &mut new_obs_buf,
-    );
-
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        ErasedGameError::Decoding(_) => {
-            // Test passes - we got the expected error type
-        }
-        _ => panic!("Expected Decoding error"),
-    }
-}
-
-#[test]
-fn test_adapter_invalid_state_decoding() {
-    let game = TestGame::new("test".to_string());
-    let mut adapter = GameAdapter::new(game);
-
-    // Try step with invalid state (wrong length)
-    let invalid_state = vec![1, 2, 3]; // Should be 4 bytes for u32
-    let action = vec![1u8];
-    let mut new_state_buf = Vec::new();
-    let mut new_obs_buf = Vec::new();
-
-    let result = adapter.step(
-        &invalid_state,
-        &action,
-        &mut new_state_buf,
-        &mut new_obs_buf,
-    );
-
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        ErasedGameError::Decoding(_) => {
-            // Test passes - we got the expected error type
-        }
-        _ => panic!("Expected Decoding error"),
-    }
-}
+use crate::erased::ErasedEnvironment;
+use crate::metadata::{BoardGameMetadata, BoardPlayerMetadata, EnvironmentMetadata};
+use crate::typed::{
+    ActionEncoding, ActionSpace, AgentId, AgentModel, AgentObservation, AgentOutcome, Capabilities,
+    ChanceModel, Decision, DecodeError, EncodeError, Encoding, EngineId, Environment,
+    EnvironmentError, EnvironmentSemantics, EpisodeStatus, ObservationEncoding, PlanningStateModel,
+    RewardModel, Timestep, TransitionDynamics, TransitionSource, TurnModel,
+};
 
 #[derive(Debug)]
-struct CounterGame;
+struct CounterEnvironment {
+    invalid_reward: bool,
+}
 
-impl Game for CounterGame {
-    type State = u64;
-    type Action = u8;
-    type Obs = [u8; 8];
+impl CounterEnvironment {
+    fn timestep(value: u32, reward: f32, source: TransitionSource) -> Timestep<f32> {
+        let done = value >= 2;
+        Timestep {
+            agents: vec![AgentId(7)],
+            observations: vec![AgentObservation {
+                agent_id: AgentId(7),
+                observation: value as f32,
+            }],
+            outcomes: vec![AgentOutcome {
+                agent_id: AgentId(7),
+                reward,
+                terminated: done,
+                truncated: false,
+            }],
+            decision: if done {
+                Decision::None
+            } else {
+                Decision::Agents {
+                    agent_ids: vec![AgentId(7)],
+                }
+            },
+            episode: if done {
+                EpisodeStatus::Terminated
+            } else {
+                EpisodeStatus::Running
+            },
+            source,
+            info: value.to_le_bytes().to_vec(),
+        }
+    }
+}
+
+impl Environment for CounterEnvironment {
+    type State = u32;
+    type Action = u32;
+    type Observation = f32;
 
     fn engine_id(&self) -> EngineId {
         EngineId {
@@ -351,39 +63,42 @@ impl Game for CounterGame {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             id: self.engine_id(),
-            encoding: Encoding {
-                state: "u64:v1".into(),
-                action: "u8:v1".into(),
-                obs: "bytes:v1".into(),
-                schema_version: 1,
-            },
-            max_horizon: 10,
-            action_space: ActionSpace::Discrete(8),
+            contract_version: 1,
+            encoding: Encoding::custom("counter-state:v1", "increment:v1", "scalar:v1"),
+            semantics: EnvironmentSemantics::deterministic_single_agent_general_reward(),
+            max_horizon: Some(2),
+            agents: AgentModel::fixed_homogeneous([AgentId(7)], ActionSpace::discrete(2)),
             preferred_batch: 1,
         }
     }
 
-    fn metadata(&self) -> GameMetadata {
-        GameMetadata::new("counter", "Counter Game")
-            .with_board(1, 1)
-            .with_actions(8)
-            .with_observation(8, 0)
+    fn metadata(&self) -> EnvironmentMetadata {
+        EnvironmentMetadata::new("counter", "Counter")
     }
 
-    fn reset(&mut self, rng: &mut ChaCha20Rng, _hint: &[u8]) -> (Self::State, Self::Obs) {
-        let value = rng.next_u64();
-        (value, value.to_le_bytes())
+    fn reset(
+        &mut self,
+        _rng: &mut ChaCha20Rng,
+        _hint: &[u8],
+    ) -> Result<(Self::State, Timestep<Self::Observation>), EnvironmentError> {
+        let reward = if self.invalid_reward { f32::NAN } else { 0.0 };
+        Ok((0, Self::timestep(0, reward, TransitionSource::Reset)))
     }
 
     fn step(
         &mut self,
         state: &mut Self::State,
         action: Self::Action,
-        rng: &mut ChaCha20Rng,
-    ) -> (Self::Obs, f32, bool, u64) {
-        *state = state.wrapping_add(action as u64);
-        let _ = rng.next_u64();
-        ((*state).to_le_bytes(), *state as f32, false, *state)
+        _rng: &mut ChaCha20Rng,
+    ) -> Result<Timestep<Self::Observation>, EnvironmentError> {
+        *state += action;
+        Ok(Self::timestep(
+            *state,
+            action as f32,
+            TransitionSource::Agents {
+                agent_ids: vec![AgentId(7)],
+            },
+        ))
     }
 
     fn encode_state(state: &Self::State, out: &mut Vec<u8>) -> Result<(), EncodeError> {
@@ -392,307 +107,452 @@ impl Game for CounterGame {
     }
 
     fn decode_state(buf: &[u8]) -> Result<Self::State, DecodeError> {
-        if buf.len() != 8 {
-            return Err(DecodeError::InvalidLength {
-                expected: 8,
-                actual: buf.len(),
-            });
-        }
-        let mut bytes = [0_u8; 8];
-        bytes.copy_from_slice(buf);
-        Ok(u64::from_le_bytes(bytes))
+        let bytes: [u8; 4] = buf.try_into().map_err(|_| DecodeError::InvalidLength {
+            expected: 4,
+            actual: buf.len(),
+        })?;
+        Ok(u32::from_le_bytes(bytes))
     }
 
     fn encode_action(action: &Self::Action, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        out.push(*action);
+        out.extend_from_slice(&action.to_le_bytes());
         Ok(())
     }
 
     fn decode_action(buf: &[u8]) -> Result<Self::Action, DecodeError> {
-        if buf.len() != 1 {
-            return Err(DecodeError::InvalidLength {
-                expected: 1,
-                actual: buf.len(),
-            });
-        }
-        Ok(buf[0])
+        Self::decode_state(buf)
     }
 
-    fn encode_obs(obs: &Self::Obs, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        out.extend_from_slice(obs);
+    fn encode_observation(
+        observation: &Self::Observation,
+        out: &mut Vec<u8>,
+    ) -> Result<(), EncodeError> {
+        out.extend_from_slice(&observation.to_le_bytes());
         Ok(())
-    }
-
-    fn view(_state: &Self::State) -> crate::BoardView {
-        // Test double: no board to project.
-        crate::BoardView::from_owners(&[], 1, 0)
     }
 }
 
 #[test]
-fn test_adapter_reset_reseeds_rng_after_step() {
-    let mut adapter = GameAdapter::new(CounterGame);
+fn adapter_preserves_generic_timestep_and_has_no_board_projection() {
+    let mut adapter = EnvironmentAdapter::try_new(CounterEnvironment {
+        invalid_reward: false,
+    })
+    .unwrap();
+    let mut state = Vec::new();
+    let mut timestep = crate::ErasedTimestep::default();
+    adapter.reset(41, &[], &mut state, &mut timestep).unwrap();
 
-    let mut initial_state = Vec::new();
-    let mut initial_obs = Vec::new();
+    assert_eq!(u32::from_le_bytes(state.clone().try_into().unwrap()), 0);
+    assert_eq!(
+        timestep.observation_for(AgentId(7)),
+        Some(&0.0f32.to_le_bytes()[..])
+    );
+    assert_eq!(timestep.source, TransitionSource::Reset);
+    assert!(adapter.presentation(&state).unwrap().is_none());
+    assert!(adapter.metadata().board.is_none());
+
+    let mut next_state = Vec::new();
     adapter
-        .reset(9, &[], &mut initial_state, &mut initial_obs)
+        .step(&state, &2u32.to_le_bytes(), &mut next_state, &mut timestep)
         .unwrap();
+    assert_eq!(timestep.reward_for(AgentId(7)), Some(2.0));
+    assert_eq!(timestep.episode, EpisodeStatus::Terminated);
+    assert_eq!(timestep.decision, Decision::None);
+}
 
-    // Advance the RNG state through a step
-    let mut action_bytes = Vec::new();
-    CounterGame::encode_action(&3, &mut action_bytes).unwrap();
-    let mut stepped_state = Vec::new();
-    let mut stepped_obs = Vec::new();
-    adapter
-        .step(
-            &initial_state,
-            &action_bytes,
-            &mut stepped_state,
-            &mut stepped_obs,
+#[test]
+fn adapter_rejects_non_finite_per_agent_rewards() {
+    let mut adapter = EnvironmentAdapter::try_new(CounterEnvironment {
+        invalid_reward: true,
+    })
+    .unwrap();
+    let error = adapter
+        .reset(
+            0,
+            &[],
+            &mut Vec::new(),
+            &mut crate::ErasedTimestep::default(),
         )
-        .unwrap();
-
-    // Reset with the same seed should reproduce the original bytes
-    let mut second_state = Vec::new();
-    let mut second_obs = Vec::new();
-    adapter
-        .reset(9, &[], &mut second_state, &mut second_obs)
-        .unwrap();
-
-    assert_eq!(initial_state, second_state);
-    assert_eq!(initial_obs, second_obs);
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ErasedEnvironmentError::ContractViolation(_)
+    ));
 }
 
 #[test]
-fn test_step_clears_prepopulated_output_buffers() {
-    let mut adapter = GameAdapter::new(CounterGame);
-
-    let mut state_buf = Vec::new();
-    let mut obs_buf = Vec::new();
-    adapter
-        .reset(123, &[], &mut state_buf, &mut obs_buf)
-        .unwrap();
-
-    let mut action_bytes = Vec::new();
-    CounterGame::encode_action(&1, &mut action_bytes).unwrap();
-
-    let mut new_state_buf = vec![0xFF; 32];
-    let mut new_obs_buf = vec![0xAA; 32];
-    adapter
+fn adapter_rejects_malformed_encoded_inputs() {
+    let mut adapter = EnvironmentAdapter::try_new(CounterEnvironment {
+        invalid_reward: false,
+    })
+    .unwrap();
+    let error = adapter
         .step(
-            &state_buf,
-            &action_bytes,
-            &mut new_state_buf,
-            &mut new_obs_buf,
+            &[1, 2],
+            &1u32.to_le_bytes(),
+            &mut Vec::new(),
+            &mut crate::ErasedTimestep::default(),
         )
-        .unwrap();
-
-    assert_eq!(new_state_buf.len(), 8);
-    assert_eq!(new_obs_buf.len(), 8);
+        .unwrap_err();
+    assert!(matches!(error, crate::ErasedEnvironmentError::Decoding(_)));
 }
 
-#[derive(Debug)]
-struct ResetEncodingFailsGame;
-
-impl Game for ResetEncodingFailsGame {
-    type State = ();
-    type Action = ();
-    type Obs = ();
-
-    fn engine_id(&self) -> EngineId {
-        EngineId {
-            env_id: "reset_fail".into(),
-            build_id: "test".into(),
-        }
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            id: self.engine_id(),
-            encoding: Encoding {
-                state: "void".into(),
-                action: "void".into(),
-                obs: "void".into(),
-                schema_version: 1,
-            },
-            max_horizon: 1,
-            action_space: ActionSpace::Discrete(1),
-            preferred_batch: 1,
-        }
-    }
-
-    fn metadata(&self) -> GameMetadata {
-        GameMetadata::new("reset_fail", "Reset Fail Game")
-            .with_board(1, 1)
-            .with_actions(1)
-            .with_observation(0, 0)
-    }
-
-    fn reset(&mut self, _rng: &mut ChaCha20Rng, _hint: &[u8]) -> (Self::State, Self::Obs) {
-        ((), ())
-    }
-
-    fn step(
-        &mut self,
-        _state: &mut Self::State,
-        _action: Self::Action,
-        _rng: &mut ChaCha20Rng,
-    ) -> (Self::Obs, f32, bool, u64) {
-        ((), 0.0, false, 0)
-    }
-
-    fn encode_state(_state: &Self::State, _out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        Err(EncodeError::InvalidData("state fail".into()))
-    }
-
-    fn decode_state(_buf: &[u8]) -> Result<Self::State, DecodeError> {
-        Ok(())
-    }
-
-    fn encode_action(_action: &Self::Action, _out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        Ok(())
-    }
-
-    fn decode_action(_buf: &[u8]) -> Result<Self::Action, DecodeError> {
-        Ok(())
-    }
-
-    fn encode_obs(_obs: &Self::Obs, _out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        Ok(())
-    }
-
-    fn view(_state: &Self::State) -> crate::BoardView {
-        // Test double: no board to project.
-        crate::BoardView::from_owners(&[], 1, 0)
-    }
+fn capabilities_with_action_space(action_space: ActionSpace) -> Capabilities {
+    let environment = CounterEnvironment {
+        invalid_reward: false,
+    };
+    let mut capabilities = environment.capabilities();
+    capabilities.agents = AgentModel::fixed_homogeneous([AgentId(7)], action_space);
+    capabilities
 }
 
 #[test]
-fn test_reset_propagates_encoding_errors() {
-    let mut adapter = GameAdapter::new(ResetEncodingFailsGame);
-    let mut state_buf = Vec::new();
-    let mut obs_buf = Vec::new();
+fn adapter_rejects_continuous_bounds_that_do_not_match_shape() {
+    let malformed = ActionSpace::Continuous {
+        low: vec![0.0, 0.0],
+        high: vec![1.0, 1.0],
+        shape: vec![3],
+    };
 
-    let err = adapter
-        .reset(0, &[], &mut state_buf, &mut obs_buf)
-        .unwrap_err();
-    match err {
-        ErasedGameError::Encoding(msg) => assert!(msg.contains("state fail")),
-        other => panic!("expected encoding error, got {other:?}"),
-    }
-}
-
-#[derive(Debug)]
-struct StepEncodingFailsGame;
-
-impl Game for StepEncodingFailsGame {
-    type State = u8;
-    type Action = ();
-    type Obs = bool;
-
-    fn engine_id(&self) -> EngineId {
-        EngineId {
-            env_id: "step_fail".into(),
-            build_id: "test".into(),
-        }
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            id: self.engine_id(),
-            encoding: Encoding {
-                state: "u8:v1".into(),
-                action: "unit".into(),
-                obs: "bool".into(),
-                schema_version: 1,
-            },
-            max_horizon: 1,
-            action_space: ActionSpace::Discrete(1),
-            preferred_batch: 1,
-        }
-    }
-
-    fn metadata(&self) -> GameMetadata {
-        GameMetadata::new("step_fail", "Step Fail Game")
-            .with_board(1, 1)
-            .with_actions(1)
-            .with_observation(1, 0)
-    }
-
-    fn reset(&mut self, _rng: &mut ChaCha20Rng, _hint: &[u8]) -> (Self::State, Self::Obs) {
-        (0, false)
-    }
-
-    fn step(
-        &mut self,
-        state: &mut Self::State,
-        _action: Self::Action,
-        _rng: &mut ChaCha20Rng,
-    ) -> (Self::Obs, f32, bool, u64) {
-        *state = state.wrapping_add(1);
-        (true, 0.0, false, 0)
-    }
-
-    fn encode_state(state: &Self::State, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        out.push(*state);
-        Ok(())
-    }
-
-    fn decode_state(buf: &[u8]) -> Result<Self::State, DecodeError> {
-        if buf.len() != 1 {
-            return Err(DecodeError::InvalidLength {
-                expected: 1,
-                actual: buf.len(),
-            });
-        }
-        Ok(buf[0])
-    }
-
-    fn encode_action(_action: &Self::Action, _out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        Ok(())
-    }
-
-    fn decode_action(buf: &[u8]) -> Result<Self::Action, DecodeError> {
-        if !buf.is_empty() {
-            return Err(DecodeError::InvalidLength {
-                expected: 0,
-                actual: buf.len(),
-            });
-        }
-        Ok(())
-    }
-
-    fn encode_obs(obs: &Self::Obs, _out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        if *obs {
-            Err(EncodeError::InvalidData("obs fail".into()))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn view(_state: &Self::State) -> crate::BoardView {
-        // Test double: no board to project.
-        crate::BoardView::from_owners(&[], 1, 0)
-    }
+    let error = crate::contract::validate_action_space(&malformed).unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ErasedEnvironmentError::ContractViolation(_)
+    ));
 }
 
 #[test]
-fn test_step_propagates_encoding_errors() {
-    let mut adapter = GameAdapter::new(StepEncodingFailsGame);
+fn adapter_rejects_discrete_encoding_for_non_discrete_actions() {
+    let mut capabilities = capabilities_with_action_space(ActionSpace::MultiDiscrete {
+        dimensions: vec![2, 3],
+    });
+    capabilities.encoding.action = ActionEncoding::DiscreteU32LittleEndian;
 
-    let mut state_buf = Vec::new();
-    let mut obs_buf = Vec::new();
-    adapter.reset(0, &[], &mut state_buf, &mut obs_buf).unwrap();
+    let error = crate::contract::validate_encoding(&capabilities).unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ErasedEnvironmentError::ContractViolation(_)
+    ));
+}
 
-    let mut new_state_buf = Vec::new();
-    let mut new_obs_buf = Vec::new();
-    let err = adapter
-        .step(&state_buf, &[], &mut new_state_buf, &mut new_obs_buf)
-        .unwrap_err();
+#[test]
+fn adapter_rejects_empty_custom_codec_ids() {
+    let mut capabilities = capabilities_with_action_space(ActionSpace::discrete(2));
+    capabilities.encoding.action = ActionEncoding::Custom { id: " ".into() };
+    capabilities.encoding.observation = ObservationEncoding::Custom {
+        id: "observation:v1".into(),
+    };
+    assert!(crate::contract::validate_encoding(&capabilities).is_err());
 
-    match err {
-        ErasedGameError::Encoding(msg) => assert!(msg.contains("obs fail")),
-        other => panic!("expected encoding error, got {other:?}"),
+    capabilities.encoding.action = ActionEncoding::Custom {
+        id: "action:v1".into(),
+    };
+    capabilities.encoding.observation = ObservationEncoding::Custom { id: "".into() };
+    assert!(crate::contract::validate_encoding(&capabilities).is_err());
+}
+
+#[test]
+fn adapter_rejects_environment_sampled_rng_as_a_complete_snapshot() {
+    let environment = CounterEnvironment {
+        invalid_reward: false,
+    };
+    let id = environment.engine_id();
+    let metadata = environment.metadata();
+    let mut capabilities = environment.capabilities();
+    capabilities.semantics.transition_dynamics = TransitionDynamics::Stochastic;
+    capabilities.semantics.chance_model = ChanceModel::EnvironmentSampled;
+    capabilities.semantics.planning_state_model = PlanningStateModel::CompleteSnapshot;
+
+    let error = crate::contract::validate_descriptors(&id, &capabilities, &metadata).unwrap_err();
+    assert!(error.to_string().contains("runtime RNG state"));
+
+    capabilities.semantics.planning_state_model = PlanningStateModel::ExternalState;
+    crate::contract::validate_descriptors(&id, &capabilities, &metadata).unwrap();
+}
+
+#[test]
+fn descriptors_require_custom_joint_actions_for_simultaneous_decisions() {
+    let environment = CounterEnvironment {
+        invalid_reward: false,
+    };
+    let id = environment.engine_id();
+    let metadata = environment.metadata();
+    let mut capabilities = environment.capabilities();
+    capabilities.semantics.turn_model = TurnModel::Simultaneous;
+    capabilities.encoding.action = ActionEncoding::DiscreteU32LittleEndian;
+
+    let error = crate::contract::validate_descriptors(&id, &capabilities, &metadata).unwrap_err();
+    assert!(error.to_string().contains("custom joint-action codec"));
+
+    capabilities.encoding.action = ActionEncoding::Custom {
+        id: "joint-action:v1".into(),
+    };
+    crate::contract::validate_descriptors(&id, &capabilities, &metadata).unwrap();
+}
+
+#[test]
+fn descriptors_require_custom_actions_for_explicit_chance() {
+    let environment = CounterEnvironment {
+        invalid_reward: false,
+    };
+    let id = environment.engine_id();
+    let metadata = environment.metadata();
+    let mut capabilities = environment.capabilities();
+    capabilities.semantics.transition_dynamics = TransitionDynamics::Stochastic;
+    capabilities.semantics.chance_model = ChanceModel::Explicit;
+    capabilities.encoding.action = ActionEncoding::DiscreteU32LittleEndian;
+
+    let error = crate::contract::validate_descriptors(&id, &capabilities, &metadata).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("custom chance/agent action codec"));
+
+    capabilities.encoding.action = ActionEncoding::Custom {
+        id: "chance-or-agent:v1".into(),
+    };
+    crate::contract::validate_descriptors(&id, &capabilities, &metadata).unwrap();
+}
+
+#[test]
+fn descriptors_reject_single_agent_semantics_with_multiple_fixed_agents() {
+    let environment = CounterEnvironment {
+        invalid_reward: false,
+    };
+    let id = environment.engine_id();
+    let metadata = environment.metadata();
+    let mut capabilities = environment.capabilities();
+    capabilities.agents =
+        AgentModel::fixed_homogeneous([AgentId(7), AgentId(8)], ActionSpace::discrete(2));
+
+    let error = crate::contract::validate_descriptors(&id, &capabilities, &metadata).unwrap_err();
+    assert!(error.to_string().contains("exactly one fixed agent"));
+}
+
+#[test]
+fn descriptors_reject_environment_ids_that_are_not_safe_runtime_segments() {
+    let environment = CounterEnvironment {
+        invalid_reward: false,
+    };
+    let mut id = environment.engine_id();
+    let mut capabilities = environment.capabilities();
+    let mut metadata = environment.metadata();
+    id.env_id = "../Counter".into();
+    capabilities.id = id.clone();
+    metadata.id = id.env_id.clone();
+
+    let error = crate::contract::validate_descriptors(&id, &capabilities, &metadata).unwrap_err();
+    assert!(error.to_string().contains("lowercase ASCII"));
+}
+
+#[test]
+fn timestep_rejects_multiple_agents_under_single_agent_semantics() {
+    let (mut capabilities, timestep) = simultaneous_contract();
+    capabilities.agents = AgentModel::Dynamic {
+        action_space: ActionSpace::discrete(2),
+    };
+    capabilities.semantics.turn_model = TurnModel::SingleAgent;
+
+    let error = crate::contract::validate_typed_timestep(&capabilities, &timestep).unwrap_err();
+    assert!(error.to_string().contains("at most one agent"));
+}
+
+fn valid_board_descriptors() -> (EngineId, Capabilities, EnvironmentMetadata) {
+    let id = EngineId {
+        env_id: "board-test".into(),
+        build_id: "test".into(),
+    };
+    let capabilities = Capabilities {
+        id: id.clone(),
+        contract_version: 1,
+        encoding: Encoding::discrete_u32_le_f32_le("board-state:v1", 29),
+        semantics:
+            EnvironmentSemantics::deterministic_alternating_perfect_information_terminal_zero_sum(),
+        max_horizon: Some(9),
+        agents: AgentModel::fixed_homogeneous([AgentId(1), AgentId(2)], ActionSpace::discrete(9)),
+        preferred_batch: 1,
+    };
+    let metadata = EnvironmentMetadata::new("board-test", "Board Test").with_board(
+        BoardGameMetadata::new(3, 3, 9)
+            .with_observation(29, 2, 18, false)
+            .with_players(vec![
+                BoardPlayerMetadata::new("One", "1"),
+                BoardPlayerMetadata::new("Two", "2"),
+            ]),
+    );
+    (id, capabilities, metadata)
+}
+
+#[test]
+fn descriptors_validate_the_entire_board_profile() {
+    let (id, capabilities, metadata) = valid_board_descriptors();
+    crate::contract::validate_descriptors(&id, &capabilities, &metadata).unwrap();
+
+    let mut malformed = metadata.clone();
+    malformed
+        .board
+        .as_mut()
+        .unwrap()
+        .observation
+        .legal_actions_offset = 17;
+    let error = crate::contract::validate_descriptors(&id, &capabilities, &malformed).unwrap_err();
+    assert!(error.to_string().contains("mask offset"));
+
+    let mut overflow = metadata;
+    let board = overflow.board.as_mut().unwrap();
+    board.width = usize::MAX;
+    board.height = 2;
+    let error = crate::contract::validate_descriptors(&id, &capabilities, &overflow).unwrap_err();
+    assert!(error.to_string().contains("overflow"));
+}
+
+#[test]
+fn adapter_validates_declared_f32_observation_payloads() {
+    let mut capabilities = capabilities_with_action_space(ActionSpace::discrete(2));
+    capabilities.encoding.observation = ObservationEncoding::F32LittleEndian { elements: 2 };
+
+    assert!(crate::contract::validate_encoded_observation(
+        &capabilities,
+        AgentId(7),
+        &1.0f32.to_le_bytes(),
+    )
+    .is_err());
+
+    let mut non_finite = 1.0f32.to_le_bytes().to_vec();
+    non_finite.extend_from_slice(&f32::NAN.to_le_bytes());
+    assert!(
+        crate::contract::validate_encoded_observation(&capabilities, AgentId(7), &non_finite,)
+            .is_err()
+    );
+
+    let mut valid = 1.0f32.to_le_bytes().to_vec();
+    valid.extend_from_slice(&2.0f32.to_le_bytes());
+    crate::contract::validate_encoded_observation(&capabilities, AgentId(7), &valid).unwrap();
+}
+
+fn simultaneous_contract() -> (Capabilities, Timestep<f32>) {
+    let mut capabilities = capabilities_with_action_space(ActionSpace::discrete(2));
+    capabilities.agents =
+        AgentModel::fixed_homogeneous([AgentId(7), AgentId(8)], ActionSpace::discrete(2));
+    capabilities.semantics.turn_model = TurnModel::Simultaneous;
+    let timestep = Timestep {
+        agents: vec![AgentId(7), AgentId(8)],
+        observations: vec![
+            AgentObservation {
+                agent_id: AgentId(7),
+                observation: 1.0,
+            },
+            AgentObservation {
+                agent_id: AgentId(8),
+                observation: 2.0,
+            },
+        ],
+        outcomes: vec![
+            AgentOutcome {
+                agent_id: AgentId(7),
+                reward: 0.0,
+                terminated: false,
+                truncated: false,
+            },
+            AgentOutcome {
+                agent_id: AgentId(8),
+                reward: 0.0,
+                terminated: false,
+                truncated: false,
+            },
+        ],
+        decision: Decision::Agents {
+            agent_ids: vec![AgentId(7), AgentId(8)],
+        },
+        episode: EpisodeStatus::Running,
+        source: TransitionSource::Chance,
+        info: Vec::new(),
+    };
+    (capabilities, timestep)
+}
+
+#[test]
+fn adapter_requires_an_observation_for_every_decision_agent() {
+    let (capabilities, mut timestep) = simultaneous_contract();
+    timestep
+        .observations
+        .retain(|observation| observation.agent_id != AgentId(8));
+
+    let error = crate::contract::validate_typed_timestep(&capabilities, &timestep).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("decision agent 8 has no observation"));
+}
+
+#[test]
+fn adapter_never_requests_an_action_from_a_completed_agent() {
+    let (capabilities, mut timestep) = simultaneous_contract();
+    timestep.outcomes[1].terminated = true;
+
+    let error = crate::contract::validate_typed_timestep(&capabilities, &timestep).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("decision agent 8 is already complete"));
+}
+
+#[test]
+fn timestep_requires_global_episode_status_to_match_every_current_agent() {
+    let (capabilities, mut timestep) = simultaneous_contract();
+    timestep.episode = EpisodeStatus::Terminated;
+    timestep.decision = Decision::None;
+    timestep.outcomes[0].terminated = true;
+
+    let error = crate::contract::validate_typed_timestep(&capabilities, &timestep).unwrap_err();
+    assert!(error.to_string().contains("every current agent"));
+}
+
+#[test]
+fn timestep_enforces_declared_terminal_zero_sum_rewards() {
+    let (mut capabilities, mut timestep) = simultaneous_contract();
+    capabilities.semantics.reward_model = RewardModel::TerminalZeroSum;
+    timestep.source = TransitionSource::Reset;
+    timestep.outcomes[0].reward = 0.25;
+    let error = crate::contract::validate_typed_timestep(&capabilities, &timestep).unwrap_err();
+    assert!(error.to_string().contains("zero reward before termination"));
+
+    timestep.episode = EpisodeStatus::Terminated;
+    timestep.decision = Decision::None;
+    for outcome in &mut timestep.outcomes {
+        outcome.terminated = true;
+        outcome.reward = 1.0;
     }
+    let error = crate::contract::validate_typed_timestep(&capabilities, &timestep).unwrap_err();
+    assert!(error.to_string().contains("sum to zero"));
+
+    timestep.outcomes[1].reward = -1.0;
+    crate::contract::validate_typed_timestep(&capabilities, &timestep).unwrap();
+}
+
+#[test]
+fn dynamic_departure_stays_in_the_transition_roster_for_its_final_outcome() {
+    let (mut capabilities, mut timestep) = simultaneous_contract();
+    capabilities.agents = AgentModel::Dynamic {
+        action_space: ActionSpace::discrete(2),
+    };
+    capabilities.semantics.turn_model = TurnModel::Sequential {
+        order: crate::typed::SequentialTurnOrder::EnvironmentDefined,
+    };
+    timestep
+        .observations
+        .retain(|item| item.agent_id == AgentId(8));
+    timestep.outcomes[0].terminated = true;
+    timestep.decision = Decision::Agents {
+        agent_ids: vec![AgentId(8)],
+    };
+    timestep.source = TransitionSource::Agents {
+        agent_ids: vec![AgentId(7)],
+    };
+
+    crate::contract::validate_typed_timestep(&capabilities, &timestep).unwrap();
+
+    timestep.agents.retain(|agent_id| *agent_id != AgentId(7));
+    timestep
+        .outcomes
+        .retain(|outcome| outcome.agent_id != AgentId(7));
+    let error = crate::contract::validate_typed_timestep(&capabilities, &timestep).unwrap_err();
+    assert!(error.to_string().contains("transition roster"));
 }

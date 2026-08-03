@@ -1,0 +1,11 @@
+[package]
+name = "algorithm-core"
+version = "0.1.0"
+edition = "2021"
+description = "Algorithm descriptors and environment compatibility checks for Cartridge2"
+
+[dependencies]
+engine-core = { path = "../engine-core" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+

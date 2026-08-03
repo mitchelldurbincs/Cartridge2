@@ -220,6 +220,7 @@ class TestStateManagement:
             scheduler.step()
 
         state = scheduler.state_dict()
+        assert state["schema_version"] == 1
         assert state["current_step"] == 5
 
     def test_state_dict_contains_warmup_metadata(self):
@@ -304,22 +305,30 @@ class TestStateManagement:
         # LR should be restored (within reasonable tolerance)
         assert abs(scheduler2.get_lr() - lr_before) < 1e-4
 
-    def test_load_legacy_state_dict(self):
-        """Test loading legacy state dict format (backwards compatibility)."""
-        # These are created to establish the test setup pattern,
-        # though we only use the config below
-        _ = Adam([torch.randn(10, requires_grad=True)], lr=0.001)  # optimizer (unused)
+    @pytest.mark.parametrize(
+        "invalid_state",
+        [
+            {"current_step": 15},
+            {"schema_version": 0, "current_step": 15},
+            {"schema_version": 2, "current_step": 15},
+        ],
+    )
+    def test_load_rejects_missing_or_unsupported_state_schema(self, invalid_state):
+        """Checkpoint state must declare the one schema this scheduler reads."""
         config = LRConfig(target_lr=0.001, warmup_steps=0, total_steps=100)
+        optimizer = Adam([torch.randn(10, requires_grad=True)], lr=0.001)
+        scheduler = WarmupCosineScheduler(optimizer, config, from_checkpoint=True)
 
-        # Create legacy state (just cosine scheduler state)
-        legacy_state = {"last_epoch": 15, "T_max": 100}
+        with pytest.raises(ValueError, match="Unsupported scheduler state schema"):
+            scheduler.load_state_dict(invalid_state)
 
-        # Load into new scheduler
-        optimizer2 = Adam([torch.randn(10, requires_grad=True)], lr=0.001)
-        scheduler2 = WarmupCosineScheduler(optimizer2, config, from_checkpoint=True)
-        scheduler2.load_state_dict(legacy_state)
+    def test_load_rejects_schema_without_required_step(self):
+        config = LRConfig(target_lr=0.001, warmup_steps=0, total_steps=100)
+        optimizer = Adam([torch.randn(10, requires_grad=True)], lr=0.001)
+        scheduler = WarmupCosineScheduler(optimizer, config, from_checkpoint=True)
 
-        assert scheduler2._current_step == 15
+        with pytest.raises(ValueError, match="missing required field 'current_step'"):
+            scheduler.load_state_dict({"schema_version": 1})
 
 
 class TestEdgeCases:

@@ -1,409 +1,351 @@
-//! Model file watcher for hot-reloading ONNX models
+//! Content-addressed ONNX checkpoint watching.
 //!
-//! This crate provides a shared implementation for watching and hot-reloading
-//! ONNX model files used by both the actor and web server components.
-//!
-//! # Features
-//!
-//! - `metadata`: Enable additional metadata tracking (load time, file modification time,
-//!   training step extraction). Useful for web server display.
-//! - `s3`: Enable S3/MinIO backend for Kubernetes deployments where models are
-//!   stored in S3-compatible storage.
-//!
-//! # Polling Fallback
-//!
-//! In addition to inotify-based file watching, this crate includes a polling fallback
-//! that periodically checks for file changes. This is essential for Docker environments
-//! where inotify events don't reliably propagate across container boundaries with
-//! bind-mounted volumes.
-//!
-//! The poll interval defaults to 5 seconds and can be configured with
-//! [`ModelWatcher::with_poll_interval`].
-//!
-//! # Example (Filesystem)
-//!
-//! ```ignore
-//! use model_watcher::ModelWatcher;
-//! use std::sync::{Arc, RwLock};
-//!
-//! let evaluator = Arc::new(RwLock::new(None));
-//! let watcher = ModelWatcher::new("./data/models", "latest.onnx", 29, 1, evaluator);
-//!
-//! // Try to load existing model
-//! watcher.try_load_existing()?;
-//!
-//! // Start watching for changes (uses both inotify and polling)
-//! let mut rx = watcher.start_watching().await?;
-//! while let Some(()) = rx.recv().await {
-//!     println!("Model reloaded!");
-//! }
-//! ```
-//!
-//! # Example (S3 - requires `s3` feature)
-//!
-//! ```ignore
-//! use model_watcher::s3::{S3ModelWatcher, S3Config};
-//! use std::sync::{Arc, RwLock};
-//!
-//! let evaluator = Arc::new(RwLock::new(None));
-//! let config = S3Config {
-//!     bucket: "my-bucket".to_string(),
-//!     key: "models/latest.onnx".to_string(),
-//!     endpoint_url: Some("http://minio:9000".to_string()),
-//!     region: Some("us-east-1".to_string()),
-//!     cache_dir: "/tmp/model-cache".into(),
-//! };
-//!
-//! let watcher = S3ModelWatcher::new(config, 29, evaluator).await?;
-//! watcher.try_load_existing().await?;
-//!
-//! let mut rx = watcher.start_watching().await?;
-//! while let Some(()) = rx.recv().await {
-//!     println!("Model reloaded from S3!");
-//! }
-//! ```
+//! Runtimes watch channels/current.json, not a mutable model file. A run-head
+//! update is accepted only after its canonical identity, immutable manifest,
+//! exact runtime profile, blob size, blob SHA-256, and ONNX contract all pass.
 
 use anyhow::{anyhow, Result};
 use mcts::OnnxEvaluator;
 use notify::{recommended_watcher, Event, EventKind, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+mod artifact;
 mod load;
 
-/// S3/MinIO backend for model watching (requires `s3` feature).
+use artifact::{read_filesystem_head, resolve_filesystem_head, run_head_path, ResolvedCheckpoint};
+
 #[cfg(feature = "s3")]
 pub mod s3;
 
 #[cfg(test)]
 mod tests;
 
-pub use load::ModelInfo;
+pub use load::{ModelInfo, ModelLoadSpec};
 
-/// Default polling interval for checking model file changes.
-///
-/// This is used as a fallback when inotify events don't propagate
-/// (common in Docker with bind mounts).
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Watches for new ONNX model files and hot-reloads them.
-///
-/// This is the shared implementation used by both actor and web server components.
-/// It uses both inotify (for fast detection when it works) and polling (as a
-/// fallback for Docker/cross-container scenarios).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadOutcome {
+    Absent,
+    Unchanged,
+    Advanced,
+    Loaded,
+}
+
+/// Policy for selecting an inference checkpoint from the authoritative RunHead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSelection {
+    /// Load the checkpoint selected directly by the latest RunCommit.
+    Latest,
+    /// Load the latest RunCommit's champion, falling back to latest before one exists.
+    ChampionOrLatest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AcceptedHead {
+    model_checkpoint_id: String,
+    run_commit_id: String,
+}
+
 pub struct ModelWatcher {
-    /// Path to the models directory
-    model_dir: PathBuf,
-    /// Expected model filename
-    model_filename: String,
-    /// Observation size for the model
-    obs_size: usize,
-    /// Number of intra-op threads for ONNX inference (0 = auto-detect)
-    intra_threads: usize,
-    /// Shared evaluator to update
+    model_root: PathBuf,
+    model_spec: ModelLoadSpec,
+    selection: ModelSelection,
     evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,
-    /// Last known modification time of the loaded model file.
-    /// Used by polling to detect changes.
-    last_mtime: Arc<RwLock<Option<SystemTime>>>,
-    /// Polling interval for checking file changes
+    accepted_head: Arc<RwLock<Option<AcceptedHead>>>,
     poll_interval: Duration,
-    /// Current model info (None = metadata tracking disabled)
-    model_info: Option<Arc<RwLock<ModelInfo>>>,
+    model_info: Arc<RwLock<ModelInfo>>,
 }
 
 impl ModelWatcher {
-    /// Create a new model watcher without metadata tracking.
-    ///
-    /// # Arguments
-    /// * `model_dir` - Directory to watch for model files
-    /// * `model_filename` - Name of the model file to watch (e.g., "latest.onnx")
-    /// * `obs_size` - Observation size expected by the model
-    /// * `intra_threads` - Number of intra-op threads for ONNX (0 = auto-detect)
-    /// * `evaluator` - Shared evaluator reference to update on reload
     pub fn new(
-        model_dir: impl AsRef<Path>,
-        model_filename: impl Into<String>,
-        obs_size: usize,
-        intra_threads: usize,
+        model_root: impl AsRef<Path>,
+        model_spec: ModelLoadSpec,
+        selection: ModelSelection,
         evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,
     ) -> Self {
         Self {
-            model_dir: model_dir.as_ref().to_path_buf(),
-            model_filename: model_filename.into(),
-            obs_size,
-            intra_threads,
+            model_root: model_root.as_ref().to_path_buf(),
+            model_spec,
+            selection,
             evaluator,
-            last_mtime: Arc::new(RwLock::new(None)),
+            accepted_head: Arc::new(RwLock::new(None)),
             poll_interval: DEFAULT_POLL_INTERVAL,
-            model_info: None,
+            model_info: Arc::new(RwLock::new(ModelInfo::default())),
         }
     }
 
-    /// Enable metadata tracking and return `self` for chaining.
-    ///
-    /// When enabled, the watcher tracks model info (path, modification time,
-    /// training step) that can be queried via [`model_info`](Self::model_info).
-    pub fn with_metadata(mut self) -> Self {
-        self.model_info = Some(Arc::new(RwLock::new(ModelInfo::default())));
-        self
-    }
-
-    /// Set a custom polling interval.
-    ///
-    /// The default is 5 seconds. Shorter intervals provide faster detection
-    /// but use more CPU. Longer intervals are more efficient but slower to
-    /// detect changes.
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
         self
     }
 
-    /// Get the full path to the model file.
-    pub fn model_path(&self) -> PathBuf {
-        self.model_dir.join(&self.model_filename)
+    pub fn run_head_path(&self) -> PathBuf {
+        run_head_path(&self.model_root)
     }
 
-    /// Get the current model info (if metadata tracking is enabled).
     pub fn model_info(&self) -> Arc<RwLock<ModelInfo>> {
-        self.model_info
-            .clone()
-            .unwrap_or_else(|| Arc::new(RwLock::new(ModelInfo::default())))
+        Arc::clone(&self.model_info)
     }
 
-    /// Try to load the model if it exists.
-    ///
-    /// Returns `Ok(true)` if a model was loaded, `Ok(false)` if no model exists.
     pub fn try_load_existing(&self) -> Result<bool> {
-        let path = self.model_path();
-        if path.exists() {
-            info!("Found existing model at {:?}", path);
-            self.load_model(&path)?;
-            Ok(true)
-        } else {
-            debug!("No existing model at {:?}", path);
-            Ok(false)
-        }
+        Ok(!matches!(self.load_current()?, LoadOutcome::Absent))
     }
 
-    /// Load a model from the given path.
-    fn load_model(&self, path: &Path) -> Result<()> {
-        load::load_model_static(
-            path,
-            self.obs_size,
-            self.intra_threads,
+    fn load_current(&self) -> Result<LoadOutcome> {
+        Self::load_current_static(
+            &self.model_root,
+            &self.model_spec,
+            self.selection,
             &self.evaluator,
-            &self.last_mtime,
-            self.model_info.as_ref(),
+            &self.accepted_head,
+            &self.model_info,
         )
     }
 
-    /// Start watching for model changes.
-    ///
-    /// This spawns two background tasks:
-    /// 1. An inotify-based watcher for fast detection when events propagate
-    /// 2. A polling fallback that checks file modification time periodically
-    ///
-    /// The polling fallback is essential for Docker environments where inotify
-    /// events don't reliably propagate across container boundaries with bind mounts.
-    ///
-    /// Returns a channel that receives `()` when a new model is loaded.
-    pub async fn start_watching(&self) -> Result<mpsc::Receiver<()>> {
-        let (tx, rx) = mpsc::channel(16);
-        let model_dir = self.model_dir.clone();
-        let model_filename = self.model_filename.clone();
-        let obs_size = self.obs_size;
-        let intra_threads = self.intra_threads;
-        let evaluator = Arc::clone(&self.evaluator);
-        let last_mtime = Arc::clone(&self.last_mtime);
-        let poll_interval = self.poll_interval;
-        let model_info = self.model_info.clone();
+    fn current_accepted_head(
+        accepted_head: &Arc<RwLock<Option<AcceptedHead>>>,
+    ) -> Result<Option<AcceptedHead>> {
+        accepted_head
+            .read()
+            .map(|guard| guard.clone())
+            .map_err(|error| anyhow!("failed to read accepted run head: {error}"))
+    }
 
-        // Create channel for file system events
-        let (fs_tx, mut fs_rx) = mpsc::channel(100);
+    fn commit_candidate(
+        candidate: ResolvedCheckpoint,
+        new_evaluator: Option<OnnxEvaluator>,
+        expected_accepted_head: Option<AcceptedHead>,
+        evaluator: &Arc<RwLock<Option<OnnxEvaluator>>>,
+        accepted_head: &Arc<RwLock<Option<AcceptedHead>>>,
+        model_info: &Arc<RwLock<ModelInfo>>,
+    ) -> Result<LoadOutcome> {
+        let mut accepted_guard = accepted_head
+            .write()
+            .map_err(|error| anyhow!("failed to lock accepted run head: {error}"))?;
+        if accepted_guard
+            .as_ref()
+            .is_some_and(|accepted| accepted.run_commit_id == candidate.run_commit_id)
+        {
+            return Ok(LoadOutcome::Unchanged);
+        }
+        if *accepted_guard != expected_accepted_head {
+            debug!(
+                candidate_checkpoint = %candidate.checkpoint_id,
+                candidate_run_commit = %candidate.run_commit_id,
+                "Discarding candidate because another load advanced the accepted RunHead"
+            );
+            return Ok(LoadOutcome::Unchanged);
+        }
+        let mut evaluator_guard = evaluator
+            .write()
+            .map_err(|error| anyhow!("failed to lock model evaluator: {error}"))?;
+        let mut info_guard = model_info
+            .write()
+            .map_err(|error| anyhow!("failed to lock model information: {error}"))?;
 
-        // Set up the file watcher
-        let mut watcher = recommended_watcher(move |res: Result<Event, notify::Error>| {
-            match res {
-                Ok(event) => {
-                    // Non-blocking send - drop events if channel is full
-                    let _ = fs_tx.blocking_send(event);
-                }
-                Err(e) => {
-                    warn!("File watcher error: {}", e);
-                }
-            }
-        })
-        .map_err(|e| anyhow!("Failed to create file watcher: {}", e))?;
-
-        // Create directory if it doesn't exist
-        if !model_dir.exists() {
-            std::fs::create_dir_all(&model_dir)
-                .map_err(|e| anyhow!("Failed to create model directory: {}", e))?;
+        if new_evaluator.is_none()
+            && (accepted_guard
+                .as_ref()
+                .is_none_or(|accepted| accepted.model_checkpoint_id != candidate.checkpoint_id)
+                || evaluator_guard.is_none())
+        {
+            return Err(anyhow!(
+                "cannot reuse an evaluator that does not match the selected checkpoint"
+            ));
+        }
+        let model_changed = new_evaluator.is_some();
+        let loaded_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        if let Some(new_evaluator) = new_evaluator {
+            *evaluator_guard = Some(new_evaluator);
+        }
+        *accepted_guard = Some(AcceptedHead {
+            model_checkpoint_id: candidate.checkpoint_id.clone(),
+            run_commit_id: candidate.run_commit_id.clone(),
+        });
+        if model_changed {
+            *info_guard = ModelInfo {
+                loaded: true,
+                checkpoint_id: Some(candidate.checkpoint_id.clone()),
+                model_sha256: Some(candidate.manifest.onnx.sha256.clone()),
+                path: Some(candidate.model_path.to_string_lossy().into_owned()),
+                loaded_at: Some(loaded_at),
+                training_step: Some(candidate.manifest.step),
+            };
         }
 
-        // Start watching the directory
+        info!(
+            checkpoint_id = %candidate.checkpoint_id,
+            run_commit_id = %candidate.run_commit_id,
+            model_sha256 = %candidate.manifest.onnx.sha256,
+            step = candidate.manifest.step,
+            path = %candidate.model_path.display(),
+            model_changed,
+            "Content-addressed RunHead accepted"
+        );
+        Ok(if model_changed {
+            LoadOutcome::Loaded
+        } else {
+            LoadOutcome::Advanced
+        })
+    }
+
+    fn load_current_static(
+        model_root: &Path,
+        model_spec: &ModelLoadSpec,
+        selection: ModelSelection,
+        evaluator: &Arc<RwLock<Option<OnnxEvaluator>>>,
+        accepted_head: &Arc<RwLock<Option<AcceptedHead>>>,
+        model_info: &Arc<RwLock<ModelInfo>>,
+    ) -> Result<LoadOutcome> {
+        let Some(head) = read_filesystem_head(model_root)? else {
+            return Ok(LoadOutcome::Absent);
+        };
+        let accepted = Self::current_accepted_head(accepted_head)?;
+        if accepted
+            .as_ref()
+            .is_some_and(|accepted| accepted.run_commit_id == head.run_commit_id)
+        {
+            return Ok(LoadOutcome::Unchanged);
+        }
+
+        let candidate = resolve_filesystem_head(
+            model_root,
+            head.clone(),
+            &model_spec.identity,
+            model_spec.environment_max_horizon,
+            selection,
+        )?;
+        let new_evaluator = if accepted
+            .as_ref()
+            .is_some_and(|accepted| accepted.model_checkpoint_id == candidate.checkpoint_id)
+        {
+            None
+        } else {
+            Some(model_spec.load(&candidate.model_path)?)
+        };
+
+        let latest = read_filesystem_head(model_root)?
+            .ok_or_else(|| anyhow!("current run head disappeared during model validation"))?;
+        if latest != head {
+            debug!(
+                candidate = %candidate.checkpoint_id,
+                current = %latest.checkpoint_id,
+                candidate_run_commit = %candidate.run_commit_id,
+                current_run_commit = %latest.run_commit_id,
+                "Discarding stale run-head candidate"
+            );
+            return Ok(LoadOutcome::Unchanged);
+        }
+
+        Self::commit_candidate(
+            candidate,
+            new_evaluator,
+            accepted,
+            evaluator,
+            accepted_head,
+            model_info,
+        )
+    }
+
+    pub async fn start_watching(&self) -> Result<mpsc::Receiver<()>> {
+        let (updates_tx, updates_rx) = mpsc::channel(16);
+        let channels_dir = self.model_root.join("channels");
+        std::fs::create_dir_all(&channels_dir).map_err(|error| {
+            anyhow!(
+                "failed to create model channel directory {:?}: {error}",
+                channels_dir
+            )
+        })?;
+
+        let (events_tx, mut events_rx) = mpsc::channel(100);
+        let mut watcher =
+            recommended_watcher(move |result: Result<Event, notify::Error>| match result {
+                Ok(event) => {
+                    let _ = events_tx.blocking_send(event);
+                }
+                Err(error) => warn!("Model channel watcher error: {error}"),
+            })
+            .map_err(|error| anyhow!("failed to create model channel watcher: {error}"))?;
         watcher
-            .watch(&model_dir, RecursiveMode::NonRecursive)
-            .map_err(|e| anyhow!("Failed to watch directory: {}", e))?;
+            .watch(&channels_dir, RecursiveMode::NonRecursive)
+            .map_err(|error| anyhow!("failed to watch model channel directory: {error}"))?;
 
-        info!("Started watching {:?} for model updates", model_dir);
-
-        // Clone for the inotify task
-        let inotify_tx = tx.clone();
-        let inotify_model_dir = model_dir.clone();
-        let inotify_model_filename = model_filename.clone();
-        let inotify_evaluator = Arc::clone(&evaluator);
-        let inotify_last_mtime = Arc::clone(&last_mtime);
-        let inotify_model_info = model_info.clone();
-
-        // Spawn task to handle inotify file events
+        let event_root = self.model_root.clone();
+        let event_spec = self.model_spec.clone();
+        let event_selection = self.selection;
+        let event_evaluator = Arc::clone(&self.evaluator);
+        let event_accepted = Arc::clone(&self.accepted_head);
+        let event_info = Arc::clone(&self.model_info);
+        let event_updates = updates_tx.clone();
         tokio::spawn(async move {
-            // Keep watcher alive in this task
             let _watcher = watcher;
-
-            // Debounce timer to avoid rapid reloads
-            let debounce_duration = Duration::from_millis(500);
-            // Initialize the timer far enough in the past so the first
-            // filesystem event is never dropped by the debounce guard.
-            let mut last_reload = std::time::Instant::now() - debounce_duration;
-
-            while let Some(event) = fs_rx.recv().await {
-                // Only care about create/modify events
-                match event.kind {
-                    EventKind::Create(_) | EventKind::Modify(_) => {}
-                    _ => continue,
-                }
-
-                // Check if this affects our model file
-                let model_path = inotify_model_dir.join(&inotify_model_filename);
-                let is_our_file = event
-                    .paths
-                    .iter()
-                    .any(|p| p.file_name() == model_path.file_name());
-
-                if !is_our_file {
+            let expected_path = run_head_path(&event_root);
+            while let Some(event) = events_rx.recv().await {
+                if !matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_))
+                    || !event.paths.iter().any(|path| path == &expected_path)
+                {
                     continue;
                 }
-
-                // Debounce rapid events
-                if last_reload.elapsed() < debounce_duration {
-                    debug!("Debouncing model reload event (inotify)");
-                    continue;
-                }
-
-                // Small delay to ensure file is fully written
-                tokio::time::sleep(Duration::from_millis(100)).await;
-
-                // Verify file exists and is readable
-                if !model_path.exists() {
-                    debug!("Model file doesn't exist yet");
-                    continue;
-                }
-
-                // Try to load the model
-                info!("Model file changed (inotify), reloading {:?}", model_path);
-
-                match load::load_model_static(
-                    &model_path,
-                    obs_size,
-                    intra_threads,
-                    &inotify_evaluator,
-                    &inotify_last_mtime,
-                    inotify_model_info.as_ref(),
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                match Self::load_current_static(
+                    &event_root,
+                    &event_spec,
+                    event_selection,
+                    &event_evaluator,
+                    &event_accepted,
+                    &event_info,
                 ) {
-                    Ok(()) => {
-                        last_reload = std::time::Instant::now();
-                        let _ = inotify_tx.send(()).await;
+                    Ok(LoadOutcome::Loaded) => {
+                        let _ = event_updates.send(()).await;
                     }
-                    Err(e) => {
-                        error!("Failed to reload model (inotify): {}", e);
-                    }
+                    Ok(LoadOutcome::Absent | LoadOutcome::Unchanged | LoadOutcome::Advanced) => {}
+                    Err(error) => error!("Rejected model channel update: {error}"),
                 }
             }
         });
 
-        // Spawn polling task as fallback for Docker/cross-container scenarios
-        let poll_tx = tx;
-        let poll_model_dir = model_dir;
-        let poll_model_filename = model_filename;
-        let poll_evaluator = evaluator;
-        let poll_last_mtime = last_mtime;
-        let poll_model_info = model_info;
-
+        let poll_root = self.model_root.clone();
+        let poll_spec = self.model_spec.clone();
+        let poll_selection = self.selection;
+        let poll_evaluator = Arc::clone(&self.evaluator);
+        let poll_accepted = Arc::clone(&self.accepted_head);
+        let poll_info = Arc::clone(&self.model_info);
+        let poll_interval = self.poll_interval;
         tokio::spawn(async move {
-            info!(
-                "Started polling fallback for model updates (interval: {:?})",
-                poll_interval
-            );
-
             let mut interval = tokio::time::interval(poll_interval);
-            // Don't fire immediately - let inotify have first chance
             interval.tick().await;
-
             loop {
                 interval.tick().await;
-
-                let model_path = poll_model_dir.join(&poll_model_filename);
-
-                // Check if file exists
-                if !model_path.exists() {
-                    debug!("Polling: model file doesn't exist yet");
-                    continue;
-                }
-
-                // Get current file modification time
-                let current_mtime = match model_path.metadata().and_then(|m| m.modified()) {
-                    Ok(mtime) => mtime,
-                    Err(e) => {
-                        debug!("Polling: failed to get file mtime: {}", e);
-                        continue;
-                    }
-                };
-
-                // Check if file has changed since last load
-                let needs_reload = {
-                    let last = poll_last_mtime.read().ok();
-                    match last.as_deref() {
-                        Some(Some(last_time)) => current_mtime > *last_time,
-                        Some(None) => true, // No model loaded yet
-                        None => {
-                            warn!("Polling: failed to read last_mtime lock");
-                            continue;
-                        }
-                    }
-                };
-
-                if !needs_reload {
-                    debug!("Polling: model file unchanged");
-                    continue;
-                }
-
-                // Small delay to ensure file is fully written
-                tokio::time::sleep(Duration::from_millis(100)).await;
-
-                info!("Model file changed (polling), reloading {:?}", model_path);
-
-                match load::load_model_static(
-                    &model_path,
-                    obs_size,
-                    intra_threads,
+                match Self::load_current_static(
+                    &poll_root,
+                    &poll_spec,
+                    poll_selection,
                     &poll_evaluator,
-                    &poll_last_mtime,
-                    poll_model_info.as_ref(),
+                    &poll_accepted,
+                    &poll_info,
                 ) {
-                    Ok(()) => {
-                        let _ = poll_tx.send(()).await;
+                    Ok(LoadOutcome::Loaded) => {
+                        let _ = updates_tx.send(()).await;
                     }
-                    Err(e) => {
-                        error!("Failed to reload model (polling): {}", e);
-                    }
+                    Ok(LoadOutcome::Absent | LoadOutcome::Unchanged | LoadOutcome::Advanced) => {}
+                    Err(error) => error!("Rejected polled model channel update: {error}"),
                 }
             }
         });
 
-        Ok(rx)
+        info!(
+            run_head = %self.run_head_path().display(),
+            poll_interval = ?self.poll_interval,
+            "Started content-addressed model watcher"
+        );
+        Ok(updates_rx)
     }
 }

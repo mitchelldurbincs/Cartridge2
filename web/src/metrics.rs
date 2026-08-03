@@ -3,9 +3,8 @@
 //! This module provides metrics for monitoring web server performance,
 //! game session tracking, and bot move latency.
 //!
-//! The metric definitions below are web-specific (its sibling is
-//! `actor/src/metrics.rs`); the shared registration/encoding plumbing lives in
-//! the `metrics-common` crate.
+//! The metric definitions below are web-specific; shared
+//! registration/encoding plumbing lives in the `metrics-common` crate.
 
 use lazy_static::lazy_static;
 use prometheus::{Histogram, HistogramOpts, HistogramVec, IntCounter, IntGauge, Opts, Registry};

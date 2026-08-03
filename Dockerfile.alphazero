@@ -1,7 +1,8 @@
 # AlphaZero Synchronized Training Container
 #
 # Bundles both the Rust actor and Python trainer for synchronized training.
-# Each iteration: clear buffer -> run actor -> train -> evaluate -> repeat
+# Each iteration: allocate an exact replay scope -> run bounded collectors
+# pinned to one source checkpoint -> seal -> train -> evaluate -> commit
 #
 # Usage:
 #   docker build -f Dockerfile.alphazero -t cartridge-alphazero .
@@ -12,7 +13,6 @@
 #
 # Or via docker-compose:
 #   docker compose up alphazero
-#   docker compose -f docker-compose.yml -f docker-compose.k8s.yml up alphazero  # S3 model storage
 
 # ============================================
 # Stage 1: Build Rust Actor
@@ -51,7 +51,7 @@ RUN if [ -z "$CARGO_FEATURES" ]; then \
     fi
 
 # The evaluation binary. The trainer shells out to it for every evaluation, so
-# without it in the image `trainer loop` cannot gate promotions at all. Its
+# without it the cartridge's `loop` command cannot gate promotions. Its
 # features are actor-independent (ONNX is always on), hence no CARGO_FEATURES.
 WORKDIR /app/engine
 RUN cargo build --release -p evaluator
@@ -74,9 +74,9 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 # git is required: the trainer declares `crucible` as a pinned git dependency.
 
-# Create non-root user for security
-# Let system assign UID automatically to avoid conflicts with existing UIDs
-RUN useradd -m cartridge
+# Pin the runtime identity so Kubernetes can grant the mounted data volume to
+# exactly the same non-root user used by the image.
+RUN useradd --create-home --uid 1000 --user-group cartridge
 
 # Create symlinks for python/pip commands
 RUN ln -sf /usr/bin/python3 /usr/bin/python
@@ -88,9 +88,6 @@ COPY --from=rust-builder /app/actor/target/release/actor /app/actor
 
 # Copy the evaluation binary (see ENV CARTRIDGE_EVAL_BINARY below)
 COPY --from=rust-builder /app/engine/target/release/cartridge-eval /app/cartridge-eval
-
-# Copy SQL schema files (needed by PostgreSQL storage backend)
-COPY sql/ /usr/local/sql/
 
 # Copy config defaults (used by Python trainer)
 COPY config.defaults.toml ./
@@ -110,7 +107,7 @@ RUN pip install --no-cache-dir --break-system-packages ./trainer
 # image. Without this, a packaging regression (a missing package-data entry, or
 # a dropped crucible dependency) passes every CI job and fails only in
 # production, at container start.
-RUN python -c "import crucible; from trainer.game_config import get_config; get_config('tictactoe')"
+RUN python -c "import crucible; from trainer.algorithms.registry import get_algorithm; from trainer.environment_catalog import get_environment; algorithm = get_algorithm('alphazero_board_v1'); algorithm.compatibility(get_environment('tictactoe')).require_compatible()"
 
 # Set before the smoke check below so it resolves the binary exactly the way
 # the running container will, rather than via the fallback candidate paths.
@@ -123,41 +120,28 @@ RUN python -c "\
 from trainer.evaluator import evaluate, find_eval_binary; \
 from trainer.players import RandomPlayer; \
 print('eval binary:', find_eval_binary()); \
-r = evaluate(player1=RandomPlayer(), player2=RandomPlayer(), env_id='tictactoe', num_games=2); \
+r = evaluate(player1=RandomPlayer(), player2=RandomPlayer(), algorithm_id='alphazero_board_v1', env_id='tictactoe', num_games=2); \
 assert r.games_played == 2, r"
 
-# Create data directory with correct permissions
-RUN mkdir -p /app/data/models && chown -R cartridge:cartridge /app/data
+# Create the root under which the trainer creates immutable runtime profiles:
+# profiles/{algorithm_id}/{env_id}/v{env_contract_version}.
+RUN mkdir -p /app/data && chown -R cartridge:cartridge /app/data
 
 # ============================================
 # Environment Configuration
 # ============================================
 # Actor binary location (used by orchestrator)
 ENV ACTOR_BINARY="/app/actor"
+ENV CARTRIDGE_COMMON_DATA_DIR="/app/data"
 
-# Data paths
-ENV DATA_DIR="/app/data"
-
-# AlphaZero training defaults
-# Note: ENV_ID is intentionally NOT set here - it should come from
-# CARTRIDGE_COMMON_ENV_ID in docker-compose or config.toml to ensure
-# consistency across all services (actor, trainer, web).
-ENV ALPHAZERO_ITERATIONS="100"
-ENV ALPHAZERO_EPISODES="500"
-ENV ALPHAZERO_STEPS="1000"
-ENV ALPHAZERO_BATCH_SIZE="64"
-ENV ALPHAZERO_LR="0.001"
-ENV ALPHAZERO_DEVICE="cpu"
-
-# Evaluation enabled by default (every iteration)
-ENV ALPHAZERO_EVAL_INTERVAL="1"
-ENV ALPHAZERO_EVAL_GAMES="50"
-
-ENV ALPHAZERO_CHECKPOINT_INTERVAL="100"
-ENV ALPHAZERO_START_ITERATION="1"
+# Training, evaluation, environment, and algorithm defaults come exclusively
+# from config.toml and CARTRIDGE_* overrides.
 
 # Run as non-root user
 USER cartridge
 
-# Run the synchronized training loop
-ENTRYPOINT ["python", "-m", "trainer", "loop"]
+# Keep the module as the stable image entrypoint and put the canonical
+# cartridge selection before the command. Supplying arguments to `docker run`
+# replaces CMD, which also makes one-off commands use the same CLI surface.
+ENTRYPOINT ["python", "-m", "trainer"]
+CMD ["--algorithm", "alphazero_board_v1", "loop"]

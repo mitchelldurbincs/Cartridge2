@@ -1,4 +1,4 @@
-"""Smoke tests for the trainer.
+"""Smoke tests for the AlphaZero learner.
 
 Run with: pytest tests/test_smoke.py -v
 
@@ -14,8 +14,24 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from trainer.algorithms.alphazero_board_v1 import ALGORITHM_ID, DESCRIPTOR
+from trainer.config import AlphaZeroLearnerConfig
 from trainer.network import AlphaZeroLoss, PolicyValueNetwork, create_network
-from trainer.trainer import Trainer, TrainerConfig
+from trainer.storage import ReplayProfile, ReplaySelection
+from trainer.trainer import AlphaZeroLearner
+
+
+def alphazero_profile(env_id: str = "tictactoe") -> ReplayProfile:
+    return ReplayProfile(
+        env_id=env_id,
+        env_contract_version=1,
+        algorithm_id=ALGORITHM_ID,
+        experience_schema=DESCRIPTOR.components.experience_schema,
+    )
+
+
+def alphazero_selection(env_id: str = "tictactoe") -> ReplaySelection:
+    return ReplaySelection(alphazero_profile(env_id), "a" * 64, None)
 
 
 class TestNetwork:
@@ -107,17 +123,17 @@ class TestAlphaZeroLoss:
         assert "loss/total" in metrics
 
 
-class TestTrainerConfig:
+class TestAlphaZeroLearnerConfig:
     """Tests for trainer configuration."""
 
     def test_config_defaults(self):
-        config = TrainerConfig()
+        config = AlphaZeroLearnerConfig()
         assert config.model_dir == "./data/models"
         assert config.batch_size == 64
         assert config.total_steps == 1000
 
     def test_config_custom(self):
-        config = TrainerConfig(
+        config = AlphaZeroLearnerConfig(
             model_dir="/custom/models",
             batch_size=128,
             total_steps=500,
@@ -127,35 +143,35 @@ class TestTrainerConfig:
         assert config.total_steps == 500
 
 
-class TestTrainer:
+class TestAlphaZeroLearner:
     """Tests for the trainer.
 
     Note: Integration tests requiring PostgreSQL are skipped by default.
     Set CARTRIDGE_STORAGE_POSTGRES_URL to run them.
     """
 
-    def test_trainer_creation_with_mock_replay(self):
-        """Test trainer creation with mocked replay buffer."""
+    def test_learner_opens_its_explicit_experience_profile(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             model_dir = Path(tmpdir) / "models"
             stats_path = Path(tmpdir) / "stats.json"
 
-            config = TrainerConfig(
+            config = AlphaZeroLearnerConfig(
                 model_dir=str(model_dir),
                 stats_path=str(stats_path),
                 total_steps=10,
+                replay_selection=alphazero_selection(),
             )
 
-            # Mock the replay buffer creation to avoid needing PostgreSQL
-            with patch("trainer.trainer.create_replay_buffer") as mock_factory:
+            with patch("trainer.trainer.create_replay_store") as mock_factory:
                 mock_replay = MagicMock()
-                mock_replay.get_metadata.return_value = None
-                mock_replay.count.return_value = 0
                 mock_factory.return_value = mock_replay
 
-                trainer = Trainer(config)
+                trainer = AlphaZeroLearner(config)
                 assert trainer.network is not None
                 assert model_dir.exists()
+                assert trainer.replay_profile == alphazero_profile()
+                assert trainer._create_replay_store() is mock_replay
+                mock_factory.assert_called_once_with(alphazero_selection())
 
     @pytest.mark.skipif(
         not os.environ.get("CARTRIDGE_STORAGE_POSTGRES_URL"),
@@ -167,14 +183,15 @@ class TestTrainer:
             model_dir = Path(tmpdir) / "models"
             stats_path = Path(tmpdir) / "stats.json"
 
-            config = TrainerConfig(
+            config = AlphaZeroLearnerConfig(
                 model_dir=str(model_dir),
                 stats_path=str(stats_path),
                 total_steps=10,
                 max_wait=5.0,  # Short timeout for testing
+                replay_selection=alphazero_selection(),
             )
 
-            trainer = Trainer(config)
+            trainer = AlphaZeroLearner(config)
             assert trainer.network is not None
 
 
@@ -183,26 +200,23 @@ class TestStorageFactory:
 
     def test_factory_requires_postgres_url(self):
         """Test that factory raises error without PostgreSQL URL."""
-        from trainer.storage import create_replay_buffer
+        from trainer.storage import create_replay_store
 
-        # Clear any existing env vars and prevent central config fallback
-        # (config.toml may provide a postgres_url, so we must block that path too)
-        with patch.dict(os.environ, {}, clear=True), patch(
-            "trainer.central_config.get_config", side_effect=Exception("no config")
-        ):
+        with patch.dict(os.environ, {}, clear=True):
             with pytest.raises(
                 ValueError, match="PostgreSQL connection string required"
             ):
-                create_replay_buffer()
+                create_replay_store(alphazero_selection())
 
     @pytest.mark.skipif(
         not os.environ.get("CARTRIDGE_STORAGE_POSTGRES_URL"),
         reason="PostgreSQL not configured",
     )
     def test_factory_with_postgres(self):
-        """Test factory creates PostgresReplayBuffer with valid URL."""
-        from trainer.storage import PostgresReplayBuffer, create_replay_buffer
+        """Test factory creates PostgresReplayStore with valid URL."""
+        from trainer.storage import PostgresReplayStore, create_replay_store
 
-        buffer = create_replay_buffer()
-        assert isinstance(buffer, PostgresReplayBuffer)
-        buffer.close()
+        store = create_replay_store(alphazero_selection())
+        assert isinstance(store, PostgresReplayStore)
+        assert store.selection == alphazero_selection()
+        store.close()

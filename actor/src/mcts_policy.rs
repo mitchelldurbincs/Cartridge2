@@ -4,7 +4,8 @@
 //! an ONNX neural network evaluator to select actions.
 
 use anyhow::{anyhow, Result};
-use engine_core::{EngineContext, LegalMask};
+use engine_core::board_profile::LegalMask;
+use engine_core::{EngineContext, ErasedTimestep};
 use mcts::{run_mcts, MctsConfig, OnnxEvaluator, SearchResult, SearchStats};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -12,7 +13,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tracing::{debug, warn};
 
-/// Result from MCTS policy selection, including training data
+/// Result from MCTS policy selection, including the policy training target.
 pub struct MctsPolicyResult {
     /// Selected action as bytes
     pub action: Vec<u8>,
@@ -21,8 +22,6 @@ pub struct MctsPolicyResult {
     /// The raw root visit distribution, unaffected by the temperature
     /// schedule below — that only decides which action gets played.
     pub policy: Vec<f32>,
-    /// Value estimate from MCTS root
-    pub value: f32,
     /// Performance statistics from the MCTS search
     pub stats: SearchStats,
 }
@@ -69,21 +68,21 @@ impl std::fmt::Debug for MctsPolicy {
 impl MctsPolicy {
     /// Create a new MCTS policy without a model loaded
     pub fn new(env_id: String, num_actions: usize, obs_size: usize) -> Self {
-        // Pre-create the simulation context to avoid repeated registry lookups
-        let sim_ctx = EngineContext::new(&env_id);
         let config = MctsConfig::for_training();
         let base_temp = config.temperature;
         Self {
             env_id,
             base_temperature: base_temp,
-            late_temperature: 0.1, // More deterministic in late game
-            temp_threshold: 0,     // Disabled by default (0 = no threshold)
+            // Scheduling is disabled until the caller supplies an explicit
+            // threshold and late temperature.
+            late_temperature: base_temp,
+            temp_threshold: 0, // Disabled by default (0 = no threshold)
             config,
             num_actions,
             obs_size,
             evaluator: Arc::new(RwLock::new(None)),
             rng: ChaCha20Rng::from_entropy(),
-            sim_ctx,
+            sim_ctx: None,
         }
     }
 
@@ -133,7 +132,8 @@ impl MctsPolicy {
     ///
     /// # Arguments
     /// * `state` - Current game state bytes
-    /// * `obs` - Current observation bytes
+    /// * `timestep` - Current algorithm-neutral timestep; the MCTS cartridge
+    ///   validates and extracts its single active-agent observation
     /// * `legal_moves_mask` - Mask of legal actions (read from the observation)
     /// * `move_number` - Current move number in the game (0-indexed)
     ///
@@ -142,7 +142,7 @@ impl MctsPolicy {
     pub fn select_action(
         &mut self,
         state: &[u8],
-        obs: &[u8],
+        timestep: &ErasedTimestep,
         legal_moves_mask: &LegalMask,
         move_number: u32,
     ) -> Result<MctsPolicyResult> {
@@ -165,11 +165,19 @@ impl MctsPolicy {
             }
         };
 
-        // Use the pre-created simulation context (avoids repeated registry lookups)
+        // A simulation context is only needed once a model makes MCTS active.
+        // Actor startup has already validated the selected environment; lazy
+        // construction keeps the model-free fallback independent of registry
+        // initialization and still reuses one context for every search.
+        if self.sim_ctx.is_none() {
+            self.sim_ctx = Some(EngineContext::new(&self.env_id).map_err(|error| {
+                anyhow!("environment '{}' is unavailable: {error}", self.env_id)
+            })?);
+        }
         let sim_ctx = self
             .sim_ctx
             .as_mut()
-            .ok_or_else(|| anyhow!("Game '{}' not registered", self.env_id))?;
+            .expect("simulation context was initialized above");
 
         // Apply temperature schedule: use lower temperature for late-game moves
         let mut config = self.config.clone();
@@ -184,8 +192,7 @@ impl MctsPolicy {
             evaluator,
             config,
             state.to_vec(),
-            obs.to_vec(),
-            legal_moves_mask.clone(),
+            timestep.clone(),
             &mut self.rng,
         )
         .map_err(|e| anyhow!("MCTS search failed: {}", e))?;
@@ -230,7 +237,6 @@ impl MctsPolicy {
         Ok(MctsPolicyResult {
             action: action_bytes,
             policy: result.policy,
-            value: result.value,
             stats: result.stats,
         })
     }
@@ -264,7 +270,6 @@ impl MctsPolicy {
         Ok(MctsPolicyResult {
             action: action_bytes,
             policy,
-            value: 0.0,                    // No value estimate without model
             stats: SearchStats::default(), // No MCTS performed
         })
     }
@@ -275,7 +280,7 @@ mod tests {
     use super::*;
 
     fn setup() {
-        engine_games::register_all_games();
+        engine_games::register_all_environments();
     }
 
     #[test]
@@ -290,14 +295,14 @@ mod tests {
         setup();
 
         let mut policy = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 42);
-
-        // Create a dummy state/obs - in practice these come from the game
-        let state = vec![0u8; 10]; // TicTacToe state is about 10 bytes
-        let obs = vec![0u8; 29 * 4]; // 29 floats = 116 bytes
-        let legal_mask = LegalMask::from_u64(0b111111111, 9); // All 9 positions legal
+        let mut context = EngineContext::new("tictactoe").unwrap();
+        let reset = context.reset(42, &[]).unwrap();
+        let observation = reset.timestep.sole_observation().unwrap();
+        let board = context.metadata().require_board().unwrap().clone();
+        let legal_mask = board.legal_mask_from_obs(&observation.data).unwrap();
 
         // Without a model, should return random action
-        let result = policy.select_action(&state, &obs, &legal_mask, 0);
+        let result = policy.select_action(&reset.state, &reset.timestep, &legal_mask, 0);
         assert!(result.is_ok());
 
         let result = result.unwrap();
@@ -517,17 +522,6 @@ mod tests {
         assert_eq!(result.stats.total_time_us, 0);
         assert_eq!(result.stats.inference_time_us, 0);
         assert_eq!(result.stats.num_batches, 0);
-    }
-
-    #[test]
-    fn test_random_action_returns_neutral_value() {
-        let mut policy = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 42);
-        let legal_mask = LegalMask::from_u64(0b111111111, 9);
-
-        let result = policy.random_action(&legal_mask).unwrap();
-
-        // Without a model, value should be neutral (0.0)
-        assert!((result.value - 0.0).abs() < 1e-6);
     }
 
     // ========================================

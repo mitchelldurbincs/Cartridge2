@@ -80,7 +80,7 @@ fn test_draw_game() {
 #[test]
 fn test_observation_encoding() {
     let state = State::new();
-    let obs = observation_from_state(&state);
+    let obs = observation_from_state(&state).unwrap();
 
     // All board positions should be 0 initially
     assert_eq!(obs.board_view, [0.0; 18]);
@@ -95,21 +95,19 @@ fn test_game_trait_implementation() {
     let mut game = TicTacToe::new();
     let mut rng = ChaCha20Rng::seed_from_u64(42);
 
-    let (state, _obs) = game.reset(&mut rng, &[]);
+    let (state, _obs) = game.reset(&mut rng, &[]).unwrap();
     assert_eq!(state, State::new());
 
     let action: Action = 4;
-    let (_new_obs, reward, done, info) = game.step(&mut state.clone(), action, &mut rng);
+    let transition = game.step(&mut state.clone(), action, &mut rng).unwrap();
 
     // Should not be done after one move
-    assert!(!done);
+    assert!(!transition.terminated);
     // Reward should be 0 for ongoing game
-    assert_eq!(reward, 0.0);
+    assert_eq!(transition.actor_reward, 0.0);
 
-    // Mask should no longer include the center position
-    assert_eq!(info & 0x1FF, 0x1FFu64 & !(1u64 << 4));
-    // Next player should be O (value 2)
-    assert_eq!((info >> 16) & 0xF, 2);
+    assert_eq!(transition.observation.legal_moves[4], 0.0);
+    assert_eq!(transition.observation.current_player, [0.0, 1.0]);
 }
 
 #[test]
@@ -145,10 +143,10 @@ fn test_observation_byte_encoding() {
         current_player: 2,
         winner: 0,
     };
-    let obs = observation_from_state(&state);
+    let obs = observation_from_state(&state).unwrap();
 
     let mut buf = Vec::new();
-    TicTacToe::encode_obs(&obs, &mut buf).unwrap();
+    TicTacToe::encode_observation(&obs, &mut buf).unwrap();
 
     // Should be 29 * 4 = 116 bytes (29 f32 values)
     assert_eq!(buf.len(), 116);
@@ -160,10 +158,10 @@ fn test_engine_capabilities() {
     let caps = game.capabilities();
 
     assert_eq!(caps.id.env_id, "tictactoe");
-    assert_eq!(caps.max_horizon, 9);
+    assert_eq!(caps.max_horizon, Some(9));
 
-    match caps.action_space {
-        ActionSpace::Discrete(n) => assert_eq!(n, 9),
+    match caps.action_space(AgentId(1)) {
+        Some(ActionSpace::Discrete { size }) => assert_eq!(*size, 9),
         ref other => {
             panic!("Expected discrete action space, but got {:?}", other);
         }
@@ -202,23 +200,6 @@ fn test_invalid_action_decoding() {
     let buf = 9u32.to_le_bytes().to_vec(); // Position out of bounds
     let result = TicTacToe::decode_action(&buf);
     assert!(result.is_err());
-}
-
-#[test]
-fn test_info_bits_encoding() {
-    let state = State {
-        board: [1, 2, 1, 0, 2, 0, 0, 0, 0],
-        current_player: 1,
-        winner: 0,
-    };
-
-    let info = TicTacToe::compute_info_bits(&state);
-
-    assert_eq!(info & 0x1FF, state.legal_moves_mask() as u64);
-    assert_eq!((info >> 16) & 0xF, state.current_player as u64);
-    assert_eq!((info >> 20) & 0xF, state.winner as u64);
-    // Four occupied squares
-    assert_eq!((info >> 24) & 0xF, 4);
 }
 
 // =========================================================================
@@ -306,6 +287,39 @@ fn test_legal_moves_mask_consistency() {
     }
 }
 
+#[test]
+fn test_observation_legal_mask_exactly_matches_step_acceptance() {
+    let states = [
+        State::new(),
+        State::new().make_move(4).make_move(0).make_move(8),
+        State::new()
+            .make_move(0)
+            .make_move(3)
+            .make_move(1)
+            .make_move(4)
+            .make_move(2),
+    ];
+
+    for state in states {
+        let observation = observation_from_state(&state).unwrap();
+        for action in 0..9u8 {
+            let mut candidate = state;
+            let before = candidate;
+            let accepted = TicTacToe::new()
+                .step(&mut candidate, action, &mut ChaCha20Rng::seed_from_u64(1))
+                .is_ok();
+            assert_eq!(
+                accepted,
+                observation.legal_moves[action as usize] == 1.0,
+                "action {action} disagrees with the observation mask for {state:?}"
+            );
+            if !accepted {
+                assert_eq!(candidate, before, "rejected action mutated the state");
+            }
+        }
+    }
+}
+
 /// Draw detection: full board with no winner
 #[test]
 fn test_draw_detection_comprehensive() {
@@ -338,28 +352,31 @@ fn test_reward_symmetry() {
     let mut rng = ChaCha20Rng::seed_from_u64(123);
 
     // Play game where X wins (top row)
-    let (mut state, _) = game.reset(&mut rng, &[]);
+    let (mut state, _) = game.reset(&mut rng, &[]).unwrap();
 
     // X at 0
-    let (_, r0, _, _) = game.step(&mut state, 0, &mut rng);
-    assert_eq!(r0, 0.0); // No winner yet
+    let transition = game.step(&mut state, 0, &mut rng).unwrap();
+    assert_eq!(transition.actor_reward, 0.0); // No winner yet
 
     // O at 3
-    let (_, r1, _, _) = game.step(&mut state, 3, &mut rng);
-    assert_eq!(r1, 0.0);
+    let transition = game.step(&mut state, 3, &mut rng).unwrap();
+    assert_eq!(transition.actor_reward, 0.0);
 
     // X at 1
-    let (_, r2, _, _) = game.step(&mut state, 1, &mut rng);
-    assert_eq!(r2, 0.0);
+    let transition = game.step(&mut state, 1, &mut rng).unwrap();
+    assert_eq!(transition.actor_reward, 0.0);
 
     // O at 4
-    let (_, r3, _, _) = game.step(&mut state, 4, &mut rng);
-    assert_eq!(r3, 0.0);
+    let transition = game.step(&mut state, 4, &mut rng).unwrap();
+    assert_eq!(transition.actor_reward, 0.0);
 
     // X at 2 - X wins!
-    let (_, r4, done, _) = game.step(&mut state, 2, &mut rng);
-    assert!(done);
-    assert_eq!(r4, 1.0, "X (previous player) should get +1 for winning");
+    let transition = game.step(&mut state, 2, &mut rng).unwrap();
+    assert!(transition.terminated);
+    assert_eq!(
+        transition.actor_reward, 1.0,
+        "X (previous player) should get +1 for winning"
+    );
 }
 
 /// No moves allowed on finished game
@@ -453,9 +470,9 @@ fn test_observation_encoding_roundtrip() {
     ];
 
     for state in &states {
-        let obs = observation_from_state(state);
+        let obs = observation_from_state(state).unwrap();
         let mut buf = Vec::new();
-        TicTacToe::encode_obs(&obs, &mut buf).expect("encode should succeed");
+        TicTacToe::encode_observation(&obs, &mut buf).expect("encode should succeed");
         assert_eq!(
             buf.len(),
             116,
@@ -502,7 +519,7 @@ fn test_random_games_invariants() {
     for seed in 0..50 {
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
         let mut game = TicTacToe::new();
-        let (mut state, _) = game.reset(&mut rng, &[]);
+        let (mut state, _) = game.reset(&mut rng, &[]).unwrap();
 
         let mut move_count = 0;
         let max_moves = 9; // TicTacToe has at most 9 moves
@@ -520,7 +537,9 @@ fn test_random_games_invariants() {
             let action: Action = legal[rng.gen_range(0..legal.len())];
 
             let prev_player = state.current_player;
-            let (_, reward, done, info) = game.step(&mut state, action, &mut rng);
+            let transition = game.step(&mut state, action, &mut rng).unwrap();
+            let reward = transition.actor_reward;
+            let done = transition.terminated;
 
             move_count += 1;
 
@@ -556,12 +575,17 @@ fn test_random_games_invariants() {
                 );
             }
 
-            // Info bits should match state
-            let mask_from_info = (info & 0x1FF) as u16;
             assert_eq!(
-                mask_from_info,
+                transition
+                    .observation
+                    .legal_moves
+                    .iter()
+                    .enumerate()
+                    .fold(0u16, |mask, (index, value)| {
+                        mask | (u16::from(*value == 1.0) << index)
+                    }),
                 state.legal_moves_mask(),
-                "Info mask should match state (seed={})",
+                "Observation mask should match state (seed={})",
                 seed
             );
         }

@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .game_config import GameConfig
+from .algorithms.alphazero_board_v1 import AlphaZeroGameConfig
 from .network import BasePolicyValueNetwork
 
 
@@ -63,13 +63,13 @@ class ConvPolicyValueNetwork(BasePolicyValueNetwork):
     player, -1 for second player).
     """
 
-    def __init__(self, config: GameConfig):
+    def __init__(self, config: AlphaZeroGameConfig):
         super().__init__()
 
         # Only plain ints are retained, never the config object itself: the
         # network is then independent of which config type it was built from,
         # and callers cannot accidentally pass one that lacks the accessor
-        # methods (storage.GameMetadata describes the same games but has none).
+        # methods (the generated environment catalog remains authoritative).
         self.obs_size = config.obs_size
         self.action_size = config.num_actions
         self.board_height = config.board_height
@@ -79,7 +79,7 @@ class ConvPolicyValueNetwork(BasePolicyValueNetwork):
         # player-to-move plane for games with absolute (seat-fixed) board
         # encodings. Player-relative observations must not see the seat:
         # it is a side channel the value head can exploit (see
-        # GameConfig.player_relative_obs).
+        # AlphaZeroGameConfig.player_relative_obs).
         self.board_planes = config.obs_channels
         self.player_relative_obs = config.player_relative_obs
         self.input_channels = self.board_planes + (0 if self.player_relative_obs else 1)

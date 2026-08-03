@@ -1,6 +1,7 @@
 # games-tictactoe
 
-TicTacToe implementation for Cartridge2. Reference game demonstrating the engine-core Game trait pattern.
+TicTacToe implementation for Cartridge2. Reference implementation of the
+narrow `BoardGame` profile, adapted into the generic `Environment` ABI.
 
 ## Overview
 
@@ -13,7 +14,7 @@ A complete TicTacToe game with:
 ## Usage
 
 ```rust
-use engine_core::EngineContext;
+use engine_core::{AgentId, EngineContext};
 use games_tictactoe::register_tictactoe;
 
 // Register the game
@@ -29,8 +30,9 @@ let reset = ctx.reset(42, &[]).unwrap();
 let action = 4u32.to_le_bytes().to_vec();
 let step = ctx.step(&reset.state, &action).unwrap();
 
-// Check result
-println!("Done: {}, Reward: {}", step.done, step.reward);
+// Read the generic per-agent outcome and episode status.
+println!("Episode: {:?}", step.timestep.episode);
+println!("P1 reward: {:?}", step.timestep.reward_for(AgentId(1)));
 ```
 
 ## Game Specification
@@ -69,9 +71,13 @@ Integer 0-8 representing board position:
 - **-1.0**: Loss
 - **0.0**: Draw or game continues
 
-### Info Bits
+### Board adapter info
 
-The `info` field (u64) encodes the legal move mask in the lower 9 bits:
+The narrow `BoardGame` transition packs an internal `u64` whose lower nine bits
+encode the legal move mask. The generic ABI exposes auxiliary data as opaque
+`timestep.info` bytes; algorithms must use the observation's declared legal-mask
+offset instead of depending on this layout.
+
 - Bit N is set if position N is a legal move
 - Example: `0b111111111` = all positions legal (empty board)
 
@@ -87,13 +93,13 @@ Action is encoded as 4 bytes (little-endian u32).
 ## Testing
 
 ```bash
-cargo test
+cargo test --manifest-path engine/Cargo.toml -p games-tictactoe
 ```
 
 ## Benchmarks
 
 ```bash
-cargo bench
+cargo bench --manifest-path engine/Cargo.toml -p games-tictactoe
 ```
 
 Benchmarks include:

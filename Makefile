@@ -37,19 +37,22 @@ endif
 ITERATIONS       ?= 50
 EPISODES         ?= 500
 STEPS            ?= 400
+ALGORITHM        ?= alphazero_board_v1
+ENV_ID           ?= tictactoe
+POSTGRES_URL     ?= postgresql://cartridge:cartridge@localhost:5432/cartridge
 
 .PHONY: help setup setup-db setup-trainer setup-actor setup-frontend \
         train play web frontend \
         test test-engine test-actor test-web test-trainer \
         lint lint-rust lint-python lint-frontend \
-        build build-actor build-eval build-web game-manifest \
-        clean clean-data clean-models clean-all \
+        build build-actor build-eval build-web environment-manifest \
+        clean clean-profile clean-all \
         db-start db-stop db-reset
 
 # --- Help ---
 
 help:
-	@echo "Cartridge2 - AlphaZero Training Platform"
+	@echo "Cartridge2 - Algorithm-Cartridge RL Platform"
 	@echo ""
 	@echo "Setup (run once):"
 	@echo "  make setup          - Full setup: DB + trainer + actor + frontend"
@@ -60,7 +63,7 @@ help:
 	@echo ""
 	@echo "Training:"
 	@echo "  make train          - Run AlphaZero training loop"
-	@echo "  make train ITERATIONS=100 EPISODES=1000 STEPS=800"
+	@echo "  make train ENV_ID=connect4 ITERATIONS=100 EPISODES=1000 STEPS=800"
 	@echo ""
 	@echo "Play:"
 	@echo "  make play           - Start web server + frontend dev server"
@@ -69,10 +72,11 @@ help:
 	@echo "  make test           - Run all tests"
 	@echo "  make lint           - Run all linters"
 	@echo "  make build          - Build all Rust binaries (release)"
+	@echo "  make environment-manifest - Regenerate the strict environment catalog"
 	@echo ""
 	@echo "Cleanup:"
-	@echo "  make clean          - Remove training data and models"
-	@echo "  make db-reset       - Clear replay buffer in PostgreSQL"
+	@echo "  make clean          - Remove the selected immutable runtime profile"
+	@echo "  make db-reset       - Delete every replay collection for the selected profile"
 
 # --- One-time setup ---
 
@@ -115,20 +119,20 @@ setup-frontend:
 
 build: build-actor build-eval build-web
 
-# Regenerate the game-metadata manifest the Python trainer reads. The engine is
-# the source of truth for board dimensions, action counts and observation
-# layout; this renders them to trainer/src/trainer/game_metadata.json.
-# `cargo test` fails if the committed file drifts from the game crates.
-game-manifest:
-	@echo "--- Regenerating game metadata manifest ---"
-	$(CARGO) run -q --manifest-path engine/Cargo.toml --bin gen-game-manifest
+# Regenerate the environment/algorithm manifest the Python trainer reads. The
+# engine owns generic capabilities and optional presentation profiles; the
+# algorithm catalog owns compatibility. `cargo test` rejects catalog drift.
+environment-manifest:
+	@echo "--- Regenerating environment manifest ---"
+	$(CARGO) run -q --manifest-path engine/Cargo.toml --bin generate-environment-manifest
 
 build-actor:
 	@echo "--- Building actor (release) $(CARGO_FEATURES) ---"
 	cd actor && $(CARGO) build --release $(CARGO_FEATURES)
 
 # The evaluation binary the trainer shells out to for every eval. Without it
-# `trainer loop` cannot gate promotions; see trainer/src/trainer/evaluator.py.
+# the cartridge's `loop` command cannot gate promotions; see
+# trainer/src/trainer/evaluator.py.
 build-eval:
 	@echo "--- Building cartridge-eval (release) ---"
 	$(CARGO) build --release --manifest-path engine/Cargo.toml -p evaluator
@@ -140,10 +144,11 @@ build-web:
 # --- Training ---
 
 data:
-	@mkdir -p data data/models
+	@mkdir -p data
 
 train: data
-	$(VENV_DIR)/bin/python -m trainer loop \
+	$(VENV_DIR)/bin/python -m trainer --algorithm $(ALGORITHM) loop \
+		--env-id $(ENV_ID) \
 		--iterations $(ITERATIONS) \
 		--episodes $(EPISODES) \
 		--steps $(STEPS)
@@ -156,10 +161,10 @@ play:
 	@$(MAKE) -j2 web frontend
 
 web:
-	cd web && $(CARGO) run
+	$(CARGO) run --manifest-path web/Cargo.toml
 
 frontend:
-	cd web/frontend && $(NPM) run dev
+	$(NPM) --prefix web/frontend run dev
 
 # --- Testing ---
 
@@ -169,7 +174,7 @@ test-engine:
 	$(CARGO) test --manifest-path engine/Cargo.toml
 
 test-actor:
-	$(CARGO) test --manifest-path actor/Cargo.toml
+	$(CARGO) test --manifest-path actor/Cargo.toml --all-features
 
 test-web:
 	$(CARGO) test --manifest-path web/Cargo.toml
@@ -182,16 +187,17 @@ test-trainer:
 lint: lint-rust lint-python
 
 lint-rust:
-	$(CARGO) fmt --check --manifest-path engine/Cargo.toml
+	$(CARGO) fmt --all --check --manifest-path engine/Cargo.toml
 	$(CARGO) fmt --check --manifest-path actor/Cargo.toml
 	$(CARGO) fmt --check --manifest-path web/Cargo.toml
 	$(CARGO) clippy --manifest-path engine/Cargo.toml --all-targets -- -D warnings
-	$(CARGO) clippy --manifest-path actor/Cargo.toml --all-targets -- -D warnings
-	$(CARGO) clippy --manifest-path web/Cargo.toml --all-targets -- -D warnings
+	$(CARGO) clippy --manifest-path engine/Cargo.toml -p model-watcher --all-targets --all-features -- -D warnings
+	$(CARGO) clippy --manifest-path actor/Cargo.toml --all-targets --all-features -- -D warnings
+	$(CARGO) clippy --manifest-path web/Cargo.toml --all-targets --all-features -- -D warnings
 
 lint-python:
-	$(VENV_DIR)/bin/python -m ruff check trainer/src/
-	$(VENV_DIR)/bin/python -m black --check trainer/src/
+	$(VENV_DIR)/bin/python -m ruff check trainer/src/ trainer/tests/ trainer/smoke_test.py
+	$(VENV_DIR)/bin/python -m black --check trainer/src/ trainer/tests/ trainer/smoke_test.py
 
 lint-frontend:
 	cd web/frontend && $(NPM) run check
@@ -213,20 +219,29 @@ else
 endif
 
 db-reset:
-	@echo "Clearing replay buffer..."
-	psql postgresql://cartridge:cartridge@localhost:5432/cartridge \
-		-c "DELETE FROM transitions;" 2>/dev/null || true
-	@echo "Replay buffer cleared."
+	@echo "Deleting every replay collection for $(ALGORITHM)/$(ENV_ID)..."
+	@identity="$$( $(VENV_DIR)/bin/python -c \
+		'from trainer.environment_catalog import get_algorithm_descriptor; from trainer.runtime_profile import resolve_runtime_profile; import sys; algorithm = get_algorithm_descriptor(sys.argv[1]); profile = resolve_runtime_profile(sys.argv[1], sys.argv[2]); print(f"{profile.env_contract_version}:{algorithm.components.experience_schema}")' \
+		"$(ALGORITHM)" "$(ENV_ID)" )"; \
+	env_contract_version="$${identity%%:*}"; \
+	experience_schema="$${identity#*:}"; \
+	psql "$(POSTGRES_URL)" -v ON_ERROR_STOP=1 \
+		-v algorithm_id="$(ALGORITHM)" \
+		-v env_id="$(ENV_ID)" \
+		-v env_contract_version="$${env_contract_version}" \
+		-v experience_schema="$${experience_schema}" \
+		-c "DELETE FROM replay_records WHERE algorithm_id = :'algorithm_id' AND env_id = :'env_id' AND env_contract_version = :'env_contract_version'::BIGINT AND experience_schema = :'experience_schema';"
 
 # --- Cleanup ---
 
-clean: clean-data clean-models
+clean: clean-profile
 
-clean-data:
-	rm -f data/stats.json data/loop_stats.json data/eval_stats.json data/best_model.json
+clean-profile:
+	@profile_path="$$( $(VENV_DIR)/bin/python -c \
+		'from trainer.central_config import get_config; from trainer.runtime_profile import resolve_runtime_profile; import sys; print(resolve_runtime_profile(sys.argv[1], sys.argv[2]).data_dir(get_config().data_root))' \
+		"$(ALGORITHM)" "$(ENV_ID)" )"; \
+	echo "Removing $${profile_path}"; \
+	rm -rf -- "$${profile_path}"
 
-clean-models:
-	rm -f data/models/*.onnx data/models/*.onnx.data data/models/*.pt
-
-clean-all: clean-data clean-models
+clean-all:
 	rm -rf data/

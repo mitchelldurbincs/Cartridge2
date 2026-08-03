@@ -12,14 +12,34 @@ import argparse
 import logging
 from pathlib import Path
 
-from .central_config import get_config
+from .environment_catalog import get_environment
 from .registry import DEFAULT_PLAY_TEMPERATURE, PlayerRegistry, register_checkpoints
 from .tournament import run_tournament
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_REGISTRY_PATH = "./data/players.json"
-DEFAULT_RESULTS_PATH = "./data/tournament.json"
+_MAX_U32 = (1 << 32) - 1
+_MAX_U64 = (1 << 64) - 1
+
+
+def _positive_u32_argument(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a positive u32 integer") from exc
+    if not 1 <= parsed <= _MAX_U32:
+        raise argparse.ArgumentTypeError("expected a positive u32 integer")
+    return parsed
+
+
+def _u64_argument(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a nonnegative u64 integer") from exc
+    if not 0 <= parsed <= _MAX_U64:
+        raise argparse.ArgumentTypeError("expected a nonnegative u64 integer")
+    return parsed
 
 
 def add_register_players_arguments(parser: argparse.ArgumentParser) -> None:
@@ -29,14 +49,14 @@ def add_register_players_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--models-dir",
         type=str,
-        default=None,
-        help="Directory of ONNX checkpoints (default: the configured models dir)",
+        default=argparse.SUPPRESS,
+        help="Checkpoint repository root (default: selected runtime profile)",
     )
     parser.add_argument(
         "--registry",
         type=str,
-        default=DEFAULT_REGISTRY_PATH,
-        help="Player registry file",
+        default=argparse.SUPPRESS,
+        help="Player registry file (default: selected runtime profile)",
     )
     parser.add_argument(
         "--simulations",
@@ -51,12 +71,6 @@ def add_register_players_arguments(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_PLAY_TEMPERATURE,
         help="Sampling temperature. 0 makes a model deterministic, so two such "
         "players replay one identical game however many are scheduled",
-    )
-    parser.add_argument(
-        "--algorithm",
-        type=str,
-        default="alphazero",
-        help="Label recording how these players were trained",
     )
     parser.add_argument(
         "--replace",
@@ -76,18 +90,26 @@ def add_tournament_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--registry",
         type=str,
-        default=DEFAULT_REGISTRY_PATH,
-        help="Player registry file",
+        default=argparse.SUPPRESS,
+        help="Player registry file (default: selected runtime profile)",
     )
     parser.add_argument(
         "--output",
         type=str,
-        default=DEFAULT_RESULTS_PATH,
-        help="Where to write the results",
+        default=argparse.SUPPRESS,
+        help="Where to write the results (default: selected runtime profile)",
     )
-    parser.add_argument("--games", type=int, default=20, help="Games per pairing")
     parser.add_argument(
-        "--seed", type=int, default=42, help="Base RNG seed, shared by every pair"
+        "--games",
+        type=_positive_u32_argument,
+        default=20,
+        help="Games per pairing (positive u32)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=_u64_argument,
+        default=42,
+        help="Base RNG seed, shared by every pair (nonnegative u64)",
     )
     parser.add_argument(
         "--log-level",
@@ -98,21 +120,17 @@ def add_tournament_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def run_register_players(args: argparse.Namespace) -> int:
-    """Add every checkpoint in a models directory to the registry."""
-    models_dir = Path(args.models_dir) if args.models_dir else get_config().models_dir
-    if not models_dir.exists():
-        logger.error(f"Models directory not found: {models_dir}")
-        return 1
-
+    """Add every immutable checkpoint in a repository to the registry."""
+    model_root = Path(args.models_dir)
     registry_path = Path(args.registry)
-    registry = PlayerRegistry.load(registry_path)
-
     try:
+        environment = get_environment(args.env_id)
+        registry = PlayerRegistry.load(registry_path)
         added = register_checkpoints(
             registry,
             env_id=args.env_id,
-            models_dir=models_dir,
-            algorithm=args.algorithm,
+            model_root=model_root,
+            algorithm_id=args.algorithm,
             simulations=args.simulations,
             temperature=args.temperature,
             replace=args.replace,
@@ -122,10 +140,18 @@ def run_register_players(args: argparse.Namespace) -> int:
         return 1
 
     registry.save(registry_path)
+    profile_count = len(
+        registry.for_profile(
+            env_id=args.env_id,
+            env_contract_version=environment.contract_version,
+            algorithm_id=args.algorithm,
+        )
+    )
 
     logger.info(
-        f"Registered {len(added)} new player(s) from {models_dir}; "
-        f"{len(registry.for_env(args.env_id))} total for {args.env_id}"
+        f"Registered {len(added)} new player(s) from {model_root}; "
+        f"{profile_count} "
+        f"total for {args.algorithm}/{args.env_id}/v{environment.contract_version}"
     )
     for record in added:
         logger.info(f"  + {record.id}")
@@ -144,12 +170,12 @@ def run_tournament_command(args: argparse.Namespace) -> int:
         )
         return 1
 
-    registry = PlayerRegistry.load(registry_path)
-
     try:
+        registry = PlayerRegistry.load(registry_path)
         results = run_tournament(
             registry,
             env_id=args.env_id,
+            algorithm_id=args.algorithm,
             games_per_pair=args.games,
             seed=args.seed,
         )

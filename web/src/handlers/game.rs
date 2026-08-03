@@ -1,18 +1,19 @@
 //! Game-related handlers.
 
+use algorithm_core::BuiltinAlgorithm;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     Json,
 };
-use engine_core::create_game;
+use engine_core::EngineContext;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::game::GameSession;
 use crate::metrics;
 use crate::types::{
-    GameInfoResponse, GameStateResponse, GamesListResponse, MoveRequest, MoveResponse,
+    FirstPlayer, GameInfoResponse, GameStateResponse, GamesListResponse, MoveRequest, MoveResponse,
     NewGameRequest,
 };
 use crate::AppState;
@@ -66,11 +67,31 @@ pub async fn get_game_info(
         ));
     }
 
-    let game = create_game(&id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Game not found: {}", id)))?;
+    let context = EngineContext::new(&id).map_err(|error| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("Environment '{id}' is unavailable: {error}"),
+        )
+    })?;
+    BuiltinAlgorithm::AlphaZeroBoardV1
+        .compatibility(&context)
+        .require_compatible()
+        .map_err(|error| {
+            internal_error(
+                "Environment is not compatible with AlphaZero board serving",
+                error,
+            )
+        })?;
 
-    let metadata = game.metadata();
-    Ok(Json(metadata.into()))
+    let metadata = context.metadata();
+    Ok(Json(GameInfoResponse::try_from(metadata).map_err(
+        |error| {
+            internal_error(
+                "Environment is not compatible with AlphaZero board serving",
+                error,
+            )
+        },
+    )?))
 }
 
 /// Get current game state.
@@ -78,7 +99,9 @@ pub async fn get_game_state(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<GameStateResponse>, (StatusCode, String)> {
     let session = state.session.lock().await;
-    Ok(Json(session.to_response()))
+    Ok(Json(session.to_response().map_err(|error| {
+        internal_error("Invalid game observation", error)
+    })?))
 }
 
 /// Start a new game.
@@ -120,14 +143,20 @@ pub async fn new_game(
 
     // If bot goes first, bot is player 1, human is player 2
     // If player goes first, human is player 1, bot is player 2
-    if req.first == "bot" {
-        session.set_human_player(2); // Human plays as O (player 2)
+    if req.first == FirstPlayer::Bot {
+        session
+            .set_human_player(2)
+            .map_err(|e| internal_error("Invalid human board seat", e))?; // Human plays as O (player 2)
         timed_bot_move(&mut session)?;
     } else {
-        session.set_human_player(1); // Human plays as X (player 1) - default
+        session
+            .set_human_player(1)
+            .map_err(|e| internal_error("Invalid human board seat", e))?; // Human plays as X (player 1) - default
     }
 
-    Ok(Json(session.to_response()))
+    Ok(Json(session.to_response().map_err(|error| {
+        internal_error("Invalid game observation", error)
+    })?))
 }
 
 /// Make a move (player + bot response).
@@ -148,7 +177,10 @@ pub async fn make_move(
     }
 
     // Check if move is legal (this handles position validation based on game type)
-    if !session.is_legal_move(req.position) {
+    if !session
+        .is_legal_move(req.position)
+        .map_err(|error| internal_error("Invalid game observation", error))?
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             format!(
@@ -183,7 +215,9 @@ pub async fn make_move(
     }
 
     Ok(Json(MoveResponse {
-        state: session.to_response(),
+        state: session
+            .to_response()
+            .map_err(|error| internal_error("Invalid game observation", error))?,
         bot_move,
     }))
 }
@@ -198,10 +232,35 @@ pub async fn make_move(
 #[cfg(test)]
 mod tests {
     use crate::types::{
-        GameInfoResponse, GameStateResponse, GamesListResponse, MoveRequest, MoveResponse,
-        NewGameRequest,
+        FirstPlayer, GameInfoResponse, GameStateResponse, GamesListResponse, MoveRequest,
+        MoveResponse, NewGameRequest,
     };
-    use engine_core::GameMetadata;
+    use engine_core::board_profile::{BoardGameMetadata, BoardPlayerMetadata, BoardRenderer};
+    use engine_core::EnvironmentMetadata;
+
+    fn board_metadata(
+        id: &str,
+        display_name: &str,
+        dimensions: (usize, usize),
+        action_count: usize,
+        observation: (usize, usize),
+        players: [(&str, &str); 2],
+        renderer: BoardRenderer,
+    ) -> EnvironmentMetadata {
+        let (width, height) = dimensions;
+        let (elements, legal_actions_offset) = observation;
+        EnvironmentMetadata::new(id, display_name).with_board(
+            BoardGameMetadata::new(width, height, action_count)
+                .with_observation(elements, 2, legal_actions_offset, false)
+                .with_players(
+                    players
+                        .into_iter()
+                        .map(|(name, symbol)| BoardPlayerMetadata::new(name, symbol))
+                        .collect(),
+                )
+                .with_renderer(renderer),
+        )
+    }
 
     #[test]
     fn test_games_list_response_creation() {
@@ -222,13 +281,17 @@ mod tests {
 
     #[test]
     fn test_game_info_response_from_metadata() {
-        let metadata = GameMetadata::new("tictactoe", "Tic-Tac-Toe")
-            .with_board(3, 3)
-            .with_actions(9)
-            .with_observation(29, 18)
-            .with_players(2, vec!["X".to_string(), "O".to_string()], vec!['X', 'O']);
+        let metadata = board_metadata(
+            "tictactoe",
+            "Tic-Tac-Toe",
+            (3, 3),
+            9,
+            (29, 18),
+            [("X", "X"), ("O", "O")],
+            BoardRenderer::Grid,
+        );
 
-        let response: GameInfoResponse = metadata.into();
+        let response = GameInfoResponse::try_from(metadata).unwrap();
 
         assert_eq!(response.env_id, "tictactoe");
         assert_eq!(response.display_name, "Tic-Tac-Toe");
@@ -239,22 +302,22 @@ mod tests {
         assert_eq!(response.legal_mask_offset, 18);
         assert_eq!(response.player_count, 2);
         assert_eq!(response.player_names, vec!["X", "O"]);
-        assert_eq!(response.player_symbols, vec!['X', 'O']);
+        assert_eq!(response.player_symbols, vec!["X", "O"]);
     }
 
     #[test]
     fn test_game_info_response_connect4() {
-        let metadata = GameMetadata::new("connect4", "Connect Four")
-            .with_board(7, 6)
-            .with_actions(7)
-            .with_observation(93, 84)
-            .with_players(
-                2,
-                vec!["Red".to_string(), "Yellow".to_string()],
-                vec!['R', 'Y'],
-            );
+        let metadata = board_metadata(
+            "connect4",
+            "Connect Four",
+            (7, 6),
+            7,
+            (93, 84),
+            [("Red", "🔴"), ("Yellow", "🟡")],
+            BoardRenderer::DropColumn,
+        );
 
-        let response: GameInfoResponse = metadata.into();
+        let response = GameInfoResponse::try_from(metadata).unwrap();
 
         assert_eq!(response.env_id, "connect4");
         assert_eq!(response.display_name, "Connect Four");
@@ -266,7 +329,7 @@ mod tests {
     #[test]
     fn test_game_state_response_default() {
         let response = GameStateResponse {
-            cells: engine_core::BoardView::from_owners(&[0u8; 9], 1, 0).cells,
+            cells: engine_core::board_profile::BoardView::from_owners(&[0u8; 9], 1, 0).cells,
             current_player: 1,
             human_player: 1,
             winner: 0,
@@ -287,7 +350,12 @@ mod tests {
     #[test]
     fn test_game_state_response_game_over() {
         let response = GameStateResponse {
-            cells: engine_core::BoardView::from_owners(&[1, 1, 1, 0, 2, 0, 0, 0, 0], 1, 0).cells,
+            cells: engine_core::board_profile::BoardView::from_owners(
+                &[1, 1, 1, 0, 2, 0, 0, 0, 0],
+                1,
+                0,
+            )
+            .cells,
             current_player: 2,
             human_player: 1,
             winner: 1,
@@ -305,22 +373,22 @@ mod tests {
     #[test]
     fn test_new_game_request_defaults() {
         let req = NewGameRequest {
-            first: "player".to_string(),
+            first: FirstPlayer::Player,
             game: None,
         };
 
-        assert_eq!(req.first, "player");
+        assert_eq!(req.first, FirstPlayer::Player);
         assert!(req.game.is_none());
     }
 
     #[test]
     fn test_new_game_request_with_game() {
         let req = NewGameRequest {
-            first: "bot".to_string(),
+            first: FirstPlayer::Bot,
             game: Some("tictactoe".to_string()),
         };
 
-        assert_eq!(req.first, "bot");
+        assert_eq!(req.first, FirstPlayer::Bot);
         assert_eq!(req.game, Some("tictactoe".to_string()));
     }
 
@@ -333,7 +401,12 @@ mod tests {
     #[test]
     fn test_move_response_creation() {
         let state = GameStateResponse {
-            cells: engine_core::BoardView::from_owners(&[1, 0, 0, 0, 2, 0, 0, 0, 0], 1, 0).cells,
+            cells: engine_core::board_profile::BoardView::from_owners(
+                &[1, 0, 0, 0, 2, 0, 0, 0, 0],
+                1,
+                0,
+            )
+            .cells,
             current_player: 1,
             human_player: 1,
             winner: 0,
@@ -355,7 +428,12 @@ mod tests {
     #[test]
     fn test_move_response_no_bot_move() {
         let state = GameStateResponse {
-            cells: engine_core::BoardView::from_owners(&[1, 1, 1, 0, 2, 0, 0, 0, 0], 1, 0).cells,
+            cells: engine_core::board_profile::BoardView::from_owners(
+                &[1, 1, 1, 0, 2, 0, 0, 0, 0],
+                1,
+                0,
+            )
+            .cells,
             current_player: 2,
             human_player: 1,
             winner: 1,
@@ -376,7 +454,7 @@ mod tests {
     #[test]
     fn test_game_state_response_serialization() {
         let response = GameStateResponse {
-            cells: engine_core::BoardView::from_owners(&[0u8; 9], 1, 0).cells,
+            cells: engine_core::board_profile::BoardView::from_owners(&[0u8; 9], 1, 0).cells,
             current_player: 1,
             human_player: 1,
             winner: 0,
@@ -414,7 +492,7 @@ mod tests {
 
         assert!(result.is_ok());
         let req = result.unwrap();
-        assert_eq!(req.first, "player"); // Default value
+        assert_eq!(req.first, FirstPlayer::Player); // Default value
         assert!(req.game.is_none());
     }
 
@@ -425,14 +503,19 @@ mod tests {
 
         assert!(result.is_ok());
         let req = result.unwrap();
-        assert_eq!(req.first, "bot");
+        assert_eq!(req.first, FirstPlayer::Bot);
         assert_eq!(req.game, Some("connect4".to_string()));
     }
 
     #[test]
     fn test_move_response_serialization() {
         let state = GameStateResponse {
-            cells: engine_core::BoardView::from_owners(&[1, 0, 0, 0, 2, 0, 0, 0, 0], 1, 0).cells,
+            cells: engine_core::board_profile::BoardView::from_owners(
+                &[1, 0, 0, 0, 2, 0, 0, 0, 0],
+                1,
+                0,
+            )
+            .cells,
             current_player: 1,
             human_player: 1,
             winner: 0,

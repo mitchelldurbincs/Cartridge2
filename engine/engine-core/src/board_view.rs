@@ -14,6 +14,18 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Optional display projection returned by an environment.
+///
+/// Presentation is not planning state and is never required by an algorithm.
+/// `Custom` gives non-board cartridges a versioned payload without forcing a
+/// board-shaped schema into the environment ABI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Presentation {
+    Board { view: BoardView },
+    Custom { contract: String, payload: Vec<u8> },
+}
+
 /// Terrain or structure occupying a cell.
 ///
 /// The union of what the bundled games need, not an open extension point —

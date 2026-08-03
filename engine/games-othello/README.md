@@ -17,7 +17,7 @@ use games_othello::register_othello;
 
 register_othello();
 let mut ctx = EngineContext::new("othello").unwrap();
-let reset = ctx.reset(42, &[]);
+let reset = ctx.reset(42, &[]).unwrap();
 ```
 
 ## Game Specification
@@ -59,7 +59,12 @@ u32 little-endian. Values 0-63 are board positions, 64 is pass.
 - Game ends when both players pass consecutively (pass count reaches 2)
 - Winner is the player with more pieces; equal counts = draw
 
-### Info Bits (u64)
+### Board adapter info
+
+The narrow `BoardGame` transition packs an internal `u64` with this layout. The
+generic ABI exposes auxiliary data as opaque `timestep.info` bytes; algorithms
+must use the observation's declared legal-mask offset instead of depending on
+these bits.
 
 | Bits | Description |
 |------|-------------|
@@ -73,5 +78,5 @@ u32 little-endian. Values 0-63 are board positions, 64 is pass.
 25 tests covering game logic, encoding round-trips, legal move generation, flipping mechanics, and pass/endgame scenarios.
 
 ```bash
-cargo test -p games-othello
+cargo test --manifest-path engine/Cargo.toml -p games-othello
 ```

@@ -1,327 +1,193 @@
 # Actor
 
-Self-play episode runner for Cartridge2. Generates game experience data by running continuous episodes and storing transitions in PostgreSQL for training.
+Rust experience-collection host for Cartridge2. The binary resolves an
+algorithm cartridge, validates its environment compatibility profile, builds
+that cartridge's collector, and writes experience to PostgreSQL.
 
-## Overview
+The only installed collector today is `alphazero_board_v1`, which dispatches
+to `AlphaZeroCollector`. The generic actor host does not imply that every game
+is an AlphaZero board game.
 
-The Actor is a long-running Rust binary that:
+## Quick start
 
-1. Runs game episodes using the engine-core library directly (no gRPC)
-2. Selects actions using MCTS with ONNX neural network evaluation
-3. Hot-reloads the model when `latest.onnx` changes
-4. Stores transitions with MCTS policy distributions and game outcomes in PostgreSQL
-5. Supports graceful shutdown via Ctrl+C
-6. Can run multiple instances in parallel for faster data generation
-
-## Quick Start
+From the repository root:
 
 ```bash
-# Run with defaults (tictactoe, unlimited episodes)
-cargo run
+# PostgreSQL is required.
+docker compose up postgres -d
 
-# Run 100 episodes with debug logging
-cargo run -- --max-episodes 100 --log-level debug
-
-# Run multiple actors in parallel
-cargo run -- --actor-id actor-1 &
-cargo run -- --actor-id actor-2 &
-cargo run -- --actor-id actor-3 &
+# Collect 100 compatible TicTacToe episodes.
+cargo run --manifest-path actor/Cargo.toml -- \
+  --algorithm alphazero_board_v1 \
+  --env-id tictactoe \
+  --max-episodes 100 \
+  --collection-scope-id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 ```
 
-## CLI Arguments
+The omitted `--source-checkpoint-id` marks this as root collection and is
+accepted only while the profile has no RunHead. Descendant collection must pass
+the exact 64-hex checkpoint selected by the current RunHead.
 
-| Argument | Env Variable | Default | Description |
-|----------|--------------|---------|-------------|
-| `--actor-id` | `ACTOR_ACTOR_ID` | `actor-1` | Unique identifier for this actor |
-| `--env-id` | `ACTOR_ENV_ID` | `tictactoe` | Game environment to run |
-| `--max-episodes` | `ACTOR_MAX_EPISODES` | `-1` | Max episodes (-1 = unlimited) |
-| `--episode-timeout-secs` | `ACTOR_EPISODE_TIMEOUT` | `30` | Per-episode timeout |
-| `--flush-interval-secs` | `ACTOR_FLUSH_INTERVAL` | `5` | Buffer flush interval |
-| `--log-level` | `ACTOR_LOG_LEVEL` | `info` | Logging level |
-| `--data-dir` | `ACTOR_DATA_DIR` | `./data` | Data directory for models |
-| `--postgres-url` | `CARTRIDGE_STORAGE_POSTGRES_URL` | `postgresql://cartridge:cartridge@localhost:5432/cartridge` | PostgreSQL connection string |
+Multiple one-shot collectors may write the same orchestrator-owned selection.
+They must receive the same collection scope and source checkpoint, but distinct
+actor IDs and finite episode quotas:
 
-Configuration is loaded from `config.toml` at the project root, with environment variables taking precedence.
-
-## Architecture
-
+```bash
+cargo run --manifest-path actor/Cargo.toml -- --algorithm alphazero_board_v1 --actor-id actor-1 --max-episodes 50 --collection-scope-id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa &
+cargo run --manifest-path actor/Cargo.toml -- --algorithm alphazero_board_v1 --actor-id actor-2 --max-episodes 50 --collection-scope-id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa &
 ```
-┌─────────────────────────────────────────────────────────┐
-│                        ACTOR                             │
-├─────────────────────────────────────────────────────────┤
-│  main()                                                  │
-│    ├─ Parse CLI args (clap)                             │
-│    ├─ Load config from config.toml                       │
-│    ├─ Validate config                                   │
-│    ├─ Load GameConfig from metadata                     │
-│    ├─ Init model watcher                                │
-│    ├─ Init tracing                                      │
-│    └─ Run actor.run() async loop                        │
-│                                                          │
-│  run() async loop                                        │
-│    ├─ Check shutdown flag                               │
-│    ├─ Check episode limit                               │
-│    └─ Run episode:                                      │
-│        ├─ engine.reset()                                │
-│        └─ loop:                                         │
-│            ├─ policy.select_action(obs)                 │
-│            ├─ engine.step(state, action)                │
-│            ├─ replay.store(transition)                  │
-│            └─ break if done                             │
-└─────────────────────────────────────────────────────────┘
-                             │
-                             ▼
-               PostgreSQL (cartridge.transitions)
-```
+
+## Startup contract
+
+Startup proceeds in this order:
+
+1. Parse and validate configuration.
+2. Resolve `--algorithm` through `algorithm-core`.
+3. Register the engine environments and require a compatible
+   algorithm/environment profile.
+4. Derive the exact model and experience identities from the algorithm
+   descriptor.
+5. Load `ModelSelection::Latest` once and require it to equal the declared
+   source checkpoint (or require no RunHead at root).
+6. Only after model identity succeeds, connect to the exact replay selection.
+
+For `alphazero_board_v1`, compatibility currently requires two fixed
+alternating players, discrete actions, perfect-information deterministic
+planning state, fixed spatial `f32` observations, an observation-embedded legal
+mask and player indicator, and terminal zero-sum outcomes. The generated
+schema-v4 manifest verifies these requirements against per-agent action spaces,
+explicit environment semantics, wire codecs, and the optional board profile.
+
+Unknown IDs and incompatible pairs fail before model or database side effects.
 
 ## Components
 
-### Actor (`src/actor.rs`)
+- `src/main.rs`: one-shot process host, tracing, and graceful shutdown.
+- `src/algorithms.rs`: algorithm ID to `CollectorAlgorithm` dispatch.
+- `src/actor.rs`: `AlphaZeroCollector` episode generation and terminal-target encoding.
+- `src/mcts_policy.rs`: AlphaZero MCTS action selection and policy targets.
+- `src/storage/postgres.rs`: pooled PostgreSQL persistence.
+- `src/stats.rs`: final structured collection, abandonment, and RSS telemetry.
 
-Orchestrates the self-play loop:
+The AlphaZero collector requires `EnvironmentMetadata.board` and derives its
+dimensions and observation layout from that optional profile. Replay storage
+does not know about boards, observations, actions, rewards, policies, or value
+targets; those details remain owned by the selected algorithm cartridge.
+
+## Model artifacts
+
+The collector resolves the immutable environment contract version and loads
+the selected runtime profile exactly once:
+
+```text
+filesystem: {data_root}/profiles/{algorithm_id}/{env_id}/v{env_contract_version}/models/channels/current.json
+S3:         profiles/{algorithm_id}/{env_id}/v{env_contract_version}/models/channels/current.json
+```
+
+The sole mutable channel is `RunHeadV2`. The actor resolves and validates the
+complete immutable RunCommit/checkpoint lineage, applies
+`ModelSelection::Latest` to the accepted RunCommit, then follows its canonical
+manifest to the digest-addressed ONNX blob. It verifies RunHead and RunCommit
+schemas/lineage, canonical manifest identity, profile, blob size/digest, and the
+ONNX tensor and metadata contract.
+
+A valid ONNX blob must carry exact custom metadata:
+
+| Key | Expected value |
+|-----|----------------|
+| `cartridge.schema_version` | `1` |
+| `cartridge.algorithm_id` | Selected algorithm ID |
+| `cartridge.model_contract` | Selected descriptor's model contract |
+| `cartridge.env_id` | Selected environment ID |
+| `cartridge.env_contract_version` | Selected environment contract version |
+
+The actor is a bounded one-shot worker and never subscribes to model updates.
+For root collection, the `current` channel must be absent and MCTS uses a
+uniform evaluator. For descendant collection, `current` must resolve and its
+latest checkpoint must exactly equal `--source-checkpoint-id`. A missing,
+different, or invalid source fails before replay storage is opened. This pins
+every record in the selection to one model generation. Older mutable artifacts
+are not discovered or migrated.
+
+## Replay contract
+
+Each record carries an immutable storage envelope and an opaque,
+algorithm-owned payload:
 
 ```rust
-pub struct Actor {
-    config: Config,
-    engine: Mutex<EngineContext>,      // Game simulation
-    mcts_policy: Mutex<MctsPolicy>,    // Action selection
-    replay: Mutex<ReplayStore>,       // PostgreSQL storage
-    episode_count: AtomicU32,
-    shutdown_signal: AtomicBool,
-}
-
-impl Actor {
-    pub fn new(config: Config) -> Result<Self>;
-    pub async fn run(&self) -> Result<()>;
-    pub fn shutdown(&self);
-    pub fn episode_count(&self) -> u32;
+pub struct ReplayRecord {
+    pub id: String,
+    pub env_id: String,
+    pub env_contract_version: u32,
+    pub algorithm_id: String,
+    pub experience_schema: String,
+    pub collection_scope_id: String,
+    pub source_checkpoint_id: Option<String>,
+    pub episode_id: String,
+    pub step_number: u32,
+    pub payload: Vec<u8>,
 }
 ```
 
-### MCTS Policy (`src/mcts_policy.rs`)
+The authoritative schema is [`../sql/schema.sql`](../sql/schema.sql). Its
+`replay_records` primary key is
+`(env_id, env_contract_version, algorithm_id, experience_schema,
+collection_scope_id, id)`. Every write, record count, distinct-episode count,
+and clear is bound to the full `ReplaySelection`; nullable source identity uses
+SQL `IS NOT DISTINCT FROM`, never wildcard semantics. Phase 1 is a clean schema
+cutover: recreate old replay databases rather than assigning implicit lineage,
+scope, source, or payload codecs to existing rows. The database contains only
+the replay-v3 marker and the generic `replay_records` table.
 
-Action selection is handled by `MctsPolicy`, which wraps the MCTS searcher and
-ONNX evaluator:
+`alphazero_board_v1` owns the `alphazero_transition_v1` codec. Its payload is
+the exact concatenation of little-endian `f32` values
+`observation[obs_size] || policy[num_actions] || terminal_value[1]`. The policy
+is the raw tau=1 MCTS visit distribution and the terminal value is from the
+perspective of that position. An episode that times out is discarded in full
+because it has no valid terminal target.
 
-- Runs Monte Carlo Tree Search with a shared `OnnxEvaluator` that can be hot-reloaded
-- Falls back to uniform random over legal moves until a model is available
-- Returns visit count distributions as policy targets for training
+## Configuration
 
-Supported action space:
-- **Discrete(n)** - Single integer 0..n (encoded as 4-byte u32)
+CLI arguments have highest priority, followed by supported `CARTRIDGE_*`
+environment variables, central configuration, and checked-in defaults. Run
+`cargo run --manifest-path actor/Cargo.toml -- --help` for the complete CLI
+surface.
 
-### Model Watcher (`src/model_watcher.rs`)
+| CLI | Environment | Purpose |
+|-----|-------------|---------|
+| `--algorithm` | `CARTRIDGE_ALGORITHM_ID` | Cartridge ID |
+| `--env-id` | `CARTRIDGE_COMMON_ENV_ID` | Environment ID |
+| `--actor-id` | `CARTRIDGE_ACTOR_ACTOR_ID` | Collector instance ID |
+| `--max-episodes` | none | Required positive episode quota for this process |
+| `--collection-scope-id` | none | Required orchestrator-owned 64-hex attempt identity |
+| `--source-checkpoint-id` | none | Required 64-hex model generation after the root iteration |
+| `--data-dir` | `CARTRIDGE_COMMON_DATA_DIR` | Runtime root; the actor appends the canonical profile namespace |
+| `--postgres-url` | `CARTRIDGE_STORAGE_POSTGRES_URL` | Replay database |
+| `--num-simulations` | none | Required exact MCTS budget computed by the synchronized loop |
+| `--c-puct` | `CARTRIDGE_MCTS_C_PUCT` | UCB exploration constant |
+| `--temperature` | `CARTRIDGE_MCTS_TEMPERATURE` | Early-move action-selection temperature |
+| `--late-temperature` | `CARTRIDGE_MCTS_LATE_TEMPERATURE` | Action-selection temperature after the threshold |
+| `--temp-threshold` | `CARTRIDGE_MCTS_TEMP_THRESHOLD` | Move at which late temperature begins; 0 disables it, otherwise it must be below the environment horizon |
+| `--dirichlet-alpha` | `CARTRIDGE_MCTS_DIRICHLET_ALPHA` | Root-noise concentration; set with weight to 0 to disable |
+| `--dirichlet-weight` | `CARTRIDGE_MCTS_DIRICHLET_WEIGHT` | Root-noise mixture weight; set with alpha to 0 to disable |
+| `--eval-batch-size` | `CARTRIDGE_MCTS_EVAL_BATCH_SIZE` | Batched leaf evaluation size |
+| `--onnx-intra-threads` | `CARTRIDGE_MCTS_ONNX_INTRA_THREADS` | ONNX intra-op threads |
 
-Hot-reload for ONNX models:
-- Watches `./data/models/latest.onnx` for changes
-- Automatically reloads the model when updated
-- Thread-safe access via Arc<RwLock>
+Central settings live in [`../config.defaults.toml`](../config.defaults.toml)
+and [`../config.toml`](../config.toml).
 
-### Game Config (`src/game_config.rs`)
+## Synchronized training
 
-Game-specific configuration derived from GameMetadata:
-- Auto-derives observation size, action space, legal mask offset
-- Supports TicTacToe and Connect 4
-- No hardcoded game parameters
+Use `python -m trainer --algorithm alphazero_board_v1 loop`. The orchestrator
+creates a fresh collection scope for each attempt, passes the authoritative
+source checkpoint to every bounded actor, and seals the exact distinct episode
+count before training. Direct long-running actor/trainer deployments are not a
+supported topology.
 
-### Replay Buffer (`src/storage/postgres.rs`)
-
-PostgreSQL-backed storage for transitions:
-
-```rust
-pub struct PostgresReplayStore {
-    pool: deadpool_postgres::Pool,
-}
-
-impl ReplayStore for PostgresReplayStore {
-    async fn store(&self, transition: &Transition) -> Result<()>;
-    async fn store_batch(&self, transitions: &[Transition]) -> Result<()>;
-    async fn count(&self) -> Result<usize>;
-    async fn clear(&self) -> Result<()>;
-    async fn store_metadata(&self, metadata: &GameMetadata) -> Result<()>;
-}
-```
-
-### Transition
-
-Data structure for a single step:
-
-```rust
-pub struct Transition {
-    pub id: String,              // Unique ID
-    pub env_id: String,          // Game environment
-    pub episode_id: String,      // Episode grouping
-    pub step_number: u32,        // Step within episode
-    pub state: Vec<u8>,          // Serialized state
-    pub action: Vec<u8>,         // Serialized action
-    pub next_state: Vec<u8>,     // Next state
-    pub observation: Vec<u8>,    // Current observation
-    pub next_observation: Vec<u8>,
-    pub reward: f32,
-    pub done: bool,
-    pub timestamp: u64,
-    pub policy_probs: Vec<u8>,   // MCTS visit distribution (f32 array)
-    pub mcts_value: f32,         // MCTS value estimate
-    pub game_outcome: Option<f32>, // Final outcome (+1/-1/0), backfilled
-}
-```
-
-## Database Schema
-
-```sql
-CREATE TABLE transitions (
-    id TEXT PRIMARY KEY,
-    env_id TEXT NOT NULL,
-    episode_id TEXT NOT NULL,
-    step_number INTEGER NOT NULL,
-    state BLOB NOT NULL,
-    action BLOB NOT NULL,
-    next_state BLOB NOT NULL,
-    observation BLOB NOT NULL,
-    next_observation BLOB NOT NULL,
-    reward REAL NOT NULL,
-    done INTEGER NOT NULL,
-    timestamp INTEGER NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    policy_probs BLOB,           -- f32[num_actions] MCTS visit distribution
-    mcts_value REAL DEFAULT 0.0, -- MCTS value estimate
-    game_outcome REAL            -- Final outcome, backfilled after episode
-);
-
-CREATE INDEX idx_transitions_timestamp ON transitions(timestamp);
-CREATE INDEX idx_transitions_episode ON transitions(episode_id);
-```
-
-## Examples
-
-### Basic Usage
+## Validation
 
 ```bash
-# Default configuration (requires PostgreSQL running)
-cargo run
-
-# Specific actor ID and episode limit
-cargo run -- --actor-id actor-1 --max-episodes 1000
-
-# Custom PostgreSQL connection
-cargo run -- --postgres-url "postgresql://user:pass@host:5432/cartridge"
+cargo fmt --manifest-path actor/Cargo.toml -- --check
+cargo clippy --manifest-path actor/Cargo.toml --all-targets --all-features -- -D warnings
+cargo test --manifest-path actor/Cargo.toml
 ```
-
-### Environment Variables
-
-```bash
-export ACTOR_ACTOR_ID=distributed-1
-export ACTOR_ENV_ID=tictactoe
-export ACTOR_MAX_EPISODES=10000
-export ACTOR_LOG_LEVEL=info
-export CARTRIDGE_STORAGE_POSTGRES_URL="postgresql://user:pass@localhost:5432/cartridge"
-cargo run
-```
-
-### Docker Compose (Recommended)
-
-```bash
-# Start PostgreSQL
-docker compose up postgres -d
-
-# Run actor
-cargo run
-```
-
-### Multiple Actors
-
-```bash
-# Run 4 actors in parallel
-for i in {1..4}; do
-  cargo run -- --actor-id "actor-$i" &
-done
-wait
-```
-
-### Integration with Trainer
-
-```bash
-# Terminal 1: Start PostgreSQL
-docker compose up postgres -d
-
-# Terminal 2: Actor generates data
-cargo run -- --actor-id actor-1
-
-# Terminal 3: Python trainer consumes data
-cd ../trainer
-# Uses CARTRIDGE_STORAGE_POSTGRES_URL from environment or config.toml
-python -m trainer train
-```
-
-## Testing
-
-```bash
-# Run all tests (29 tests)
-cargo test
-
-# Run specific test with output
-cargo test test_actor_run_single_episode -- --nocapture
-
-# Run benchmarks
-cargo bench
-```
-
-### Test Coverage
-
-- **Game Config tests** - Game-specific configuration from metadata
-- **Health tests** - Health state management and progress tracking
-- **MCTS Policy tests** - MCTS-based action selection and random fallback
-- **Metrics tests** - Prometheus metrics recording
-- **Stats tests** - Episode statistics tracking
-
-## Dependencies
-
-| Crate | Purpose |
-|-------|---------|
-| `engine-core` | Game simulation API |
-| `engine-config` | Centralized configuration |
-| `engine-games` | Game registration |
-| `mcts` | Monte Carlo Tree Search |
-| `tokio-postgres` | PostgreSQL client |
-| `deadpool-postgres` | PostgreSQL connection pool |
-| `tokio` | Async runtime |
-| `clap` | CLI argument parsing |
-| `rand_chacha` | Deterministic RNG |
-| `tracing` | Structured logging |
-| `notify` | File watching for model hot-reload |
-| `prometheus` | Metrics collection |
-
-## Performance
-
-- **Zero-copy buffers** - Efficient handling of state/action/observation data
-- **Async I/O** - Non-blocking episode execution
-- **Deterministic RNG** - ChaCha20Rng for reproducible randomness
-- **Pooled PostgreSQL writes** - Concurrent actor-safe replay buffer ingestion
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Unknown env_id** - Ensure game is registered with engine-core
-2. **PostgreSQL connection failed** - Check `CARTRIDGE_STORAGE_POSTGRES_URL` and that PostgreSQL is running
-3. **Permission denied** - Check write permissions on data directory
-
-### Debug Mode
-
-```bash
-# Enable debug logging
-RUST_LOG=debug cargo run -- --log-level debug
-
-# Check database connection
-docker compose ps postgres
-docker compose logs postgres
-```
-
-## Future Work
-
-- [x] MCTS policy implementation
-- [x] ONNX neural network policy
-- [x] Model hot-reload via file watching
-- [x] Auto-derived game configuration from GameMetadata
-- [ ] Distributed actor coordination
-- [ ] Priority experience replay

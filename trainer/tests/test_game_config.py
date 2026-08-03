@@ -1,23 +1,29 @@
-"""Tests for game_config.py - Game configuration registry.
+"""Tests for the AlphaZero recipe and engine-owned environment catalog.
 
 Tests cover:
-- GameConfig dataclass initialization and properties
-- Game registry functionality
+- AlphaZeroGameConfig initialization and properties
+- Environment and algorithm registry functionality
 - Configuration validation
 - Specific game configurations (TicTacToe, Connect4, Othello)
 """
 
 import pytest
 
-from trainer.game_config import GAME_CONFIGS, GameConfig, get_config, list_games
+from trainer.algorithms.alphazero_board_v1 import (
+    ALGORITHM_ID,
+    AlphaZeroGameConfig,
+    get_game_config,
+    list_compatible_environments,
+)
+from trainer.environment_catalog import ENVIRONMENTS, get_environment, list_environments
 
 
-class TestGameConfig:
-    """Tests for the GameConfig dataclass."""
+class TestAlphaZeroGameConfig:
+    """Tests for the algorithm-specific learner configuration."""
 
     def test_game_config_defaults(self):
-        """Test GameConfig default values."""
-        config = GameConfig(
+        """Test AlphaZeroGameConfig default values."""
+        config = AlphaZeroGameConfig(
             env_id="test",
             display_name="Test Game",
             board_width=5,
@@ -25,6 +31,8 @@ class TestGameConfig:
             num_actions=25,
             obs_size=50,
             legal_mask_offset=25,
+            obs_channels=2,
+            player_relative_obs=False,
         )
 
         assert config.env_id == "test"
@@ -42,8 +50,8 @@ class TestGameConfig:
         assert config.obs_channels == 2
 
     def test_game_config_custom(self):
-        """Test GameConfig with custom values."""
-        config = GameConfig(
+        """Test AlphaZeroGameConfig with custom values."""
+        config = AlphaZeroGameConfig(
             env_id="test",
             display_name="Test Game",
             board_width=8,
@@ -56,6 +64,7 @@ class TestGameConfig:
             num_res_blocks=6,
             num_filters=256,
             obs_channels=3,
+            player_relative_obs=False,
         )
 
         assert config.hidden_size == 512
@@ -66,7 +75,7 @@ class TestGameConfig:
 
     def test_board_size_property(self):
         """Test board_size property calculation."""
-        config = GameConfig(
+        config = AlphaZeroGameConfig(
             env_id="test",
             display_name="Test Game",
             board_width=3,
@@ -74,11 +83,13 @@ class TestGameConfig:
             num_actions=9,
             obs_size=20,
             legal_mask_offset=10,
+            obs_channels=1,
+            player_relative_obs=False,
         )
 
         assert config.board_size == 9
 
-        config2 = GameConfig(
+        config2 = AlphaZeroGameConfig(
             env_id="test2",
             display_name="Test Game 2",
             board_width=7,
@@ -86,41 +97,15 @@ class TestGameConfig:
             num_actions=7,
             obs_size=100,
             legal_mask_offset=50,
+            obs_channels=1,
+            player_relative_obs=False,
         )
 
         assert config2.board_size == 42
 
-    def test_legal_mask_bits_property(self):
-        """Test legal_mask_bits property calculation."""
-        config = GameConfig(
-            env_id="test",
-            display_name="Test Game",
-            board_width=3,
-            board_height=3,
-            num_actions=9,
-            obs_size=20,
-            legal_mask_offset=10,
-        )
-
-        # (1 << 9) - 1 = 0b111111111 = 511
-        assert config.legal_mask_bits == 511
-
-        config2 = GameConfig(
-            env_id="test2",
-            display_name="Test Game 2",
-            board_width=7,
-            board_height=6,
-            num_actions=7,
-            obs_size=100,
-            legal_mask_offset=50,
-        )
-
-        # (1 << 7) - 1 = 0b1111111 = 127
-        assert config2.legal_mask_bits == 127
-
     def test_legal_mask_end_property(self):
         """Test legal_mask_end property calculation."""
-        config = GameConfig(
+        config = AlphaZeroGameConfig(
             env_id="test",
             display_name="Test Game",
             board_width=3,
@@ -128,68 +113,69 @@ class TestGameConfig:
             num_actions=9,
             obs_size=20,
             legal_mask_offset=10,
+            obs_channels=1,
+            player_relative_obs=False,
         )
 
         # 10 + 9 = 19
         assert config.legal_mask_end == 19
 
 
-class TestGameRegistry:
-    """Tests for the game configuration registry."""
+class TestEnvironmentCatalog:
+    """Tests for engine-owned environment discovery."""
 
-    def test_list_games_returns_all_games(self):
-        """Test that list_games returns all registered game IDs."""
-        games = list_games()
+    def test_list_environments_returns_all_registered_ids(self):
+        environments = list_environments()
 
-        assert isinstance(games, list)
-        assert "tictactoe" in games
-        assert "connect4" in games
-        assert "othello" in games
-        assert len(games) >= 3
+        assert isinstance(environments, list)
+        assert "tictactoe" in environments
+        assert "connect4" in environments
+        assert "othello" in environments
+        assert len(environments) >= 3
 
     def test_get_config_tictactoe(self):
         """Test that tictactoe config is returned correctly."""
-        config = get_config("tictactoe")
+        config = get_game_config("tictactoe")
 
-        assert isinstance(config, GameConfig)
+        assert isinstance(config, AlphaZeroGameConfig)
         assert config.env_id == "tictactoe"
         assert config.display_name == "Tic-Tac-Toe"
 
     def test_get_config_connect4(self):
         """Test that connect4 config is returned correctly."""
-        config = get_config("connect4")
+        config = get_game_config("connect4")
 
-        assert isinstance(config, GameConfig)
+        assert isinstance(config, AlphaZeroGameConfig)
         assert config.env_id == "connect4"
         assert config.display_name == "Connect 4"
 
     def test_get_config_othello(self):
         """Test that othello config is returned correctly."""
-        config = get_config("othello")
+        config = get_game_config("othello")
 
-        assert isinstance(config, GameConfig)
+        assert isinstance(config, AlphaZeroGameConfig)
         assert config.env_id == "othello"
         assert config.display_name == "Othello"
 
     def test_get_config_unknown_raises(self):
         """Test that unknown game raises ValueError."""
         with pytest.raises(ValueError) as exc_info:
-            get_config("unknown_game")
+            get_game_config("unknown_game")
 
         assert "unknown_game" in str(exc_info.value)
-        assert "Available games" in str(exc_info.value)
+        assert "Available" in str(exc_info.value)
 
     def test_get_config_case_sensitive(self):
         """Test that game IDs are case sensitive."""
         # These should all raise ValueError
         with pytest.raises(ValueError):
-            get_config("TicTacToe")
+            get_game_config("TicTacToe")
 
         with pytest.raises(ValueError):
-            get_config("TICTACTOE")
+            get_game_config("TICTACTOE")
 
         with pytest.raises(ValueError):
-            get_config("Connect4")
+            get_game_config("Connect4")
 
 
 class TestTicTacToeConfig:
@@ -197,7 +183,7 @@ class TestTicTacToeConfig:
 
     def test_tictactoe_dimensions(self):
         """Test TicTacToe board dimensions."""
-        config = get_config("tictactoe")
+        config = get_game_config("tictactoe")
 
         assert config.board_width == 3
         assert config.board_height == 3
@@ -205,14 +191,13 @@ class TestTicTacToeConfig:
 
     def test_tictactoe_actions(self):
         """Test TicTacToe action space."""
-        config = get_config("tictactoe")
+        config = get_game_config("tictactoe")
 
         assert config.num_actions == 9
-        assert config.legal_mask_bits == 511  # 0b111111111
 
     def test_tictactoe_observation(self):
         """Test TicTacToe observation structure."""
-        config = get_config("tictactoe")
+        config = get_game_config("tictactoe")
 
         # obs_size = 18 (board) + 9 (legal mask) + 2 (player) = 29
         assert config.obs_size == 29
@@ -221,7 +206,7 @@ class TestTicTacToeConfig:
 
     def test_tictactoe_network_type(self):
         """Test TicTacToe uses MLP network."""
-        config = get_config("tictactoe")
+        config = get_game_config("tictactoe")
 
         assert config.network_type == "mlp"
         assert config.hidden_size == 128
@@ -232,7 +217,7 @@ class TestConnect4Config:
 
     def test_connect4_dimensions(self):
         """Test Connect4 board dimensions."""
-        config = get_config("connect4")
+        config = get_game_config("connect4")
 
         assert config.board_width == 7
         assert config.board_height == 6
@@ -240,14 +225,13 @@ class TestConnect4Config:
 
     def test_connect4_actions(self):
         """Test Connect4 action space."""
-        config = get_config("connect4")
+        config = get_game_config("connect4")
 
         assert config.num_actions == 7
-        assert config.legal_mask_bits == 127  # 0b1111111
 
     def test_connect4_observation(self):
         """Test Connect4 observation structure."""
-        config = get_config("connect4")
+        config = get_game_config("connect4")
 
         # obs_size = 42 (Red) + 42 (Yellow) + 7 (legal) + 2 (player) = 93
         assert config.obs_size == 93
@@ -256,7 +240,7 @@ class TestConnect4Config:
 
     def test_connect4_network_type(self):
         """Test Connect4 uses ResNet."""
-        config = get_config("connect4")
+        config = get_game_config("connect4")
 
         assert config.network_type == "resnet"
         assert config.num_res_blocks == 4
@@ -272,7 +256,7 @@ class TestOthelloConfig:
 
     def test_othello_dimensions(self):
         """Test Othello board dimensions."""
-        config = get_config("othello")
+        config = get_game_config("othello")
 
         assert config.board_width == 8
         assert config.board_height == 8
@@ -280,14 +264,13 @@ class TestOthelloConfig:
 
     def test_othello_actions(self):
         """Test Othello action space."""
-        config = get_config("othello")
+        config = get_game_config("othello")
 
         assert config.num_actions == 65  # 64 positions + 1 pass
-        assert config.legal_mask_bits == (1 << 65) - 1  # Very large number
 
     def test_othello_observation(self):
         """Test Othello observation structure."""
-        config = get_config("othello")
+        config = get_game_config("othello")
 
         # obs_size = 128 (board: 64*2) + 65 (legal) + 2 (player) = 195
         assert config.obs_size == 195
@@ -296,7 +279,7 @@ class TestOthelloConfig:
 
     def test_othello_network_type(self):
         """Test Othello uses ResNet."""
-        config = get_config("othello")
+        config = get_game_config("othello")
 
         assert config.network_type == "resnet"
         assert config.num_res_blocks == 6
@@ -306,50 +289,55 @@ class TestOthelloConfig:
         assert config.hidden_size == 128  # dataclass default, unused here
 
 
-class TestGameConfigsRegistry:
-    """Tests for the GAME_CONFIGS dictionary directly."""
+class TestAlphaZeroRecipeRegistry:
+    """Tests for the algorithm-owned environment recipes."""
 
     def test_registry_has_expected_games(self):
         """Test that all expected games are in the registry."""
         expected_games = ["tictactoe", "connect4", "othello"]
 
+        compatible = list_compatible_environments()
         for game in expected_games:
-            assert game in GAME_CONFIGS
-            assert isinstance(GAME_CONFIGS[game], GameConfig)
+            assert game in compatible
+            assert isinstance(get_game_config(game), AlphaZeroGameConfig)
 
-    def test_registry_values_are_game_configs(self):
-        """Test that all registry values are GameConfig instances."""
-        for env_id, config in GAME_CONFIGS.items():
-            assert isinstance(config, GameConfig)
+    def test_recipes_build_algorithm_configs(self):
+        for env_id in list_compatible_environments():
+            config = get_game_config(env_id)
+            assert isinstance(config, AlphaZeroGameConfig)
             assert config.env_id == env_id
 
-    def test_registry_is_dict(self):
-        """Test that GAME_CONFIGS is a dictionary."""
-        assert isinstance(GAME_CONFIGS, dict)
-        assert len(GAME_CONFIGS) >= 3
+    def test_every_compatible_environment_has_a_safe_network_recipe(self):
+        for env_id in list_compatible_environments():
+            config = get_game_config(env_id)
+            assert config.network_type in {"mlp", "resnet"}
+            assert config.hidden_size > 0
+            assert config.num_res_blocks > 0
+            assert config.num_filters > 0
 
 
 class TestGeneralsConfig:
     """Generals 8x8 — the only game with a non-trivial observation encoding."""
 
     def test_generals_dimensions(self):
-        config = get_config("generals_8x8")
+        config = get_game_config("generals_8x8")
 
         assert config.board_width == 8
         assert config.board_height == 8
         assert config.num_actions == 257  # 64 tiles * 4 directions + wait
-        assert config.obs_size == 835  # 576 planes + 257 legal + 2 player
-        assert config.legal_mask_offset == 576
+        assert config.obs_size == 899  # 640 planes + 257 legal + 2 player
+        assert config.legal_mask_offset == 640
 
     def test_generals_uses_player_relative_resnet(self):
-        config = get_config("generals_8x8")
+        config = get_game_config("generals_8x8")
 
         assert config.network_type == "resnet"
         assert config.num_res_blocks == 6
         assert config.num_filters == 128
-        # 9 generals_obs:v1 planes, encoded own/enemy relative to the player to
-        # act — so the network must not also receive the player indicator.
-        assert config.obs_channels == 9
+        # 10 generals_obs:v2 planes, encoded own/enemy relative to the player to
+        # act and including the exact cap countdown — so the network must not
+        # also receive the player indicator.
+        assert config.obs_channels == 10
         assert config.player_relative_obs is True
 
 
@@ -364,26 +352,20 @@ class TestManifestIntegrity:
     def test_manifest_is_loadable(self):
         """Fail here, attributably, rather than at some other module's import.
 
-        Several modules call get_config() at import time, so a missing or
-        malformed manifest otherwise surfaces as a confusing collection error
-        in an unrelated test file.
+        A missing or malformed manifest should fail at catalog import rather
+        than surface later as a confusing learner error.
         """
-        assert GAME_CONFIGS, "manifest produced no games"
+        assert ENVIRONMENTS, "manifest produced no environments"
 
-    def test_every_game_has_a_network_choice(self):
-        """Adding a game in Rust must force a deliberate architecture choice.
-
-        If a manifest game could fall back to defaults it would silently get
-        network_type="mlp" — a dense net on a board, which trains to nothing
-        without ever erroring.
-        """
-        from trainer.game_config import _TRAINING_OVERRIDES
-
-        assert set(_TRAINING_OVERRIDES) == set(GAME_CONFIGS)
+    def test_every_compatible_catalog_entry_builds_an_algorithm_config(self):
+        for env_id in list_compatible_environments():
+            config = get_game_config(env_id)
+            assert config.env_id == env_id
 
     def test_observation_layout_invariants(self):
         """Mirrors the engine-side assertions in engine-games."""
-        for env_id, config in GAME_CONFIGS.items():
+        for env_id in list_compatible_environments():
+            config = get_game_config(env_id)
             assert config.obs_channels > 0, f"{env_id}: obs_channels unset"
             assert (
                 config.legal_mask_offset == config.obs_channels * config.board_size
@@ -395,28 +377,44 @@ class TestManifestIntegrity:
     def test_facts_are_not_restated_in_python(self):
         """The registry must be built from the manifest, not hardcoded.
 
-        Guards against someone "fixing" a drift failure by pasting literals
-        back into game_config.py, which would reintroduce exactly the
+        Guards against someone "fixing" a drift failure by pasting environment
+        literals into the learner recipe, which would reintroduce the
         two-sources-of-truth problem the manifest removed.
         """
         import json
         from importlib.resources import files
 
         manifest = json.loads(
-            files("trainer").joinpath("game_metadata.json").read_text(encoding="utf-8")
+            files("trainer")
+            .joinpath("environment_manifest.json")
+            .read_text(encoding="utf-8")
         )
-        by_id = {g["env_id"]: g for g in manifest["games"]}
+        by_id = {
+            environment["metadata"]["id"]: environment
+            for environment in manifest["environments"]
+        }
 
-        assert set(by_id) == set(GAME_CONFIGS)
-        for env_id, config in GAME_CONFIGS.items():
-            game = by_id[env_id]
-            for field in (
-                "obs_size",
-                "legal_mask_offset",
-                "num_actions",
-                "obs_channels",
-            ):
-                assert getattr(config, field) == game[field], f"{env_id}.{field}"
+        assert set(by_id) == set(ENVIRONMENTS)
+        for env_id, environment in ENVIRONMENTS.items():
+            board = by_id[env_id]["metadata"]["board"]
+            if board is None:
+                assert environment.board is None
+                continue
+            parsed = environment.require_board()
+            expected = {
+                "elements": board["observation"]["elements"],
+                "legal_actions_offset": board["observation"]["legal_actions_offset"],
+                "spatial_channels": board["observation"]["spatial_channels"],
+            }
+            for field, value in expected.items():
+                assert getattr(parsed.observation, field) == value, f"{env_id}.{field}"
+            assert parsed.action_count == board["action_count"]
+
+    def test_every_environment_has_the_alpha_zero_compatibility_report(self):
+        for env_id in list_environments():
+            report = get_environment(env_id).compatibility(ALGORITHM_ID)
+            assert report.algorithm_id == ALGORITHM_ID
+            assert report.env_id == env_id
 
 
 if __name__ == "__main__":

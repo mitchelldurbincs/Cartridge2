@@ -4,26 +4,128 @@
 
 # Cartridge2
 
-A simplified AlphaZero training and visualization platform for board games. Train neural network agents via self-play and play against them through a web interface.
+An algorithm-oriented reinforcement-learning platform. Environments describe
+game mechanics and capabilities; algorithm cartridges bind collection,
+experience, learning, model, and evaluation implementations to compatible
+environments.
 
-**Games:** TicTacToe, Connect 4, Othello (all complete), Generals 8x8 (engine + trainer complete; not yet stronger than random, and not playable in the web UI)
+The first installed cartridge is `alphazero_board_v1`. It packages the
+project's AlphaZero board-game behavior as one explicit implementation instead
+of treating its assumptions as properties of every game.
+
+**Games:** TicTacToe, Connect 4, Othello (complete), and Generals 8x8
+(engine/trainer/web complete; training has not yet beaten random at local
+compute scale)
 
 **Why the name?**
 I love history (Hannibal Barca is my goat) and it also just happens to be close to cartridge which is a goal of this project - being able to easily add new games.
 You may have noticed that the C in the logo is the esteemed harbor of Carthage.
 
 **Improvements over v1**
-The original Cartridge used 7 microservices with gRPC, Go, and Kubernetes—great for production scale, but overkill for experimentation. Cartridge2 simplifies everything: just Rust + Python, filesystem-based storage, and a single `docker compose up` to start training. It also swaps PPO for AlphaZero, which produces higher-quality training data for board games.
+The original Cartridge used 7 microservices with gRPC, Go, and Kubernetes—great for production scale, but overkill for experimentation. Cartridge2 simplifies everything: Rust + Python, shared storage, and a single `docker compose up` to start training. Algorithm identity is now explicit, so future cartridges can provide different collectors and learners without pretending every environment is an AlphaZero board game.
+
+## Algorithm cartridges
+
+Select the algorithm independently from the environment:
+
+```toml
+[common]
+env_id = "connect4"
+
+[algorithm]
+id = "alphazero_board_v1"
+```
+
+The same selection can be supplied with `--algorithm alphazero_board_v1` or
+`CARTRIDGE_ALGORITHM_ID=alphazero_board_v1`. The actor, trainer, and evaluator
+resolve the selected ID through their local algorithm registry and reject an
+unknown or incompatible algorithm/environment pair at startup.
+
+The engine-generated `environment_manifest.json` catalog uses schema version 4.
+Its top-level `environments` entries contain exactly `metadata`, `capabilities`,
+and `algorithm_profiles`. Generic metadata is display-only and its nested
+`board` profile may be null. Capabilities carry the immutable contract version,
+wire codecs, explicit environment semantics, optional horizon, and per-agent
+action spaces. Each installed algorithm descriptor names seven contracts:
+collector, learner, orchestration, experience schema, model contract,
+evaluation suite, and serving suite. Python strictly consumes this catalog
+rather than inferring algorithm support from board dimensions or network
+settings.
+
+`alphazero_board_v1` currently requires:
+
+- exactly two fixed players with one active player at a time;
+- alternating turns, perfect information, and deterministic planning snapshots;
+- finite indexed discrete actions with an observation-embedded legal mask;
+- fixed-size spatial `f32` observations with a two-element player indicator; and
+- terminal-only, zero-sum rewards.
+
+The generic ABI represents fixed or dynamic agents, single-agent, sequential,
+and simultaneous decisions, explicit or environment-sampled chance, perfect or
+partial observations, deterministic or stochastic transitions, general
+per-agent rewards, terminated versus truncated episodes, and discrete,
+multi-discrete, or continuous action spaces. That representation does not make
+an algorithm compatible: single-agent, chance, simultaneous, multi-agent,
+partial-observation, recurrent, and continuous-control workloads need matching
+algorithm cartridges and are rejected by `alphazero_board_v1`.
+
+The standard action codecs cover sequential discrete, multi-discrete, and
+continuous actions. Simultaneous joint actions and explicit chance outcomes are
+currently environment-defined `Custom` codecs, so their algorithm cartridge
+must understand that declared codec; a shared decision-action envelope belongs
+to the next runtime phase.
+
+### Model artifact identity
+
+Model files are part of the cartridge contract, not interchangeable blobs.
+Checkpoint publication is content-addressed: immutable ONNX and learner-state
+objects live under `models/blobs/sha256/`, their canonical manifest lives under
+`models/manifests/sha256/{checkpoint_id}.json`, and
+`models/channels/current.json` is the sole authoritative mutable `RunHeadV2`.
+Learner continuation and collection select its latest checkpoint; web serving
+selects champion state from its latest RunCommit, falling back to latest before
+the first promotion. The checkpoint ID is the SHA-256 of the manifest bytes.
+
+The manifest binds the selected algorithm/model/environment contract, step,
+parent checkpoint, learner-config digest, and exact size/SHA-256 of both blobs.
+ONNX identity schema version 1 also requires the exact
+`cartridge.schema_version`, `cartridge.algorithm_id`,
+`cartridge.model_contract`, `cartridge.env_id`, and
+`cartridge.env_contract_version` custom metadata. Publication safely validates
+the staged learner envelope and materializes only immutable objects. A canonical
+`RunCommitV1` then binds that checkpoint, its exact embedded statistics,
+evaluation/champion state, and its parent RunCommit. The sole mutable
+`RunHeadV2` advances with compare-and-set semantics only after the complete
+RunCommit and checkpoint chains validate. Consumers verify those chains,
+manifest identity, profile, blob digest/size, learner envelope, and model
+interface before loading.
+
+No `current` head means fresh training and random play. A present invalid object
+is rejected, and a rejected web hot reload never replaces the last valid
+evaluator.
+Old mutable checkpoint filenames and ONNX files without schema-v1 identity are
+not loaded; there is no legacy inference or implicit identity fallback.
+
+Training statistics are authoritative only as the exact canonical snapshot
+embedded in the selected `RunCommitV1`; `stats_id` hashes those embedded bytes.
+The profile-root `stats.json` is an atomically refreshed web projection, not
+learner continuity state. Existing malformed or incomplete authority fails
+closed.
+
+Promotion evidence is likewise immutable under
+`models/evaluations/manifests/sha256/{evaluation_id}.json`. The selected
+RunCommit carries the champion checkpoint and supporting evaluation together;
+there is no second champion pointer. Evaluation recipes, results, and recursive
+champion lineage are verified before selection or promotion.
 
 ## Architecture
 
 ```
-+---------------------------------------------------------------+
-|                    PostgreSQL + Filesystem                     |
-|   PostgreSQL            - Replay buffer (transitions)          |
-|   ./data/models/        - ONNX model files                     |
-|   ./data/stats.json     - Training telemetry                   |
-+---------------------------------------------------------------+
++--------------------------------------------------------------------------+
+|                      PostgreSQL + Runtime storage                         |
+| PostgreSQL - replay rows fenced by exact profile, scope, and source       |
+| ./data/profiles/{algorithm}/{env}/v{contract}/ - models and telemetry     |
++--------------------------------------------------------------------------+
          |                       |                       |
          v                       v                       v
 +-----------------+    +-----------------+    +------------------+
@@ -35,9 +137,13 @@ The original Cartridge used 7 microservices with gRPC, Go, and Kubernetes—grea
 +-----------------+    +-----------------+    +------------------+
 ```
 
-PostgreSQL is used for the replay buffer (storing training transitions) while models
-are stored on the filesystem. For cloud deployments, S3/MinIO can be used for model
-storage.
+PostgreSQL is used for replay while model authority is stored on the filesystem
+or S3. Every transition carries its environment contract, algorithm,
+experience schema, collection scope, and nullable source checkpoint. A learner
+opens an exact `ReplaySelection`; count, distinct-episode seal, sample, clear,
+cleanup, and write operations cannot cross another cartridge, attempt, or model
+generation.
+For cloud deployments, S3/MinIO can be used for model storage.
 
 ## Quick Start
 
@@ -52,23 +158,26 @@ docker compose up postgres  # Or use a local PostgreSQL installation
 
 **Terminal 1** - Start the Rust backend:
 ```bash
-cd web && cargo run
+cargo run --manifest-path web/Cargo.toml
 # Server starts on http://localhost:8080
 ```
 
 **Terminal 2** - Start the Svelte frontend:
 ```bash
-cd web/frontend && npm install && npm run dev
+npm --prefix web/frontend install
+npm --prefix web/frontend run dev
 # Dev server starts on http://localhost:5173
 ```
 
 **Terminal 3** - Train a model:
 ```bash
-cd trainer && pip install -e .
+pip install -e "trainer/.[dev]"
+make build-actor build-eval
 # Required: the Python trainer reads the replay-buffer connection string only
 # from this env var (config.toml's storage.postgres_url is not used by it)
 export CARTRIDGE_STORAGE_POSTGRES_URL=postgresql://cartridge:cartridge@localhost:5432/cartridge
-python -m trainer loop --iterations 50 --episodes 200 --steps 500
+python -m trainer --algorithm alphazero_board_v1 loop \
+  --iterations 50 --episodes 200 --steps 500
 ```
 
 Open http://localhost:5173 to play!
@@ -81,8 +190,8 @@ Docker is convenient for quick testing but may have performance overhead.
 # Train a model using synchronized AlphaZero loop
 docker compose up alphazero
 
-# Train Connect4 instead of TicTacToe
-CARTRIDGE_COMMON_ENV_ID=connect4 docker compose up alphazero
+# Train TicTacToe instead of the Compose default (Connect 4)
+CARTRIDGE_COMMON_ENV_ID=tictactoe docker compose up alphazero
 
 # Play against the trained model
 docker compose up web frontend
@@ -93,38 +202,42 @@ docker compose up web frontend
 
 ```
 cartridge2/
-|-- actor/                     # Self-play episode runner
+|-- actor/                     # Algorithm-dispatched experience collector
 |   |-- src/
 |   |   |-- main.rs            # Entry point
-|   |   |-- actor.rs           # Episode loop
+|   |   |-- algorithms.rs      # Algorithm -> collector dispatch
+|   |   |-- actor.rs           # AlphaZero collector
 |   |   |-- config.rs          # CLI configuration
-|   |   |-- game_config.rs     # Game-specific config from metadata
-|   |   |-- health.rs          # Health check endpoint
 |   |   |-- mcts_policy.rs     # MCTS policy implementation
-|   |   |-- metrics.rs         # Prometheus metrics
+|   |   |-- resources.rs       # Process resource diagnostics
 |   |   |-- stats.rs           # Self-play statistics
 |   |   +-- storage/           # Storage backends (PostgreSQL)
 |   +-- tests/
 |
 |-- engine/                    # Rust workspace
+|   |-- algorithm-core/        # Algorithm catalog + compatibility reports
 |   |-- engine-config/         # Centralized configuration loading
-|   |-- engine-core/           # Game trait + registry
+|   |-- engine-core/           # Generic Environment ABI + registry
 |   |   +-- src/
-|   |       |-- typed.rs       # Game trait definition
-|   |       |-- adapter.rs     # Type erasure adapter
-|   |       |-- erased.rs      # Erased game interface
+|   |       |-- typed.rs       # Typed Environment contract
+|   |       |-- contract.rs    # Descriptor/timestep contract validation
+|   |       |-- adapter.rs     # Private typed-to-erased adapter
+|   |       |-- erased.rs      # Sealed bytes-only runtime boundary
 |   |       |-- context.rs     # EngineContext API
-|   |       |-- metadata.rs    # GameMetadata for game configuration
-|   |       +-- registry.rs    # Static game registry
-|   |-- engine-games/          # Game registration + metadata manifest generator
-|   |-- evaluator/              # cartridge-eval: plays evaluation games
+|   |       |-- metadata.rs    # Generic + optional board metadata
+|   |       |-- board_game.rs  # Narrow AlphaZero board-game adapter
+|   |       |-- board_view.rs  # Optional presentation projection
+|   |       +-- registry.rs    # Immutable environment registry
+|   |-- engine-games/          # Bundled environments + manifest generator
+|   |-- envs-counter/          # Direct non-board Environment reference
+|   |-- evaluator/             # Algorithm-dispatched evaluation binary
 |   |-- games-generals/         # Generals 8x8 implementation
-|   |-- metrics-common/         # Prometheus plumbing shared by actor and web
+|   |-- metrics-common/         # Prometheus registration/encoding utilities
 |   |-- games-tictactoe/       # TicTacToe implementation
 |   |-- games-connect4/        # Connect 4 implementation
 |   |-- games-othello/         # Othello implementation
 |   |-- mcts/                  # Monte Carlo Tree Search
-|   +-- model-watcher/         # Shared model hot-reload library
+|   +-- model-watcher/         # RunHead validation, web reload, actor one-shot load
 |
 |-- web/                       # HTTP server + frontend
 |   |-- src/
@@ -146,40 +259,50 @@ cartridge2/
 |   |-- pyproject.toml         # Package configuration
 |   +-- src/trainer/
 |       |-- __main__.py        # CLI entrypoint
-|       |-- trainer.py         # Training loop
+|       |-- algorithms/        # Installed Python algorithm bindings
+|       |-- environment_catalog.py # Strict manifest-v4 contract catalog
+|       |-- runtime_profile.py # Canonical artifact namespace
+|       |-- trainer.py         # AlphaZero learner implementation
 |       |-- network.py         # Neural network (MLP)
 |       |-- resnet.py          # ResNet architecture
 |       |-- evaluator.py       # Model evaluation
 |       |-- solver_eval/       # Perfect-solver move scoring (Connect4)
-|       |-- wandb_logger.py    # Weights & Biases logging wrapper
-|       |-- game_config.py     # Engine manifest + network overrides
-|       |-- game_metadata.json # GENERATED by `make game-manifest`
+|       |-- environment_manifest.json # GENERATED by `make environment-manifest`
 |       |-- stats.py           # Training statistics
-|       |-- config.py          # TrainerConfig dataclass
+|       |-- config.py          # AlphaZeroLearnerConfig dataclass
 |       |-- checkpoint.py      # Checkpoint utilities
 |       |-- central_config.py  # Central config.toml loading
 |       |-- orchestrator/      # Synchronized AlphaZero orchestrator
 |       |-- players.py           # Who occupies a seat in an evaluation game
-|       +-- storage/           # Storage backends (PostgreSQL, S3, filesystem)
+|       +-- storage/           # Exact replay selection + artifact publication
 |
-|-- data/                      # Runtime data (gitignored)
-|   |-- models/                # ONNX checkpoints
-|   +-- stats.json             # Training telemetry
+|-- data/                      # Runtime root (gitignored)
+|   +-- profiles/{algorithm}/{env}/v{contract}/
+|       |-- models/            # PyTorch + ONNX checkpoints
+|       +-- *.json             # Profile-scoped telemetry and registries
 |
 |-- config.toml                # Central configuration
-|-- docker-compose.yml         # Local mode services
-+-- docker-compose.k8s.yml     # K8s mode services (PostgreSQL + MinIO)
+|-- docker-compose.yml         # PostgreSQL + MinIO local stack
+|-- k8s/                      # Kustomize deployment manifests
++-- terraform/                # Cloud infrastructure modules
 ```
 
 ## Components
 
 ### Engine Core (`engine/engine-core/`)
 
-Pure Rust game logic library:
+Pure Rust environment runtime:
 
-- **Game Trait** - Type-safe interface for implementing games
-- **Type Erasure** - Runtime polymorphism via trait objects
-- **Registry** - Static game registration system
+- **Environment trait** - Algorithm-neutral typed reset/step contract
+- **Timesteps** - Explicit transition rosters, per-agent observations and
+  outcomes, decisions/sources, and separate terminated/truncated status
+- **Capabilities** - Versioned wire encodings, agent/action spaces, and declared
+  turn, information, planning-state, chance, transition, and reward semantics
+- **Type erasure** - Sealed, validated bytes-only runtime polymorphism; public
+  consumers enter through `EngineContext`
+- **Optional profiles** - Board metadata, presentation, and legal masks stay in
+  the explicit `engine_core::board_profile` namespace
+- **Registry** - Immutable process-local environment registration
 - **EngineContext** - High-level API for game simulation
 
 ```rust
@@ -200,19 +323,28 @@ let step = ctx.step(&reset.state, &action).unwrap();
 
 ### Actor (`actor/`)
 
-Self-play episode generator:
+Algorithm-dispatched experience collector. For `alphazero_board_v1` it:
 
 - Runs game simulations using `EngineContext`
 - MCTS with ONNX neural network evaluation
-- Hot-reloads model when `latest.onnx` changes
-- Stores transitions in PostgreSQL replay buffer
+- Resolves `ModelSelection::Latest` from the profile RunHead exactly once
+- Stores opaque, exact-selection-bound replay records in PostgreSQL
 - MCTS visit distributions saved as policy targets
-- Game outcomes backfilled to all positions
+- Terminal outcomes encoded for every collected position
 
 ```bash
 # Requires PostgreSQL running (use docker compose up postgres)
-cargo run -- --env-id tictactoe --max-episodes 10000
+cargo run --manifest-path actor/Cargo.toml -- \
+  --algorithm alphazero_board_v1 \
+  --env-id tictactoe \
+  --max-episodes 10000 \
+  --collection-scope-id "$(openssl rand -hex 32)"
 ```
+
+This low-level example is valid only for a root profile with no RunHead. For a
+non-root collection, also pass the exact `--source-checkpoint-id`. Normal use is
+the synchronized `loop`, which allocates scopes, partitions quotas across
+bounded collectors, and verifies the final episode seal automatically.
 
 ### Web Server (`web/`)
 
@@ -228,18 +360,18 @@ Axum HTTP server with endpoints:
 | `/game/state` | GET | Get current board state |
 | `/move` | POST | Make player move + get bot response |
 | `/stats` | GET | Read training telemetry |
-| `/actor-stats` | GET | Read actor self-play stats |
 | `/model` | GET | Get info about loaded model |
 
 ### Python Trainer (`trainer/`)
 
-PyTorch training loop:
+The Python algorithm registry owns learner construction. The
+`alphazero_board_v1` binding builds a PyTorch learner that:
 
-- Reads transitions from PostgreSQL replay buffer
+- Reads opaque replay records and decodes the cartridge-owned payload
 - AlphaZero-style loss (policy cross-entropy + value MSE)
 - MCTS visit distributions as soft policy targets
 - Game outcomes propagated as value targets
-- Exports ONNX models with atomic write-then-rename
+- Publishes content-addressed checkpoint blobs/manifests, then advances channels
 - Cosine annealing LR schedule
 - Gradient clipping for stability
 - Checkpoint management
@@ -247,30 +379,32 @@ PyTorch training loop:
 
 #### Synchronized AlphaZero training loop
 
-The Python package now includes an orchestrated, synchronous AlphaZero workflow
+The `alphazero_board_v1` cartridge includes an orchestrated, synchronous workflow
 that coordinates the actor, trainer, and post-iteration evaluation. This
-pipeline clears the replay buffer each iteration, generates fresh self-play
-episodes, trains on that data, and then benchmarks the resulting model against
-the random baseline.
+pipeline allocates a fresh replay collection scope for every attempt, pins its
+bounded collectors to the exact source checkpoint, seals the configured number
+of completed episodes, trains only from that scope, and then evaluates the
+resulting candidate. Rows from older or abandoned attempts are retained but
+cannot match the learner's exact replay selection.
 
-Run locally (with defaults targeting TicTacToe):
+Run locally (the checked-in `config.toml` targets Connect 4):
 
 ```bash
 # Using the subcommand interface
-trainer loop --iterations 5 --episodes 200 --steps 500
-# Or: python -m trainer loop --iterations 5 --episodes 200 --steps 500
-
-# Legacy entry point also works
-trainer-loop --iterations 5 --episodes 200 --steps 500
+trainer --algorithm alphazero_board_v1 loop --iterations 5 --episodes 200 --steps 500
+# Or: python -m trainer --algorithm alphazero_board_v1 loop --iterations 5 --episodes 200 --steps 500
 ```
 
-Configuration can be supplied via flags or environment variables (prefixed with
-`ALPHAZERO_` or `CARTRIDGE_`). For example, to train Connect4 with GPU acceleration
-and disable evaluation for speed:
+Configuration can be supplied via flags or `CARTRIDGE_` environment variables.
+For example, to train Connect4 with GPU acceleration and disable evaluation for
+speed:
 
 ```bash
-ALPHAZERO_ENV_ID=connect4 ALPHAZERO_DEVICE=cuda ALPHAZERO_EVAL_INTERVAL=0 \
-    trainer loop --iterations 20 --episodes 300 --steps 1000
+CARTRIDGE_COMMON_ENV_ID=connect4 \
+CARTRIDGE_TRAINING_DEVICE=cuda \
+CARTRIDGE_EVALUATION_INTERVAL=0 \
+    trainer --algorithm alphazero_board_v1 loop \
+      --iterations 20 --episodes 300 --steps 1000
 ```
 
 Docker usage mirrors the same interface:
@@ -278,23 +412,22 @@ Docker usage mirrors the same interface:
 ```bash
 docker compose up alphazero
 # Override parameters as needed
-CARTRIDGE_COMMON_ENV_ID=connect4 docker compose up alphazero
+CARTRIDGE_COMMON_ENV_ID=tictactoe docker compose up alphazero
 ```
 
-See [Deployment Modes](#deployment-modes) for K8s-style backends with PostgreSQL and MinIO.
+See [Deployment Modes](#deployment-modes) for local Compose and Kubernetes.
 
 ## Deployment Modes
 
-### Default Mode (PostgreSQL + Filesystem)
+### Local Mode (PostgreSQL + Filesystem)
 
-Uses PostgreSQL for replay buffer and filesystem for model storage. Docker Compose automatically starts PostgreSQL.
+Direct local processes use PostgreSQL for replay and the filesystem for model
+storage. Docker Compose instead configures MinIO so every container shares the
+same profile-scoped artifacts.
 
 ```bash
-# Start synchronized training (PostgreSQL starts automatically)
-docker compose up alphazero
-
-# Start web UI to play against trained model
-docker compose up web frontend
+export CARTRIDGE_STORAGE_POSTGRES_URL=postgresql://cartridge:cartridge@localhost:5432/cartridge
+python -m trainer --algorithm alphazero_board_v1 loop
 ```
 
 ### Cloud Mode (PostgreSQL + S3)
@@ -302,8 +435,8 @@ docker compose up web frontend
 Uses PostgreSQL for replay buffer and S3/MinIO for model storage. Enables distributed deployments.
 
 ```bash
-# Start with MinIO for model storage
-docker compose -f docker-compose.yml -f docker-compose.k8s.yml up
+# Compose configures MinIO for model storage
+docker compose up
 
 # Parallel self-play: the alphazero service runs multiple actor processes
 # internally — tune [training].num_actors in config.toml (or
@@ -353,50 +486,52 @@ The web server implements **deny-by-default** CORS behavior for security:
 
 ### Container Security
 
-All Docker containers run as a non-root `cartridge` user for improved security. Container images include:
-- Minimal attack surface (Ubuntu 24.04 base)
-- No unnecessary packages
-- Health checks configured
-- Read-only filesystem where possible
+The Cartridge2 application images run as a non-root `cartridge` user. The web
+and frontend images define health checks; Compose and Kubernetes add
+service-level checks for the remaining long-running components. Infrastructure
+images such as PostgreSQL and MinIO retain their upstream users and hardening
+requirements.
 
 ### Secrets Scanning
 
 The CI pipeline includes automated secrets scanning with GitLeaks to prevent accidental credential commits.
 
-## Adding a New Game
+## Adding a New Environment
 
-1. Create a new crate in `engine/games-{name}/`
-2. Implement the `Game` trait:
+1. Create a new crate in `engine/envs-{name}/` (reserve `games-{name}` for
+   environments that are specifically games).
+2. Implement the generic `Environment` trait. Publish an immutable
+   `contract_version`, exact state/action/observation encodings, agent action
+   spaces, environment semantics, and per-agent `Timestep` values. Its `env_id`
+   is a runtime namespace segment containing only lowercase ASCII letters,
+   digits, `_`, or `-`.
+3. Add optional `EnvironmentMetadata` and `Presentation` only for human-facing
+   consumers. A non-board environment does not need board dimensions, a legal
+   mask, or player-seat metadata.
+4. Register the environment:
 
 ```rust
-pub trait Game {
-    type State;   // Game state (must be Copy-friendly)
-    type Action;  // Action space
-    type Obs;     // Observation for neural networks
+use engine_core::register_environment;
+use envs_counter::CounterEnvironment;
 
-    fn reset(&mut self, rng: &mut ChaCha20Rng, hint: &[u8]) -> (State, Obs);
-    fn step(&mut self, state: &mut State, action: Action, rng: &mut ChaCha20Rng)
-        -> (Obs, f32, bool, u64);  // obs, reward, done, info_bits
-
-    fn encode_state(state: &State, buf: &mut Vec<u8>) -> Result<(), Error>;
-    fn decode_state(buf: &[u8]) -> Result<State, Error>;
-    // ... similar for Action and Obs
+pub fn register_counter() {
+    register_environment::<CounterEnvironment>()
+        .expect("counter must only be registered once");
 }
 ```
 
-3. Register the game:
+For the existing deterministic two-seat board family, implement the narrower
+`engine_core::board_profile::BoardGame` trait and use
+`engine_core::board_profile::register_board_game::<YourBoardGame>()`; its private adapter is the only place
+that maps scalar previous-actor rewards and alternating turns into the generic
+per-agent ABI. `engine/envs-counter` is the reference implementation for a
+direct, non-board `Environment`.
 
-```rust
-use engine_core::{register_game, GameAdapter};
-
-pub fn register_connect4() {
-    register_game("connect4".to_string(), || {
-        Box::new(GameAdapter::new(Connect4::new()))
-    });
-}
-```
-
-4. Add tests for game logic and encoding round-trips
+5. Add reset/step, descriptor-validation, and strict codec round-trip tests.
+6. Regenerate the manifest with `make environment-manifest`.
+7. Inspect the generated algorithm compatibility reports. Registering an
+   environment does not make it trainable by every algorithm; if no installed
+   cartridge is compatible, add or extend an algorithm binding deliberately.
 
 ## Development
 
@@ -404,12 +539,12 @@ pub fn register_connect4() {
 
 ```bash
 # Build all Rust components
-cd engine && cargo build --release
-cd ../actor && cargo build --release
-cd ../web && cargo build --release
+cargo build --release --manifest-path engine/Cargo.toml
+cargo build --release --manifest-path actor/Cargo.toml
+cargo build --release --manifest-path web/Cargo.toml
 
 # Install Python dependencies
-cd trainer && pip install -e .
+pip install -e "trainer/.[dev]"
 ```
 
 ### Test
@@ -421,21 +556,26 @@ make test          # engine + actor + web + trainer
 cargo test --manifest-path engine/Cargo.toml
 cargo test --manifest-path actor/Cargo.toml
 cargo test --manifest-path web/Cargo.toml
-cd trainer && python -m pytest tests/
+python -m pytest trainer/tests/
 ```
 
 ### Format & Lint
 
 ```bash
-cd engine && cargo fmt && cargo clippy
-cd actor && cargo fmt && cargo clippy
-cd web && cargo fmt && cargo clippy
+cargo fmt --all --manifest-path engine/Cargo.toml
+cargo clippy --manifest-path engine/Cargo.toml
+cargo fmt --manifest-path actor/Cargo.toml
+cargo clippy --manifest-path actor/Cargo.toml
+cargo fmt --manifest-path web/Cargo.toml
+cargo clippy --manifest-path web/Cargo.toml
 ```
 
 ## Current Status
 
 **Core:**
-- [x] Engine core abstractions (Game trait, adapter, registry, metadata)
+- [x] Generic Environment ABI, validator/adapter, registry, and optional profiles
+- [x] Explicit algorithm catalog and startup dispatch
+- [x] Manifest v4 generic environment contract and compatibility profiles
 - [x] EngineContext high-level API
 - [x] TicTacToe game implementation
 - [x] Connect 4 game implementation
@@ -443,7 +583,7 @@ cd web && cargo fmt && cargo clippy
 - [x] MCTS implementation with ONNX evaluation
 
 **Training:**
-- [x] Actor (episode runner, MCTS + ONNX, model hot-reload)
+- [x] Bounded actor (one-shot episode runner, MCTS + pinned ONNX generation)
 - [x] Python trainer (PyTorch, ONNX export, cosine LR)
 - [x] Synchronized AlphaZero training loop (orchestrator)
 - [x] MCTS policy targets + game outcome propagation
@@ -452,7 +592,7 @@ cd web && cargo fmt && cargo clippy
 **Storage Backends:**
 - [x] PostgreSQL replay buffer (default)
 - [x] Filesystem model storage (default)
-- [x] S3/MinIO model storage (cloud mode)
+- [x] S3/MinIO model storage (Compose and distributed deployments)
 
 **Web:**
 - [x] Web server (Axum, game API)
@@ -462,8 +602,6 @@ cd web && cargo fmt && cargo clippy
 **Deployment:**
 - [x] Docker Compose (PostgreSQL, optional MinIO for S3)
 - [x] Parallel self-play actors (`[training].num_actors`)
-
-**Planned:**
 - [x] Kubernetes manifests (Kustomize, `k8s/`) + Terraform modules
 
 ## Design Decisions
@@ -473,11 +611,11 @@ cd web && cargo fmt && cargo clippy
 | Architecture | Monolith + Python | Simplicity for MVP, easy local development |
 | Deployment | Docker Compose | Simple orchestration, PostgreSQL included |
 | Language | Rust + Python | Type safety + ML ecosystem |
-| Game Interface | Typed trait + erasure | Compile-time safety + runtime flexibility |
+| Environment Interface | Typed ABI + validated erasure | Compile-time safety + runtime flexibility without board assumptions |
 | Replay Storage | PostgreSQL | Concurrent access, scales with multiple actors |
 | Model Storage | Filesystem / S3 | Filesystem for local, S3/MinIO for distributed |
 | Model Format | ONNX | Framework-agnostic, production-ready |
-| RNG | ChaCha20 | Deterministic, reproducible simulations |
+| RNG | ChaCha20 | Deterministic when seeded; synchronized collection intentionally uses system entropy while evaluation records a fixed seed |
 
 ## License
 

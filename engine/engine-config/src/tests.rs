@@ -1,6 +1,9 @@
 //! Tests for the configuration module.
 
 use super::*;
+use std::sync::Mutex;
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn test_default_config() {
@@ -8,18 +11,17 @@ fn test_default_config() {
     assert_eq!(config.common.env_id, "tictactoe");
     assert_eq!(config.common.data_dir, "./data");
     assert_eq!(config.common.log_level, "info");
+    assert_eq!(config.algorithm.id, "alphazero_board_v1");
     assert_eq!(config.actor.actor_id, "actor-1");
-    assert_eq!(config.actor.max_episodes, -1);
     assert_eq!(config.web.host, "0.0.0.0");
     assert_eq!(config.web.port, 8080);
-    assert_eq!(config.mcts.num_simulations, 800);
+    assert!((config.mcts.late_temperature - 1.0).abs() < f32::EPSILON);
 }
 
 #[test]
 fn test_training_defaults() {
     let config = CentralConfig::default();
     assert_eq!(config.training.iterations, 100);
-    assert_eq!(config.training.start_iteration, 1);
     assert_eq!(config.training.episodes_per_iteration, 500);
     assert_eq!(config.training.steps_per_iteration, 1000);
     assert_eq!(config.training.batch_size, 64);
@@ -28,7 +30,6 @@ fn test_training_defaults() {
     assert!((config.training.grad_clip_norm - 1.0).abs() < f64::EPSILON);
     assert_eq!(config.training.device, "cpu");
     assert_eq!(config.training.checkpoint_interval, 100);
-    assert_eq!(config.training.max_checkpoints, 10);
 }
 
 #[test]
@@ -36,16 +37,19 @@ fn test_evaluation_defaults() {
     let config = CentralConfig::default();
     assert_eq!(config.evaluation.interval, 1);
     assert_eq!(config.evaluation.games, 50);
+    assert_eq!(config.evaluation.simulations, 0);
+    assert!((config.evaluation.temperature - 0.2).abs() < f32::EPSILON);
+    assert_eq!(config.evaluation.solver_games, 0);
+    assert_eq!(config.evaluation.evaluation_seed, 42);
 }
 
 #[test]
 fn test_mcts_defaults() {
     let config = CentralConfig::default();
-    assert_eq!(config.mcts.num_simulations, 800);
-    assert!((config.mcts.c_puct - 1.4).abs() < f64::EPSILON);
-    assert!((config.mcts.temperature - 1.0).abs() < f64::EPSILON);
-    assert!((config.mcts.dirichlet_alpha - 0.3).abs() < f64::EPSILON);
-    assert!((config.mcts.dirichlet_weight - 0.25).abs() < f64::EPSILON);
+    assert!((config.mcts.c_puct - 1.4).abs() < f32::EPSILON);
+    assert!((config.mcts.temperature - 1.0).abs() < f32::EPSILON);
+    assert!((config.mcts.dirichlet_alpha - 0.3).abs() < f32::EPSILON);
+    assert!((config.mcts.dirichlet_weight - 0.25).abs() < f32::EPSILON);
     assert_eq!(config.mcts.eval_batch_size, 32);
     assert_eq!(config.mcts.onnx_intra_threads, 1);
 }
@@ -67,18 +71,25 @@ fn test_storage_config_defaults() {
 
 #[test]
 fn test_cartridge_env_overrides() {
+    let _guard = ENV_LOCK.lock().unwrap();
     std::env::set_var("CARTRIDGE_COMMON_ENV_ID", "connect4");
-    std::env::set_var("CARTRIDGE_ACTOR_MAX_EPISODES", "7");
+    std::env::set_var("CARTRIDGE_ALGORITHM_ID", "test_algorithm");
     std::env::set_var("CARTRIDGE_TRAINING_WEIGHT_DECAY", "0.5");
+    std::env::set_var("CARTRIDGE_EVALUATION_EVALUATION_SEED", "17");
+    std::env::set_var("CARTRIDGE_EVALUATION_TEMPERATURE", "0.35");
 
-    let config = load_config();
+    let config = load_config().unwrap();
     assert_eq!(config.common.env_id, "connect4");
-    assert_eq!(config.actor.max_episodes, 7);
+    assert_eq!(config.algorithm.id, "test_algorithm");
     assert!((config.training.weight_decay - 0.5).abs() < f64::EPSILON);
+    assert_eq!(config.evaluation.evaluation_seed, 17);
+    assert!((config.evaluation.temperature - 0.35).abs() < f32::EPSILON);
 
     std::env::remove_var("CARTRIDGE_COMMON_ENV_ID");
-    std::env::remove_var("CARTRIDGE_ACTOR_MAX_EPISODES");
+    std::env::remove_var("CARTRIDGE_ALGORITHM_ID");
     std::env::remove_var("CARTRIDGE_TRAINING_WEIGHT_DECAY");
+    std::env::remove_var("CARTRIDGE_EVALUATION_EVALUATION_SEED");
+    std::env::remove_var("CARTRIDGE_EVALUATION_TEMPERATURE");
 }
 
 #[test]
@@ -88,9 +99,11 @@ fn test_parse_config_toml() {
 env_id = "connect4"
 data_dir = "/custom/data"
 
+[algorithm]
+id = "alphazero_board_v1"
+
 [actor]
 actor_id = "my-actor"
-max_episodes = 100
 
 [training]
 iterations = 50
@@ -99,8 +112,8 @@ batch_size = 128
     let config: CentralConfig = toml::from_str(toml_content).unwrap();
     assert_eq!(config.common.env_id, "connect4");
     assert_eq!(config.common.data_dir, "/custom/data");
+    assert_eq!(config.algorithm.id, "alphazero_board_v1");
     assert_eq!(config.actor.actor_id, "my-actor");
-    assert_eq!(config.actor.max_episodes, 100);
     assert_eq!(config.training.iterations, 50);
     assert_eq!(config.training.batch_size, 128);
 }
@@ -114,6 +127,7 @@ env_id = "connect4"
     let config: CentralConfig = toml::from_str(toml_content).unwrap();
     assert_eq!(config.common.env_id, "connect4");
     assert_eq!(config.common.data_dir, "./data"); // Default
+    assert_eq!(config.algorithm.id, "alphazero_board_v1");
     assert_eq!(config.actor.actor_id, "actor-1"); // Default
     assert_eq!(config.web.port, 8080); // Default
 }
@@ -144,13 +158,15 @@ pool_max_size = 32
 
 #[test]
 fn test_storage_env_overrides() {
+    let _guard = ENV_LOCK.lock().unwrap();
     std::env::set_var("CARTRIDGE_STORAGE_MODEL_BACKEND", "s3");
+    std::env::set_var("CARTRIDGE_STORAGE_S3_BUCKET", "test-models");
     std::env::set_var(
         "CARTRIDGE_STORAGE_POSTGRES_URL",
         "postgresql://test@localhost/db",
     );
 
-    let config = load_config();
+    let config = load_config().unwrap();
     assert_eq!(config.storage.model_backend, "s3");
     assert_eq!(
         config.storage.postgres_url,
@@ -158,7 +174,96 @@ fn test_storage_env_overrides() {
     );
 
     std::env::remove_var("CARTRIDGE_STORAGE_MODEL_BACKEND");
+    std::env::remove_var("CARTRIDGE_STORAGE_S3_BUCKET");
     std::env::remove_var("CARTRIDGE_STORAGE_POSTGRES_URL");
+}
+
+#[test]
+fn test_unknown_config_key_is_rejected() {
+    let error = toml::from_str::<CentralConfig>(
+        r#"
+[algorithm]
+idd = "typo"
+"#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("unknown field"));
+    assert!(error.contains("idd"));
+}
+
+#[test]
+fn test_removed_actor_service_keys_are_rejected() {
+    for field in ["max_episodes", "flush_interval_secs", "health_port"] {
+        let source = format!("[actor]\n{field} = 1\n");
+        let error = toml::from_str::<CentralConfig>(&source)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(error.contains(field), "{error}");
+    }
+}
+
+#[test]
+fn test_removed_mcts_num_simulations_config_is_rejected() {
+    let error = toml::from_str::<CentralConfig>("[mcts]\nnum_simulations = 800\n")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unknown field"), "{error}");
+    assert!(error.contains("num_simulations"), "{error}");
+}
+
+#[test]
+fn test_unknown_known_section_environment_keys_are_rejected() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    for key in [
+        "CARTRIDGE_MCTS_NUM_SIMULATIONS",
+        "CARTRIDGE_ACTOR_MAX_EPISODES",
+        "CARTRIDGE_ACTOR_HEALTH_PORT",
+        "CARTRIDGE_EVALUATION_SEED",
+    ] {
+        std::env::set_var(key, "1");
+        let error = apply_env_overrides(CentralConfig::default())
+            .unwrap_err()
+            .to_string();
+        std::env::remove_var(key);
+        assert!(error.contains(key), "{error}");
+    }
+}
+
+#[test]
+fn test_operational_cartridge_environment_keys_are_allowed() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("CARTRIDGE_TRACE_ID", "trace-1");
+    std::env::set_var("CARTRIDGE_EVAL_BINARY", "/tmp/evaluator");
+    let result = apply_env_overrides(CentralConfig::default());
+    std::env::remove_var("CARTRIDGE_TRACE_ID");
+    std::env::remove_var("CARTRIDGE_EVAL_BINARY");
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_malformed_explicit_file_is_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, "[algorithm\nid = broken").unwrap();
+
+    let error = load_from_path(&path).unwrap_err().to_string();
+    assert!(error.contains("failed to parse configuration"));
+    assert!(error.contains("config.toml"));
+}
+
+#[test]
+fn test_invalid_typed_environment_override_is_rejected() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("CARTRIDGE_WEB_PORT", "not-a-port");
+    let error = apply_env_overrides(CentralConfig::default())
+        .unwrap_err()
+        .to_string();
+    std::env::remove_var("CARTRIDGE_WEB_PORT");
+
+    assert!(error.contains("CARTRIDGE_WEB_PORT"));
+    assert!(error.contains("not-a-port"));
 }
 
 #[test]
@@ -177,22 +282,136 @@ port = 3000
 fn test_mcts_config_from_toml() {
     let toml_content = r#"
 [mcts]
-num_simulations = 1600
 c_puct = 2.0
 temperature = 0.5
+late_temperature = 0.05
 dirichlet_alpha = 0.5
 dirichlet_weight = 0.3
 eval_batch_size = 64
 onnx_intra_threads = 4
 "#;
     let config: CentralConfig = toml::from_str(toml_content).unwrap();
-    assert_eq!(config.mcts.num_simulations, 1600);
-    assert!((config.mcts.c_puct - 2.0).abs() < f64::EPSILON);
-    assert!((config.mcts.temperature - 0.5).abs() < f64::EPSILON);
-    assert!((config.mcts.dirichlet_alpha - 0.5).abs() < f64::EPSILON);
-    assert!((config.mcts.dirichlet_weight - 0.3).abs() < f64::EPSILON);
+    assert!((config.mcts.c_puct - 2.0).abs() < f32::EPSILON);
+    assert!((config.mcts.late_temperature - 0.05).abs() < f32::EPSILON);
+    assert!((config.mcts.temperature - 0.5).abs() < f32::EPSILON);
+    assert!((config.mcts.dirichlet_alpha - 0.5).abs() < f32::EPSILON);
+    assert!((config.mcts.dirichlet_weight - 0.3).abs() < f32::EPSILON);
     assert_eq!(config.mcts.eval_batch_size, 64);
     assert_eq!(config.mcts.onnx_intra_threads, 4);
+}
+
+#[test]
+fn shared_count_widths_match_the_authenticated_wire_contract() {
+    let config: CentralConfig = toml::from_str(
+        r#"
+[training]
+iterations = 4294967296
+episodes_per_iteration = 2147483648
+steps_per_iteration = 4294967296
+batch_size = 4294967296
+checkpoint_interval = 4294967296
+num_actors = 1
+
+[evaluation]
+interval = 4294967296
+games = 2147483648
+solver_games = 0
+
+[mcts]
+eval_batch_size = 2147483648
+onnx_intra_threads = 2147483648
+"#,
+    )
+    .unwrap();
+    assert_eq!(config.training.iterations, 1_u64 << 32);
+    assert_eq!(config.training.episodes_per_iteration, 1_u32 << 31);
+    assert_eq!(config.evaluation.games, 1_u32 << 31);
+    assert_eq!(config.mcts.eval_batch_size, 1_u32 << 31);
+
+    for source in [
+        "[training]\nepisodes_per_iteration = 4294967296\n",
+        "[training]\nnum_actors = 4294967296\n",
+        "[evaluation]\ngames = 4294967296\n",
+        "[evaluation]\nsolver_games = 4294967296\n",
+        "[mcts]\neval_batch_size = 4294967296\n",
+        "[mcts]\nonnx_intra_threads = 4294967296\n",
+    ] {
+        assert!(toml::from_str::<CentralConfig>(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn test_invalid_search_numbers_are_rejected() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    for mutate in [
+        |config: &mut CentralConfig| config.evaluation.temperature = f32::NAN,
+        |config: &mut CentralConfig| config.mcts.c_puct = f32::INFINITY,
+        |config: &mut CentralConfig| config.mcts.dirichlet_weight = 1.01,
+        |config: &mut CentralConfig| config.mcts.dirichlet_alpha = 0.0,
+        |config: &mut CentralConfig| config.mcts.temp_threshold = 1,
+        |config: &mut CentralConfig| config.mcts.start_sims = 0,
+        |config: &mut CentralConfig| config.mcts.eval_batch_size = 0,
+    ] {
+        let mut config = CentralConfig::default();
+        mutate(&mut config);
+        assert!(apply_env_overrides(config).is_err());
+    }
+}
+
+#[test]
+fn test_noncanonical_mcts_schedules_are_rejected() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    for mutate in [
+        |config: &mut CentralConfig| {
+            config.mcts.max_sims = config.mcts.start_sims;
+        },
+        |config: &mut CentralConfig| {
+            config.mcts.max_sims = config.mcts.start_sims + 10;
+            config.mcts.sim_ramp_rate = 11;
+        },
+        |config: &mut CentralConfig| {
+            config.training.iterations = 2;
+            config.mcts.max_sims = config.mcts.start_sims + 10;
+            config.mcts.sim_ramp_rate = 5;
+        },
+    ] {
+        let mut config = CentralConfig::default();
+        mutate(&mut config);
+        assert!(apply_env_overrides(config).is_err());
+    }
+}
+
+#[test]
+fn test_ineffective_solver_settings_are_rejected() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let mut wrong_environment = CentralConfig::default();
+    wrong_environment.evaluation.solver_games = 1;
+    let error = apply_env_overrides(wrong_environment)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("solver_games"), "{error}");
+
+    let mut missing_games = CentralConfig::default();
+    missing_games.common.env_id = "connect4".to_string();
+    missing_games.evaluation.promotion_metric = "solver_optimal".to_string();
+    let error = apply_env_overrides(missing_games).unwrap_err().to_string();
+    assert!(error.contains("solver_optimal"), "{error}");
+}
+
+#[test]
+fn test_inactive_promotion_parameters_are_rejected() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let mut win_rate = CentralConfig::default();
+    win_rate.evaluation.promotion_margin = 0.1;
+    let error = apply_env_overrides(win_rate).unwrap_err().to_string();
+    assert!(error.contains("promotion_margin"), "{error}");
+
+    let mut solver = CentralConfig::default();
+    solver.common.env_id = "connect4".to_string();
+    solver.evaluation.promotion_metric = "solver_optimal".to_string();
+    solver.evaluation.solver_games = 1;
+    let error = apply_env_overrides(solver).unwrap_err().to_string();
+    assert!(error.contains("win_threshold"), "{error}");
 }
 
 #[test]

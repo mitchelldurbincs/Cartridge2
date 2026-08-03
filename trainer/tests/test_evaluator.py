@@ -8,11 +8,14 @@ CI job, which has no Rust toolchain.
 """
 
 import json
+import math
+import struct
 from pathlib import Path
 
 import pytest
 
 from trainer import evaluator
+from trainer.algorithms.alphazero_board_v1 import ALGORITHM_ID
 from trainer.evaluator import (
     EvalBinaryNotFound,
     EvalResults,
@@ -22,9 +25,12 @@ from trainer.evaluator import (
 )
 from trainer.players import ModelPlayer, RandomPlayer
 
+MODEL_FILENAME = f"{'a' * 64}.onnx"
+MODEL_PATH = f"/models/{MODEL_FILENAME}"
+
 SUMMARY_FIELDS = {
     "env_id": "connect4",
-    "player1_name": "ONNX(latest.onnx)",
+    "player1_name": f"ONNX({MODEL_FILENAME})",
     "player2_name": "Random",
     "games_played": 10,
     "player1_wins": 6,
@@ -75,39 +81,55 @@ class TestFindEvalBinary:
 class TestBuildEvalCommand:
     def test_random_player_needs_no_model_arguments(self, stub_binary):
         command = build_eval_command(
-            RandomPlayer(), RandomPlayer(), "othello", 8, 3, Path("/tmp/out.json")
+            RandomPlayer(),
+            RandomPlayer(),
+            ALGORITHM_ID,
+            "othello",
+            8,
+            3,
+            Path("/tmp/out.json"),
         )
 
         assert arg_value(command, "--p1") == "random"
         assert arg_value(command, "--p2") == "random"
+        assert arg_value(command, "--algorithm") == ALGORITHM_ID
         assert arg_value(command, "--env-id") == "othello"
         assert arg_value(command, "--games") == "8"
         assert arg_value(command, "--seed") == "3"
         assert "--p1-temperature" not in command
 
     def test_model_player_carries_its_temperature_and_search_budget(self, stub_binary):
+        player = ModelPlayer(MODEL_PATH, temperature=0.2, simulations=100)
         command = build_eval_command(
-            ModelPlayer("/models/latest.onnx", temperature=0.2, simulations=100),
+            player,
             RandomPlayer(),
+            ALGORITHM_ID,
             "connect4",
             10,
             42,
             Path("/tmp/out.json"),
         )
 
-        assert arg_value(command, "--p1") == "/models/latest.onnx"
-        assert arg_value(command, "--p1-temperature") == "0.2"
+        assert arg_value(command, "--p1") == MODEL_PATH
+        assert arg_value(command, "--p1-temperature") == str(player.temperature)
         assert arg_value(command, "--p1-sims") == "100"
 
     def test_positions_are_dumped_only_when_asked(self, stub_binary):
         without = build_eval_command(
-            RandomPlayer(), RandomPlayer(), "connect4", 2, 1, Path("/tmp/out.json")
+            RandomPlayer(),
+            RandomPlayer(),
+            ALGORITHM_ID,
+            "connect4",
+            2,
+            1,
+            Path("/tmp/out.json"),
         )
         assert "--dump-positions" not in without
 
         with_dump = build_eval_command(
             RandomPlayer(),
             RandomPlayer(),
+            ALGORITHM_ID,
             "connect4",
             2,
             1,
@@ -120,6 +142,7 @@ class TestBuildEvalCommand:
         command = build_eval_command(
             ModelPlayer("/models/a.onnx", temperature=0.2, simulations=50),
             ModelPlayer("/models/b.onnx", temperature=0.0, simulations=25),
+            ALGORITHM_ID,
             "connect4",
             4,
             1,
@@ -143,35 +166,15 @@ class TestEvaluate:
         monkeypatch.setattr(evaluator, "run_eval_binary", fake_run)
 
         results = evaluate(
-            player1=ModelPlayer("/models/latest.onnx"),
+            player1=ModelPlayer(MODEL_PATH),
             player2=RandomPlayer(),
+            algorithm_id=ALGORITHM_ID,
             env_id="connect4",
             num_games=10,
         )
 
         assert results == EvalResults(**SUMMARY_FIELDS)
         assert arg_value(seen["command"], "--games") == "10"
-
-    def test_config_keyword_is_accepted_and_ignored(self, stub_binary, monkeypatch):
-        # crucible's HeadToHeadEvalLike seam always passes config; the engine
-        # already knows the game, so it must not change anything here.
-        monkeypatch.setattr(
-            evaluator,
-            "run_eval_binary",
-            lambda command: Path(arg_value(command, "--output")).write_text(
-                json.dumps(SUMMARY_FIELDS)
-            ),
-        )
-
-        with_config = evaluate(
-            player1=RandomPlayer(),
-            player2=RandomPlayer(),
-            env_id="connect4",
-            config=object(),
-            num_games=10,
-            verbose=False,
-        )
-        assert with_config == EvalResults(**SUMMARY_FIELDS)
 
     def test_binary_failure_propagates(self, stub_binary, monkeypatch):
         def fail(command):
@@ -183,8 +186,32 @@ class TestEvaluate:
             evaluate(
                 player1=RandomPlayer(),
                 player2=RandomPlayer(),
+                algorithm_id=ALGORITHM_ID,
                 env_id="connect4",
                 num_games=2,
+            )
+
+    @pytest.mark.parametrize(
+        ("num_games", "seed", "message"),
+        [
+            (0, 0, "num_games"),
+            (1 << 32, 0, "num_games"),
+            (1, -1, "seed"),
+            (1, 1 << 64, "seed"),
+            (2, (1 << 64) - 1, "game index"),
+        ],
+    )
+    def test_invalid_game_schedule_is_rejected_before_binary_resolution(
+        self, num_games, seed, message
+    ):
+        with pytest.raises(ValueError, match=message):
+            evaluate(
+                player1=RandomPlayer(),
+                player2=RandomPlayer(),
+                algorithm_id=ALGORITHM_ID,
+                env_id="connect4",
+                num_games=num_games,
+                seed=seed,
             )
 
 
@@ -196,18 +223,31 @@ class TestEvalResults:
         assert results.player2_win_rate == pytest.approx(0.3)
         assert results.draw_rate == pytest.approx(0.1)
 
-    def test_zero_games_yields_zero_rates_not_a_division_error(self):
-        results = EvalResults(**{**SUMMARY_FIELDS, "games_played": 0})
+    def test_zero_games_is_not_a_valid_evaluator_result(self):
+        with pytest.raises(ValueError, match="games_played"):
+            EvalResults(
+                **{
+                    **SUMMARY_FIELDS,
+                    "games_played": 0,
+                    "player1_wins": 0,
+                    "player2_wins": 0,
+                    "draws": 0,
+                    "player1_wins_as_first": 0,
+                    "player1_wins_as_second": 0,
+                    "player2_wins_as_first": 0,
+                    "player2_wins_as_second": 0,
+                }
+            )
 
-        assert results.player1_win_rate == 0.0
-        assert results.player2_win_rate == 0.0
-        assert results.draw_rate == 0.0
+    def test_inconsistent_binary_summary_is_rejected(self):
+        with pytest.raises(ValueError, match="must sum"):
+            EvalResults(**{**SUMMARY_FIELDS, "draws": 2})
 
     def test_summary_reports_both_players_and_the_outcome(self):
         summary = EvalResults(**SUMMARY_FIELDS).summary()
 
         assert "connect4" in summary
-        assert "ONNX(latest.onnx)" in summary
+        assert f"ONNX({MODEL_FILENAME})" in summary
         assert "Random" in summary
         assert "60.0%" in summary
         assert "21.5" in summary
@@ -223,8 +263,34 @@ class TestPlayers:
         )
 
     def test_model_player_defaults_to_greedy_play_without_search(self):
-        # The pre-migration Python evaluator behaved this way; keeping it the
-        # default is what makes eval numbers comparable across the move.
-        player = ModelPlayer("/models/latest.onnx")
+        # Zero simulations is the AlphaZero evaluator's explicit raw-policy mode.
+        player = ModelPlayer(MODEL_PATH)
         assert player.temperature == 0.0
         assert player.simulations == 0
+
+    def test_model_player_canonicalizes_temperature_to_f32(self):
+        player = ModelPlayer(MODEL_PATH, temperature=0.2)
+        expected = float(struct.unpack("!f", struct.pack("!f", 0.2))[0])
+
+        assert player.temperature == expected
+
+        negative_zero = ModelPlayer(MODEL_PATH, temperature=-0.0)
+        assert math.copysign(1.0, negative_zero.temperature) == 1.0
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({"model_path": ""}, "model_path"),
+            ({"temperature": float("nan")}, "temperature"),
+            ({"temperature": -0.1}, "temperature"),
+            ({"temperature": float("inf")}, "temperature"),
+            ({"simulations": -1}, "simulations"),
+            ({"simulations": 1 << 32}, "simulations"),
+        ],
+    )
+    def test_model_player_rejects_values_rust_cannot_execute(self, overrides, message):
+        values = {"model_path": MODEL_PATH}
+        values.update(overrides)
+
+        with pytest.raises(ValueError, match=message):
+            ModelPlayer(**values)

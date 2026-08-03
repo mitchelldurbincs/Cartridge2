@@ -12,16 +12,14 @@
 #   docker compose up alphazero
 #
 #   # Override game via environment variable
-#   CARTRIDGE_COMMON_ENV_ID=connect4 docker compose up alphazero
+#   CARTRIDGE_COMMON_ENV_ID=tictactoe docker compose up alphazero
 #
 #   # Play against the trained model
 #   docker compose up web frontend
 #   # Open http://localhost in browser
 #
-#   # Run standalone evaluation
-#   # (--entrypoint is required: the image's ENTRYPOINT is `python -m trainer loop`,
-#   #  so a bare `run ... python -m trainer evaluate` would be appended to it.)
-#   docker compose run --rm --entrypoint python alphazero -m trainer evaluate --model /app/data/models/latest.onnx
+#   # Run a one-off command through the same canonical cartridge CLI
+#   docker compose run --rm alphazero --algorithm alphazero_board_v1 evaluate
 #
 #   # Watch training progress
 #   docker compose logs -f alphazero
@@ -39,10 +37,12 @@ x-aws-env: &aws-env
 
 x-storage-env: &storage-env
   <<: *aws-env
+  CARTRIDGE_ALGORITHM_ID: ${CARTRIDGE_ALGORITHM_ID:-alphazero_board_v1}
+  CARTRIDGE_COMMON_ENV_ID: ${CARTRIDGE_COMMON_ENV_ID:-connect4}
+  CARTRIDGE_COMMON_DATA_DIR: /app/data
   CARTRIDGE_STORAGE_MODEL_BACKEND: s3
   CARTRIDGE_STORAGE_S3_BUCKET: cartridge-models
   CARTRIDGE_STORAGE_S3_ENDPOINT: http://minio:9000
-  CARTRIDGE_STORAGE_POSTGRES_URL: postgresql://cartridge:cartridge@postgres:5432/cartridge
 
 services:
   # ==========================================================================
@@ -54,7 +54,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: cartridge
-      POSTGRES_PASSWORD: cartridge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cartridge}
       POSTGRES_DB: cartridge
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -99,9 +99,9 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-changeme}
     entrypoint: >
       /bin/sh -c "
+      set -eu;
       mc alias set cartridge http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
       mc mb cartridge/cartridge-models --ignore-existing;
-      mc anonymous set download cartridge/cartridge-models;
       echo 'MinIO bucket ready';
       "
     networks:
@@ -110,8 +110,8 @@ services:
   # ==========================================================================
   # AlphaZero - Synchronized Training
   # ==========================================================================
-  # Each iteration: clear buffer -> generate episodes -> train -> evaluate
-  # This ensures training data comes from the current model only.
+  # Each iteration owns an exact replay scope and bounded collector children,
+  # all pinned to the source checkpoint selected by the parent loop.
   #
   # All settings loaded from config.toml. Override with environment variables:
   #   CARTRIDGE_COMMON_ENV_ID, CARTRIDGE_TRAINING_ITERATIONS, etc.
@@ -121,6 +121,11 @@ services:
       dockerfile: Dockerfile.alphazero
       args:
         CARGO_FEATURES: "s3"
+    entrypoint: ["python", "-m", "trainer"]
+    command:
+      - "--algorithm"
+      - "${CARTRIDGE_ALGORITHM_ID:-alphazero_board_v1}"
+      - "loop"
     depends_on:
       postgres:
         condition: service_healthy
@@ -131,19 +136,19 @@ services:
       - ./config.toml:/app/config.toml:ro
     environment:
       <<: *storage-env
-      # Pass through environment overrides (empty = use config.toml defaults)
-      CARTRIDGE_COMMON_ENV_ID: ${CARTRIDGE_COMMON_ENV_ID:-}
-      CARTRIDGE_TRAINING_ITERATIONS: ${CARTRIDGE_TRAINING_ITERATIONS:-}
-      CARTRIDGE_TRAINING_EPISODES_PER_ITERATION: ${CARTRIDGE_TRAINING_EPISODES_PER_ITERATION:-}
-      CARTRIDGE_TRAINING_STEPS_PER_ITERATION: ${CARTRIDGE_TRAINING_STEPS_PER_ITERATION:-}
-      CARTRIDGE_TRAINING_DEVICE: ${CARTRIDGE_TRAINING_DEVICE:-}
-      CARTRIDGE_EVALUATION_INTERVAL: ${CARTRIDGE_EVALUATION_INTERVAL:-}
-      CARTRIDGE_EVALUATION_GAMES: ${CARTRIDGE_EVALUATION_GAMES:-}
-    # Metrics ports for Prometheus scraping
-    # Note: Not exposed to host, only accessible within Docker network
+      # Replay is trainer/collector authority. Keep this out of the shared
+      # model environment so the serving process receives no DB credential.
+      CARTRIDGE_STORAGE_POSTGRES_URL: postgresql://cartridge:${POSTGRES_PASSWORD:-cartridge}@postgres:5432/cartridge
+      CARTRIDGE_TRAINING_ITERATIONS: ${CARTRIDGE_TRAINING_ITERATIONS:-400}
+      CARTRIDGE_TRAINING_EPISODES_PER_ITERATION: ${CARTRIDGE_TRAINING_EPISODES_PER_ITERATION:-500}
+      CARTRIDGE_TRAINING_STEPS_PER_ITERATION: ${CARTRIDGE_TRAINING_STEPS_PER_ITERATION:-400}
+      CARTRIDGE_TRAINING_DEVICE: ${CARTRIDGE_TRAINING_DEVICE:-auto}
+      CARTRIDGE_EVALUATION_INTERVAL: ${CARTRIDGE_EVALUATION_INTERVAL:-5}
+      CARTRIDGE_EVALUATION_GAMES: ${CARTRIDGE_EVALUATION_GAMES:-200}
+    # Parent-loop metrics for Prometheus scraping. Bounded collector children
+    # have no stable network endpoint.
     expose:
-      - "9090"  # Trainer metrics
-      - "9091"  # Actor metrics
+      - "9090"
     networks:
       - cartridge-net
 
@@ -161,13 +166,10 @@ services:
       minio-setup:
         condition: service_completed_successfully
     volumes:
-      - ./data:/app/data
+      - ./data:/app/data:ro
       - ./config.toml:/app/config.toml:ro
     environment:
-      <<: *aws-env
-      CARTRIDGE_STORAGE_MODEL_BACKEND: s3
-      CARTRIDGE_STORAGE_S3_BUCKET: cartridge-models
-      CARTRIDGE_STORAGE_S3_ENDPOINT: http://minio:9000
+      <<: *storage-env
       RUST_LOG: info
     ports:
       - "8080:8080"
@@ -192,10 +194,8 @@ services:
   # ==========================================================================
   # Prometheus - Metrics collection and monitoring
   # ==========================================================================
-  # Collects metrics from all components:
-  #   - Actor metrics at http://alphazero:9091/metrics
-  #   - Trainer metrics at http://alphazero:9090/metrics
-  #   - Web server metrics at http://web:8080/metrics
+  # Collects parent-loop metrics at http://alphazero:9090/metrics and web
+  # metrics at http://web:8080/metrics.
   #
   # Access Prometheus UI at http://localhost:9092
   prometheus:

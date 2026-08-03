@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -27,9 +27,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref }}
-          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -39,19 +36,12 @@ jobs:
             engine
             actor
             web
-      # Formats the code; on PRs the resulting fixes are committed back.
-      - name: Format code (engine)
-        run: cargo fmt --all --manifest-path engine/Cargo.toml
-      - name: Format code (actor)
-        run: cargo fmt --manifest-path actor/Cargo.toml
-      - name: Format code (web)
-        run: cargo fmt --manifest-path web/Cargo.toml
-      - name: Commit formatting fixes
-        if: github.event_name == 'pull_request'
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "style: auto-fix Rust formatting"
-          file_pattern: "*.rs"
+      - name: Check formatting (engine)
+        run: cargo fmt --all --manifest-path engine/Cargo.toml -- --check
+      - name: Check formatting (actor)
+        run: cargo fmt --manifest-path actor/Cargo.toml -- --check
+      - name: Check formatting (web)
+        run: cargo fmt --manifest-path web/Cargo.toml -- --check
 
   rust-clippy:
     name: Rust Clippy
@@ -69,10 +59,14 @@ jobs:
             web
       - name: Clippy (engine)
         run: cargo clippy --manifest-path engine/Cargo.toml --all-targets -- -D warnings
+      - name: Clippy (model watcher, all features)
+        run: cargo clippy --manifest-path engine/Cargo.toml -p model-watcher --all-targets --all-features -- -D warnings
       - name: Clippy (actor)
-        run: cargo clippy --manifest-path actor/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path actor/Cargo.toml --all-targets --all-features -- -D warnings
       - name: Clippy (web)
-        run: cargo clippy --manifest-path web/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path web/Cargo.toml --all-targets --all-features -- -D warnings
+      - name: Clippy (web without ONNX)
+        run: cargo clippy --manifest-path web/Cargo.toml --all-targets --no-default-features -- -D warnings
 
   rust-test:
     name: Rust Tests
@@ -88,10 +82,14 @@ jobs:
             web
       - name: Test engine
         run: cargo test --manifest-path engine/Cargo.toml
+      - name: Test model watcher (all features)
+        run: cargo test --manifest-path engine/Cargo.toml -p model-watcher --all-features
       - name: Test actor
-        run: cargo test --manifest-path actor/Cargo.toml
+        run: cargo test --manifest-path actor/Cargo.toml --all-features
       - name: Test web
         run: cargo test --manifest-path web/Cargo.toml
+      - name: Test web without ONNX
+        run: cargo test --manifest-path web/Cargo.toml --no-default-features
 
   rust-build:
     name: Rust Build (Release)
@@ -147,9 +145,6 @@ jobs:
         working-directory: trainer
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref }}
-          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -157,17 +152,10 @@ jobs:
           cache-dependency-path: trainer/pyproject.toml
       - name: Install linters
         run: pip install ruff black
-      # Auto-fix linting issues
-      - name: Ruff fix
-        run: ruff check --fix src/
-      - name: Black format
-        run: black src/
-      - name: Commit lint fixes
-        if: github.event_name == 'pull_request'
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "style: auto-fix Python formatting"
-          file_pattern: "trainer/**/*.py"
+      - name: Ruff check
+        run: ruff check src/ tests/ smoke_test.py
+      - name: Black check
+        run: black --check src/ tests/ smoke_test.py
 
   python-test:
     name: Python Tests
@@ -252,6 +240,7 @@ jobs:
           file: ./Dockerfile.alphazero
           push: false
           tags: cartridge-alphazero:test
+          build-args: CARGO_FEATURES=s3
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Build Web image
@@ -261,6 +250,7 @@ jobs:
           file: ./web/Dockerfile
           push: false
           tags: cartridge-web:test
+          build-args: CARGO_FEATURES=s3
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Build Frontend image

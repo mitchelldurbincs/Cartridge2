@@ -1,91 +1,108 @@
-# Database Schema
+# Replay database schema
 
-Cartridge2 uses PostgreSQL for the replay buffer (storing training transitions) and training coordination.
+Cartridge2 uses PostgreSQL as an algorithm-neutral replay store. Storage owns
+only an immutable profile envelope and an opaque payload. The cartridge named
+by `algorithm_id` and `experience_schema` owns the payload codec; adding a new
+algorithm does not add algorithm-specific columns or tables.
 
-## Schema Files
+## Schema files
 
 | File | Purpose | Used by |
 |------|---------|---------|
-| `schema.sql` | Core schema for local development | Rust actor, Python trainer |
-| `../scripts/init-postgres.sql` | Extended schema for Docker/K8s deployments | Docker Compose (mounted as init script) |
+| `schema.sql` | Canonical replay-v3 DDL | Rust actor and local setup |
+| `../trainer/src/trainer/storage/schema.sql` | Byte-identical packaged mirror | Python trainer |
+| `../scripts/init-postgres.sql` | Canonical DDL plus deployment grants | Docker Compose |
+| `../k8s/base/postgres/init-configmap.yaml` | Canonical DDL embedded for Kubernetes | In-cluster PostgreSQL |
 
-### Differences
+Every form creates exactly `cartridge_schema_versions` and `replay_records`.
+The deployment forms add only their role grants. Actor and trainer create the
+schema only when the database has no tables; otherwise startup requires the
+exact table set, columns, PostgreSQL types, nullability, primary-key order, and
+schema marker. Partial, extra, unversioned, or wrong-version schemas fail fast.
 
-Both files share the same core tables (`transitions`, `game_metadata`). The `init-postgres.sql` file adds:
+## Replay protocol v3
 
-- **`training_stats`** - Stores per-iteration training metrics for distributed coordination
-- **`model_versions`** - Tracks model versions and S3 keys for distributed model storage
-- **Permission grants** for K8s service accounts
+`cartridge_schema_versions` must contain exactly:
 
-For local development, the actor and trainer create tables automatically if they don't exist. For Docker/K8s, `init-postgres.sql` is mounted into the PostgreSQL container's `docker-entrypoint-initdb.d/` directory and runs on first startup.
+```text
+('replay', 3)
+```
 
-## Tables
+`replay_records` has this storage-owned envelope:
 
-### transitions
+| Column | PostgreSQL type | Contract |
+|--------|-----------------|----------|
+| `id` | `TEXT` | Non-empty record ID, unique within the scoped profile |
+| `env_id` | `TEXT` | Environment ID |
+| `env_contract_version` | `BIGINT` | Immutable environment contract version in `[1, 2^32-1]` |
+| `algorithm_id` | `TEXT` | Algorithm cartridge that owns the payload |
+| `experience_schema` | `TEXT` | Algorithm-owned payload codec ID |
+| `collection_scope_id` | `TEXT` | Required lowercase 64-hex identity unique to one collection attempt |
+| `source_checkpoint_id` | `TEXT NULL` | Lowercase 64-hex model generation, null only for root collection |
+| `episode_id` | `TEXT` | Algorithm grouping key for one episode |
+| `step_number` | `BIGINT` | Record order within the episode in `[0, 2^32-1]` |
+| `payload` | `BYTEA` | Opaque algorithm-owned bytes |
+| `created_at` | `TIMESTAMP` | Server-side insertion time |
 
-Main replay buffer table. Stores game episode data used for training.
+The primary key is:
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | TEXT PK | Unique transition ID |
-| `env_id` | TEXT | Game identifier (e.g., "tictactoe", "connect4") |
-| `episode_id` | TEXT | Groups transitions from a single game |
-| `step_number` | INTEGER | Position within the episode |
-| `state` | BYTEA | Encoded game state |
-| `action` | BYTEA | Encoded action taken |
-| `next_state` | BYTEA | Encoded resulting state |
-| `observation` | BYTEA | Neural network input for current state |
-| `next_observation` | BYTEA | Neural network input for next state |
-| `reward` | REAL | Immediate reward |
-| `done` | BOOLEAN | Whether the game ended |
-| `timestamp` | BIGINT | Unix timestamp for ordering |
-| `policy_probs` | BYTEA | MCTS visit distribution (policy target) |
-| `mcts_value` | REAL | MCTS value estimate |
-| `game_outcome` | REAL | Backfilled final game result (+1, -1, 0) |
-| `created_at` | TIMESTAMP | Row creation time |
+```text
+(env_id, env_contract_version, algorithm_id, experience_schema,
+ collection_scope_id, id)
+```
 
-**Indexes:** `timestamp` (sampling), `episode_id` (outcome backfill), `env_id` (filtering)
+Indexes support newest-first selection retention and selection-scoped episode
+ordering. Every count, distinct-episode count, sample, clear, cleanup, and write
+operation is bound to the full `ReplaySelection`: the four-field profile,
+`collection_scope_id`, and exact nullable `source_checkpoint_id`. SQL compares
+the nullable source with `IS NOT DISTINCT FROM`, so null means root and never
+means “all sources.” A record from another profile, attempt, or model generation
+is rejected before storage.
 
-### game_metadata
+The table intentionally contains no state, action, observation, reward,
+terminal, policy, value, board, or presentation columns. Those meanings belong
+to a cartridge codec, not PostgreSQL.
 
-Self-describing game configuration. Written by the actor so the trainer knows game dimensions.
+### Installed AlphaZero payload
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `env_id` | TEXT PK | Game identifier |
-| `display_name` | TEXT | Human-readable name |
-| `board_width` | INTEGER | Board width |
-| `board_height` | INTEGER | Board height |
-| `num_actions` | INTEGER | Action space size |
-| `obs_size` | INTEGER | Observation vector length |
-| `legal_mask_offset` | INTEGER | Offset into observation for legal move mask |
-| `player_count` | INTEGER | Number of players |
+`alphazero_transition_v1` encodes one payload as the concatenation below, with
+every element represented as little-endian IEEE-754 `f32`:
 
-### training_stats (K8s only)
+```text
+observation[obs_size] || policy[num_actions] || terminal_value[1]
+```
 
-Per-iteration training metrics for distributed coordination.
+The AlphaZero decoder requires the exact byte length, finite values, policy
+entries in `[0, 1]` summing to one, and a terminal value in `[-1, 1]`. Storage
+does not know or validate those fields; the installed AlphaZero cartridge does.
 
-### model_versions (K8s only)
+## Clean cutover
 
-Tracks ONNX model versions and S3 storage keys. Used when `model_backend = "s3"`.
+Replay v3 has no migration, compatibility view, legacy table reader, default
+profile inference, or implicit collection scope. Replay-v1 and replay-v2
+databases are deliberately rejected. Preserve any data you need, then recreate
+the replay database from the current schema.
 
 ## Setup
 
 ```bash
-# Local: Docker Compose starts PostgreSQL automatically
+# Docker Compose initializes a fresh volume automatically.
 docker compose up postgres
 
-# Or use a local PostgreSQL installation:
+# Or initialize a fresh local database explicitly.
 createdb cartridge
 psql cartridge -f sql/schema.sql
 psql cartridge -c "CREATE USER cartridge WITH PASSWORD 'cartridge'; GRANT ALL ON DATABASE cartridge TO cartridge;"
 ```
 
-## Connection
+Default local DSN:
 
-Default connection string: `postgresql://cartridge:cartridge@localhost:5432/cartridge`
+```text
+postgresql://cartridge:cartridge@localhost:5432/cartridge
+```
 
-Override via `config.toml` or environment variable:
+Override it for actor and trainer with:
+
 ```bash
-CARTRIDGE_STORAGE_POSTGRES_URL=postgresql://user:pass@host:5432/dbname
+export CARTRIDGE_STORAGE_POSTGRES_URL=postgresql://user:pass@host:5432/dbname
 ```

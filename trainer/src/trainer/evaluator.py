@@ -12,9 +12,8 @@ somebody had reimplemented, which is why Othello was never evaluable. Playing
 through the engine also lets evaluation use MCTS; the Python evaluator could
 only play the raw policy argmax, which understates a model.
 
-Usage (defaults assume running from the trainer/ directory):
-    python -m trainer.evaluator --model ../data/models/latest.onnx --games 100
-    python -m trainer.evaluator --env-id connect4 --games 100
+Usage:
+    python -m trainer --algorithm alphazero_board_v1 evaluate --games 100
 """
 
 from __future__ import annotations
@@ -22,15 +21,16 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
+import struct
 import subprocess
-import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from .game_config import get_config
-from .logging_utils import silence_noisy_loggers
+from .algorithms import get_algorithm
+from .environment_catalog import get_environment
 from .players import ModelPlayer, RandomPlayer
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,85 @@ _BINARY_CANDIDATES = (
 # Default RNG seed for evaluation runs. Fixed rather than random so a model's
 # eval is reproducible and successive iterations face the same conditions.
 DEFAULT_SEED = 42
+_MAX_U32 = (1 << 32) - 1
+_MAX_U64 = (1 << 64) - 1
+_MAX_F32 = float.fromhex("0x1.fffffep+127")
+
+
+def _positive_u32(value: object, *, field: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= _MAX_U32
+    ):
+        raise ValueError(f"{field} must be a positive u32 integer")
+    return value
+
+
+def _u32(value: object, *, field: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= _MAX_U32
+    ):
+        raise ValueError(f"{field} must be a nonnegative u32 integer")
+    return value
+
+
+def _u64(value: object, *, field: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= _MAX_U64
+    ):
+        raise ValueError(f"{field} must be a nonnegative u64 integer")
+    return value
+
+
+def _canonical_f32(value: object, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a finite nonnegative f32")
+    normalized = float(value)
+    if not math.isfinite(normalized) or normalized < 0.0 or normalized > _MAX_F32:
+        raise ValueError(f"{field} must be a finite nonnegative f32")
+    narrowed = float(struct.unpack("!f", struct.pack("!f", normalized))[0])
+    return 0.0 if narrowed == 0.0 else narrowed
+
+
+def _validate_evaluation_schedule(num_games: object, seed: object) -> tuple[int, int]:
+    games = _positive_u32(num_games, field="num_games")
+    base_seed = _u64(seed, field="seed")
+    if base_seed > _MAX_U64 - (games - 1):
+        raise ValueError("seed plus the game index exceeds u64")
+    return games, base_seed
+
+
+def _positive_u32_argument(value: str) -> int:
+    try:
+        return _positive_u32(int(value), field="--games")
+    except (ValueError, TypeError) as exc:
+        raise argparse.ArgumentTypeError("expected a positive u32 integer") from exc
+
+
+def _u32_argument(value: str) -> int:
+    try:
+        return _u32(int(value), field="--simulations")
+    except (ValueError, TypeError) as exc:
+        raise argparse.ArgumentTypeError("expected a nonnegative u32 integer") from exc
+
+
+def _u64_argument(value: str) -> int:
+    try:
+        return _u64(int(value), field="--seed")
+    except (ValueError, TypeError) as exc:
+        raise argparse.ArgumentTypeError("expected a nonnegative u64 integer") from exc
+
+
+def _f32_argument(value: str) -> float:
+    try:
+        return _canonical_f32(float(value), field="--temperature")
+    except (ValueError, TypeError) as exc:
+        raise argparse.ArgumentTypeError("expected a finite nonnegative f32") from exc
 
 
 class EvalBinaryNotFound(RuntimeError):
@@ -108,6 +187,44 @@ class EvalResults:
     player2_wins_as_second: int
     avg_game_length: float
 
+    def __post_init__(self) -> None:
+        for field in ("env_id", "player1_name", "player2_name"):
+            value = getattr(self, field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field} must be a nonempty string")
+        _positive_u32(self.games_played, field="games_played")
+        for field in (
+            "player1_wins",
+            "player2_wins",
+            "draws",
+            "player1_wins_as_first",
+            "player1_wins_as_second",
+            "player2_wins_as_first",
+            "player2_wins_as_second",
+        ):
+            _u32(getattr(self, field), field=field)
+        if self.player1_wins + self.player2_wins + self.draws != self.games_played:
+            raise ValueError("evaluation outcome counts must sum to games_played")
+        if (
+            self.player1_wins_as_first + self.player1_wins_as_second
+            != self.player1_wins
+        ):
+            raise ValueError("player1 seat-win counts must sum to player1_wins")
+        if (
+            self.player2_wins_as_first + self.player2_wins_as_second
+            != self.player2_wins
+        ):
+            raise ValueError("player2 seat-win counts must sum to player2_wins")
+        if (
+            isinstance(self.avg_game_length, bool)
+            or not isinstance(self.avg_game_length, (int, float))
+            or not math.isfinite(float(self.avg_game_length))
+            or self.avg_game_length < 0.0
+        ):
+            raise ValueError("avg_game_length must be finite and nonnegative")
+        normalized = float(self.avg_game_length)
+        self.avg_game_length = 0.0 if normalized == 0.0 else normalized
+
     @property
     def player1_win_rate(self) -> float:
         return self.player1_wins / self.games_played if self.games_played else 0.0
@@ -141,6 +258,7 @@ class EvalResults:
 def build_eval_command(
     player1: ModelPlayer | RandomPlayer,
     player2: ModelPlayer | RandomPlayer,
+    algorithm_id: str,
     env_id: str,
     num_games: int,
     seed: int,
@@ -148,8 +266,11 @@ def build_eval_command(
     dump_positions: Path | None = None,
 ) -> list[str]:
     """Assemble the ``cartridge-eval`` argument vector."""
+    num_games, seed = _validate_evaluation_schedule(num_games, seed)
     command = [
         str(find_eval_binary()),
+        "--algorithm",
+        algorithm_id,
         "--env-id",
         env_id,
         "--games",
@@ -180,24 +301,22 @@ def run_eval_binary(command: list[str]) -> None:
 def evaluate(
     player1: ModelPlayer | RandomPlayer,
     player2: ModelPlayer | RandomPlayer,
+    algorithm_id: str,
     env_id: str,
-    config: object = None,
     num_games: int = 100,
     verbose: bool = False,
     seed: int = DEFAULT_SEED,
 ) -> EvalResults:
     """Play ``num_games`` between two players and return the aggregate result.
 
-    Each player takes the first seat for half the games, matching the binary's
-    own split, so first-mover advantage cancels.
+    Player 1 takes the first seat on even game indices and the second seat on
+    odd indices, matching the binary's deterministic alternating schedule.
 
     Args:
         player1: Player being evaluated (typically the candidate model).
-        player2: Opponent (typically the random baseline or the best model).
+        player2: Opponent (typically the random baseline or the champion).
+        algorithm_id: Algorithm cartridge ID.
         env_id: Environment ID.
-        config: Accepted and ignored. The engine knows the game; this keyword
-            exists because crucible's ``HeadToHeadEvalLike`` seam passes it,
-            and removing it there is a separate change.
         num_games: Total games to play.
         verbose: Log the resulting summary block.
         seed: Base RNG seed; game N uses ``seed + N``.
@@ -205,12 +324,22 @@ def evaluate(
     Returns:
         EvalResults with aggregated statistics.
     """
-    del config  # See the docstring: part of the injected seam, not used here.
+    num_games, seed = _validate_evaluation_schedule(num_games, seed)
+    algorithm = get_algorithm(algorithm_id)
+    algorithm.compatibility(get_environment(env_id)).require_compatible()
 
     with tempfile.TemporaryDirectory() as tmp:
         output_path = Path(tmp) / "eval.json"
         run_eval_binary(
-            build_eval_command(player1, player2, env_id, num_games, seed, output_path)
+            build_eval_command(
+                player1,
+                player2,
+                algorithm_id,
+                env_id,
+                num_games,
+                seed,
+                output_path,
+            )
         )
         results = EvalResults(**json.loads(output_path.read_text()))
 
@@ -221,7 +350,7 @@ def evaluate(
 
 def add_evaluate_arguments(
     parser: argparse.ArgumentParser,
-    model_default: str = "./data/models/latest.onnx",
+    model_default: str | None = None,
 ) -> None:
     """Add evaluation arguments to a parser.
 
@@ -230,41 +359,46 @@ def add_evaluate_arguments(
 
     Args:
         parser: ArgumentParser to add arguments to.
-        model_default: Default path for the model file.
+        model_default: Default path for the model file. The canonical
+            cartridge binding leaves this unset and resolves it from the
+            parsed environment's runtime profile.
     """
+    from .central_config import get_config
+
+    central_config = get_config()
     parser.add_argument(
         "--model",
         type=str,
-        default=model_default,
-        help="Path to ONNX model file",
+        default=argparse.SUPPRESS if model_default is None else model_default,
+        help="Path to ONNX model file (default: selected runtime profile)",
     )
     parser.add_argument(
         "--env-id",
         type=str,
-        default="tictactoe",
+        default=central_config.common.env_id,
         help="Game environment to evaluate",
     )
     parser.add_argument(
         "--games",
-        type=int,
+        type=_positive_u32_argument,
         default=100,
         help="Number of games to play",
     )
     parser.add_argument(
         "--temperature",
-        type=float,
+        type=_f32_argument,
         default=0.0,
         help="Sampling temperature (0 = greedy)",
     )
     parser.add_argument(
         "--simulations",
-        type=int,
+        type=_u32_argument,
         default=0,
         help="MCTS simulations per move (0 = play the policy head directly)",
     )
     parser.add_argument(
         "--seed",
-        type=int,
+        type=_u64_argument,
         default=DEFAULT_SEED,
         help="Base RNG seed; game N uses seed + N",
     )
@@ -294,11 +428,22 @@ def run_evaluation(args: argparse.Namespace) -> int:
     Returns:
         Exit code (0 for success, 1 for failure).
     """
-    config = get_config(args.env_id)
+    try:
+        args.games, args.seed = _validate_evaluation_schedule(args.games, args.seed)
+        args.simulations = _u32(args.simulations, field="simulations")
+        args.temperature = _canonical_f32(args.temperature, field="temperature")
+    except ValueError as exc:
+        logger.error(str(exc))
+        return 1
+
+    algorithm = get_algorithm(args.algorithm)
+    environment = get_environment(args.env_id)
+    algorithm.compatibility(environment).require_compatible()
+    board = environment.require_board()
     logger.info(
-        f"Game config for {args.env_id}: "
-        f"board={config.board_width}x{config.board_height}, "
-        f"actions={config.num_actions}, obs_size={config.obs_size}"
+        f"Environment {args.env_id} with {args.algorithm}: "
+        f"board={board.width}x{board.height}, "
+        f"actions={board.action_count}, obs_size={board.observation.elements}"
     )
 
     model_path = Path(args.model)
@@ -319,6 +464,7 @@ def run_evaluation(args: argparse.Namespace) -> int:
         results = evaluate(
             player1=model,
             player2=opponent,
+            algorithm_id=args.algorithm,
             env_id=args.env_id,
             num_games=args.games,
             verbose=args.verbose,
@@ -345,25 +491,3 @@ def run_evaluation(args: argparse.Namespace) -> int:
         )
 
     return 0
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Evaluate trained model against random play",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    add_evaluate_arguments(parser, model_default="../data/models/latest.onnx")
-    args = parser.parse_args()
-
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    silence_noisy_loggers()
-
-    return run_evaluation(args)
-
-
-if __name__ == "__main__":
-    sys.exit(main())

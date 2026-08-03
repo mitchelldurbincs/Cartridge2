@@ -12,9 +12,9 @@
 #   1. Install PostgreSQL: brew install postgresql@16 && brew services start postgresql@16
 #   2. Create DB: createdb cartridge
 #      psql cartridge -c "CREATE USER cartridge WITH PASSWORD 'cartridge'; GRANT ALL ON DATABASE cartridge TO cartridge;"
-#   3. Install trainer: cd trainer && pip install -e ".[dev]"
+#   3. Install trainer: pip install -e "trainer/.[dev]"
 #   4. Build actor with CoreML: cd actor && cargo build --release --features coreml
-#   5. Run training: python -m trainer loop
+#   5. Run training: python -m trainer --algorithm alphazero_board_v1 loop
 #   Device auto-detection uses MPS (Metal) for PyTorch training.
 #   Actors use CoreML for ONNX inference when built with --features coreml.
 #   Recommended: num_actors = 6 for 8-core, 8-10 for M2/M3/M4 Pro/Max.
@@ -23,8 +23,8 @@
 # Common Settings
 # =============================================================================
 [common]
-# Base data directory for all runtime files (models/, stats.json;
-# the replay buffer itself lives in PostgreSQL)
+# Base runtime root. Components append the immutable namespace
+# profiles/{algorithm_id}/{env_id}/v{env_contract_version}; replay lives in PostgreSQL.
 data_dir = "./data"
 
 # Game environment: tictactoe, connect4, othello
@@ -32,6 +32,11 @@ env_id = "connect4"
 
 # Logging level: trace, debug, info, warn, error
 log_level = "info"
+
+# Training/collection/evaluation implementation selected for this environment.
+# The first installed cartridge is the explicit AlphaZero board-game profile.
+[algorithm]
+id = "alphazero_board_v1"
 
 # =============================================================================
 # Training Loop Settings (AlphaZero synchronized training)
@@ -41,7 +46,6 @@ log_level = "info"
 iterations = 400 
 
 # Starting iteration number (for resuming training)
-start_iteration = 1
 
 # Self-play episodes to generate per iteration
 episodes_per_iteration = 500
@@ -70,9 +74,6 @@ device = "auto"
 # Steps between checkpoint saves
 checkpoint_interval = 250 
 
-# Maximum number of checkpoints to keep
-max_checkpoints = 10
-
 # Number of parallel actor processes for self-play
 # More actors = faster episode generation (scales well with CPU cores)
 # Recommended: 6 for 8-core, 8-10 for 10+ core machines
@@ -88,26 +89,33 @@ interval = 5
 # Number of games per evaluation
 games = 200
 
-# Win rate threshold to become new "best" model (gatekeeper)
-# Current model must win > this rate against best to replace it
+# Win rate threshold for candidate promotion to champion
+# Candidate must win > this rate against the champion to replace it
 win_threshold = 0.55
 
 # Also evaluate against random baseline (useful for absolute performance)
 eval_vs_random = true
 
-# Perfect-solver move scoring during evaluation (connect4 only).
-# Every model decision is scored against the bitbully solver; results go to
-# eval_stats.json, solver_stats.json, and W&B (solver/* metrics).
-solver_games = 100        # Games per solver eval (0 = disable)
-solver_seed = 42          # Fixed seed so rates are comparable across iterations
+# Search budget and action-selection temperature for evaluation games.
+# Zero simulations evaluates the policy head directly.
+simulations = 0
+temperature = 0.2
 
-# Best-model promotion criterion:
-#   "win_rate"       - promote when candidate beats best.onnx > win_threshold (default)
+# Perfect-solver move scoring during evaluation (connect4 only).
+# Every model decision is scored against the bitbully solver. Synchronized
+# evidence is immutable in EvaluationArtifactV2/RunCommitV1; eval_stats.json and
+# solver_stats.json are disposable projections. W&B receives solver/* metrics.
+solver_games = 100        # Games per solver eval (0 = disable)
+evaluation_seed = 42      # Fixed seed for head-to-head, random, and solver games
+
+# Champion promotion criterion:
+#   "win_rate"       - promote when the candidate's head-to-head rate exceeds
+#                      win_threshold (default)
 #   "solver_optimal" - promote when candidate's value-optimal rate exceeds the
-#                      best model's stored rate by promotion_margin (connect4 only;
-#                      falls back to win_rate when solver eval is unavailable)
+#                      champion's rate by promotion_margin (connect4 only;
+#                      requires solver_games > 0)
 promotion_metric = "win_rate"
-promotion_margin = 0.01
+promotion_margin = 0.0  # Inactive under win_rate; set >0 with solver_optimal if desired
 
 # =============================================================================
 # Actor Settings (Self-play episode runner)
@@ -116,19 +124,11 @@ promotion_margin = 0.01
 # Unique actor identifier
 actor_id = "actor-1"
 
-# Maximum episodes to run (-1 for unlimited)
-max_episodes = -1
-
-# Timeout per episode in seconds (Connect4 games can take 30+ moves).
-# Treated as a floor: the actor raises it to at least 1 second per move of
-# the game's horizon, so a value tuned for a short game does not silently
-# truncate a long one (generals_8x8 runs ~400 plies). Episodes that do hit
-# the limit are discarded whole and counted in actor_stats.json
-# (episodes_abandoned) and the actor_episodes_abandoned_total metric.
+# Exact hard timeout per episode in seconds. Choose it for the selected game
+# and search budget (generals_8x8 can run roughly 400 plies). Any abandonment
+# fails that scoped collection attempt; its partial rows are never sampled by
+# a later attempt.
 episode_timeout_secs = 180
-
-# Interval to flush data to database in seconds
-flush_interval_secs = 5
 
 # Log progress every N episodes (0 to disable)
 log_interval = 50
@@ -155,9 +155,6 @@ max_sims = 250        # Maximum simulations (reached after ramping)
 sim_ramp_rate = 10    # Simulations to add per iteration
 # With these settings: iter 1=50, iter 10=140, iter 21+=250
 
-# Legacy setting (used if ramping not configured)
-num_simulations = 200
-
 # Exploration constant (c_puct)
 # Lower values = more exploitation of current best moves
 c_puct = 1.0
@@ -165,15 +162,19 @@ c_puct = 1.0
 # Temperature for action selection (higher = more exploration)
 temperature = 1.0
 
+# Temperature at and after temp_threshold
+late_temperature = 0.1
+
 # Move number after which to reduce temperature (0 = disabled)
 # For Connect4, use ~50% of typical game length for late-game exploitation
+# A nonzero threshold must be strictly below the environment's max_horizon.
 temp_threshold = 15
 
-# Dirichlet noise alpha (0 to disable)
+# Dirichlet noise alpha (set alpha and weight to 0 together to disable)
 # Lower values = more concentrated noise; ~0.3-0.5 good for 7 actions
 dirichlet_alpha = 0.4
 
-# Dirichlet noise weight
+# Dirichlet noise weight (set alpha and weight to 0 together to disable)
 dirichlet_weight = 0.25
 
 # Batch size for neural network evaluation during MCTS
@@ -184,7 +185,6 @@ eval_batch_size = 64
 
 # Number of intra-op threads for ONNX inference
 # 1 = single-threaded (best for small models/batches, multiple parallel actors)
-# 0 = auto-detect (uses all available CPU cores)
 # >1 = use exactly this many threads per inference
 # For MCTS with multiple actors, 1 is usually best to avoid thread contention
 onnx_intra_threads = 1
@@ -215,7 +215,7 @@ model_backend = "filesystem"
 # PostgreSQL connection string (required for replay buffer)
 # For local dev: docker compose up postgres
 # NOTE: this key is read by the Rust actor and web server only. The Python
-# trainer (`python -m trainer loop/train/evaluate`) reads the connection
+# trainer (`python -m trainer --algorithm <id> <command>`) reads the connection
 # string exclusively from the CARTRIDGE_STORAGE_POSTGRES_URL environment
 # variable and fails at startup if it is not set.
 postgres_url = "postgresql://cartridge:cartridge@localhost:5432/cartridge"
@@ -236,7 +236,7 @@ pool_idle_timeout = 300     # Seconds before idle connection is closed
 # =============================================================================
 # Weights & Biases Logging
 # =============================================================================
-# One W&B run per `python -m trainer loop` invocation: training losses per
+# One W&B run per `python -m trainer --algorithm <id> loop` invocation: training losses per
 # step, eval + solver metrics per iteration, all on the global-step x-axis.
 # Requires `wandb login` (or WANDB_API_KEY) when enabled; WANDB_MODE=offline
 # logs locally without a network. WANDB_PROJECT / WANDB_ENTITY env vars

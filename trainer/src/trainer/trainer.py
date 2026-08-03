@@ -1,10 +1,10 @@
 """Training loop with ONNX export and stats tracking.
 
 This module provides the main training loop that:
-1. Loads batches from the PostgreSQL replay buffer
+1. Samples opaque records from the profile-bound PostgreSQL replay store
 2. Trains the AlphaZero-style network
-3. Exports ONNX checkpoints using atomic write-then-rename
-4. Writes stats.json for web visualization
+3. Stages validated content-addressed ONNX and learner-state checkpoints
+4. Commits an embedded stats snapshot through RunHead and rebuilds stats.json
 
 Training targets:
     - Policy targets: MCTS visit count distributions (soft targets) from the actor.
@@ -24,31 +24,82 @@ import torch.optim as optim
 
 from . import checkpoint_runner, replay_setup, step_metrics
 from . import metrics as prom_metrics
-from .backoff import LOG_EVERY_N_WAITS, WaitTimeout
-from .checkpoint import load_pytorch_checkpoint
-from .config import TrainerConfig
-from .game_config import get_config
+from .algorithms.alphazero_board_v1 import (
+    ALGORITHM_ID,
+    DESCRIPTOR,
+    decode_replay_batch,
+    get_game_config,
+)
+from .checkpoint import learner_config_sha256, restore_learner_state
+from .config import AlphaZeroLearnerConfig
+from .environment_catalog import get_environment
 from .lr_scheduler import LRConfig, WarmupCosineScheduler
 from .network import AlphaZeroLoss, create_network
-from .stats import EvalStats, TrainerStats, load_stats
-from .storage import create_replay_buffer
+from .stats import (
+    PreparedStatsSnapshotV2,
+    TrainerStats,
+    decode_stats_snapshot,
+    prepare_stats_snapshot,
+    write_ephemeral_stats_projection,
+    write_stats_projection,
+)
+from .storage import ReplayProfile, ReplaySelection, create_replay_store
+from .storage.evaluation import create_evaluation_repository
+from .storage.publisher import (
+    ArtifactValidationError,
+    CheckpointRef,
+    OnnxArtifactContract,
+    create_checkpoint_publisher,
+)
+from .storage.run_commit import RunCommitRepository, RunCommitV1
 
-# Re-export for convenience (used by tests and external callers)
-__all__ = ["Trainer", "TrainerConfig", "EvalStats", "TrainerStats", "WaitTimeout"]
+__all__ = ["AlphaZeroLearner"]
 
 logger = logging.getLogger(__name__)
 
 
-class Trainer:
+class AlphaZeroLearner:
     """AlphaZero-style trainer for game agents."""
 
-    def __init__(self, config: TrainerConfig):
+    def __init__(self, config: AlphaZeroLearnerConfig):
+        if config.total_steps <= 0:
+            raise ValueError("total_steps must be greater than zero")
+        if not isinstance(config.defer_run_commit, bool):
+            raise TypeError("defer_run_commit must be a boolean")
         self.config = config
         resolved_device = config.resolve_device()
         self.device = torch.device(resolved_device)
 
         # Get game configuration
-        self.game_config = get_config(config.env_id)
+        environment = get_environment(config.env_id)
+        self.game_config = get_game_config(config.env_id)
+        self.replay_profile = ReplayProfile(
+            env_id=config.env_id,
+            env_contract_version=environment.contract_version,
+            algorithm_id=ALGORITHM_ID,
+            experience_schema=DESCRIPTOR.components.experience_schema,
+        )
+        if not isinstance(config.replay_selection, ReplaySelection):
+            raise ValueError(
+                "Training requires an explicit ReplaySelection with collection "
+                "scope and source checkpoint"
+            )
+        if config.replay_selection.profile != self.replay_profile:
+            raise ArtifactValidationError(
+                "Learner replay selection profile does not match its cartridge"
+            )
+        self.replay_selection = config.replay_selection
+        self.model_contract = DESCRIPTOR.components.model_contract
+        self.artifact_contract = OnnxArtifactContract(
+            algorithm_id=self.replay_profile.algorithm_id,
+            env_id=config.env_id,
+            env_contract_version=environment.contract_version,
+            model_artifact_schema_version=DESCRIPTOR.model_artifact_schema_version,
+            model_contract=self.model_contract,
+            obs_size=self.game_config.obs_size,
+            num_actions=self.game_config.num_actions,
+        )
+        self.config_sha256 = learner_config_sha256(config)
 
         # Create model directory
         Path(config.model_dir).mkdir(parents=True, exist_ok=True)
@@ -65,20 +116,94 @@ class Trainer:
             weight_decay=config.weight_decay,
         )
 
-        # Try to load existing checkpoint (critical for training continuity!)
+        self.checkpoint_publisher = create_checkpoint_publisher(
+            self.artifact_contract,
+            Path(config.model_dir),
+        )
+        self.evaluation_repository = create_evaluation_repository(
+            self.checkpoint_publisher
+        )
+        self.run_commit_repository = RunCommitRepository(
+            self.checkpoint_publisher,
+            self.evaluation_repository,
+        )
+
+        # Resolve one indivisible checkpoint/stats state through RunHeadV2.
         self._checkpoint_loaded = False
         self._loaded_step: int | None = None
         self._loaded_scheduler_state: dict | None = None
-        checkpoint_result = load_pytorch_checkpoint(
-            self.network,
-            self.optimizer,
-            Path(config.model_dir),
-            self.device,
+        self.start_step = config.start_step
+        run_head = self.checkpoint_publisher.resolve_run_head()
+        self.current_run_commit: RunCommitV1 | None = None
+        self.current_run_commit_id: str | None = None
+        checkpoint_ref: CheckpointRef | None = None
+        stats = TrainerStats(env_id=self.artifact_contract.env_id)
+        if run_head is not None:
+            run_chain = self.run_commit_repository.resolve_chain(run_head.run_commit_id)
+            if not run_chain or run_chain[-1].run_commit_id != run_head.run_commit_id:
+                raise ArtifactValidationError(
+                    "RunHead does not resolve to a complete RunCommit lineage"
+                )
+            run_commit = run_chain[-1].commit
+            if run_commit.checkpoint_id != run_head.checkpoint_id:
+                raise ArtifactValidationError(
+                    "RunHead checkpoint does not match its RunCommit"
+                )
+            if run_commit.profile != self.artifact_contract.profile:
+                raise ArtifactValidationError("RunCommit learner profile mismatch")
+            if run_commit.config_sha256 != self.config_sha256:
+                raise ArtifactValidationError("RunCommit learner config mismatch")
+            if run_commit.run_recipe is not None and not config.defer_run_commit:
+                raise ArtifactValidationError(
+                    "Standalone learner cannot continue a recipe-owned run; "
+                    "select a new profile data root"
+                )
+            checkpoint_ref = self.checkpoint_publisher.resolve_checkpoint(
+                run_head.checkpoint_id,
+                expected_config_sha256=self.config_sha256,
+            )
+            # The RunCommit bytes remain immutable authority. Training receives
+            # a separate mutable projection so its live counters cannot become
+            # an unauthenticated view of the selected snapshot.
+            stats = decode_stats_snapshot(
+                run_commit.stats_snapshot.data,
+                expected_stats_id=run_commit.stats_id,
+                expected_binding=run_commit.stats_snapshot.binding,
+            ).stats
+            self.current_run_commit = run_commit
+            self.current_run_commit_id = run_head.run_commit_id
+
+        expected_source_checkpoint_id = (
+            run_head.checkpoint_id if run_head is not None else None
         )
-        if checkpoint_result is not None:
-            loaded_step, self._loaded_scheduler_state = checkpoint_result
+        if self.replay_selection.source_checkpoint_id != expected_source_checkpoint_id:
+            raise ArtifactValidationError(
+                "Learner replay source checkpoint does not match RunHead"
+            )
+
+        self.last_checkpoint_ref: CheckpointRef | None = checkpoint_ref
+        self.last_prepared_stats: PreparedStatsSnapshotV2 | None = None
+        self.parent_checkpoint_id: str | None = (
+            checkpoint_ref.checkpoint_id if checkpoint_ref is not None else None
+        )
+        if checkpoint_ref is not None:
+            self._loaded_scheduler_state = restore_learner_state(
+                self.network,
+                self.optimizer,
+                checkpoint_ref.learner_state_path,
+                self.device,
+                checkpoint_ref.manifest,
+                self.artifact_contract,
+            )
+            loaded_step = checkpoint_ref.manifest.step
             self._loaded_step = loaded_step
             self._checkpoint_loaded = True
+            if config.start_step not in (0, loaded_step):
+                raise ValueError(
+                    "Configured start_step does not match the checkpoint: "
+                    f"got {config.start_step}, checkpoint is step {loaded_step}"
+                )
+            self.start_step = loaded_step
             logger.info(f"Resuming training from checkpoint (step {loaded_step})")
 
         # Initialize LR scheduler (warmup + cosine annealing)
@@ -102,10 +227,7 @@ class Trainer:
 
         # Restore scheduler state from checkpoint if available
         if self._loaded_scheduler_state is not None:
-            try:
-                self.lr_scheduler.load_state_dict(self._loaded_scheduler_state)
-            except Exception as e:
-                logger.warning(f"Failed to restore scheduler state: {e}")
+            self.lr_scheduler.load_state_dict(self._loaded_scheduler_state)
 
         # Initialize loss function
         self.loss_fn = AlphaZeroLoss(
@@ -113,12 +235,12 @@ class Trainer:
             policy_weight=config.policy_loss_weight,
         )
 
-        # Stats tracking - load existing stats to preserve eval history
-        self.stats = load_stats(config.stats_path)
-        self.stats.total_steps = config.total_steps
-        self.stats.env_id = config.env_id
-        self.stats._max_history = config.max_history_length
-        self.samples_seen = 0
+        self.stats = stats
+        self.stats.total_steps = self.start_step + config.total_steps
+        self.samples_seen = self.stats.samples_seen
+        # stats.json is never authority. Rebuild it even for a fresh run so a
+        # stale projection cannot survive after an absent RunHeadV2.
+        write_ephemeral_stats_projection(self.stats, config.stats_path)
 
         # Replay maintenance
         self._replay_cleanup_every = (
@@ -131,29 +253,23 @@ class Trainer:
         self._recent_losses: list[dict[str, float]] = []
         self._rolling_window = 100
 
-        # Buffer size caching (avoid expensive count() calls every step)
-        self._buffer_size_cache: int = 0
-        self._buffer_size_update_interval: int = 100  # Update every 100 steps
-
-        # Checkpoint tracking - discover existing checkpoints on disk
-        self.checkpoints: list[Path] = self._discover_existing_checkpoints()
-
-    def _discover_existing_checkpoints(self) -> list[Path]:
-        return checkpoint_runner.discover_existing_checkpoints(self)
+        # Replay-count caching (avoid expensive count() calls every step)
+        self._replay_record_count_cache = self.stats.replay_record_count
+        self._replay_record_count_update_interval: int = 100
 
     def _wait_with_backoff(
         self, condition_fn, description: str, check_interval: float | None = None
     ) -> None:
         replay_setup.wait_with_backoff(self, condition_fn, description, check_interval)
 
-    def _create_replay_buffer(self):
-        """Create PostgreSQL replay buffer using the factory.
+    def _create_replay_store(self):
+        """Create the profile-bound PostgreSQL replay store.
 
         Returns:
-            PostgresReplayBuffer instance.
+            PostgresReplayStore instance.
         """
-        logger.info("Connecting to PostgreSQL replay buffer...")
-        return create_replay_buffer()
+        logger.info("Connecting to PostgreSQL replay store...")
+        return create_replay_store(self.replay_selection)
 
     def _setup_replay(self, replay, env_id: str) -> None:
         replay_setup.setup_replay(self, replay, env_id)
@@ -182,8 +298,8 @@ class Trainer:
     def _handle_replay_cleanup(self, global_step: int, replay, env_id: str) -> None:
         replay_setup.handle_replay_cleanup(self, global_step, replay, env_id)
 
-    def _handle_checkpoint_and_eval(self, step: int, global_step: int) -> None:
-        checkpoint_runner.handle_checkpoint_and_eval(self, step, global_step)
+    def _handle_checkpoint(self, step: int, global_step: int) -> None:
+        checkpoint_runner.handle_checkpoint(self, step, global_step)
 
     def train(self) -> TrainerStats:
         """Run the training loop.
@@ -208,51 +324,39 @@ class Trainer:
             batch_size=self.config.batch_size,
         )
 
-        replay = self._create_replay_buffer()
+        replay = self._create_replay_store()
         try:
             env_id = self.config.env_id
             self._setup_replay(replay, env_id)
 
-            # Training loop — while loop so step only increments after successful training
-            consecutive_skips = 0
-            start_step = self.config.start_step
+            # Sampling fills with replacement as needed, so one usable replay
+            # record is sufficient for every positive minibatch size.
+            start_step = self.start_step
             step = 0
+            last_global_step = start_step
             while step < self.config.total_steps:
                 if self.config.shutdown_check and self.config.shutdown_check():
                     logger.info("Shutdown requested, stopping training early")
                     break
 
-                batch = replay.sample_batch_tensors(
-                    self.config.batch_size,
+                records = replay.sample(self.config.batch_size)
+                if len(records) != self.config.batch_size:
+                    raise RuntimeError(
+                        "ReplayStore.sample contract violation: "
+                        f"requested {self.config.batch_size} records, "
+                        f"received {len(records)}"
+                    )
+                batch = decode_replay_batch(
+                    records,
+                    selection=self.replay_selection,
+                    obs_size=self.game_config.obs_size,
                     num_actions=self.game_config.num_actions,
-                    env_id=env_id,
                 )
-                if batch is None:
-                    consecutive_skips += 1
-                    if consecutive_skips % LOG_EVERY_N_WAITS == 1:
-                        logger.warning(
-                            f"Not enough data for batch (need {self.config.batch_size}), "
-                            f"sleeping {self.config.wait_interval}s... "
-                            f"(skip {consecutive_skips}"
-                            f"/{self.config.max_consecutive_empty_batches or 'inf'})"
-                        )
-                    if (
-                        self.config.max_consecutive_empty_batches > 0
-                        and consecutive_skips
-                        >= self.config.max_consecutive_empty_batches
-                    ):
-                        raise RuntimeError(
-                            f"Replay buffer returned {consecutive_skips} consecutive "
-                            f"empty batches. The buffer may be empty or corrupted. "
-                            f"Increase --max-empty-batches or check data pipeline."
-                        )
-                    time.sleep(self.config.wait_interval)
-                    continue
 
                 step += 1
                 global_step = start_step + step
+                last_global_step = global_step
                 self.stats.step = global_step
-                consecutive_skips = 0
                 observations, policy_targets, value_targets = batch
                 self.samples_seen += len(observations)
 
@@ -272,12 +376,16 @@ class Trainer:
                     env_id,
                 )
                 self._handle_replay_cleanup(global_step, replay, env_id)
-                self._handle_checkpoint_and_eval(step, global_step)
+                self._handle_checkpoint(step, global_step)
 
             # Final checkpoint
-            final_global_step = start_step + self.config.total_steps
-            self._save_checkpoint(final_global_step)
-            self._write_stats()
+            final_checkpoint = self._save_checkpoint(last_global_step)
+            self.stats.step = last_global_step
+            self.stats.last_checkpoint = final_checkpoint.checkpoint_id
+            if self.config.defer_run_commit:
+                self._prepare_run_state(final_checkpoint)
+            else:
+                self._publish_run_state(final_checkpoint)
         finally:
             replay.close()
 
@@ -330,11 +438,71 @@ class Trainer:
 
         return metrics
 
-    def _evaluate_checkpoint(self, checkpoint_path: Path, step: int) -> None:
-        checkpoint_runner.evaluate_checkpoint(self, checkpoint_path, step)
-
-    def _save_checkpoint(self, step: int) -> Path:
+    def _save_checkpoint(self, step: int) -> CheckpointRef:
         return checkpoint_runner.save_checkpoint(self, step)
 
-    def _write_stats(self) -> None:
-        step_metrics.write_stats(self)
+    def _prepare_run_state(self, checkpoint: CheckpointRef) -> PreparedStatsSnapshotV2:
+        """Bind current in-memory stats to one staged checkpoint."""
+        self.stats.last_checkpoint = checkpoint.checkpoint_id
+        prepared = prepare_stats_snapshot(self.stats, checkpoint)
+        self.last_checkpoint_ref = checkpoint
+        self.last_prepared_stats = prepared
+        return prepared
+
+    def _publish_run_state(self, checkpoint: CheckpointRef) -> RunCommitV1:
+        """Publish one standalone RunCommit and atomically advance RunHeadV2."""
+        if self.config.defer_run_commit:
+            raise RuntimeError(
+                "Deferred loop learners cannot commit RunHead from inside training"
+            )
+        prepared = self._prepare_run_state(checkpoint)
+        parent = self.current_run_commit
+        parent_id = self.current_run_commit_id
+        if (parent is None) != (parent_id is None):
+            raise ArtifactValidationError("In-memory RunCommit identity is incomplete")
+
+        # Overlapping stats/checkpoint/evaluation cadences can call this twice
+        # without changing any state. Do not manufacture a no-op child commit.
+        if (
+            parent is not None
+            and parent.checkpoint_id == checkpoint.checkpoint_id
+            and parent.stats_id == prepared.stats_id
+        ):
+            self.parent_checkpoint_id = checkpoint.checkpoint_id
+            write_stats_projection(prepared, self.config.stats_path)
+            return parent
+
+        commit = RunCommitV1(
+            profile=self.artifact_contract.profile,
+            config_sha256=self.config_sha256,
+            parent_run_commit_id=parent_id,
+            checkpoint_id=checkpoint.checkpoint_id,
+            stats_snapshot=prepared,
+            champion=parent.champion if parent is not None else None,
+            evaluation_head_id=(
+                parent.evaluation_head_id if parent is not None else None
+            ),
+            orchestration=None,
+        )
+        reference = self.run_commit_repository.publish(commit)
+        head = self.checkpoint_publisher.commit_run_head(
+            checkpoint_id=checkpoint.checkpoint_id,
+            run_commit_id=reference.run_commit_id,
+            expected_run_commit_id=parent_id,
+        )
+        if (
+            head.checkpoint_id != checkpoint.checkpoint_id
+            or head.run_commit_id != reference.run_commit_id
+        ):
+            raise ArtifactValidationError(
+                "RunHead advanced to a descendant while committing this learner; "
+                "stop and reload authoritative state"
+            )
+
+        # Update lineage before rebuilding the derived projection. If the
+        # projection write fails, retry/resume still follows the committed head.
+        self.current_run_commit = commit
+        self.current_run_commit_id = reference.run_commit_id
+        self.parent_checkpoint_id = checkpoint.checkpoint_id
+        write_stats_projection(prepared, self.config.stats_path)
+        return commit

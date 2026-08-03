@@ -54,8 +54,5 @@ spec:
               echo "Creating bucket..."
               mc mb cartridge/cartridge-models --ignore-existing
 
-              echo "Setting bucket policy to allow downloads..."
-              mc anonymous set download cartridge/cartridge-models
-
               echo "MinIO setup complete!"
               mc ls cartridge/

@@ -1,6 +1,10 @@
 # mcts
 
-Monte Carlo Tree Search implementation for AlphaZero-style game playing. Works with any game implementing the engine-core Game trait.
+Search implementation owned by the `alphazero_board_v1` cartridge. It does
+not accept every registered environment: construction requires the exact
+two-player, alternating-turn, deterministic, perfect-information,
+terminal-zero-sum capability contract, indexed discrete actions, and the
+AlphaZero observation/legal-mask layout.
 
 ## Overview
 
@@ -32,10 +36,15 @@ let config = MctsConfig::for_training()
     .with_simulations(800)
     .with_temperature(1.0);
 
-// Run search
-let legal_mask = reset.info & 0x1FF;  // Lower 9 bits
 let mut rng = ChaCha20Rng::seed_from_u64(42);
-let result = run_mcts(&mut ctx, &evaluator, config, reset.state, legal_mask, &mut rng).unwrap();
+let result = run_mcts(
+    &mut ctx,
+    &evaluator,
+    config,
+    reset.state,
+    reset.timestep,
+    &mut rng,
+).unwrap();
 
 println!("Best action: {}", result.action);
 println!("Policy: {:?}", result.policy);
@@ -51,12 +60,14 @@ let config = MctsConfig {
     dirichlet_alpha: 0.3,    // Root noise for exploration
     dirichlet_epsilon: 0.25, // Weight of noise vs prior
     temperature: 1.0,        // Action selection temperature
+    virtual_loss: 1.0,       // Discourage duplicate pending leaves
+    eval_batch_size: 32,     // Batched leaf evaluation
 };
 
 // Presets
 let training = MctsConfig::for_training();  // Exploratory
 let testing = MctsConfig::for_testing();    // Fewer sims
-let playing = MctsConfig::for_playing();    // Greedy (temp=0)
+let playing = MctsConfig::for_evaluation(); // No noise, greedy selection
 ```
 
 ## Evaluators
@@ -67,9 +78,9 @@ The `Evaluator` trait provides policy priors and value estimates:
 pub trait Evaluator: Send + Sync {
     fn evaluate(
         &self,
-        state: &[u8],
-        legal_mask: u64,
-        action_space_size: usize,
+        obs: &[u8],
+        legal_mask: &LegalMask,
+        num_actions: usize,
     ) -> Result<EvalResult, EvaluatorError>;
 }
 
@@ -88,14 +99,25 @@ pub struct EvalResult {
 Enable the `onnx` feature for neural network inference:
 
 ```bash
-cargo build --features onnx
+cargo build --manifest-path engine/Cargo.toml -p mcts --features onnx
 ```
 
 ```rust
 use mcts::OnnxEvaluator;
 
-let evaluator = OnnxEvaluator::new("model.onnx")?;
+let contract = algorithm.model_artifact_contract(env_id, env_contract_version);
+let evaluator = OnnxEvaluator::load_from_file(
+    "model.onnx",
+    obs_size,
+    num_actions,
+    1,
+    &identity,
+)?;
 ```
+
+ONNX loading requires the exact model identity, tensor names, dtypes, dynamic
+batch dimension, and policy/value shapes. A filename or matching dimensions do
+not authorize an artifact.
 
 ## Module Structure
 
@@ -117,7 +139,8 @@ pub struct SearchResult {
     pub action: u32,        // Best action index
     pub policy: Vec<f32>,   // Visit count distribution
     pub value: f32,         // Root value estimate
-    pub visits: u32,        // Total simulations run
+    pub simulations: u32,   // Total simulations run
+    pub stats: SearchStats, // Search timing and counters
 }
 ```
 
@@ -125,15 +148,16 @@ pub struct SearchResult {
 
 ```bash
 # All tests
-cargo test
+cargo test --manifest-path engine/Cargo.toml -p mcts
 
 # With ONNX support
-cargo test --features onnx
+cargo test --manifest-path engine/Cargo.toml -p mcts --features onnx
 ```
 
 ## Dependencies
 
-- `engine-core` - Game abstraction
+- `engine-core` - Generic environment ABI; MCTS accepts only the guarded
+  AlphaZero board profile
 - `rand` / `rand_chacha` - Deterministic randomness
 - `rand_distr` - Dirichlet distribution for root noise
 - `ort` / `ndarray` - ONNX Runtime (optional)

@@ -11,18 +11,17 @@ import argparse
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from trainer.algorithms.alphazero_board_v1 import ALGORITHM_ID
 from trainer.players import ModelPlayer, RandomPlayer
 from trainer.solver_eval import (
     BucketStats,
     SolverEvalResults,
-    append_solver_stats,
     classify_score,
-    discover_checkpoints,
     format_progression_table,
-    infer_step_from_filename,
     judge_move,
     ply_bucket,
     run_solver_evaluation,
@@ -105,7 +104,7 @@ def fake_dump(num_games: int, plies_per_game: int = 6) -> list[dict]:
 def fake_summary(num_games: int, plies_per_game: int = 6) -> dict:
     return {
         "env_id": "connect4",
-        "player1_name": "ONNX(latest.onnx)",
+        "player1_name": "ONNX(candidate.onnx)",
         "player2_name": "Random",
         "games_played": num_games,
         "player1_wins": num_games,
@@ -231,18 +230,6 @@ class TestPlyBucket:
         assert ply_bucket(42) == "ply_21_plus"
 
 
-class TestInferStep:
-    """Test checkpoint filename parsing."""
-
-    def test_infer_step_from_filename(self):
-        assert infer_step_from_filename("model_step_016000.onnx") == 16000
-        assert infer_step_from_filename("model_step_015450.onnx") == 15450
-        assert infer_step_from_filename("data/models/model_step_000100.onnx") == 100
-        assert infer_step_from_filename("latest.onnx") is None
-        assert infer_step_from_filename("best.onnx") is None
-        assert infer_step_from_filename("model_step_16000.pt") is None
-
-
 class TestBucketStats:
     """Test aggregation and metric invariants."""
 
@@ -298,8 +285,9 @@ class TestSolverEvalResults:
     def _results(self) -> SolverEvalResults:
         results = SolverEvalResults(
             env_id="connect4",
-            model_name="ONNX(latest.onnx)",
-            model_path="data/models/latest.onnx",
+            model_name="ONNX(candidate.onnx)",
+            model_path="data/models/candidate.onnx",
+            checkpoint_id=None,
             step=None,
             opponent_name="Random",
             games=10,
@@ -313,6 +301,7 @@ class TestSolverEvalResults:
         d = self._results().to_dict()
         for key in (
             "model",
+            "checkpoint_id",
             "step",
             "games",
             "seed",
@@ -333,7 +322,7 @@ class TestSolverEvalResults:
 
     def test_summary_contains_metrics(self):
         summary = self._results().summary()
-        assert "ONNX(latest.onnx)" in summary
+        assert "ONNX(candidate.onnx)" in summary
         assert "Random" in summary
         assert "overall" in summary
         assert "%" in summary
@@ -346,9 +335,10 @@ class TestSolverEvaluateDriver:
         scorer = MockScorer()
 
         results = solver_evaluate(
-            model=ModelPlayer("/models/latest.onnx"),
+            model=ModelPlayer("/models/candidate.onnx"),
             opponent=RandomPlayer(),
             scorer=scorer,
+            algorithm_id=ALGORITHM_ID,
             env_id="connect4",
             num_games=2,
             seed=42,
@@ -359,14 +349,41 @@ class TestSolverEvaluateDriver:
         assert 0 < scorer.queries < total_moves  # the model's share only
         assert scorer.resets == 2  # one fresh mirrored board per game
 
+    def test_checkpoint_identity_and_step_are_explicit_metadata(self, stub_eval_binary):
+        checkpoint_id = "a" * 64
+        results = solver_evaluate(
+            model=ModelPlayer("/models/a.onnx"),
+            opponent=RandomPlayer(),
+            scorer=MockScorer(),
+            algorithm_id=ALGORITHM_ID,
+            env_id="connect4",
+            num_games=2,
+            checkpoint_id=checkpoint_id,
+            checkpoint_step=16000,
+        )
+        assert results.checkpoint_id == checkpoint_id
+        assert results.step == 16000
+
+        direct = solver_evaluate(
+            model=ModelPlayer("/models/b.onnx"),
+            opponent=RandomPlayer(),
+            scorer=MockScorer(),
+            algorithm_id=ALGORITHM_ID,
+            env_id="connect4",
+            num_games=2,
+        )
+        assert direct.checkpoint_id is None
+        assert direct.step is None
+
     def test_every_move_is_mirrored_even_when_not_scored(self, stub_eval_binary):
         # The solver board has to follow the whole game, not just the model's
         # half, or it desyncs on the very next query.
         scorer = MockScorer()
         solver_evaluate(
-            model=ModelPlayer("/models/latest.onnx"),
+            model=ModelPlayer("/models/candidate.onnx"),
             opponent=RandomPlayer(),
             scorer=scorer,
+            algorithm_id=ALGORITHM_ID,
             env_id="connect4",
             num_games=2,
             seed=42,
@@ -376,9 +393,10 @@ class TestSolverEvaluateDriver:
 
     def test_outcome_counts_come_from_the_binary_summary(self, stub_eval_binary):
         results = solver_evaluate(
-            model=ModelPlayer("/models/latest.onnx"),
+            model=ModelPlayer("/models/candidate.onnx"),
             opponent=RandomPlayer(),
             scorer=MockScorer(),
+            algorithm_id=ALGORITHM_ID,
             env_id="connect4",
             num_games=4,
             seed=42,
@@ -393,9 +411,10 @@ class TestSolverEvaluateDriver:
     def test_seat_split_and_ply_buckets(self, stub_eval_binary):
         scorer = MockScorer()
         results = solver_evaluate(
-            model=ModelPlayer("/models/latest.onnx"),
+            model=ModelPlayer("/models/candidate.onnx"),
             opponent=RandomPlayer(),
             scorer=scorer,
+            algorithm_id=ALGORITHM_ID,
             env_id="connect4",
             num_games=4,
             seed=42,
@@ -412,9 +431,10 @@ class TestSolverEvaluateDriver:
 
     def test_seed_is_passed_through_to_the_binary(self, stub_eval_binary):
         solver_evaluate(
-            model=ModelPlayer("/models/latest.onnx"),
+            model=ModelPlayer("/models/candidate.onnx"),
             opponent=RandomPlayer(),
             scorer=MockScorer(),
+            algorithm_id=ALGORITHM_ID,
             env_id="connect4",
             num_games=2,
             seed=1234,
@@ -428,9 +448,10 @@ class TestSolverEvaluateDriver:
 
         def run(seed: int) -> dict:
             results = solver_evaluate(
-                model=ModelPlayer("/models/latest.onnx"),
+                model=ModelPlayer("/models/candidate.onnx"),
                 opponent=RandomPlayer(),
                 scorer=MockScorer(),
+                algorithm_id=ALGORITHM_ID,
                 env_id="connect4",
                 num_games=4,
                 seed=seed,
@@ -447,60 +468,57 @@ class TestSolverEvaluateDriver:
         # namespace is sufficient.
         assert run_solver_evaluation(args) == 1
 
+    def test_default_model_resolves_the_current_checkpoint_channel(
+        self, tmp_path, monkeypatch
+    ):
+        from trainer.solver_eval import cli as solver_cli
 
-class TestStatsFile:
-    """Test solver_stats.json append behavior."""
+        checkpoint = SimpleNamespace(
+            checkpoint_id="a" * 64,
+            onnx_path=tmp_path / "blobs" / "sha256" / f"{'b' * 64}.onnx",
+            manifest=SimpleNamespace(step=123),
+        )
+        repository = SimpleNamespace(resolve_head=lambda: checkpoint)
+        calls = []
 
-    def test_append_creates_and_appends(self, tmp_path):
-        output = tmp_path / "solver_stats.json"
+        class Result:
+            bitbully_version = None
 
-        append_solver_stats({"model": "a"}, output)
-        with open(output) as f:
-            stats = json.load(f)
-        assert stats["solver_evaluations"] == [{"model": "a"}]
+            @staticmethod
+            def summary():
+                return "summary"
 
-        append_solver_stats({"model": "b"}, output)
-        with open(output) as f:
-            stats = json.load(f)
-        assert len(stats["solver_evaluations"]) == 2
+            @staticmethod
+            def to_dict():
+                return {"checkpoint_id": checkpoint.checkpoint_id, "step": 123}
 
-    def test_append_recovers_from_corrupt_file(self, tmp_path):
-        output = tmp_path / "solver_stats.json"
-        output.write_text("{not json")
+        monkeypatch.setattr(
+            solver_cli, "create_checkpoint_publisher", lambda *_: repository
+        )
+        monkeypatch.setattr(solver_cli, "SolverScorer", object)
+        monkeypatch.setattr(
+            solver_cli,
+            "solver_evaluate",
+            lambda **kwargs: calls.append(kwargs) or Result(),
+        )
+        args = SimpleNamespace(
+            all_checkpoints=False,
+            models_dir=str(tmp_path),
+            env_id="connect4",
+            algorithm=ALGORITHM_ID,
+            games=2,
+            seed=42,
+            temperature=0.0,
+            verbose=False,
+        )
 
-        append_solver_stats({"model": "a"}, output)
-        with open(output) as f:
-            stats = json.load(f)
-        assert len(stats["solver_evaluations"]) == 1
+        assert solver_cli.run_solver_evaluation(args) == 0
+        assert calls[0]["checkpoint_id"] == checkpoint.checkpoint_id
+        assert calls[0]["checkpoint_step"] == 123
 
 
 class TestCheckpointDiscovery:
-    """Test checkpoint discovery and progression table."""
-
-    def test_discover_checkpoints_ordering(self, tmp_path):
-        for name in (
-            "model_step_016000.onnx",
-            "model_step_009000.onnx",
-            "model_step_015450.onnx",
-            "latest.onnx",
-            "best.onnx",
-            "unrelated.pt",
-        ):
-            (tmp_path / name).touch()
-
-        found = [p.name for p in discover_checkpoints(tmp_path)]
-        assert found == [
-            "model_step_009000.onnx",
-            "model_step_015450.onnx",
-            "model_step_016000.onnx",
-            "latest.onnx",
-            "best.onnx",
-        ]
-
-    def test_discover_checkpoints_missing_latest_best(self, tmp_path):
-        (tmp_path / "model_step_000100.onnx").touch()
-        found = [p.name for p in discover_checkpoints(tmp_path)]
-        assert found == ["model_step_000100.onnx"]
+    """Test manifest-derived progression metadata."""
 
     def test_format_progression_table(self):
         def make(step, name):
@@ -508,6 +526,7 @@ class TestCheckpointDiscovery:
                 env_id="connect4",
                 model_name=name,
                 model_path=name,
+                checkpoint_id=f"{step:064x}" if step is not None else None,
                 step=step,
                 opponent_name="Random",
                 games=10,
@@ -516,7 +535,7 @@ class TestCheckpointDiscovery:
             )
 
         table = format_progression_table(
-            [make(None, "latest.onnx"), make(16000, "b.onnx"), make(15450, "a.onnx")]
+            [make(None, "candidate.onnx"), make(16000, "b.onnx"), make(15450, "a.onnx")]
         )
         lines = table.splitlines()
         assert "value-opt" in lines[0]
@@ -610,9 +629,10 @@ class TestSolverScorerIntegration:
 
     def test_solver_evaluate_end_to_end(self, scorer, stub_eval_binary):
         results = solver_evaluate(
-            model=ModelPlayer("/models/latest.onnx"),
+            model=ModelPlayer("/models/candidate.onnx"),
             opponent=RandomPlayer(),
             scorer=scorer,
+            algorithm_id=ALGORITHM_ID,
             env_id="connect4",
             num_games=2,
             seed=7,
@@ -657,6 +677,7 @@ class TestSolverAgainstRealEngineGames:
             build_eval_command(
                 RandomPlayer(),
                 RandomPlayer(),
+                ALGORITHM_ID,
                 "connect4",
                 4,
                 11,

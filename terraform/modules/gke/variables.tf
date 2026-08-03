@@ -33,11 +33,6 @@ variable "services_range_name" {
   type        = string
 }
 
-variable "private_vpc_connection" {
-  description = "Private VPC connection ID (for dependency)"
-  type        = string
-}
-
 variable "enable_private_cluster" {
   description = "Enable private cluster (nodes have no public IPs)"
   type        = bool

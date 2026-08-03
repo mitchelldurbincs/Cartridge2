@@ -19,6 +19,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from ..algorithms import get_algorithm
+from ..environment_catalog import get_environment
 from ..evaluator import build_eval_command, run_eval_binary
 from ..players import ModelPlayer, RandomPlayer
 from .judgment import (
@@ -29,7 +31,7 @@ from .judgment import (
     judge_move,
     ply_bucket,
 )
-from .results import SolverEvalResults, infer_step_from_filename
+from .results import SolverEvalResults
 
 logger = logging.getLogger(__name__)
 
@@ -190,40 +192,47 @@ def solver_evaluate(
     model: ModelPlayer,
     opponent: ModelPlayer | RandomPlayer,
     scorer,
+    algorithm_id: str,
     env_id: str,
-    config: object = None,
     num_games: int = 100,
     seed: int = 42,
     verbose: bool = False,
+    checkpoint_id: str | None = None,
+    checkpoint_step: int | None = None,
 ) -> SolverEvalResults:
     """Play games through the engine and score every model decision.
 
-    The model takes seat 1 for the first ``num_games // 2`` games and seat 2
-    for the rest — the binary's own split, and the same one ``evaluate()``
-    uses. Game N is played with ``seed + N``, so runs are reproducible and
+    The model takes seat 1 on even game indices and seat 2 on odd indices —
+    the binary's deterministic alternating schedule, also used by
+    ``evaluate()``. Game N uses ``seed + N``, so runs are reproducible and
     every checkpoint faces identical conditions.
 
     Args:
         model: The model whose moves are judged; it plays as player 1.
         opponent: Its opponent, normally the random baseline.
         scorer: A ``SolverScorer``.
+        algorithm_id: Algorithm cartridge ID.
         env_id: Environment ID (connect4 — the only solved game here).
-        config: Accepted and ignored; part of crucible's ``SolverHooks`` seam.
         num_games: Games to play.
         seed: Base RNG seed.
-        verbose: Log every move played, as the old Python driver did.
+        verbose: Log every move played.
+        checkpoint_id: Immutable manifest ID, when the model came from a
+            checkpoint repository. Direct one-off ONNX paths leave this null.
+        checkpoint_step: Manifest training step. Never inferred from a filename.
     """
-    del config  # Part of the injected seam, not needed now the engine plays.
+    algorithm = get_algorithm(algorithm_id)
+    algorithm.compatibility(get_environment(env_id)).require_compatible()
 
     results = SolverEvalResults(
         env_id=env_id,
         model_name=model.name,
-        model_path=getattr(model, "model_path", ""),
-        step=infer_step_from_filename(getattr(model, "model_path", "")),
+        model_path=model.model_path,
+        checkpoint_id=checkpoint_id,
+        step=checkpoint_step,
         opponent_name=opponent.name,
         games=num_games,
         seed=seed,
-        temperature=getattr(model, "temperature", 0.0),
+        temperature=model.temperature,
     )
 
     run_start = time.perf_counter()
@@ -231,7 +240,9 @@ def solver_evaluate(
     hits_before = scorer.cache_hits
     solve_time_before = scorer.solve_time_seconds
 
-    summary, positions = _play_and_dump(model, opponent, env_id, num_games, seed)
+    summary, positions = _play_and_dump(
+        model, opponent, algorithm_id, env_id, num_games, seed
+    )
 
     current_game: int | None = None
     for record in positions:
@@ -281,6 +292,7 @@ def solver_evaluate(
 def _play_and_dump(
     model: ModelPlayer,
     opponent: ModelPlayer | RandomPlayer,
+    algorithm_id: str,
     env_id: str,
     num_games: int,
     seed: int,
@@ -293,6 +305,7 @@ def _play_and_dump(
             build_eval_command(
                 model,
                 opponent,
+                algorithm_id,
                 env_id,
                 num_games,
                 seed,

@@ -12,8 +12,7 @@
    - [Game Session](#53-game-session)
    - [Training Statistics](#54-training-statistics)
    - [Model Information](#55-model-information)
-   - [Actor Statistics](#56-actor-statistics)
-   - [Prometheus Metrics](#57-prometheus-metrics)
+   - [Prometheus Metrics](#56-prometheus-metrics)
 6. [Type Definitions](#6-type-definitions)
 7. [Error Handling](#7-error-handling)
 8. [Game-Specific Behavior](#8-game-specific-behavior)
@@ -207,6 +206,11 @@ curl http://localhost:8080/games
 
 Get detailed metadata for a specific game.
 
+This is a board-serving DTO, not the generic engine manifest shape. The web
+cartridge requires `EnvironmentMetadata.board` and flattens that nested profile
+to the fields below; an environment without the board profile is valid in the
+engine but cannot start under `alphazero_mcts_web_v1`.
+
 **Path Parameters**
 
 | Parameter | Type | Description |
@@ -340,7 +344,7 @@ Host: localhost:8080
 | `legal_moves` | number[] | Valid action indices for the next move |
 
 Each entry of `cells` is the engine's own projection of that board square
-(`engine_core::CellView`), so the server never has to decode a game's private
+(`engine_core::board_profile::CellView`), so the server never has to decode a game's private
 state encoding:
 
 | Field | Type | Description |
@@ -573,7 +577,7 @@ curl -X POST http://localhost:8080/move \
 
 #### GET /stats
 
-Get current training statistics from `stats.json`.
+Get current training statistics from the server's selected runtime profile.
 
 **Request**
 
@@ -591,7 +595,9 @@ Host: localhost:8080
   "total_loss": 0.2345,
   "policy_loss": 0.1234,
   "value_loss": 0.1111,
-  "replay_buffer_size": 125000,
+  "samples_seen": 192000,
+  "replay_record_count": 125000,
+  "last_checkpoint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "learning_rate": 0.0001,
   "timestamp": 1704067200.0,
   "env_id": "tictactoe",
@@ -611,7 +617,8 @@ Host: localhost:8080
       "total_loss": 0.8,
       "policy_loss": 0.4,
       "value_loss": 0.4,
-      "learning_rate": 0.001
+      "learning_rate": 0.001,
+      "grad_norm": 0.73
     }
   ]
 }
@@ -626,7 +633,9 @@ Host: localhost:8080
 | `total_loss` | number | Combined loss (policy + value) |
 | `policy_loss` | number | Policy head loss |
 | `value_loss` | number | Value head loss |
-| `replay_buffer_size` | number | Number of transitions in buffer |
+| `samples_seen` | number | Total learner samples consumed through this checkpoint |
+| `replay_record_count` | number | Number of records in the exact sealed replay selection |
+| `last_checkpoint` | string | SHA-256 identity of the latest committed checkpoint |
 | `learning_rate` | number | Current learning rate |
 | `timestamp` | number | Unix timestamp of last update |
 | `env_id` | string | Game being trained |
@@ -639,9 +648,9 @@ Host: localhost:8080
 | Field | Type | Description |
 |-------|------|-------------|
 | `step` | number | Training step when evaluated |
-| `win_rate` | number | Win rate (0.0 - 1.0) |
-| `draw_rate` | number | Draw rate (0.0 - 1.0) |
-| `loss_rate` | number | Loss rate (0.0 - 1.0) |
+| `win_rate` | number | Win rate against the random baseline (0.0 - 1.0) |
+| `draw_rate` | number | Draw rate against the random baseline (0.0 - 1.0) |
+| `loss_rate` | number | Loss rate against the random baseline (0.0 - 1.0) |
 | `games_played` | number | Games in evaluation |
 | `avg_game_length` | number | Average moves per game |
 | `timestamp` | number | Unix timestamp |
@@ -655,11 +664,17 @@ Host: localhost:8080
 | `policy_loss` | number | Policy loss at step |
 | `value_loss` | number | Value loss at step |
 | `learning_rate` | number | Learning rate at step |
+| `grad_norm` | number \| null | Gradient norm when recorded |
 
 **Notes**
 
-- Returns empty/default stats if `stats.json` doesn't exist
-- File is read from `{data_dir}/stats.json`
+- This endpoint reads the web projection from
+  `{data_root}/profiles/{algorithm_id}/{env_id}/v{env_contract_version}/stats.json`
+- Returns empty/default stats only while that projection does not exist
+- A present non-regular, unreadable, malformed, partial, or extra-field
+  projection is a contract error and returns HTTP 500
+- Learner resume does not trust this projection; its authoritative snapshot is
+  embedded in the immutable `RunCommitV1` selected by the sole RunHead
 - History is downsampled for large training runs
 
 **Example**
@@ -688,8 +703,9 @@ Host: localhost:8080
 ```json
 {
   "loaded": true,
-  "path": "/app/data/models/latest.onnx",
-  "file_modified": 1704067200,
+  "checkpoint_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "model_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "path": "/app/data/profiles/alphazero_board_v1/connect4/v1/models/blobs/sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.onnx",
   "loaded_at": 1704067210,
   "training_step": 1500,
   "status": "Model loaded (step 1500)"
@@ -701,8 +717,9 @@ Host: localhost:8080
 ```json
 {
   "loaded": false,
+  "checkpoint_id": null,
+  "model_sha256": null,
   "path": null,
-  "file_modified": null,
   "loaded_at": null,
   "training_step": null,
   "status": "No model loaded - bot plays randomly"
@@ -714,17 +731,35 @@ Host: localhost:8080
 | Field | Type | Description |
 |-------|------|-------------|
 | `loaded` | boolean | Is a model currently loaded? |
-| `path` | string \| null | Path to model file |
-| `file_modified` | number \| null | File modification time (Unix timestamp) |
+| `checkpoint_id` | string \| null | SHA-256 identity of the canonical checkpoint manifest |
+| `model_sha256` | string \| null | SHA-256 identity of the immutable ONNX blob |
+| `path` | string \| null | Local cache path or S3 URI of the loaded immutable ONNX blob |
 | `loaded_at` | number \| null | When model was loaded (Unix timestamp) |
-| `training_step` | number \| null | Training step (parsed from filename) |
+| `training_step` | number \| null | Training step declared by the verified manifest |
 | `status` | string | Human-readable status message |
 
 **Model Loading**
 
-- Server watches `{data_dir}/models/latest.onnx` for changes
-- Hot-reloads model automatically when file changes
-- Bot plays randomly if no model is loaded
+- Filesystem mode watches
+  `{data_root}/profiles/{algorithm_id}/{env_id}/v{env_contract_version}/models/channels/current.json`;
+  S3 mode polls the equivalent object key
+- This sole mutable `RunHeadV2` selects a fully validated immutable
+  RunCommit/checkpoint chain. Learner continuation and bounded collection use
+  the latest checkpoint, while web inference uses the champion stored in the
+  latest RunCommit, falling back to latest before the first promotion
+- Hot reload tracks accepted RunHead generations, not only checkpoint-ID
+  changes. A generation is accepted even when promotion retains the same
+  champion; the selected manifest and ONNX blob are still fully revalidated
+- Requires ONNX custom metadata `cartridge.schema_version=1` plus exact
+  `cartridge.algorithm_id`, `cartridge.model_contract`, `cartridge.env_id`,
+  and `cartridge.env_contract_version` values for the
+  configured profile
+- Bot plays randomly only when the `current` channel is absent (or no valid
+  checkpoint has yet been loaded)
+- A present invalid pointer, manifest, blob, or model fails initial server
+  startup; an invalid hot reload is logged and leaves the last valid checkpoint
+  active
+- Mutable legacy model files are not discovered or migrated
 
 **Example**
 
@@ -734,67 +769,7 @@ curl http://localhost:8080/model
 
 ---
 
-### 5.6 Actor Statistics
-
-#### GET /actor-stats
-
-Get self-play statistics written by the actor to `{data_dir}/actor_stats.json`.
-Returns zeroed defaults if the file doesn't exist yet.
-
-**Request**
-
-```http
-GET /actor-stats HTTP/1.1
-Host: localhost:8080
-```
-
-**Response**
-
-```json
-{
-  "env_id": "connect4",
-  "episodes_completed": 1250,
-  "total_steps": 31875,
-  "player1_wins": 640,
-  "player2_wins": 545,
-  "draws": 65,
-  "episodes_abandoned": 0,
-  "transitions_discarded": 0,
-  "avg_episode_length": 25.5,
-  "episodes_per_second": 3.2,
-  "runtime_seconds": 390.6,
-  "mcts_avg_inference_us": 850.0,
-  "timestamp": 1704067200
-}
-```
-
-**Response Fields**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `env_id` | string | Game being self-played |
-| `episodes_completed` | number | Episodes finished |
-| `total_steps` | number | Total game steps across all episodes |
-| `player1_wins` | number | Episodes won by player 1 |
-| `player2_wins` | number | Episodes won by player 2 |
-| `draws` | number | Episodes ending in a draw |
-| `episodes_abandoned` | number | Episodes that ended without reaching a terminal state (wall-clock timeout or step guard). Their transitions were **discarded** — non-zero means self-play data is being lost, biased toward the longest episodes. |
-| `transitions_discarded` | number | Transitions discarded with those episodes |
-| `avg_episode_length` | number | Average moves per episode |
-| `episodes_per_second` | number | Self-play throughput |
-| `runtime_seconds` | number | Total actor runtime |
-| `mcts_avg_inference_us` | number | Average MCTS inference time (µs) |
-| `timestamp` | number | Unix timestamp of last update |
-
-**Example**
-
-```bash
-curl http://localhost:8080/actor-stats
-```
-
----
-
-### 5.7 Prometheus Metrics
+### 5.6 Prometheus Metrics
 
 #### GET /metrics
 
@@ -877,7 +852,9 @@ interface TrainingStats {
   total_loss: number;
   policy_loss: number;
   value_loss: number;
-  replay_buffer_size: number;
+  samples_seen: number;
+  replay_record_count: number;
+  last_checkpoint: string;
   learning_rate: number;
   timestamp: number;
   env_id: string;
@@ -902,34 +879,20 @@ interface HistoryEntry {
   policy_loss: number;
   value_loss: number;
   learning_rate: number;
+  grad_norm: number | null;
 }
 
 // Model info
 interface ModelInfo {
   loaded: boolean;
+  checkpoint_id: string | null;
+  model_sha256: string | null;
   path: string | null;
-  file_modified: number | null;
   loaded_at: number | null;
   training_step: number | null;
   status: string;
 }
 
-// Actor self-play statistics
-interface ActorStats {
-  env_id: string;
-  episodes_completed: number;
-  total_steps: number;
-  player1_wins: number;
-  player2_wins: number;
-  draws: number;
-  episodes_abandoned: number;
-  transitions_discarded: number;
-  avg_episode_length: number;
-  episodes_per_second: number;
-  runtime_seconds: number;
-  mcts_avg_inference_us: number;
-  timestamp: number;
-}
 ```
 
 ### Rust Definitions
@@ -1104,30 +1067,23 @@ The server handles requests as fast as possible. For production deployments, con
 ### Complete Game Flow
 
 ```bash
-# 1. Check available games
-curl http://localhost:8080/games
-# Response: {"games":["connect4"]}   <- only the configured game
+# 1. Resolve the one configured game
+GAME="$(curl -s http://localhost:8080/games | jq -r '.games[0]')"
 
 # 2. Get game info
-curl http://localhost:8080/game-info/tictactoe
-# Response: {"env_id":"tictactoe","display_name":"Tic-Tac-Toe",...}
+curl "http://localhost:8080/game-info/$GAME"
 
 # 3. Start new game (player first)
 curl -X POST http://localhost:8080/game/new \
   -H "Content-Type: application/json" \
-  -d '{"first": "player", "game": "tictactoe"}'
+  -d "{\"first\": \"player\", \"game\": \"$GAME\"}"
 # Response: {"cells":[{"owner":0,"kind":"normal","value":0},...],"current_player":1,...}
 
-# 4. Make moves until game ends
+# 4. Submit an action index advertised in legal_moves
 curl -X POST http://localhost:8080/move \
   -H "Content-Type: application/json" \
   -d '{"position": 4}'
 # Response: {"cells":[...],"bot_move":5,...}
-
-curl -X POST http://localhost:8080/move \
-  -H "Content-Type: application/json" \
-  -d '{"position": 0}'
-# Response: {"cells":[...],"bot_move":2,...}
 
 # 5. Continue until winner != 0 or game_over == true
 ```
@@ -1324,7 +1280,6 @@ curl -s http://localhost:8080/game/state | jq '.board | . as $b | [range(0;9)] |
 | POST | `/game/new` | Start new game |
 | POST | `/move` | Make a move |
 | GET | `/stats` | Get training statistics |
-| GET | `/actor-stats` | Get actor self-play statistics |
 | GET | `/model` | Get model info |
 
 ### Status Code Quick Reference

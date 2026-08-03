@@ -4,7 +4,7 @@
 //! for game states. In AlphaZero, this is a neural network. For testing,
 //! we provide a uniform evaluator that returns equal priors.
 
-use engine_core::LegalMask;
+use engine_core::board_profile::LegalMask;
 use thiserror::Error;
 
 /// Errors that can occur during evaluation.

@@ -1,6 +1,10 @@
 # Cartridge2 Web Interface
 
-Minimal web interface for playing the currently configured game (`common.env_id`) against the trained model, and monitoring training.
+Serving host and Svelte UI for the selected algorithm/environment contract.
+Startup resolves `[algorithm].id`, requires environment compatibility, and
+dispatches the descriptor's serving component. The installed implementation is
+`alphazero_mcts_web_v1` from `alphazero_board_v1`; it additionally requires the
+environment's optional `metadata.board` profile and board presentation.
 
 ## Architecture
 
@@ -13,9 +17,9 @@ Minimal web interface for playing the currently configured game (`common.env_id`
                     ┌────────────┴────────────┐
                     ▼                         ▼
               ┌──────────┐              ┌──────────────┐
-              │ engine-  │              │ data/        │
-              │ core     │              │ stats.json   │
-              └──────────┘              └──────────────┘
+              │ engine-  │              │ selected runtime profile │
+              │ core     │              │ model + stats            │
+              └──────────┘              └──────────────────────────┘
 ```
 
 ## API Endpoints
@@ -30,7 +34,6 @@ Minimal web interface for playing the currently configured game (`common.env_id`
 | `/game/new` | POST | Start a new game |
 | `/move` | POST | Make a move (player + bot response) |
 | `/stats` | GET | Read training stats from stats.json |
-| `/actor-stats` | GET | Read actor self-play stats |
 | `/model` | GET | Get info about the loaded model |
 
 ## Quick Start
@@ -38,8 +41,7 @@ Minimal web interface for playing the currently configured game (`common.env_id`
 ### 1. Start the Rust backend
 
 ```bash
-cd web
-cargo run
+cargo run --manifest-path web/Cargo.toml
 ```
 
 The server starts on `http://localhost:8080`.
@@ -47,9 +49,8 @@ The server starts on `http://localhost:8080`.
 ### 2. Start the Svelte frontend
 
 ```bash
-cd web/frontend
-npm install
-npm run dev
+npm --prefix web/frontend install
+npm --prefix web/frontend run dev
 ```
 
 The dev server starts on `http://localhost:5173` with hot-reload.
@@ -64,19 +65,20 @@ Open http://localhost:5173 in your browser.
 
 ```bash
 # Build frontend
-cd frontend
-npm run build
+npm --prefix web/frontend run build
 
 # Build backend
-cargo build --release
+cargo build --release --manifest-path web/Cargo.toml
 ```
 
-The frontend builds to `frontend/dist/`, which is served by **nginx** in the `frontend` container — the Axum router registers API routes only and has no static-file service.
+The frontend builds to `web/frontend/dist/`, which is served by **nginx** in
+the frontend container. The Axum router registers API routes only and has no
+static-file service.
 
 ### Run tests
 
 ```bash
-cargo test
+cargo test --manifest-path web/Cargo.toml
 ```
 
 ## Configuration
@@ -86,7 +88,22 @@ The web server uses `config.toml` from the project root for centralized configur
 - `CARTRIDGE_WEB_HOST` - Server bind address (default: `0.0.0.0`)
 - `CARTRIDGE_WEB_PORT` - Server port (default: `8080`)
 - `CARTRIDGE_COMMON_ENV_ID` - Default game environment (default: `tictactoe`)
-- `CARTRIDGE_COMMON_DATA_DIR` - Base data directory for stats.json (default: `./data`)
+- `CARTRIDGE_ALGORITHM_ID` - Algorithm cartridge (default: `alphazero_board_v1`)
+- `CARTRIDGE_COMMON_DATA_DIR` - Runtime root (default: `./data`)
+- `CARTRIDGE_STORAGE_MODEL_BACKEND` - `filesystem` or `s3`
+
+The web host appends
+`profiles/{algorithm_id}/{env_id}/v{env_contract_version}` to the runtime root.
+Filesystem mode watches that profile's `models/channels/current.json`; S3 mode
+polls the equivalent object key. This sole mutable `RunHeadV2` selects a fully
+validated immutable RunCommit/checkpoint chain. Web uses
+`ChampionOrLatest`: champion state from the latest RunCommit wins, with that
+commit's latest checkpoint used before the first promotion. The accepted
+RunHead generation advances even when the selected champion checkpoint remains
+unchanged. RunHead, RunCommit lineage, manifest/blob digests and sizes, exact
+five-field artifact identity, and policy/value tensor contract must all
+validate. An absent RunHead permits random play, while present invalid authority
+fails startup without replacing the last valid in-memory evaluator.
 
 For full configuration options, see `config.toml` and `config.defaults.toml`.
 

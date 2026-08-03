@@ -7,8 +7,8 @@ over a run's checkpoints it reads as a training curve — which is the progress
 signal win-rate-vs-random cannot give, since every decent checkpoint pins at
 100% and the curve goes flat exactly when you want resolution.
 
-Nothing here knows how a player was trained. A PPO checkpoint and an AlphaZero
-checkpoint enter the same pool and get comparable ratings.
+Every tournament is scoped to one environment and one algorithm cartridge so
+all players share a model contract and evaluation suite.
 """
 
 from __future__ import annotations
@@ -22,13 +22,16 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from .atomic_io import atomic_write
+from crucible.atomic_io import atomic_write
+
+from .algorithms import get_algorithm
+from .environment_catalog import get_environment
 from .evaluator import DEFAULT_SEED, evaluate
-from .registry import RANDOM_PLAYER_ID, PlayerRecord, PlayerRegistry
+from .registry import PlayerRecord, PlayerRegistry, random_player_id
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 5
 
 #: Elo points per factor-of-10 odds. The conventional constant; changing it
 #: rescales every rating, so it is not a knob.
@@ -42,6 +45,8 @@ PRIOR_GAMES = 2.0
 
 _MAX_ITERATIONS = 1000
 _TOLERANCE = 1e-9
+_MAX_U32 = (1 << 32) - 1
+_MAX_U64 = (1 << 64) - 1
 
 
 @dataclass
@@ -67,7 +72,6 @@ class Rating:
     losses: int
     draws: int
     step: int | None = None
-    algorithm: str = "unknown"
 
     @property
     def score_rate(self) -> float:
@@ -82,6 +86,10 @@ class TournamentResults:
     """A whole round-robin: every pairing, and the ratings fitted from them."""
 
     env_id: str
+    env_contract_version: int
+    algorithm_id: str
+    model_contract: str
+    model_artifact_schema_version: int
     games_per_pair: int
     seed: int
     anchor: str
@@ -95,6 +103,10 @@ class TournamentResults:
         return {
             "schema_version": self.schema_version,
             "env_id": self.env_id,
+            "env_contract_version": self.env_contract_version,
+            "algorithm_id": self.algorithm_id,
+            "model_contract": self.model_contract,
+            "model_artifact_schema_version": self.model_artifact_schema_version,
             "games_per_pair": self.games_per_pair,
             "seed": self.seed,
             "anchor": self.anchor,
@@ -151,19 +163,63 @@ def fit_ratings(
 
     Ratings are shifted so ``anchor`` sits at 0, making every number read as
     "Elo above the baseline". With no anchor the mean is 0 instead.
+
+    The player field and every result are validated before fitting. Ratings are
+    an artifact derived from the declared field, so silently dropping a result
+    or changing the anchoring rule would make the artifact describe different
+    evidence than its caller supplied.
     """
+    if len(set(player_ids)) != len(player_ids):
+        raise ValueError("player_ids must not contain duplicates")
+    if (
+        isinstance(prior_games, bool)
+        or not isinstance(prior_games, (int, float))
+        or not math.isfinite(prior_games)
+        or prior_games <= 0.0
+    ):
+        raise ValueError("prior_games must be a finite positive number")
+
+    index = {pid: i for i, pid in enumerate(player_ids)}
+    if anchor is not None and anchor not in index:
+        raise ValueError(f"anchor {anchor!r} is not present in player_ids")
+
+    for match_number, match in enumerate(matches, start=1):
+        unknown_players = {
+            player_id
+            for player_id in (match.player1, match.player2)
+            if player_id not in index
+        }
+        if unknown_players:
+            unknown = ", ".join(sorted(repr(player) for player in unknown_players))
+            raise ValueError(
+                f"match {match_number} references players absent from player_ids: "
+                f"{unknown}"
+            )
+        if match.player1 == match.player2:
+            raise ValueError(f"match {match_number} must contain two distinct players")
+
+        for field_name in ("games", "player1_wins", "player2_wins", "draws"):
+            count = getattr(match, field_name)
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ValueError(
+                    f"match {match_number} {field_name} must be a non-negative integer"
+                )
+        recorded_games = match.player1_wins + match.player2_wins + match.draws
+        if match.games != recorded_games:
+            raise ValueError(
+                f"match {match_number} games must equal player1_wins + "
+                "player2_wins + draws"
+            )
+
     if not player_ids:
         return {}
 
-    index = {pid: i for i, pid in enumerate(player_ids)}
     n = len(player_ids)
 
     # score[i][j] = points i took off j; played[i][j] = games between them.
     score = [[0.0] * n for _ in range(n)]
     played = [[0.0] * n for _ in range(n)]
     for match in matches:
-        if match.player1 not in index or match.player2 not in index:
-            continue
         i, j = index[match.player1], index[match.player2]
         total = match.player1_wins + match.player2_wins + match.draws
         score[i][j] += match.player1_wins + 0.5 * match.draws
@@ -197,23 +253,26 @@ def fit_ratings(
     return {pid: rating - offset for pid, rating in ratings.items()}
 
 
-def playable_field(registry: PlayerRegistry, env_id: str) -> list[PlayerRecord]:
-    """Registered players for ``env_id`` whose checkpoints still exist.
+def playable_field(
+    registry: PlayerRegistry,
+    *,
+    env_id: str,
+    env_contract_version: int,
+    algorithm_id: str,
+) -> list[PlayerRecord]:
+    """Return a profile's field after validating every immutable artifact.
 
-    Checkpoint rotation deletes old models, so the registry outlives the files
-    it points at. One missing checkpoint should cost its own entry, not the
-    whole tournament.
+    Content-addressed checkpoints are permanent repository objects.  A missing
+    or corrupt object means the registry/repository contract is broken, so a
+    tournament fails instead of silently changing its field.
     """
-    field_ = []
-    for player in registry.for_env(env_id):
-        if player.is_playable():
-            field_.append(player)
-        else:
-            logger.warning(
-                "Skipping player '%s': checkpoint %s is missing",
-                player.id,
-                player.checkpoint,
-            )
+    field_ = registry.for_profile(
+        env_id=env_id,
+        env_contract_version=env_contract_version,
+        algorithm_id=algorithm_id,
+    )
+    for player in field_:
+        player.validate_artifact()
     return field_
 
 
@@ -248,6 +307,7 @@ def warn_about_deterministic_players(players: list[PlayerRecord]) -> list[str]:
 def run_tournament(
     registry: PlayerRegistry,
     env_id: str,
+    algorithm_id: str,
     games_per_pair: int = 20,
     seed: int = DEFAULT_SEED,
     run_match=evaluate,
@@ -260,21 +320,51 @@ def run_tournament(
     ``run_match`` is the head-to-head callable, injected so tests do not need
     the binary.
     """
-    players = playable_field(registry, env_id)
+    if (
+        isinstance(games_per_pair, bool)
+        or not isinstance(games_per_pair, int)
+        or not 1 <= games_per_pair <= _MAX_U32
+    ):
+        raise ValueError("games_per_pair must be a positive u32 integer")
+    if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= _MAX_U64:
+        raise ValueError("seed must be a nonnegative u64 integer")
+    if seed > _MAX_U64 - (games_per_pair - 1):
+        raise ValueError("seed plus the game index exceeds u64")
+
+    algorithm = get_algorithm(algorithm_id)
+    environment = get_environment(env_id)
+    algorithm.compatibility(environment).require_compatible()
+    descriptor = algorithm.descriptor
+    players = playable_field(
+        registry,
+        env_id=env_id,
+        env_contract_version=environment.contract_version,
+        algorithm_id=algorithm_id,
+    )
     if len(players) < 2:
         raise ValueError(
-            f"A tournament needs at least 2 playable players for '{env_id}', found "
+            f"A tournament needs at least 2 playable players for "
+            f"'{env_id}' with '{algorithm_id}', found "
             f"{len(players)}. Register some with `trainer register-players`."
         )
 
     results = TournamentResults(
         env_id=env_id,
+        env_contract_version=environment.contract_version,
+        algorithm_id=algorithm_id,
+        model_contract=descriptor.components.model_contract,
+        model_artifact_schema_version=descriptor.model_artifact_schema_version,
         games_per_pair=games_per_pair,
         seed=seed,
-        anchor=RANDOM_PLAYER_ID,
+        anchor=random_player_id(
+            env_id=env_id,
+            env_contract_version=environment.contract_version,
+            algorithm_id=algorithm_id,
+        ),
     )
     warn_about_deterministic_players(players)
     by_id = {p.id: p for p in players}
+    player_specs = {player.id: player.to_player() for player in players}
     pairings = list(itertools.combinations(players, 2))
     logger.info(
         "Tournament: %d players, %d pairings, %d games each (%d games total)",
@@ -287,8 +377,9 @@ def run_tournament(
     start = time.perf_counter()
     for number, (first, second) in enumerate(pairings, start=1):
         outcome = run_match(
-            player1=first.to_player(),
-            player2=second.to_player(),
+            player1=player_specs[first.id],
+            player2=player_specs[second.id],
+            algorithm_id=algorithm_id,
             env_id=env_id,
             num_games=games_per_pair,
             verbose=False,
@@ -310,7 +401,7 @@ def run_tournament(
     ratings = fit_ratings(
         [p.id for p in players],
         results.matches,
-        anchor=RANDOM_PLAYER_ID if RANDOM_PLAYER_ID in by_id else None,
+        anchor=results.anchor if results.anchor in by_id else None,
     )
 
     tallies = {p.id: [0, 0, 0, 0] for p in players}  # games, wins, losses, draws
@@ -333,7 +424,6 @@ def run_tournament(
             losses=tallies[pid][2],
             draws=tallies[pid][3],
             step=by_id[pid].step,
-            algorithm=by_id[pid].algorithm,
         )
         for pid in (p.id for p in players)
     ]

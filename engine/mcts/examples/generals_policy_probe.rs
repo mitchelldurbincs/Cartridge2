@@ -8,7 +8,8 @@
 //! Run: cargo run -p mcts --features onnx --example generals_policy_probe \
 //!        --release -- <model.onnx> [num_sims]
 
-use engine_core::EngineContext;
+use algorithm_core::{resolve_algorithm, ALPHAZERO_BOARD_V1_ID};
+use engine_core::{Decision, EngineContext, ErasedTimestep};
 use mcts::{run_mcts, MctsConfig, OnnxEvaluator, UniformEvaluator};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -34,26 +35,48 @@ fn print_policy(label: &str, policy: &[f32]) {
     );
 }
 
+fn active_observation(timestep: &ErasedTimestep) -> &[u8] {
+    let agent = match &timestep.decision {
+        Decision::Agents { agent_ids } if agent_ids.len() == 1 => agent_ids[0],
+        decision => panic!("expected one agent, got {decision:?}"),
+    };
+    timestep.observation_for(agent).unwrap()
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let model_path = args.get(1).expect("usage: probe <model.onnx> [sims]");
     let sims: u32 = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(35);
 
-    engine_games::register_all_games();
+    engine_games::register_all_environments();
     let mut ctx = EngineContext::new("generals_8x8").unwrap();
     let meta = ctx.metadata();
+    let board = meta.require_board().unwrap();
 
     let config = MctsConfig::for_training()
         .with_simulations(sims)
         .with_eval_batch_size(64)
         .with_temperature(1.0);
 
-    let evaluator = OnnxEvaluator::load(model_path, meta.obs_size, 1).unwrap();
+    let model_contract = resolve_algorithm(ALPHAZERO_BOARD_V1_ID)
+        .unwrap()
+        .descriptor()
+        .model_artifact_contract("generals_8x8", ctx.capabilities().contract_version);
+    let evaluator = OnnxEvaluator::load_from_file(
+        model_path,
+        board.observation.elements,
+        board.action_count,
+        1,
+        &model_contract,
+    )
+    .unwrap();
     let uniform = UniformEvaluator::new();
 
     for seed in [42u64, 7, 13] {
         let reset = ctx.reset(seed, &[]).unwrap();
-        let mask = meta.legal_mask_from_obs(&reset.obs);
+        let mask = board
+            .legal_mask_from_obs(active_observation(&reset.timestep))
+            .unwrap();
         println!("--- seed {seed}: {} legal actions ---", mask.count_ones());
 
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
@@ -62,8 +85,7 @@ fn main() {
             &evaluator,
             config.clone(),
             reset.state.clone(),
-            reset.obs.clone(),
-            mask.clone(),
+            reset.timestep.clone(),
             &mut rng,
         )
         .unwrap();
@@ -75,8 +97,7 @@ fn main() {
             &uniform,
             config.clone(),
             reset.state,
-            reset.obs,
-            mask,
+            reset.timestep,
             &mut rng,
         )
         .unwrap();

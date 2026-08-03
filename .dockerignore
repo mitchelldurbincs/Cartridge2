@@ -1,5 +1,5 @@
 # Root .dockerignore for Cartridge2
-# Used by: Dockerfile.alphazero, actor/Dockerfile, web/Dockerfile
+# Used by: Dockerfile.alphazero and web/Dockerfile
 # These Dockerfiles use the repo root as build context
 
 # =============================================================================
@@ -13,6 +13,7 @@ target/
 # Runtime data (mounted as volume, not copied into image)
 # =============================================================================
 data/
+data-backup-*/
 *.onnx
 
 # =============================================================================
@@ -35,6 +36,9 @@ data/
 # Documentation (not needed in container)
 # =============================================================================
 *.md
+# The trainer package metadata names this file, so the AlphaZero image build
+# must receive it even though documentation is otherwise excluded.
+!trainer/README.md
 docs/
 CLAUDE.md
 
