@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import logging
 import math
 import secrets
@@ -10,13 +9,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..central_config import get_config
 from ..environment_catalog import get_environment
 from ..runtime_profile import resolve_runtime_profile
+from ..storage import ReplayProfile, ReplaySelection
 from ..storage.publisher import create_checkpoint_publisher
-from .dqn_config import DqnLearnerConfig
+from .dqn_application import format_evaluation_result
+from .dqn_requests import DqnCollectRequest, DqnEvaluateRequest, DqnTrainRequest
 
 if TYPE_CHECKING:
+    from ..environment_catalog import EnvironmentDescriptor
     from .dqn_v1 import DqnV1
 
 logger = logging.getLogger(__name__)
@@ -42,9 +43,11 @@ class DqnLoopConfig:
     seed: int
     onnx_intra_threads: int
     evaluation_episodes: int
-    actor_binary: str | None
-    eval_binary: str | None
-    data_dir: str | None
+    episode_timeout_secs: int
+    actor_binary: Path | None
+    eval_binary: Path | None
+    data_root: Path
+    log_level: str
 
     def __post_init__(self) -> None:
         for name in (
@@ -55,6 +58,7 @@ class DqnLoopConfig:
             "target_sync_interval",
             "hidden_size",
             "onnx_intra_threads",
+            "episode_timeout_secs",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -79,58 +83,10 @@ class DqnLoopConfig:
             raise ValueError("epsilon_end cannot exceed epsilon_start")
         if not math.isfinite(self.epsilon_decay) or not 0.0 < self.epsilon_decay <= 1.0:
             raise ValueError("epsilon_decay must be finite and in (0, 1]")
-
-    @classmethod
-    def from_args(cls, args: argparse.Namespace) -> "DqnLoopConfig":
-        return cls(
-            env_id=args.env_id,
-            iterations=args.iterations,
-            episodes_per_iteration=args.episodes_per_iteration,
-            steps_per_iteration=args.steps_per_iteration,
-            batch_size=args.batch_size,
-            learning_rate=args.learning_rate,
-            weight_decay=args.weight_decay,
-            gamma=args.gamma,
-            target_sync_interval=args.target_sync_interval,
-            hidden_size=args.hidden_size,
-            grad_clip_norm=args.grad_clip,
-            device=args.device,
-            epsilon_start=args.epsilon_start,
-            epsilon_end=args.epsilon_end,
-            epsilon_decay=args.epsilon_decay,
-            seed=args.seed,
-            onnx_intra_threads=args.onnx_intra_threads,
-            evaluation_episodes=args.evaluation_episodes,
-            actor_binary=args.actor_binary,
-            eval_binary=args.eval_binary,
-            data_dir=args.data_dir,
-        )
-
-
-def configure_dqn_loop_parser(parser: argparse.ArgumentParser) -> None:
-    learner = DqnLearnerConfig()
-    parser.add_argument("--env-id", default="counter")
-    parser.add_argument("--iterations", type=int, required=True)
-    parser.add_argument("--episodes-per-iteration", type=int, default=100)
-    parser.add_argument("--steps-per-iteration", type=int, default=learner.total_steps)
-    parser.add_argument("--batch-size", type=int, default=learner.batch_size)
-    parser.add_argument("--learning-rate", type=float, default=learner.learning_rate)
-    parser.add_argument("--weight-decay", type=float, default=learner.weight_decay)
-    parser.add_argument("--gamma", type=float, default=learner.gamma)
-    parser.add_argument("--target-sync-interval", type=int, default=learner.target_sync_interval)
-    parser.add_argument("--hidden-size", type=int, default=learner.hidden_size)
-    parser.add_argument("--grad-clip", type=float, default=learner.grad_clip_norm)
-    parser.add_argument("--device", default=learner.device)
-    parser.add_argument("--epsilon-start", type=float, default=0.25)
-    parser.add_argument("--epsilon-end", type=float, default=0.01)
-    parser.add_argument("--epsilon-decay", type=float, default=0.95)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--onnx-intra-threads", type=int, default=1)
-    parser.add_argument("--evaluation-episodes", type=int, default=100)
-    parser.add_argument("--actor-binary")
-    parser.add_argument("--eval-binary")
-    parser.add_argument("--data-dir")
-    parser.add_argument("--log-level", default="INFO")
+        if not isinstance(self.data_root, Path):
+            raise TypeError("data_root must be a pathlib.Path")
+        if not isinstance(self.log_level, str) or not self.log_level.strip():
+            raise ValueError("log_level must be non-empty")
 
 
 class DqnLoop:
@@ -141,88 +97,129 @@ class DqnLoop:
     def run(self) -> int:
         environment = get_environment(self.config.env_id)
         self.cartridge.compatibility(environment).require_compatible()
-        data_root = Path(self.config.data_dir or get_config().data_root)
         profile_dir = resolve_runtime_profile(
             self.cartridge.descriptor.id, environment.env_id
-        ).data_dir(data_root)
+        ).data_dir(self.config.data_root)
         model_dir = profile_dir / "models"
-        stats_path = profile_dir / "stats.json"
-        data_dir = str(data_root)
         checkpoints = create_checkpoint_publisher(
             self.cartridge.artifact_contract(environment), model_dir
         )
 
         for iteration in range(1, self.config.iterations + 1):
-            head = checkpoints.resolve_run_head()
-            source_checkpoint_id = head.checkpoint_id if head is not None else None
-            collection_scope_id = secrets.token_hex(32)
-            epsilon = (
-                1.0
-                if source_checkpoint_id is None
-                else max(
-                    self.config.epsilon_end,
-                    self.config.epsilon_start * self.config.epsilon_decay ** (iteration - 1),
-                )
+            source_checkpoint_id = self._run_iteration(
+                environment, profile_dir, checkpoints, iteration
             )
-            source = {
-                "source_checkpoint_id": source_checkpoint_id,
-                "source_root": source_checkpoint_id is None,
-            }
-            collect_args = argparse.Namespace(
-                env_id=environment.env_id,
-                episodes=self.config.episodes_per_iteration,
-                collection_scope_id=collection_scope_id,
-                epsilon=epsilon,
-                seed=(self.config.seed + iteration - 1) % (1 << 64),
-                onnx_intra_threads=self.config.onnx_intra_threads,
-                actor_id=f"dqn-loop-{iteration}",
-                episode_timeout_secs=30,
-                actor_binary=self.config.actor_binary,
-                data_dir=data_dir,
-                log_level="INFO",
-                **source,
-            )
-            if self.cartridge._run_collect(collect_args) != 0:
-                return 1
-            train_args = argparse.Namespace(
-                env_id=environment.env_id,
-                model_dir=str(model_dir),
-                stats_path=str(stats_path),
-                steps=self.config.steps_per_iteration,
-                batch_size=self.config.batch_size,
-                learning_rate=self.config.learning_rate,
-                weight_decay=self.config.weight_decay,
-                gamma=self.config.gamma,
-                target_sync_interval=self.config.target_sync_interval,
-                hidden_size=self.config.hidden_size,
-                grad_clip=self.config.grad_clip_norm,
-                device=self.config.device,
-                collection_scope_id=collection_scope_id,
-                log_level="INFO",
-                **source,
-            )
-            if self.cartridge._run_train(train_args) != 0:
-                return 1
-            advanced = checkpoints.resolve_run_head()
-            if advanced is None or advanced.checkpoint_id == source_checkpoint_id:
-                raise RuntimeError("DQN learner did not advance the authoritative RunHead")
-            if self.config.evaluation_episodes > 0:
-                evaluate_args = argparse.Namespace(
-                    env_id=environment.env_id,
-                    episodes=self.config.evaluation_episodes,
-                    seed=(self.config.seed + iteration - 1) % (1 << 64),
-                    checkpoint_id=advanced.checkpoint_id,
-                    random=False,
-                    model_dir=str(model_dir),
-                    eval_binary=self.config.eval_binary,
-                    onnx_intra_threads=self.config.onnx_intra_threads,
-                )
-                if self.cartridge._run_evaluate(evaluate_args) != 0:
-                    return 1
             logger.info(
                 "DQN iteration %s/%s committed checkpoint %s",
                 iteration,
                 self.config.iterations,
-                advanced.checkpoint_id,
+                source_checkpoint_id,
             )
         return 0
+
+    def _run_iteration(
+        self, environment, profile_dir: Path, checkpoints, iteration: int
+    ) -> str:
+        head = checkpoints.resolve_run_head()
+        source_checkpoint_id = head.checkpoint_id if head is not None else None
+        selection = self._selection(environment, source_checkpoint_id)
+        collect_request = self._collect_request(environment, selection, iteration)
+        if self.cartridge.collect(collect_request) != 0:
+            raise RuntimeError("DQN collector exited unsuccessfully")
+        self.cartridge.train(self._train_request(environment, profile_dir, selection))
+        advanced = checkpoints.resolve_run_head()
+        if advanced is None or advanced.checkpoint_id == source_checkpoint_id:
+            raise RuntimeError("DQN learner did not advance the authoritative RunHead")
+        if self.config.evaluation_episodes > 0:
+            result = self.cartridge.evaluate(
+                self._evaluate_request(
+                    environment, profile_dir, advanced.checkpoint_id, iteration
+                )
+            )
+            print(format_evaluation_result(result))
+        return advanced.checkpoint_id
+
+    def _selection(
+        self, environment: "EnvironmentDescriptor", source_checkpoint_id: str | None
+    ) -> ReplaySelection:
+        return ReplaySelection(
+            profile=ReplayProfile(
+                env_id=environment.env_id,
+                env_contract_version=environment.contract_version,
+                algorithm_id=self.cartridge.descriptor.id,
+                experience_schema=self.cartridge.descriptor.components.experience_schema,
+            ),
+            collection_scope_id=secrets.token_hex(32),
+            source_checkpoint_id=source_checkpoint_id,
+        )
+
+    def _collect_request(
+        self,
+        environment: "EnvironmentDescriptor",
+        selection: ReplaySelection,
+        iteration: int,
+    ) -> DqnCollectRequest:
+        source_checkpoint_id = selection.source_checkpoint_id
+        epsilon = (
+            1.0
+            if source_checkpoint_id is None
+            else max(
+                self.config.epsilon_end,
+                self.config.epsilon_start
+                * self.config.epsilon_decay ** (iteration - 1),
+            )
+        )
+        return DqnCollectRequest(
+            env_id=environment.env_id,
+            episodes=self.config.episodes_per_iteration,
+            collection_scope_id=selection.collection_scope_id,
+            source_checkpoint_id=source_checkpoint_id,
+            epsilon=epsilon,
+            seed=(self.config.seed + iteration - 1) % (1 << 64),
+            onnx_intra_threads=self.config.onnx_intra_threads,
+            actor_id=f"dqn-loop-{iteration}",
+            episode_timeout_secs=self.config.episode_timeout_secs,
+            actor_binary=self.config.actor_binary,
+            data_root=self.config.data_root,
+            log_level=self.config.log_level,
+        )
+
+    def _train_request(
+        self,
+        environment: "EnvironmentDescriptor",
+        profile_dir: Path,
+        selection: ReplaySelection,
+    ) -> DqnTrainRequest:
+        return DqnTrainRequest(
+            env_id=environment.env_id,
+            replay_selection=selection,
+            model_dir=profile_dir / "models",
+            stats_path=profile_dir / "stats.json",
+            total_steps=self.config.steps_per_iteration,
+            batch_size=self.config.batch_size,
+            learning_rate=self.config.learning_rate,
+            weight_decay=self.config.weight_decay,
+            gamma=self.config.gamma,
+            target_sync_interval=self.config.target_sync_interval,
+            hidden_size=self.config.hidden_size,
+            grad_clip_norm=self.config.grad_clip_norm,
+            device=self.config.device,
+            log_level=self.config.log_level,
+        )
+
+    def _evaluate_request(
+        self,
+        environment: "EnvironmentDescriptor",
+        profile_dir: Path,
+        checkpoint_id: str,
+        iteration: int,
+    ) -> DqnEvaluateRequest:
+        return DqnEvaluateRequest(
+            env_id=environment.env_id,
+            episodes=self.config.evaluation_episodes,
+            seed=(self.config.seed + iteration - 1) % (1 << 64),
+            checkpoint_id=checkpoint_id,
+            model_dir=profile_dir / "models",
+            eval_binary=self.config.eval_binary,
+            onnx_intra_threads=self.config.onnx_intra_threads,
+        )

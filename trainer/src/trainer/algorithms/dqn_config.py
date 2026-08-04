@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import argparse
 import math
 from dataclasses import dataclass
-from typing import Any
 
 from ..storage.base import ReplaySelection
 
@@ -25,11 +23,10 @@ def _finite(value: object, field: str, *, minimum: float = 0.0) -> float:
     return result
 
 
-@dataclass
-class DqnLearnerConfig:
-    env_id: str = "counter"
-    model_dir: str = "./data/models"
-    stats_path: str = "./data/stats.json"
+@dataclass(frozen=True)
+class DqnLearnerOptions:
+    """User-facing learner defaults shared by the train and loop commands."""
+
     total_steps: int = 500
     batch_size: int = 64
     learning_rate: float = 1e-3
@@ -39,7 +36,28 @@ class DqnLearnerConfig:
     hidden_size: int = 128
     grad_clip_norm: float = 10.0
     device: str = "cpu"
-    replay_selection: ReplaySelection | None = None
+
+
+LEARNER_DEFAULTS = DqnLearnerOptions()
+
+
+@dataclass
+class DqnLearnerConfig:
+    """Complete internal learner configuration with an explicit replay fence."""
+
+    env_id: str
+    model_dir: str
+    stats_path: str
+    replay_selection: ReplaySelection
+    total_steps: int = LEARNER_DEFAULTS.total_steps
+    batch_size: int = LEARNER_DEFAULTS.batch_size
+    learning_rate: float = LEARNER_DEFAULTS.learning_rate
+    weight_decay: float = LEARNER_DEFAULTS.weight_decay
+    gamma: float = LEARNER_DEFAULTS.gamma
+    target_sync_interval: int = LEARNER_DEFAULTS.target_sync_interval
+    hidden_size: int = LEARNER_DEFAULTS.hidden_size
+    grad_clip_norm: float = LEARNER_DEFAULTS.grad_clip_norm
+    device: str = LEARNER_DEFAULTS.device
 
     def __post_init__(self) -> None:
         for field in (
@@ -64,6 +82,8 @@ class DqnLearnerConfig:
         for field in ("model_dir", "stats_path"):
             if not isinstance(getattr(self, field), str) or not getattr(self, field):
                 raise ValueError(f"{field} must be non-empty")
+        if not isinstance(self.replay_selection, ReplaySelection):
+            raise TypeError("replay_selection must be an explicit ReplaySelection")
 
     def resolve_device(self) -> str:
         if self.device != "auto":
@@ -89,44 +109,3 @@ class DqnLearnerConfig:
             "hidden_size": self.hidden_size,
             "grad_clip_norm": self.grad_clip_norm,
         }
-
-    @classmethod
-    def configure_parser(
-        cls, parser: argparse.ArgumentParser, *, defaults: dict[str, Any] | None = None
-    ) -> None:
-        values = cls()
-        overrides = defaults or {}
-        parser.add_argument("--env-id", default=overrides.get("env_id", values.env_id))
-        parser.add_argument("--model-dir", default=overrides.get("model_dir"))
-        parser.add_argument("--stats-path", default=overrides.get("stats_path"))
-        parser.add_argument("--steps", type=int, default=values.total_steps)
-        parser.add_argument("--batch-size", type=int, default=values.batch_size)
-        parser.add_argument("--learning-rate", type=float, default=values.learning_rate)
-        parser.add_argument("--weight-decay", type=float, default=values.weight_decay)
-        parser.add_argument("--gamma", type=float, default=values.gamma)
-        parser.add_argument("--target-sync-interval", type=int, default=values.target_sync_interval)
-        parser.add_argument("--hidden-size", type=int, default=values.hidden_size)
-        parser.add_argument("--grad-clip", type=float, default=values.grad_clip_norm)
-        parser.add_argument("--device", default=values.device)
-        parser.add_argument("--collection-scope-id", required=True)
-        source = parser.add_mutually_exclusive_group(required=True)
-        source.add_argument("--source-checkpoint-id")
-        source.add_argument("--source-root", action="store_true")
-        parser.add_argument("--log-level", default="INFO")
-
-    @classmethod
-    def from_args(cls, args: argparse.Namespace) -> "DqnLearnerConfig":
-        return cls(
-            env_id=args.env_id,
-            model_dir=args.model_dir,
-            stats_path=args.stats_path,
-            total_steps=args.steps,
-            batch_size=args.batch_size,
-            learning_rate=args.learning_rate,
-            weight_decay=args.weight_decay,
-            gamma=args.gamma,
-            target_sync_interval=args.target_sync_interval,
-            hidden_size=args.hidden_size,
-            grad_clip_norm=args.grad_clip,
-            device=args.device,
-        )

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import struct
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import onnxruntime as ort
@@ -12,6 +14,8 @@ from trainer import __main__ as cli
 from trainer.algorithms import get_algorithm
 from trainer.algorithms.dqn_config import DqnLearnerConfig
 from trainer.algorithms.dqn_learner import DqnLearner, DqnQNetwork
+from trainer.algorithms.dqn_loop import DqnLoop, DqnLoopConfig
+from trainer.algorithms.dqn_requests import DqnCollectRequest
 from trainer.algorithms.dqn_v1 import (
     ALGORITHM_ID,
     DqnEvaluationResults,
@@ -122,7 +126,9 @@ def test_dqn_train_step_updates_online_q_parameters(tmp_path):
         payload=payload(terminated=True, availability=(0, 0)),
     )
     batch = decode_replay_batch([record], selection=selected, obs_size=2, num_actions=2)
-    before = [parameter.detach().clone() for parameter in learner.network.online.parameters()]
+    before = [
+        parameter.detach().clone() for parameter in learner.network.online.parameters()
+    ]
     loss, _ = learner.train_step(batch)
     assert np.isfinite(loss)
     assert any(
@@ -219,7 +225,9 @@ def test_dqn_learner_publishes_a_q_value_run_head(tmp_path, monkeypatch):
     resumed_head = resumed.checkpoints.resolve_run_head()
     assert resumed_head is not None
     assert resumed_head.checkpoint_id != first_checkpoint_id
-    resumed_checkpoint = resumed.checkpoints.resolve_checkpoint(resumed_head.checkpoint_id)
+    resumed_checkpoint = resumed.checkpoints.resolve_checkpoint(
+        resumed_head.checkpoint_id
+    )
     assert resumed_checkpoint.manifest.parent_checkpoint_id == first_checkpoint_id
     assert resumed_checkpoint.manifest.step == 4
     assert resumed_stats.samples_seen == 8
@@ -307,21 +315,171 @@ def test_dqn_cli_defaults_are_stable():
     assert collect.episode_timeout_secs == 30
     assert collect.log_level == "INFO"
 
-    evaluate = parser.parse_args(
-        ["--algorithm", ALGORITHM_ID, "evaluate", "--random"]
-    )
+    evaluate = parser.parse_args(["--algorithm", ALGORITHM_ID, "evaluate", "--random"])
     assert evaluate.env_id == "counter"
     assert evaluate.episodes == 100
     assert evaluate.seed == 42
     assert evaluate.onnx_intra_threads == 1
 
-    loop = parser.parse_args(
-        ["--algorithm", ALGORITHM_ID, "loop", "--iterations", "1"]
-    )
+    loop = parser.parse_args(["--algorithm", ALGORITHM_ID, "loop", "--iterations", "1"])
     assert loop.env_id == "counter"
     assert loop.episodes_per_iteration == 100
     assert loop.evaluation_episodes == 100
+    assert loop.episode_timeout_secs == 30
     assert loop.log_level == "INFO"
+
+
+def test_typed_collect_request_preserves_subprocess_arguments_and_exit_code(
+    tmp_path, monkeypatch
+):
+    actor_binary = tmp_path / "actor"
+    actor_binary.touch()
+    calls = []
+
+    def run(command, **options):
+        calls.append((command, options))
+        return SimpleNamespace(returncode=7)
+
+    monkeypatch.setattr("trainer.algorithms.dqn_application.subprocess.run", run)
+    request = DqnCollectRequest(
+        env_id="counter",
+        episodes=3,
+        collection_scope_id="a" * 64,
+        source_checkpoint_id="b" * 64,
+        epsilon=0.25,
+        seed=9,
+        onnx_intra_threads=2,
+        actor_id="collector-9",
+        episode_timeout_secs=17,
+        actor_binary=actor_binary,
+        data_root=tmp_path / "data",
+        log_level="WARNING",
+    )
+
+    assert get_algorithm(ALGORITHM_ID).collect(request) == 7
+    assert calls == [
+        (
+            [
+                str(actor_binary),
+                "--algorithm",
+                ALGORITHM_ID,
+                "--env-id",
+                "counter",
+                "--max-episodes",
+                "3",
+                "--collection-scope-id",
+                "a" * 64,
+                "--collector-config",
+                '{"epsilon":0.25,"onnx_intra_threads":2,"schema_version":1,"seed":9}',
+                "--actor-id",
+                "collector-9",
+                "--episode-timeout-secs",
+                "17",
+                "--data-dir",
+                str(tmp_path / "data"),
+                "--log-level",
+                "warning",
+                "--source-checkpoint-id",
+                "b" * 64,
+            ],
+            {"check": False},
+        )
+    ]
+
+
+def test_dqn_loop_calls_typed_application_methods_and_honors_runtime_options(
+    tmp_path, monkeypatch, capsys
+):
+    cartridge = get_algorithm(ALGORITHM_ID)
+    requests = {"collect": [], "train": [], "evaluate": []}
+
+    class Checkpoints:
+        calls = 0
+
+        def resolve_run_head(self):
+            self.calls += 1
+            if self.calls == 1:
+                return None
+            return SimpleNamespace(checkpoint_id="c" * 64)
+
+    monkeypatch.setattr(
+        "trainer.algorithms.dqn_loop.create_checkpoint_publisher",
+        lambda contract, model_dir: Checkpoints(),
+    )
+    monkeypatch.setattr(
+        cartridge,
+        "collect",
+        lambda request: requests["collect"].append(request) or 0,
+    )
+    monkeypatch.setattr(
+        cartridge,
+        "train",
+        lambda request: requests["train"].append(request),
+    )
+
+    def evaluate(request):
+        requests["evaluate"].append(request)
+        return DqnEvaluationResults(
+            env_id="counter",
+            player_name="ONNX(model.onnx)",
+            episodes_played=2,
+            terminated_episodes=2,
+            truncated_episodes=0,
+            mean_return=1.0,
+            min_return=1.0,
+            max_return=1.0,
+            avg_episode_length=3.0,
+        )
+
+    monkeypatch.setattr(cartridge, "evaluate", evaluate)
+    config = DqnLoopConfig(
+        env_id="counter",
+        iterations=1,
+        episodes_per_iteration=2,
+        steps_per_iteration=3,
+        batch_size=4,
+        learning_rate=0.001,
+        weight_decay=0.0,
+        gamma=0.99,
+        target_sync_interval=5,
+        hidden_size=16,
+        grad_clip_norm=10.0,
+        device="cpu",
+        epsilon_start=0.25,
+        epsilon_end=0.01,
+        epsilon_decay=0.95,
+        seed=11,
+        onnx_intra_threads=2,
+        evaluation_episodes=2,
+        episode_timeout_secs=19,
+        actor_binary=None,
+        eval_binary=None,
+        data_root=Path(tmp_path),
+        log_level="WARNING",
+    )
+
+    assert DqnLoop(cartridge, config).run() == 0
+    assert (
+        len(requests["collect"])
+        == len(requests["train"])
+        == len(requests["evaluate"])
+        == 1
+    )
+    assert requests["collect"][0].episode_timeout_secs == 19
+    assert requests["collect"][0].log_level == "WARNING"
+    assert requests["train"][0].log_level == "WARNING"
+    assert (
+        requests["train"][0].replay_selection.collection_scope_id
+        == requests["collect"][0].collection_scope_id
+    )
+    assert requests["train"][0].replay_selection.source_checkpoint_id is None
+    assert requests["evaluate"][0].checkpoint_id == "c" * 64
+    assert capsys.readouterr().out == (
+        '{"avg_episode_length":3.0,"env_id":"counter","episodes_played":2,'
+        '"max_return":1.0,"mean_return":1.0,"min_return":1.0,'
+        '"player_name":"ONNX(model.onnx)","terminated_episodes":2,'
+        '"truncated_episodes":0}\n'
+    )
 
 
 def test_dqn_evaluation_result_is_a_single_agent_return_contract():
