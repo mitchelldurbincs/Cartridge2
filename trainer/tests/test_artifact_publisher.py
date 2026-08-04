@@ -282,7 +282,7 @@ def test_staging_publishes_the_exact_private_snapshot(tmp_path, staged_blobs):
 
     publisher = FilesystemCheckpointPublisher(model_root=tmp_path / "models", contract=CONTRACT)
     with patch(
-        "trainer.storage.publisher.validate_onnx_checkpoint",
+        "trainer.storage.checkpoint_validation.validate_onnx_checkpoint",
         side_effect=mutate_caller_owned_sources,
     ):
         checkpoint = publisher.stage_checkpoint(
@@ -502,9 +502,9 @@ def test_immutable_object_with_different_bytes_is_never_overwritten(tmp_path, st
 
 def test_failure_before_manifest_does_not_advance_channels(tmp_path, staged_blobs):
     publisher = FilesystemCheckpointPublisher(model_root=tmp_path, contract=CONTRACT)
-    from trainer.storage import publisher as publisher_module
+    from trainer.storage import checkpoint_filesystem as publisher_module
 
-    original = publisher_module._create_or_verify
+    original = publisher_module.create_or_verify
     calls = 0
 
     def fail_manifest(path, data):
@@ -514,7 +514,7 @@ def test_failure_before_manifest_does_not_advance_channels(tmp_path, staged_blob
             raise RuntimeError("manifest storage failed")
         original(path, data)
 
-    with patch.object(publisher_module, "_create_or_verify", side_effect=fail_manifest):
+    with patch.object(publisher_module, "create_or_verify", side_effect=fail_manifest):
         with pytest.raises(RuntimeError, match="manifest storage failed"):
             _publish(publisher, staged_blobs)
 
