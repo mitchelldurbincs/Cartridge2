@@ -57,16 +57,19 @@ jobs:
             engine
             actor
             web
+      # --locked: build the dependency graph recorded in the committed
+      # Cargo.lock rather than re-resolving. Without it CI silently tests a
+      # different graph than the one that was reviewed.
       - name: Clippy (engine)
-        run: cargo clippy --manifest-path engine/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --locked --manifest-path engine/Cargo.toml --all-targets -- -D warnings
       - name: Clippy (model watcher, all features)
-        run: cargo clippy --manifest-path engine/Cargo.toml -p model-watcher --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --manifest-path engine/Cargo.toml -p model-watcher --all-targets --all-features -- -D warnings
       - name: Clippy (actor)
-        run: cargo clippy --manifest-path actor/Cargo.toml --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --manifest-path actor/Cargo.toml --all-targets --all-features -- -D warnings
       - name: Clippy (web)
-        run: cargo clippy --manifest-path web/Cargo.toml --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --manifest-path web/Cargo.toml --all-targets --all-features -- -D warnings
       - name: Clippy (web without ONNX)
-        run: cargo clippy --manifest-path web/Cargo.toml --all-targets --no-default-features -- -D warnings
+        run: cargo clippy --locked --manifest-path web/Cargo.toml --all-targets --no-default-features -- -D warnings
 
   rust-test:
     name: Rust Tests
@@ -81,15 +84,15 @@ jobs:
             actor
             web
       - name: Test engine
-        run: cargo test --manifest-path engine/Cargo.toml
+        run: cargo test --locked --manifest-path engine/Cargo.toml
       - name: Test model watcher (all features)
-        run: cargo test --manifest-path engine/Cargo.toml -p model-watcher --all-features
+        run: cargo test --locked --manifest-path engine/Cargo.toml -p model-watcher --all-features
       - name: Test actor
-        run: cargo test --manifest-path actor/Cargo.toml --all-features
+        run: cargo test --locked --manifest-path actor/Cargo.toml --all-features
       - name: Test web
-        run: cargo test --manifest-path web/Cargo.toml
+        run: cargo test --locked --manifest-path web/Cargo.toml
       - name: Test web without ONNX
-        run: cargo test --manifest-path web/Cargo.toml --no-default-features
+        run: cargo test --locked --manifest-path web/Cargo.toml --no-default-features
 
   rust-build:
     name: Rust Build (Release)
@@ -104,15 +107,36 @@ jobs:
             actor
             web
       - name: Build engine
-        run: cargo build --release --manifest-path engine/Cargo.toml
+        run: cargo build --locked --release --manifest-path engine/Cargo.toml
       - name: Build actor
-        run: cargo build --release --manifest-path actor/Cargo.toml
+        run: cargo build --locked --release --manifest-path actor/Cargo.toml
       - name: Build web
-        run: cargo build --release --manifest-path web/Cargo.toml
+        run: cargo build --locked --release --manifest-path web/Cargo.toml
 
   rust-security-audit:
     name: Rust Security Audit
     runs-on: ubuntu-latest
+    # Gating, but with today's four known advisories listed explicitly so the
+    # gate catches anything NEW while the existing backlog stays visible
+    # instead of silently suppressed. Each needs a semver-major dependency
+    # bump, so none is a one-line fix; they are tracked as follow-up work:
+    #
+    #   RUSTSEC-2024-0437  protobuf 2.28.0 <- prometheus 0.13.4 <- metrics-common.
+    #                      Clearing it means prometheus 0.14+, which drops
+    #                      protobuf but changes the API used by
+    #                      engine/metrics-common and web/src/metrics.rs.
+    #   RUSTSEC-2026-0098  rustls-webpki 0.101.7 <- rustls 0.21.12, reached only
+    #   RUSTSEC-2026-0099  through feature-gated deps (not in the default build
+    #   RUSTSEC-2026-0104  tree). Needs the rustls 0.23 chain.
+    #
+    # Delete an entry the moment its upgrade lands. Do not add one without a
+    # justification here, and do not reach for continue-on-error again.
+    env:
+      AUDIT_IGNORES: >-
+        --ignore RUSTSEC-2024-0437
+        --ignore RUSTSEC-2026-0098
+        --ignore RUSTSEC-2026-0099
+        --ignore RUSTSEC-2026-0104
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -123,16 +147,17 @@ jobs:
             actor
             web
       - name: Install cargo-audit
-        run: cargo install cargo-audit
+        run: cargo install cargo-audit --locked
+      # cargo-audit audits a *lockfile* and has no --manifest-path flag, so the
+      # previous invocations exited with a CLI usage error -- which
+      # continue-on-error then swallowed. The audit had never actually run.
+      # Both halves are fixed here: the right flag, and no suppression.
       - name: Run cargo audit (engine)
-        run: cargo audit --manifest-path engine/Cargo.toml
-        continue-on-error: true
+        run: cargo audit --file engine/Cargo.lock $AUDIT_IGNORES
       - name: Run cargo audit (actor)
-        run: cargo audit --manifest-path actor/Cargo.toml
-        continue-on-error: true
+        run: cargo audit --file actor/Cargo.lock $AUDIT_IGNORES
       - name: Run cargo audit (web)
-        run: cargo audit --manifest-path web/Cargo.toml
-        continue-on-error: true
+        run: cargo audit --file web/Cargo.lock $AUDIT_IGNORES
 
   # ============================================
   # Python Jobs (Trainer)
@@ -193,6 +218,9 @@ jobs:
           cache-dependency-path: trainer/pyproject.toml
       - name: Install pip-audit
         run: pip install pip-audit
+      # Advisory, deliberately: pip-audit resolves the environment rather than a
+      # committed lockfile, so it reports transitive advisories the repo cannot
+      # act on directly. cargo audit and gitleaks are the gating scanners.
       - name: Run pip-audit
         run: pip-audit
         continue-on-error: true
@@ -215,6 +243,8 @@ jobs:
           cache-dependency-path: web/frontend/package-lock.json
       - name: Install dependencies
         run: npm ci
+      # Advisory, deliberately: most findings here are dev-only transitive deps
+      # of the build toolchain, which do not ship in the built frontend.
       - name: Run npm audit
         run: npm audit
         continue-on-error: true
@@ -273,8 +303,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # Gating: a secrets scanner that cannot fail the build is decorative.
+      # NOTE for the first run: gitleaks-action v2 is free for personal repos
+      # and public repos, but requires GITLEAKS_LICENSE for organisation-owned
+      # ones. If this job starts failing on licensing rather than on findings,
+      # add the secret -- do not re-add continue-on-error.
       - name: Run GitLeaks
         uses: gitleaks/gitleaks-action@v2
-        continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

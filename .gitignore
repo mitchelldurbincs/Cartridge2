@@ -3,7 +3,10 @@
 /actor/target/
 /web/target/
 target/
-Cargo.lock
+
+# NOTE: Cargo.lock is deliberately NOT ignored. `actor` and `web` are binaries
+# and `engine` is the workspace they are built from, so the lockfiles are what
+# make the artifact CI builds the artifact CI tested. CI passes --locked.
 
 # Python
 __pycache__/

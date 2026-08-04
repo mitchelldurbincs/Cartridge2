@@ -41,6 +41,21 @@ pub enum ConfigError {
     InvalidConfig(String),
 }
 
+impl ConfigError {
+    /// Configuration path associated with a filesystem or parsing failure.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::ExplicitPathMissing(path)
+            | Self::Read { path, .. }
+            | Self::Parse { path, .. } => Some(path),
+            Self::NonUnicodeEnv { .. }
+            | Self::InvalidEnv { .. }
+            | Self::UnknownEnv(_)
+            | Self::InvalidConfig(_) => None,
+        }
+    }
+}
+
 /// Standard locations to search for config.toml.
 pub const CONFIG_SEARCH_PATHS: &[&str] = &["config.toml", "../config.toml", "/app/config.toml"];
 
