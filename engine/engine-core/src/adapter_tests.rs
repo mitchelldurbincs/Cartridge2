@@ -132,10 +132,9 @@ impl Environment for CounterEnvironment {
 
 #[test]
 fn adapter_preserves_generic_timestep_and_has_no_board_projection() {
-    let mut adapter = EnvironmentAdapter::try_new(CounterEnvironment {
+    let mut adapter = EnvironmentAdapter::new(CounterEnvironment {
         invalid_reward: false,
-    })
-    .unwrap();
+    });
     let mut state = Vec::new();
     let mut timestep = crate::ErasedTimestep::default();
     adapter.reset(41, &[], &mut state, &mut timestep).unwrap();
@@ -159,19 +158,12 @@ fn adapter_preserves_generic_timestep_and_has_no_board_projection() {
 }
 
 #[test]
-fn adapter_rejects_non_finite_per_agent_rewards() {
-    let mut adapter = EnvironmentAdapter::try_new(CounterEnvironment {
+fn engine_context_rejects_non_finite_per_agent_rewards() {
+    let mut context = crate::EngineContext::from_environment(CounterEnvironment {
         invalid_reward: true,
     })
     .unwrap();
-    let error = adapter
-        .reset(
-            0,
-            &[],
-            &mut Vec::new(),
-            &mut crate::ErasedTimestep::default(),
-        )
-        .unwrap_err();
+    let error = context.reset(0, &[]).unwrap_err();
     assert!(matches!(
         error,
         crate::ErasedEnvironmentError::ContractViolation(_)
@@ -180,10 +172,9 @@ fn adapter_rejects_non_finite_per_agent_rewards() {
 
 #[test]
 fn adapter_rejects_malformed_encoded_inputs() {
-    let mut adapter = EnvironmentAdapter::try_new(CounterEnvironment {
+    let mut adapter = EnvironmentAdapter::new(CounterEnvironment {
         invalid_reward: false,
-    })
-    .unwrap();
+    });
     let error = adapter
         .step(
             &[1, 2],

@@ -43,7 +43,7 @@ fn typed_factory<E>() -> Result<Box<dyn ErasedEnvironment>, ErasedEnvironmentErr
 where
     E: Environment + Default,
 {
-    Ok(Box::new(EnvironmentAdapter::try_new(E::default())?))
+    Ok(Box::new(EnvironmentAdapter::new(E::default())))
 }
 
 fn board_game_factory<G>() -> Result<Box<dyn ErasedEnvironment>, ErasedEnvironmentError>
@@ -56,7 +56,7 @@ where
             "BoardGame implementation must publish board metadata".to_string(),
         ));
     }
-    Ok(Box::new(EnvironmentAdapter::try_new(environment)?))
+    Ok(Box::new(EnvironmentAdapter::new(environment)))
 }
 
 fn validate_factory(

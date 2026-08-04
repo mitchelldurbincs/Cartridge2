@@ -47,7 +47,7 @@ impl EngineContext {
     pub fn from_environment<E: Environment>(
         environment: E,
     ) -> Result<Self, ErasedEnvironmentError> {
-        Self::from_erased(Box::new(EnvironmentAdapter::try_new(environment)?))
+        Self::from_erased(Box::new(EnvironmentAdapter::new(environment)))
     }
 
     fn from_erased(

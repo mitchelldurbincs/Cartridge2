@@ -1,14 +1,16 @@
-//! Runtime validation shared by typed adapters and raw erased environments.
+//! Descriptor checks and authoritative `EngineContext` runtime validation.
 
 use std::collections::BTreeSet;
 
 use crate::erased::{ErasedEnvironmentError, ErasedTimestep};
 use crate::metadata::{BoardGameMetadata, EnvironmentMetadata};
+#[cfg(test)]
+use crate::typed::Timestep;
 use crate::typed::{
     ActionAvailability, ActionAvailabilityContract, ActionEncoding, ActionSpace, AgentId,
     AgentModel, AgentOutcome, Capabilities, ChanceModel, Decision, EngineId, EpisodeStatus,
-    ObservationEncoding, RewardModel, TensorDType, Timestep, TransitionDynamics, TransitionSource,
-    TurnModel, WIRE_ENCODING_SCHEMA_VERSION,
+    ObservationEncoding, RewardModel, TensorDType, TransitionDynamics, TransitionSource, TurnModel,
+    WIRE_ENCODING_SCHEMA_VERSION,
 };
 
 fn valid_runtime_segment(value: &str) -> bool {
@@ -594,6 +596,7 @@ fn validate_timestep_fields(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn validate_typed_timestep<O>(
     capabilities: &Capabilities,
     timestep: &Timestep<O>,
