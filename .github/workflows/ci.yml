@@ -64,8 +64,8 @@ jobs:
         run: cargo clippy --locked --manifest-path engine/Cargo.toml --all-targets -- -D warnings
       - name: Clippy (model watcher, all features)
         run: cargo clippy --locked --manifest-path engine/Cargo.toml -p model-watcher --all-targets --all-features -- -D warnings
-      - name: Clippy (actor)
-        run: cargo clippy --locked --manifest-path actor/Cargo.toml --all-targets --all-features -- -D warnings
+      - name: Clippy (actor, Linux features)
+        run: cargo clippy --locked --manifest-path actor/Cargo.toml --all-targets --features s3 -- -D warnings
       - name: Clippy (web)
         run: cargo clippy --locked --manifest-path web/Cargo.toml --all-targets --all-features -- -D warnings
       - name: Clippy (web without ONNX)
@@ -87,8 +87,10 @@ jobs:
         run: cargo test --locked --manifest-path engine/Cargo.toml
       - name: Test model watcher (all features)
         run: cargo test --locked --manifest-path engine/Cargo.toml -p model-watcher --all-features
-      - name: Test actor
-        run: cargo test --locked --manifest-path actor/Cargo.toml --all-features
+      - name: Test actor (filesystem and S3)
+        # CoreML is an Apple-only execution provider. On Linux, `s3` is the
+        # complete supported feature set and still covers both storage paths.
+        run: cargo test --locked --manifest-path actor/Cargo.toml --features s3
       - name: Test web
         run: cargo test --locked --manifest-path web/Cargo.toml
       - name: Test web without ONNX
