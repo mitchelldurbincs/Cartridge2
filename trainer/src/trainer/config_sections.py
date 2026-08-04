@@ -47,12 +47,7 @@ def _default_list(section: str, key: str) -> list[str]:
 
 def _nonnegative_u32(value: object, *, field_name: str, positive: bool = False) -> int:
     minimum = 1 if positive else 0
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or value < minimum
-        or value > _MAX_U32
-    ):
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum or value > _MAX_U32:
         qualifier = "positive" if positive else "nonnegative"
         raise ValueError(f"{field_name} must be a {qualifier} u32 integer")
     return value
@@ -60,12 +55,7 @@ def _nonnegative_u32(value: object, *, field_name: str, positive: bool = False) 
 
 def _nonnegative_u64(value: object, *, field_name: str, positive: bool = False) -> int:
     minimum = 1 if positive else 0
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or value < minimum
-        or value > _MAX_U64
-    ):
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum or value > _MAX_U64:
         qualifier = "positive" if positive else "nonnegative"
         raise ValueError(f"{field_name} must be a {qualifier} u64 integer")
     return value
@@ -81,20 +71,14 @@ def _nonnegative_f32(value: object, *, field_name: str) -> float:
     return 0.0 if narrowed == 0.0 else narrowed
 
 
-def validate_simulation_schedule(
-    *, iterations: int, start: int, maximum: int, ramp: int
-) -> None:
+def validate_simulation_schedule(*, iterations: int, start: int, maximum: int, ramp: int) -> None:
     if start == maximum:
         if ramp != 0:
-            raise ValueError(
-                "mcts.sim_ramp_rate must be zero when start_sims equals max_sims"
-            )
+            raise ValueError("mcts.sim_ramp_rate must be zero when start_sims equals max_sims")
         return
     delta = maximum - start
     if ramp == 0 or ramp > delta:
-        raise ValueError(
-            "ramped MCTS requires mcts.sim_ramp_rate in [1, max_sims - start_sims]"
-        )
+        raise ValueError("ramped MCTS requires mcts.sim_ramp_rate in [1, max_sims - start_sims]")
     steps_to_cap = (delta + ramp - 1) // ramp
     if iterations - 1 < steps_to_cap:
         raise ValueError(
@@ -134,9 +118,7 @@ class TrainingConfig:
     num_actors: int = _default("training", "num_actors")
 
     def __post_init__(self) -> None:
-        _nonnegative_u64(
-            self.iterations, field_name="training.iterations", positive=True
-        )
+        _nonnegative_u64(self.iterations, field_name="training.iterations", positive=True)
         episodes = _nonnegative_u32(
             self.episodes_per_iteration,
             field_name="training.episodes_per_iteration",
@@ -147,21 +129,15 @@ class TrainingConfig:
             field_name="training.steps_per_iteration",
             positive=True,
         )
-        _nonnegative_u64(
-            self.batch_size, field_name="training.batch_size", positive=True
-        )
+        _nonnegative_u64(self.batch_size, field_name="training.batch_size", positive=True)
         _nonnegative_u64(
             self.checkpoint_interval,
             field_name="training.checkpoint_interval",
             positive=True,
         )
-        actors = _nonnegative_u32(
-            self.num_actors, field_name="training.num_actors", positive=True
-        )
+        actors = _nonnegative_u32(self.num_actors, field_name="training.num_actors", positive=True)
         if actors > episodes:
-            raise ValueError(
-                "training.num_actors cannot exceed training.episodes_per_iteration"
-            )
+            raise ValueError("training.num_actors cannot exceed training.episodes_per_iteration")
 
 
 @dataclass
@@ -181,24 +157,16 @@ class EvaluationConfig:
 
     def __post_init__(self) -> None:
         interval = _nonnegative_u64(self.interval, field_name="evaluation.interval")
-        games = _nonnegative_u32(
-            self.games, field_name="evaluation.games", positive=True
-        )
+        games = _nonnegative_u32(self.games, field_name="evaluation.games", positive=True)
         if not isinstance(self.eval_vs_random, bool):
             raise ValueError("evaluation.eval_vs_random must be boolean")
         _nonnegative_u32(self.simulations, field_name="evaluation.simulations")
-        solver_games = _nonnegative_u32(
-            self.solver_games, field_name="evaluation.solver_games"
-        )
-        seed = _nonnegative_u64(
-            self.evaluation_seed, field_name="evaluation.evaluation_seed"
-        )
+        solver_games = _nonnegative_u32(self.solver_games, field_name="evaluation.solver_games")
+        seed = _nonnegative_u64(self.evaluation_seed, field_name="evaluation.evaluation_seed")
         largest_run = max(games, solver_games)
         if seed > _MAX_U64 - (largest_run - 1):
             raise ValueError("evaluation seed schedule exceeds u64")
-        self.temperature = _nonnegative_f32(
-            self.temperature, field_name="evaluation.temperature"
-        )
+        self.temperature = _nonnegative_f32(self.temperature, field_name="evaluation.temperature")
         for field_name in ("win_threshold", "promotion_margin"):
             value = getattr(self, field_name)
             if (
@@ -219,9 +187,7 @@ class EvaluationConfig:
                     "evaluation.win_threshold must be zero when promotion_metric is solver_optimal"
                 )
         else:
-            raise ValueError(
-                "evaluation.promotion_metric must be win_rate or solver_optimal"
-            )
+            raise ValueError("evaluation.promotion_metric must be win_rate or solver_optimal")
         if interval > 0 and not self.eval_vs_random and solver_games == 0:
             raise ValueError(
                 "scheduled evaluation requires first-candidate evidence: enable "
@@ -276,9 +242,7 @@ class MctsConfig:
 
     def __post_init__(self) -> None:
         self.c_puct = _nonnegative_f32(self.c_puct, field_name="mcts.c_puct")
-        self.temperature = _nonnegative_f32(
-            self.temperature, field_name="mcts.temperature"
-        )
+        self.temperature = _nonnegative_f32(self.temperature, field_name="mcts.temperature")
         self.late_temperature = _nonnegative_f32(
             self.late_temperature, field_name="mcts.late_temperature"
         )
@@ -306,28 +270,18 @@ class MctsConfig:
                 "the schedule is enabled"
             )
         _nonnegative_u32(self.temp_threshold, field_name="mcts.temp_threshold")
-        start = _nonnegative_u32(
-            self.start_sims, field_name="mcts.start_sims", positive=True
-        )
-        maximum = _nonnegative_u32(
-            self.max_sims, field_name="mcts.max_sims", positive=True
-        )
+        start = _nonnegative_u32(self.start_sims, field_name="mcts.start_sims", positive=True)
+        maximum = _nonnegative_u32(self.max_sims, field_name="mcts.max_sims", positive=True)
         _nonnegative_u32(self.sim_ramp_rate, field_name="mcts.sim_ramp_rate")
         if start > maximum:
             raise ValueError("mcts.start_sims cannot exceed mcts.max_sims")
         if start == maximum and self.sim_ramp_rate != 0:
-            raise ValueError(
-                "mcts.sim_ramp_rate must be zero when start_sims equals max_sims"
-            )
-        if start < maximum and (
-            self.sim_ramp_rate == 0 or self.sim_ramp_rate > maximum - start
-        ):
+            raise ValueError("mcts.sim_ramp_rate must be zero when start_sims equals max_sims")
+        if start < maximum and (self.sim_ramp_rate == 0 or self.sim_ramp_rate > maximum - start):
             raise ValueError(
                 "ramped MCTS requires mcts.sim_ramp_rate in [1, max_sims - start_sims]"
             )
-        _nonnegative_u32(
-            self.eval_batch_size, field_name="mcts.eval_batch_size", positive=True
-        )
+        _nonnegative_u32(self.eval_batch_size, field_name="mcts.eval_batch_size", positive=True)
         _nonnegative_u32(
             self.onnx_intra_threads,
             field_name="mcts.onnx_intra_threads",

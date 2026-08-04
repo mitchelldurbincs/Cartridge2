@@ -11,9 +11,8 @@ use super::{
 use crate::DQN_V1_ID;
 
 pub(crate) const DQN_UNVERIFIED_ASSUMPTIONS: &[&str] = &[
-    "observations contain enough state for value learning",
-    "the decision legal mask exactly matches actions accepted by the environment",
-    "reward magnitudes and episode lengths are suitable for the configured learner",
+    "observations contain enough information for a feed-forward Q-network",
+    "the declared action availability exactly matches accepted actions",
 ];
 
 pub(crate) fn dqn_compatibility(

@@ -117,9 +117,7 @@ class DqnLoop:
             )
         return 0
 
-    def _run_iteration(
-        self, environment, profile_dir: Path, checkpoints, iteration: int
-    ) -> str:
+    def _run_iteration(self, environment, profile_dir: Path, checkpoints, iteration: int) -> str:
         head = checkpoints.resolve_run_head()
         source_checkpoint_id = head.checkpoint_id if head is not None else None
         selection = self._selection(environment, source_checkpoint_id)
@@ -132,9 +130,7 @@ class DqnLoop:
             raise RuntimeError("DQN learner did not advance the authoritative RunHead")
         if self.config.evaluation_episodes > 0:
             result = self.cartridge.evaluate(
-                self._evaluate_request(
-                    environment, profile_dir, advanced.checkpoint_id, iteration
-                )
+                self._evaluate_request(environment, profile_dir, advanced.checkpoint_id, iteration)
             )
             print(format_evaluation_result(result))
         return advanced.checkpoint_id
@@ -165,8 +161,7 @@ class DqnLoop:
             if source_checkpoint_id is None
             else max(
                 self.config.epsilon_end,
-                self.config.epsilon_start
-                * self.config.epsilon_decay ** (iteration - 1),
+                self.config.epsilon_start * self.config.epsilon_decay ** (iteration - 1),
             )
         )
         return DqnCollectRequest(

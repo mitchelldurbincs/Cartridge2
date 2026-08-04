@@ -71,9 +71,7 @@ class DqnEvaluationResults:
             "avg_episode_length",
         }
         if not isinstance(value, dict) or set(value) != fields:
-            raise ValueError(
-                "DQN evaluation result fields do not match the exact contract"
-            )
+            raise ValueError("DQN evaluation result fields do not match the exact contract")
         result = cls(**value)
         if not result.env_id or not result.player_name:
             raise ValueError("DQN evaluation identity fields must be non-empty")
@@ -83,13 +81,8 @@ class DqnEvaluationResults:
                 raise ValueError(f"DQN evaluation {name} must be a nonnegative integer")
         if result.episodes_played <= 0:
             raise ValueError("DQN evaluation must contain at least one episode")
-        if (
-            result.terminated_episodes + result.truncated_episodes
-            != result.episodes_played
-        ):
-            raise ValueError(
-                "DQN evaluation completion counts do not partition its episodes"
-            )
+        if result.terminated_episodes + result.truncated_episodes != result.episodes_played:
+            raise ValueError("DQN evaluation completion counts do not partition its episodes")
         for name in ("mean_return", "min_return", "max_return", "avg_episode_length"):
             item = getattr(result, name)
             if isinstance(item, bool) or not isinstance(item, (int, float)):
@@ -127,9 +120,7 @@ def decode_replay_batch(
 
     for index, record in enumerate(records):
         if not selection.matches(record):
-            raise ValueError(
-                f"DQN replay record {record.id!r} crosses its selection fence"
-            )
+            raise ValueError(f"DQN replay record {record.id!r} crosses its selection fence")
         payload = record.payload
         if len(payload) != expected_bytes:
             raise ValueError(
@@ -137,16 +128,12 @@ def decode_replay_batch(
                 f"expected {expected_bytes}"
             )
         cursor = 0
-        observations[index] = np.frombuffer(
-            payload, dtype="<f4", count=obs_size, offset=cursor
-        )
+        observations[index] = np.frombuffer(payload, dtype="<f4", count=obs_size, offset=cursor)
         cursor += observation_bytes
         action = int.from_bytes(payload[cursor : cursor + 4], "little")
         cursor += 4
         if action >= num_actions:
-            raise ValueError(
-                f"DQN replay record {record.id!r} has invalid action {action}"
-            )
+            raise ValueError(f"DQN replay record {record.id!r} has invalid action {action}")
         actions[index] = action
         reward = np.frombuffer(payload, dtype="<f4", count=1, offset=cursor)[0]
         cursor += 4
@@ -160,16 +147,12 @@ def decode_replay_batch(
         flags = payload[cursor : cursor + 2]
         cursor += 2
         if any(flag not in (0, 1) for flag in flags) or flags == b"\x01\x01":
-            raise ValueError(
-                f"DQN replay record {record.id!r} has invalid completion flags"
-            )
+            raise ValueError(f"DQN replay record {record.id!r} has invalid completion flags")
         terminated[index] = bool(flags[0])
         truncated[index] = bool(flags[1])
         availability = np.frombuffer(payload, dtype=np.uint8, offset=cursor)
         if np.any(availability > 1):
-            raise ValueError(
-                f"DQN replay record {record.id!r} has invalid availability"
-            )
+            raise ValueError(f"DQN replay record {record.id!r} has invalid availability")
         next_availability[index] = availability.astype(np.bool_)
         done = bool(flags[0] or flags[1])
         if done == bool(availability.any()):
@@ -181,9 +164,7 @@ def decode_replay_batch(
             not np.isfinite(observations[index]).all()
             or not np.isfinite(next_observations[index]).all()
         ):
-            raise ValueError(
-                f"DQN replay record {record.id!r} has non-finite observation"
-            )
+            raise ValueError(f"DQN replay record {record.id!r} has non-finite observation")
 
     return DqnReplayBatch(
         observations,
@@ -222,9 +203,7 @@ class DqnV1:
     def compatibility(self, environment: EnvironmentDescriptor) -> CompatibilityReport:
         return environment.compatibility(self.descriptor.id)
 
-    def artifact_contract(
-        self, environment: EnvironmentDescriptor
-    ) -> OnnxArtifactContract:
+    def artifact_contract(self, environment: EnvironmentDescriptor) -> OnnxArtifactContract:
         self.compatibility(environment).require_compatible()
         tensor = environment.capabilities.encoding.observation_tensor
         agents = environment.capabilities.agents.agents
@@ -241,9 +220,7 @@ class DqnV1:
             algorithm_id=self.descriptor.id,
             env_id=environment.env_id,
             env_contract_version=environment.contract_version,
-            model_artifact_schema_version=(
-                self.descriptor.model_artifact_schema_version
-            ),
+            model_artifact_schema_version=(self.descriptor.model_artifact_schema_version),
             model_contract=self.descriptor.components.model_contract,
             inputs=(
                 OnnxTensorSpec(

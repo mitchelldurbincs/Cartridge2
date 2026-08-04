@@ -139,9 +139,7 @@ class TestEnvironmentVariableOverrides:
 
         assert config.evaluation.eval_vs_random is False
 
-    def test_scheduled_evaluation_requires_first_candidate_evidence(
-        self, monkeypatch, tmp_path
-    ):
+    def test_scheduled_evaluation_requires_first_candidate_evidence(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         reset_config()
         monkeypatch.setenv("CARTRIDGE_EVALUATION_EVAL_VS_RANDOM", "false")
@@ -171,9 +169,7 @@ class TestConfigDataclasses:
         config = Config()
         for section_name, values in CANONICAL_DEFAULTS_DATA.items():
             section = getattr(config, section_name)
-            actual = {
-                item.name: getattr(section, item.name) for item in fields(section)
-            }
+            actual = {item.name: getattr(section, item.name) for item in fields(section)}
             for key, expected in values.items():
                 if isinstance(expected, float):
                     assert actual[key] == pytest.approx(expected)
@@ -232,11 +228,7 @@ class TestConfigDataclasses:
         assert isinstance(config.models_dir, Path)
         assert isinstance(config.stats_path, Path)
         assert config.data_dir == (
-            config.data_root
-            / "profiles"
-            / config.algorithm.id
-            / config.common.env_id
-            / "v2"
+            config.data_root / "profiles" / config.algorithm.id / config.common.env_id / "v2"
         )
 
 
@@ -386,9 +378,7 @@ class TestThreadSafety:
 class TestConfigEdgeCases:
     """Test edge cases and error handling."""
 
-    def test_invalid_env_var_for_int_fails_during_config_load(
-        self, monkeypatch, tmp_path
-    ):
+    def test_invalid_env_var_for_int_fails_during_config_load(self, monkeypatch, tmp_path):
         """Typed configuration rejects invalid integer overrides immediately."""
         # Isolate from repo's config.toml by changing to temp directory
         monkeypatch.chdir(tmp_path)
@@ -415,9 +405,7 @@ class TestConfigEdgeCases:
             get_config(reload=True)
 
     def test_unknown_key_is_rejected(self, monkeypatch, tmp_path):
-        (tmp_path / "config.toml").write_text(
-            '[algorithm]\nidd = "alphazero_board_v1"\n'
-        )
+        (tmp_path / "config.toml").write_text('[algorithm]\nidd = "alphazero_board_v1"\n')
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(
             "trainer.central_config.CONFIG_SEARCH_PATHS", [tmp_path / "config.toml"]
@@ -445,16 +433,12 @@ class TestConfigEdgeCases:
         with pytest.raises(FileNotFoundError, match="canonical config.defaults.toml"):
             get_config(reload=True)
 
-    def test_divergent_canonical_default_copies_are_rejected(
-        self, monkeypatch, tmp_path
-    ):
+    def test_divergent_canonical_default_copies_are_rejected(self, monkeypatch, tmp_path):
         first = tmp_path / "first.toml"
         second = tmp_path / "second.toml"
         first.write_text("[common]\nenv_id = 'one'\n")
         second.write_text("[common]\nenv_id = 'two'\n")
-        monkeypatch.setattr(
-            "trainer.central_config.DEFAULTS_SEARCH_PATHS", [first, second]
-        )
+        monkeypatch.setattr("trainer.central_config.DEFAULTS_SEARCH_PATHS", [first, second])
         reset_config()
 
         with pytest.raises(RuntimeError, match="copies diverge"):
@@ -465,9 +449,7 @@ class TestConfigEdgeCases:
         incomplete.write_text(
             '[common]\ndata_dir = "./data"\nenv_id = "tictactoe"\nlog_level = "info"\n'
         )
-        monkeypatch.setattr(
-            "trainer.central_config.DEFAULTS_SEARCH_PATHS", [incomplete]
-        )
+        monkeypatch.setattr("trainer.central_config.DEFAULTS_SEARCH_PATHS", [incomplete])
         monkeypatch.setattr(
             "trainer.central_config.CONFIG_SEARCH_PATHS", [tmp_path / "missing.toml"]
         )
@@ -476,17 +458,13 @@ class TestConfigEdgeCases:
         with pytest.raises(ValueError, match="missing sections"):
             get_config(reload=True)
 
-    def test_missing_required_canonical_default_key_is_rejected(
-        self, monkeypatch, tmp_path
-    ):
+    def test_missing_required_canonical_default_key_is_rejected(self, monkeypatch, tmp_path):
         from trainer import central_config
 
         incomplete = tmp_path / "config.defaults.toml"
         canonical = (central_config._PROJECT_ROOT / "config.defaults.toml").read_text()
         incomplete.write_text(canonical.replace('device = "cpu"\n', ""))
-        monkeypatch.setattr(
-            "trainer.central_config.DEFAULTS_SEARCH_PATHS", [incomplete]
-        )
+        monkeypatch.setattr("trainer.central_config.DEFAULTS_SEARCH_PATHS", [incomplete])
         monkeypatch.setattr(
             "trainer.central_config.CONFIG_SEARCH_PATHS", [tmp_path / "missing.toml"]
         )
@@ -495,9 +473,7 @@ class TestConfigEdgeCases:
         with pytest.raises(ValueError, match=r"\[training\].*device"):
             get_config(reload=True)
 
-    def test_removed_mcts_num_simulations_config_is_rejected(
-        self, monkeypatch, tmp_path
-    ):
+    def test_removed_mcts_num_simulations_config_is_rejected(self, monkeypatch, tmp_path):
         (tmp_path / "config.toml").write_text("[mcts]\nnum_simulations = 800\n")
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(

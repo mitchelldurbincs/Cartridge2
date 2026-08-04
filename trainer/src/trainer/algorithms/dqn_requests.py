@@ -133,11 +133,7 @@ def _positive_int(value: int, name: str) -> None:
 
 
 def _u64(value: int, name: str) -> None:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or not 0 <= value < 1 << 64
-    ):
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 1 << 64:
         raise ValueError(f"{name} must be a u64")
 
 

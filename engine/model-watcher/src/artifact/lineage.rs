@@ -195,7 +195,9 @@ fn validate_orchestration_evaluation(
     inherited_evaluation: Option<&String>,
 ) -> Result<()> {
     let scheduled = recipe.evaluation_interval != 0
-        && orchestration.iteration % recipe.evaluation_interval == 0;
+        && orchestration
+            .iteration
+            .is_multiple_of(recipe.evaluation_interval);
     if scheduled != orchestration.evaluation_id.is_some() {
         bail!("orchestration evaluation presence disagrees with its run recipe");
     }

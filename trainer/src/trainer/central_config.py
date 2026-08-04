@@ -80,22 +80,16 @@ def _validate_canonical_defaults(data: object) -> None:
         if unknown_sections:
             details.append("unknown sections: " + ", ".join(unknown_sections))
         raise ValueError(
-            "Canonical config.defaults.toml schema mismatch ("
-            + "; ".join(details)
-            + ")"
+            "Canonical config.defaults.toml schema mismatch (" + "; ".join(details) + ")"
         )
 
     for section, expected_keys in _CONFIG_SECTIONS.items():
         values = data[section]
         if not isinstance(values, dict):
-            raise ValueError(
-                f"Canonical config.defaults.toml [{section}] must be a TOML table"
-            )
+            raise ValueError(f"Canonical config.defaults.toml [{section}] must be a TOML table")
         actual_keys = set(values)
         optional_none_keys = {
-            item.name
-            for item in fields(_CONFIG_SECTION_TYPES[section])
-            if item.default is None
+            item.name for item in fields(_CONFIG_SECTION_TYPES[section]) if item.default is None
         }
         missing_keys = sorted(expected_keys - optional_none_keys - actual_keys)
         unknown_keys = sorted(actual_keys - expected_keys)
@@ -153,9 +147,7 @@ def _find_config_file() -> Path | None:
         path = Path(env_path)
         if path.is_file():
             return path.resolve()
-        raise FileNotFoundError(
-            f"CARTRIDGE_CONFIG points to missing file: {env_path!r}"
-        )
+        raise FileNotFoundError(f"CARTRIDGE_CONFIG points to missing file: {env_path!r}")
 
     project_config = _PROJECT_ROOT / "config.toml"
     cwd_is_project = Path.cwd().resolve().is_relative_to(_PROJECT_ROOT.resolve())
@@ -237,30 +229,22 @@ def _build_section(data: dict[str, Any], section_name: str) -> Any:
     section_data = data.get(section_name, {})
     unknown = sorted(set(section_data) - _CONFIG_SECTIONS[section_name])
     if unknown:
-        raise ValueError(
-            f"Unknown configuration keys in [{section_name}]: " + ", ".join(unknown)
-        )
+        raise ValueError(f"Unknown configuration keys in [{section_name}]: " + ", ".join(unknown))
     return cls(**section_data)
 
 
 def _dict_to_config(data: dict[str, Any]) -> Config:
     unknown_sections = sorted(set(data) - set(_CONFIG_SECTIONS))
     if unknown_sections:
-        raise ValueError(
-            "Unknown configuration sections: " + ", ".join(unknown_sections)
-        )
-    config = Config(
-        **{section: _build_section(data, section) for section in _CONFIG_SECTION_TYPES}
-    )
+        raise ValueError("Unknown configuration sections: " + ", ".join(unknown_sections))
+    config = Config(**{section: _build_section(data, section) for section in _CONFIG_SECTION_TYPES})
     _validate_cross_section_config(config)
     return config
 
 
 def _validate_cross_section_config(config: Config) -> None:
     if config.training.iterations > _MAX_U64 // config.training.steps_per_iteration:
-        raise ValueError(
-            "training.iterations * training.steps_per_iteration exceeds u64"
-        )
+        raise ValueError("training.iterations * training.steps_per_iteration exceeds u64")
     validate_simulation_schedule(
         iterations=config.training.iterations,
         start=config.mcts.start_sims,
@@ -312,15 +296,11 @@ def _validate_storage(config: Config) -> None:
             f"{config.storage.model_backend!r}"
         )
     if config.storage.model_backend == "s3" and (
-        not isinstance(config.storage.s3_bucket, str)
-        or not config.storage.s3_bucket.strip()
+        not isinstance(config.storage.s3_bucket, str) or not config.storage.s3_bucket.strip()
     ):
-        raise ValueError(
-            "storage.s3_bucket is required when storage.model_backend is 's3'"
-        )
+        raise ValueError("storage.s3_bucket is required when storage.model_backend is 's3'")
     if config.storage.s3_endpoint is not None and (
-        not isinstance(config.storage.s3_endpoint, str)
-        or not config.storage.s3_endpoint.strip()
+        not isinstance(config.storage.s3_endpoint, str) or not config.storage.s3_endpoint.strip()
     ):
         raise ValueError("storage.s3_endpoint must be a non-empty string when set")
     for value, path in (

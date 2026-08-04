@@ -53,9 +53,7 @@ class DqnApplication:
             "--collection-scope-id",
             request.collection_scope_id,
             "--collector-config",
-            json.dumps(
-                collector_config, sort_keys=True, separators=(",", ":"), allow_nan=False
-            ),
+            json.dumps(collector_config, sort_keys=True, separators=(",", ":"), allow_nan=False),
             "--actor-id",
             request.actor_id,
             "--episode-timeout-secs",
@@ -79,9 +77,7 @@ class DqnApplication:
             experience_schema=self.cartridge.descriptor.components.experience_schema,
         )
         if request.replay_selection.profile != expected_profile:
-            raise ValueError(
-                "DQN replay selection does not match the requested environment"
-            )
+            raise ValueError("DQN replay selection does not match the requested environment")
         config = DqnLearnerConfig(
             env_id=request.env_id,
             model_dir=str(request.model_dir),
@@ -118,9 +114,7 @@ class DqnApplication:
             _BINARY_CANDIDATES,
         )
         if binary is None:
-            raise ValueError(
-                "cartridge-eval binary not found; build it or pass --eval-binary"
-            )
+            raise ValueError("cartridge-eval binary not found; build it or pass --eval-binary")
         command = [
             str(binary),
             "--algorithm",
@@ -139,9 +133,7 @@ class DqnApplication:
         completed = subprocess.run(command, check=False, capture_output=True, text=True)
         if completed.returncode != 0:
             message = completed.stderr.strip() or completed.stdout.strip()
-            raise RuntimeError(
-                f"cartridge-eval exited with {completed.returncode}: {message}"
-            )
+            raise RuntimeError(f"cartridge-eval exited with {completed.returncode}: {message}")
         return DqnEvaluationResults.from_json(json.loads(completed.stdout))
 
 

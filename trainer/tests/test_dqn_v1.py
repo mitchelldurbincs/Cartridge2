@@ -126,9 +126,7 @@ def test_dqn_train_step_updates_online_q_parameters(tmp_path):
         payload=payload(terminated=True, availability=(0, 0)),
     )
     batch = decode_replay_batch([record], selection=selected, obs_size=2, num_actions=2)
-    before = [
-        parameter.detach().clone() for parameter in learner.network.online.parameters()
-    ]
+    before = [parameter.detach().clone() for parameter in learner.network.online.parameters()]
     loss, _ = learner.train_step(batch)
     assert np.isfinite(loss)
     assert any(
@@ -225,9 +223,7 @@ def test_dqn_learner_publishes_a_q_value_run_head(tmp_path, monkeypatch):
     resumed_head = resumed.checkpoints.resolve_run_head()
     assert resumed_head is not None
     assert resumed_head.checkpoint_id != first_checkpoint_id
-    resumed_checkpoint = resumed.checkpoints.resolve_checkpoint(
-        resumed_head.checkpoint_id
-    )
+    resumed_checkpoint = resumed.checkpoints.resolve_checkpoint(resumed_head.checkpoint_id)
     assert resumed_checkpoint.manifest.parent_checkpoint_id == first_checkpoint_id
     assert resumed_checkpoint.manifest.step == 4
     assert resumed_stats.samples_seen == 8
@@ -329,9 +325,7 @@ def test_dqn_cli_defaults_are_stable():
     assert loop.log_level == "INFO"
 
 
-def test_typed_collect_request_preserves_subprocess_arguments_and_exit_code(
-    tmp_path, monkeypatch
-):
+def test_typed_collect_request_preserves_subprocess_arguments_and_exit_code(tmp_path, monkeypatch):
     actor_binary = tmp_path / "actor"
     actor_binary.touch()
     calls = []
@@ -459,12 +453,7 @@ def test_dqn_loop_calls_typed_application_methods_and_honors_runtime_options(
     )
 
     assert DqnLoop(cartridge, config).run() == 0
-    assert (
-        len(requests["collect"])
-        == len(requests["train"])
-        == len(requests["evaluate"])
-        == 1
-    )
+    assert len(requests["collect"]) == len(requests["train"]) == len(requests["evaluate"]) == 1
     assert requests["collect"][0].episode_timeout_secs == 19
     assert requests["collect"][0].log_level == "WARNING"
     assert requests["train"][0].log_level == "WARNING"

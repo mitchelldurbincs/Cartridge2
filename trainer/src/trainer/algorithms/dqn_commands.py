@@ -88,12 +88,8 @@ def configure_train_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--stats-path")
     parser.add_argument("--steps", type=int, default=LEARNER_DEFAULTS.total_steps)
     parser.add_argument("--batch-size", type=int, default=LEARNER_DEFAULTS.batch_size)
-    parser.add_argument(
-        "--learning-rate", type=float, default=LEARNER_DEFAULTS.learning_rate
-    )
-    parser.add_argument(
-        "--weight-decay", type=float, default=LEARNER_DEFAULTS.weight_decay
-    )
+    parser.add_argument("--learning-rate", type=float, default=LEARNER_DEFAULTS.learning_rate)
+    parser.add_argument("--weight-decay", type=float, default=LEARNER_DEFAULTS.weight_decay)
     parser.add_argument("--gamma", type=float, default=LEARNER_DEFAULTS.gamma)
     parser.add_argument(
         "--target-sync-interval",
@@ -101,9 +97,7 @@ def configure_train_parser(parser: argparse.ArgumentParser) -> None:
         default=LEARNER_DEFAULTS.target_sync_interval,
     )
     parser.add_argument("--hidden-size", type=int, default=LEARNER_DEFAULTS.hidden_size)
-    parser.add_argument(
-        "--grad-clip", type=float, default=LEARNER_DEFAULTS.grad_clip_norm
-    )
+    parser.add_argument("--grad-clip", type=float, default=LEARNER_DEFAULTS.grad_clip_norm)
     parser.add_argument("--device", default=LEARNER_DEFAULTS.device)
     parser.add_argument("--collection-scope-id", required=True)
     source = parser.add_mutually_exclusive_group(required=True)
@@ -134,16 +128,10 @@ def configure_loop_parser(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=LOOP_DEFAULTS.episodes_per_iteration,
     )
-    parser.add_argument(
-        "--steps-per-iteration", type=int, default=LEARNER_DEFAULTS.total_steps
-    )
+    parser.add_argument("--steps-per-iteration", type=int, default=LEARNER_DEFAULTS.total_steps)
     parser.add_argument("--batch-size", type=int, default=LEARNER_DEFAULTS.batch_size)
-    parser.add_argument(
-        "--learning-rate", type=float, default=LEARNER_DEFAULTS.learning_rate
-    )
-    parser.add_argument(
-        "--weight-decay", type=float, default=LEARNER_DEFAULTS.weight_decay
-    )
+    parser.add_argument("--learning-rate", type=float, default=LEARNER_DEFAULTS.learning_rate)
+    parser.add_argument("--weight-decay", type=float, default=LEARNER_DEFAULTS.weight_decay)
     parser.add_argument("--gamma", type=float, default=LEARNER_DEFAULTS.gamma)
     parser.add_argument(
         "--target-sync-interval",
@@ -151,21 +139,13 @@ def configure_loop_parser(parser: argparse.ArgumentParser) -> None:
         default=LEARNER_DEFAULTS.target_sync_interval,
     )
     parser.add_argument("--hidden-size", type=int, default=LEARNER_DEFAULTS.hidden_size)
-    parser.add_argument(
-        "--grad-clip", type=float, default=LEARNER_DEFAULTS.grad_clip_norm
-    )
+    parser.add_argument("--grad-clip", type=float, default=LEARNER_DEFAULTS.grad_clip_norm)
     parser.add_argument("--device", default=LEARNER_DEFAULTS.device)
-    parser.add_argument(
-        "--epsilon-start", type=float, default=LOOP_DEFAULTS.epsilon_start
-    )
+    parser.add_argument("--epsilon-start", type=float, default=LOOP_DEFAULTS.epsilon_start)
     parser.add_argument("--epsilon-end", type=float, default=LOOP_DEFAULTS.epsilon_end)
-    parser.add_argument(
-        "--epsilon-decay", type=float, default=LOOP_DEFAULTS.epsilon_decay
-    )
+    parser.add_argument("--epsilon-decay", type=float, default=LOOP_DEFAULTS.epsilon_decay)
     parser.add_argument("--seed", type=int, default=LOOP_DEFAULTS.seed)
-    parser.add_argument(
-        "--onnx-intra-threads", type=int, default=LOOP_DEFAULTS.onnx_intra_threads
-    )
+    parser.add_argument("--onnx-intra-threads", type=int, default=LOOP_DEFAULTS.onnx_intra_threads)
     parser.add_argument(
         "--evaluation-episodes", type=int, default=LOOP_DEFAULTS.evaluation_episodes
     )
@@ -194,20 +174,14 @@ def run_train(cartridge: "DqnV1", args: argparse.Namespace) -> int:
 
 def run_evaluate(cartridge: "DqnV1", args: argparse.Namespace) -> int:
     def evaluate() -> int:
-        print(
-            format_evaluation_result(
-                cartridge.evaluate(_evaluate_request(cartridge, args))
-            )
-        )
+        print(format_evaluation_result(cartridge.evaluate(_evaluate_request(cartridge, args))))
         return 0
 
     return _with_exit_code("DQN evaluation failed", evaluate)
 
 
 def run_loop(cartridge: "DqnV1", args: argparse.Namespace) -> int:
-    return _with_exit_code(
-        "DQN loop failed", lambda: DqnLoop(cartridge, _loop_config(args)).run()
-    )
+    return _with_exit_code("DQN loop failed", lambda: DqnLoop(cartridge, _loop_config(args)).run())
 
 
 def _collect_request(args: argparse.Namespace) -> DqnCollectRequest:
@@ -230,17 +204,15 @@ def _collect_request(args: argparse.Namespace) -> DqnCollectRequest:
 
 def _train_request(cartridge: "DqnV1", args: argparse.Namespace) -> DqnTrainRequest:
     environment = get_environment(args.env_id)
-    profile_dir = resolve_runtime_profile(
-        cartridge.descriptor.id, environment.env_id
-    ).data_dir(get_config().data_root)
+    profile_dir = resolve_runtime_profile(cartridge.descriptor.id, environment.env_id).data_dir(
+        get_config().data_root
+    )
     selection = _replay_selection(cartridge, environment, args)
     return DqnTrainRequest(
         env_id=environment.env_id,
         replay_selection=selection,
         model_dir=Path(args.model_dir) if args.model_dir else profile_dir / "models",
-        stats_path=(
-            Path(args.stats_path) if args.stats_path else profile_dir / "stats.json"
-        ),
+        stats_path=(Path(args.stats_path) if args.stats_path else profile_dir / "stats.json"),
         total_steps=args.steps,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
@@ -254,13 +226,11 @@ def _train_request(cartridge: "DqnV1", args: argparse.Namespace) -> DqnTrainRequ
     )
 
 
-def _evaluate_request(
-    cartridge: "DqnV1", args: argparse.Namespace
-) -> DqnEvaluateRequest:
+def _evaluate_request(cartridge: "DqnV1", args: argparse.Namespace) -> DqnEvaluateRequest:
     environment = get_environment(args.env_id)
-    profile_dir = resolve_runtime_profile(
-        cartridge.descriptor.id, environment.env_id
-    ).data_dir(get_config().data_root)
+    profile_dir = resolve_runtime_profile(cartridge.descriptor.id, environment.env_id).data_dir(
+        get_config().data_root
+    )
     return DqnEvaluateRequest(
         env_id=environment.env_id,
         episodes=args.episodes,
