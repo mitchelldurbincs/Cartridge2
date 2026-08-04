@@ -176,11 +176,11 @@ jobs:
           cache: pip
           cache-dependency-path: trainer/pyproject.toml
       - name: Install linters
-        run: pip install ruff black
+        run: pip install ruff==0.16.1
       - name: Ruff check
         run: ruff check src/ tests/ smoke_test.py
-      - name: Black check
-        run: black --check src/ tests/ smoke_test.py
+      - name: Ruff format check
+        run: ruff format --check src/ tests/ smoke_test.py
 
   python-test:
     name: Python Tests

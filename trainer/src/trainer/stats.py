@@ -512,9 +512,7 @@ class TrainerStats:
             "timestamp": self.timestamp,
             "history": self.history,  # Already bounded on append
             "env_id": self.env_id,
-            "last_evaluation": (
-                self.last_evaluation.to_dict() if self.last_evaluation else None
-            ),
+            "last_evaluation": (self.last_evaluation.to_dict() if self.last_evaluation else None),
             "evaluation_history": self.evaluation_history,
         }
 
@@ -532,9 +530,7 @@ class TrainerStats:
             raise StatsArtifactError("stats.history must be an array of objects")
         if not isinstance(evaluation_history, list):
             raise StatsArtifactError("stats.evaluation_history must be an array")
-        parsed_evaluations = [
-            EvaluationStats.from_dict(entry) for entry in evaluation_history
-        ]
+        parsed_evaluations = [EvaluationStats.from_dict(entry) for entry in evaluation_history]
         last_evaluation = fields["last_evaluation"]
         if last_evaluation is not None:
             last_evaluation = EvaluationStats.from_dict(last_evaluation)

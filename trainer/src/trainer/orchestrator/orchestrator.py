@@ -466,9 +466,7 @@ class Orchestrator(_CoreOrchestrator):
                 metrics={
                     "outcome/win_rate": result.candidate_win_rate,
                     "outcome/draw_rate": result.draw_rate,
-                    "outcome/loss_rate": (
-                        1.0 - result.candidate_win_rate - result.draw_rate
-                    ),
+                    "outcome/loss_rate": (1.0 - result.candidate_win_rate - result.draw_rate),
                 },
                 episodes=result.games_played,
                 mean_episode_length=result.average_game_length,

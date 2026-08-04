@@ -1688,7 +1688,7 @@ commit and were wrong in three separate documents before this was written. Run
 
 ```bash
 make test          # engine + actor + web + trainer
-make lint          # fmt/clippy + ruff/black
+make lint          # fmt/clippy + Ruff lint/format
 
 # Or individually
 cargo test --manifest-path engine/Cargo.toml

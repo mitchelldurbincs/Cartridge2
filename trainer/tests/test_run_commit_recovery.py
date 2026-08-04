@@ -273,9 +273,7 @@ def commit_for(
                         "outcome/win_rate": random_result.candidate_win_rate,
                         "outcome/draw_rate": random_result.draw_rate,
                         "outcome/loss_rate": (
-                            1.0
-                            - random_result.candidate_win_rate
-                            - random_result.draw_rate
+                            1.0 - random_result.candidate_win_rate - random_result.draw_rate
                         ),
                     },
                     episodes=random_result.games_played,

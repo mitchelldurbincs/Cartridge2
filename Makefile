@@ -197,7 +197,7 @@ lint-rust:
 
 lint-python:
 	$(VENV_DIR)/bin/python -m ruff check trainer/src/ trainer/tests/ trainer/smoke_test.py
-	$(VENV_DIR)/bin/python -m black --check trainer/src/ trainer/tests/ trainer/smoke_test.py
+	$(VENV_DIR)/bin/python -m ruff format --check trainer/src/ trainer/tests/ trainer/smoke_test.py
 
 lint-frontend:
 	cd web/frontend && $(NPM) run check

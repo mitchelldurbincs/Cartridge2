@@ -417,6 +417,6 @@ contract, orchestration recipe, and evaluation suite.
 
 ```bash
 python -m ruff check trainer/src trainer/tests trainer/smoke_test.py
-python -m black --check trainer/src trainer/tests trainer/smoke_test.py
+python -m ruff format --check trainer/src trainer/tests trainer/smoke_test.py
 python -m pytest trainer/tests -v --tb=short
 ```

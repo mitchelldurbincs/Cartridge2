@@ -84,9 +84,7 @@ class TensorSpecDescriptor:
         if any(dimension.size is None for dimension in self.dimensions):
             return None
         return math.prod(
-            dimension.size
-            for dimension in self.dimensions
-            if dimension.size is not None
+            dimension.size for dimension in self.dimensions if dimension.size is not None
         )
 
 

@@ -119,7 +119,18 @@ RUN apt-get update && apt-get install -y \
 
 # Keep the serving image on the same explicit non-root identity as the trainer;
 # both processes read the shared profile projection volume in Kubernetes.
-RUN useradd --create-home --uid 1000 --user-group cartridge
+# Ubuntu 24.04 already has a UID-1000 user, so reuse that account when present.
+RUN set -eux; \
+    existing_user="$(getent passwd 1000 | cut -d: -f1)"; \
+    if [ -n "$existing_user" ]; then \
+        existing_group="$(id -gn "$existing_user")"; \
+        usermod --login cartridge --home /home/cartridge --move-home "$existing_user"; \
+        if [ "$existing_group" != "cartridge" ]; then \
+            groupmod --new-name cartridge "$existing_group"; \
+        fi; \
+    else \
+        useradd --create-home --uid 1000 --user-group cartridge; \
+    fi
 
 WORKDIR /app
 

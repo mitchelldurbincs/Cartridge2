@@ -220,9 +220,7 @@ def _validate_onnx_runtime_equivalence(
                 output_names,
                 {
                     spec.name: value.detach().cpu().numpy()
-                    for spec, value in zip(
-                        artifact_contract.inputs, inputs, strict=True
-                    )
+                    for spec, value in zip(artifact_contract.inputs, inputs, strict=True)
                 },
             )
         except Exception as exc:
@@ -281,8 +279,10 @@ def _deterministic_inputs(
 ) -> tuple[torch.Tensor, ...]:
     inputs = []
     for spec in contract.inputs:
-        if not spec.shape or spec.shape[0] != "batch_size" or any(
-            not isinstance(dimension, int) for dimension in spec.shape[1:]
+        if (
+            not spec.shape
+            or spec.shape[0] != "batch_size"
+            or any(not isinstance(dimension, int) for dimension in spec.shape[1:])
         ):
             raise ValueError(
                 f"ONNX exporter requires {spec.name!r} shape to be "
@@ -323,12 +323,9 @@ def _validate_live_outputs(
     validated = []
     for spec, output in zip(contract.outputs, outputs, strict=True):
         if not isinstance(output, torch.Tensor):
-            raise ArtifactValidationError(
-                f"Live network output '{spec.name}' must be a tensor"
-            )
+            raise ArtifactValidationError(f"Live network output '{spec.name}' must be a tensor")
         expected_shape = tuple(
-            batch_size if dimension == "batch_size" else dimension
-            for dimension in spec.shape
+            batch_size if dimension == "batch_size" else dimension for dimension in spec.shape
         )
         if tuple(output.shape) != expected_shape:
             raise ArtifactValidationError(
@@ -336,9 +333,7 @@ def _validate_live_outputs(
                 f"expected {expected_shape}"
             )
         if output.dtype != torch.float32:
-            raise ArtifactValidationError(
-                f"Live network output '{spec.name}' must use float32"
-            )
+            raise ArtifactValidationError(f"Live network output '{spec.name}' must use float32")
         if not torch.isfinite(output).all():
             raise ArtifactValidationError(
                 f"Live network output '{spec.name}' contains non-finite values"
@@ -375,9 +370,7 @@ def export_onnx_artifact(
             opset_version=18,
             input_names=input_names,
             output_names=output_names,
-            dynamic_shapes=tuple(
-                {0: torch.export.Dim("batch_size")} for _ in dummy_inputs
-            ),
+            dynamic_shapes=tuple({0: torch.export.Dim("batch_size")} for _ in dummy_inputs),
             dynamo=True,
             external_data=False,
             # Cartridge validation below is fail-closed. PyTorch's verify mode

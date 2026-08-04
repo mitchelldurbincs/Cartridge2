@@ -244,9 +244,7 @@ def establish_first_run(checkpoints, evaluations, runner, candidate):
             metrics={
                 "outcome/win_rate": vs_random.candidate_win_rate,
                 "outcome/draw_rate": vs_random.draw_rate,
-                "outcome/loss_rate": (
-                    1.0 - vs_random.candidate_win_rate - vs_random.draw_rate
-                ),
+                "outcome/loss_rate": (1.0 - vs_random.candidate_win_rate - vs_random.draw_rate),
             },
             episodes=vs_random.games_played,
             mean_episode_length=vs_random.average_game_length,

@@ -129,11 +129,11 @@ cd trainer
 
 # Lint
 python -m ruff check src/ tests/ smoke_test.py
-python -m black --check src/ tests/ smoke_test.py
+python -m ruff format --check src/ tests/ smoke_test.py
 
 # Auto-fix lint issues
 python -m ruff check --fix src/ tests/ smoke_test.py
-python -m black src/ tests/ smoke_test.py
+python -m ruff format src/ tests/ smoke_test.py
 
 # Test (requires deps: pip install -e ".[dev]")
 python -m pytest tests/ -v --tb=short

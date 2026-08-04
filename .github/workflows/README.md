@@ -31,7 +31,7 @@ environment and algorithm contracts. Regenerate with
 
 | Job | What it does |
 |-----|-------------|
-| **python-lint** | Checks `ruff` and `black` on trainer source, tests, and smoke test |
+| **python-lint** | Checks Ruff linting and formatting on trainer source, tests, and smoke test |
 | **python-test** | Installs the trainer with dev deps (which pulls the pinned `crucible` orchestration core), then runs `pytest` |
 | **python-security-audit** | `pip-audit` (non-blocking) |
 
@@ -82,7 +82,7 @@ cargo test --manifest-path engine/Cargo.toml
 # Python (needs crucible - see the python-test note above)
 cd trainer
 ruff check src/ tests/ smoke_test.py
-black --check src/ tests/ smoke_test.py
+ruff format --check src/ tests/ smoke_test.py
 python -m pytest tests/
 
 # Frontend
