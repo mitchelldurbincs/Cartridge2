@@ -1,81 +1,91 @@
-//! S3/MinIO backend for model watching.
-//!
-//! This module provides S3-based model watching for Kubernetes deployments
-//! where models are stored in S3-compatible storage (AWS S3, MinIO, etc.).
-//!
-//! Unlike the filesystem watcher, S3 watching is polling-only since S3
-//! doesn't support filesystem events.
+//! S3/MinIO watcher for content-addressed checkpoints selected by RunHeadV2.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::Client;
-use mcts::OnnxEvaluator;
-use std::path::PathBuf;
+use aws_sdk_s3::{error::ProvideErrorMetadata, operation::get_object::GetObjectError, Client};
+use mcts::SharedOnnxEvaluator;
+use std::collections::HashSet;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
-#[cfg(feature = "metadata")]
-use std::time::{SystemTime, UNIX_EPOCH};
-
-#[cfg(feature = "metadata")]
-use crate::ModelInfo;
-
-mod download;
+use crate::artifact::{
+    parse_canonical_json, parse_run_commit, select_inference_checkpoint, sha256_hex,
+    validate_manifest, validate_run_commit_chain, validate_run_head, verify_blob_bytes,
+    CheckpointManifestV1, ResolvedRunCommit, RunHeadV2, RUN_HEAD_CHANNEL,
+};
+use crate::{AcceptedHead, ModelInfo, ModelLoadSpec, ModelSelection};
 
 #[cfg(test)]
 mod tests;
 
-pub use download::S3Config;
-
-/// Default polling interval for S3 model checks.
 const DEFAULT_S3_POLL_INTERVAL: Duration = Duration::from_secs(10);
+static CACHE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Default ONNX intra-op thread setting for S3-backed model loading.
-///
-/// `0` delegates to the evaluator's auto-detection logic, which matches the
-/// behavior of the filesystem watcher when no explicit thread count is wired in.
-const DEFAULT_ONNX_INTRA_THREADS: usize = 0;
+#[derive(Debug, Clone)]
+pub struct S3Config {
+    pub bucket: String,
+    /// Runtime profile prefix that contains blobs/, manifests/, and channels/.
+    pub prefix: String,
+    pub endpoint_url: Option<String>,
+    pub region: Option<String>,
+    pub cache_dir: PathBuf,
+}
 
-/// S3-backed model watcher for Kubernetes deployments.
-///
-/// Polls an S3 bucket for model updates and hot-reloads them.
+enum RemoteUpdate {
+    Absent,
+    Unchanged,
+    Advanced,
+    Loaded,
+}
+
+struct S3LoadContext<'a> {
+    client: &'a Client,
+    bucket: &'a str,
+    prefix: &'a str,
+    cache_dir: &'a Path,
+    model_spec: &'a ModelLoadSpec,
+    selection: ModelSelection,
+    evaluator: &'a Arc<RwLock<Option<SharedOnnxEvaluator>>>,
+    accepted_head: &'a Arc<RwLock<Option<AcceptedHead>>>,
+    model_info: &'a Arc<RwLock<ModelInfo>>,
+}
+
 pub struct S3ModelWatcher {
-    /// S3 client
     client: Client,
-    /// S3 bucket name
     bucket: String,
-    /// S3 object key for the model (e.g., "models/latest.onnx")
-    key: String,
-    /// Observation size for the model
-    obs_size: usize,
-    /// Shared evaluator to update
-    evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,
-    /// Last known ETag of the model
-    last_etag: Arc<RwLock<Option<String>>>,
-    /// Polling interval
+    prefix: String,
+    model_spec: ModelLoadSpec,
+    selection: ModelSelection,
+    evaluator: Arc<RwLock<Option<SharedOnnxEvaluator>>>,
+    accepted_head: Arc<RwLock<Option<AcceptedHead>>>,
     poll_interval: Duration,
-    /// Local cache directory for downloaded models
     cache_dir: PathBuf,
-    /// Current model info (only with metadata feature)
-    #[cfg(feature = "metadata")]
     model_info: Arc<RwLock<ModelInfo>>,
 }
 
 impl S3ModelWatcher {
-    /// Create a new S3 model watcher.
-    ///
-    /// # Arguments
-    /// * `config` - S3 configuration
-    /// * `obs_size` - Observation size expected by the model
-    /// * `evaluator` - Shared evaluator reference to update on reload
     pub async fn new(
         config: S3Config,
-        obs_size: usize,
-        evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,
+        model_spec: ModelLoadSpec,
+        selection: ModelSelection,
+        evaluator: Arc<RwLock<Option<SharedOnnxEvaluator>>>,
     ) -> Result<Self> {
-        let mut sdk_config_loader = aws_config::defaults(BehaviorVersion::latest()).region(
+        if config.bucket.trim().is_empty() {
+            bail!("S3 model watcher bucket cannot be empty");
+        }
+        if config.prefix.trim().is_empty()
+            || config.prefix.starts_with('/')
+            || config.prefix.ends_with('/')
+        {
+            bail!("S3 model watcher prefix must be a non-empty relative prefix without a trailing slash");
+        }
+
+        let mut loader = aws_config::defaults(BehaviorVersion::latest()).region(
             aws_sdk_s3::config::Region::new(
                 config
                     .region
@@ -83,179 +93,363 @@ impl S3ModelWatcher {
                     .unwrap_or_else(|| "us-east-1".to_string()),
             ),
         );
-
-        // Use custom endpoint for MinIO/LocalStack
         if let Some(endpoint) = &config.endpoint_url {
-            sdk_config_loader = sdk_config_loader.endpoint_url(endpoint);
+            loader = loader.endpoint_url(endpoint);
         }
-
-        let sdk_config = sdk_config_loader.load().await;
-        let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&sdk_config);
-
-        // Force path-style access for MinIO compatibility
+        let sdk_config = loader.load().await;
+        let mut builder = aws_sdk_s3::config::Builder::from(&sdk_config);
         if config.endpoint_url.is_some() {
-            s3_config_builder = s3_config_builder.force_path_style(true);
+            builder = builder.force_path_style(true);
         }
-
-        let client = Client::from_conf(s3_config_builder.build());
-
-        // Ensure cache directory exists
-        tokio::fs::create_dir_all(&config.cache_dir).await?;
 
         Ok(Self {
-            client,
+            client: Client::from_conf(builder.build()),
             bucket: config.bucket,
-            key: config.key,
-            obs_size,
+            prefix: config.prefix,
+            model_spec,
+            selection,
             evaluator,
-            last_etag: Arc::new(RwLock::new(None)),
+            accepted_head: Arc::new(RwLock::new(None)),
             poll_interval: DEFAULT_S3_POLL_INTERVAL,
             cache_dir: config.cache_dir,
-            #[cfg(feature = "metadata")]
             model_info: Arc::new(RwLock::new(ModelInfo::default())),
         })
     }
 
-    /// Set a custom polling interval.
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
         self
     }
 
-    /// Get the current model info.
-    #[cfg(feature = "metadata")]
     pub fn model_info(&self) -> Arc<RwLock<ModelInfo>> {
         Arc::clone(&self.model_info)
     }
 
-    /// Try to load the model if it exists in S3.
-    ///
-    /// Returns `Ok(true)` if a model was loaded, `Ok(false)` if no model exists.
-    pub async fn try_load_existing(&self) -> Result<bool> {
-        match self.check_and_download().await {
-            Ok(Some(path)) => {
-                self.load_model(&path)?;
-                Ok(true)
-            }
-            Ok(None) => {
-                debug!("No model found in S3 at s3://{}/{}", self.bucket, self.key);
-                Ok(false)
-            }
-            Err(e) => {
-                warn!("Failed to check S3 for model: {}", e);
-                Ok(false)
-            }
-        }
+    fn run_head_key(prefix: &str) -> String {
+        format!("{prefix}/channels/{RUN_HEAD_CHANNEL}.json")
     }
 
-    /// Load a model from the given local path.
-    fn load_model(&self, path: &PathBuf) -> Result<()> {
-        info!("Loading model from {:?}", path);
+    fn manifest_key(prefix: &str, checkpoint_id: &str) -> String {
+        format!("{prefix}/manifests/sha256/{checkpoint_id}.json")
+    }
 
-        #[cfg(feature = "metadata")]
-        let training_step = Self::extract_training_step(path);
+    fn run_commit_key(prefix: &str, run_commit_id: &str) -> String {
+        format!("{prefix}/run-commits/sha256/{run_commit_id}.json")
+    }
 
-        let new_evaluator = OnnxEvaluator::load(path, self.obs_size, DEFAULT_ONNX_INTRA_THREADS)
-            .map_err(|e| anyhow!("Failed to load ONNX model: {}", e))?;
+    fn model_key(prefix: &str, digest: &str) -> String {
+        format!("{prefix}/blobs/sha256/{digest}.onnx")
+    }
 
-        {
-            let mut guard = self
-                .evaluator
-                .write()
-                .map_err(|e| anyhow!("Failed to acquire evaluator write lock: {}", e))?;
-            *guard = Some(new_evaluator);
+    fn is_absent(error: &GetObjectError) -> bool {
+        error.is_no_such_key() || matches!(error.code(), Some("NoSuchKey" | "NotFound" | "404"))
+    }
+
+    async fn get_optional(client: &Client, bucket: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        let response = match client.get_object().bucket(bucket).key(key).send().await {
+            Ok(response) => response,
+            Err(error) if error.as_service_error().is_some_and(Self::is_absent) => return Ok(None),
+            Err(error) => return Err(anyhow!("failed to GET s3://{bucket}/{key}: {error}")),
+        };
+        let body = response
+            .body
+            .collect()
+            .await
+            .with_context(|| format!("failed to read s3://{bucket}/{key}"))?;
+        Ok(Some(body.into_bytes().to_vec()))
+    }
+
+    async fn get_required(client: &Client, bucket: &str, key: &str) -> Result<Vec<u8>> {
+        Self::get_optional(client, bucket, key)
+            .await?
+            .ok_or_else(|| anyhow!("required immutable object s3://{bucket}/{key} does not exist"))
+    }
+
+    async fn cache_model(cache_dir: &Path, digest: &str, bytes: &[u8]) -> Result<PathBuf> {
+        let directory = cache_dir.join("blobs").join("sha256");
+        tokio::fs::create_dir_all(&directory)
+            .await
+            .with_context(|| format!("failed to create model cache {directory:?}"))?;
+        let path = directory.join(format!("{digest}.onnx"));
+        if let Ok(existing) = tokio::fs::read(&path).await {
+            if sha256_hex(&existing) != digest {
+                bail!("immutable model cache blob {path:?} has the wrong digest");
+            }
+            return Ok(path);
         }
 
-        #[cfg(feature = "metadata")]
+        let counter = CACHE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary = directory.join(format!(".{digest}.{}.{}.tmp", std::process::id(), counter));
+        tokio::fs::write(&temporary, bytes)
+            .await
+            .with_context(|| format!("failed to write model cache candidate {temporary:?}"))?;
+        match tokio::fs::hard_link(&temporary, &path).await {
+            Ok(()) => {
+                tokio::fs::remove_file(&temporary).await.with_context(|| {
+                    format!("failed to remove linked model cache candidate {temporary:?}")
+                })?;
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                let existing = tokio::fs::read(&path)
+                    .await
+                    .with_context(|| format!("failed to verify raced model cache {path:?}"))?;
+                let _ = tokio::fs::remove_file(&temporary).await;
+                if sha256_hex(&existing) != digest {
+                    bail!("raced immutable model cache blob {path:?} has the wrong digest");
+                }
+            }
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return Err(error)
+                    .with_context(|| format!("failed to publish model cache blob {path:?}"));
+            }
+        }
+        Ok(path)
+    }
+
+    async fn resolve_run_commit_chain(
+        client: &Client,
+        bucket: &str,
+        prefix: &str,
+        head: &RunHeadV2,
+        model_spec: &ModelLoadSpec,
+    ) -> Result<Vec<ResolvedRunCommit>> {
+        let mut reversed = Vec::new();
+        let mut seen = HashSet::new();
+        let mut current_id = Some(head.run_commit_id.clone());
+        while let Some(run_commit_id) = current_id {
+            if !seen.insert(run_commit_id.clone()) {
+                bail!("S3 RunCommit lineage contains a cycle");
+            }
+            let run_commit_key = Self::run_commit_key(prefix, &run_commit_id);
+            let run_commit_bytes = Self::get_required(client, bucket, &run_commit_key).await?;
+            let commit = parse_run_commit(
+                "S3 RunCommit",
+                &run_commit_id,
+                &run_commit_bytes,
+                &model_spec.identity,
+                model_spec.environment_max_horizon,
+            )?;
+            let manifest_key = Self::manifest_key(prefix, &commit.checkpoint_id);
+            let manifest_bytes = Self::get_required(client, bucket, &manifest_key).await?;
+            let actual_checkpoint_id = sha256_hex(&manifest_bytes);
+            if actual_checkpoint_id != commit.checkpoint_id {
+                bail!(
+                    "S3 checkpoint manifest digest is {actual_checkpoint_id}, RunCommit requires {}",
+                    commit.checkpoint_id
+                );
+            }
+            let manifest: CheckpointManifestV1 =
+                parse_canonical_json("S3 checkpoint manifest", &manifest_bytes)?;
+            validate_manifest(&manifest, &model_spec.identity)?;
+            current_id = commit.parent_run_commit_id.clone();
+            reversed.push(ResolvedRunCommit {
+                run_commit_id,
+                commit,
+                manifest,
+            });
+        }
+        reversed.reverse();
+        validate_run_commit_chain(&reversed, head)?;
+        Ok(reversed)
+    }
+
+    async fn load_current(context: S3LoadContext<'_>) -> Result<RemoteUpdate> {
+        let S3LoadContext {
+            client,
+            bucket,
+            prefix,
+            cache_dir,
+            model_spec,
+            selection,
+            evaluator,
+            accepted_head,
+            model_info,
+        } = context;
+        let run_head_key = Self::run_head_key(prefix);
+        let Some(run_head_bytes) = Self::get_optional(client, bucket, &run_head_key).await? else {
+            return Ok(RemoteUpdate::Absent);
+        };
+        let run_head: RunHeadV2 = parse_canonical_json("S3 current run head", &run_head_bytes)?;
+        validate_run_head(&run_head)?;
+        let accepted = accepted_head
+            .read()
+            .map_err(|error| anyhow!("failed to read accepted run head: {error}"))?
+            .clone();
+        if accepted
+            .as_ref()
+            .is_some_and(|accepted| accepted.run_commit_id == run_head.run_commit_id)
         {
-            let mut info = self
-                .model_info
-                .write()
-                .map_err(|e| anyhow!("Failed to acquire model_info write lock: {}", e))?;
-            *info = ModelInfo {
+            return Ok(RemoteUpdate::Unchanged);
+        }
+
+        let chain =
+            Self::resolve_run_commit_chain(client, bucket, prefix, &run_head, model_spec).await?;
+        let selected = select_inference_checkpoint(&chain, selection)?;
+        let checkpoint_id = selected.commit.checkpoint_id.clone();
+        let manifest = selected.manifest.clone();
+
+        let model_key = Self::model_key(prefix, &manifest.onnx.sha256);
+        let model_bytes = Self::get_required(client, bucket, &model_key).await?;
+        verify_blob_bytes("S3 ONNX", &model_bytes, &manifest.onnx)?;
+        let new_evaluator = if accepted
+            .as_ref()
+            .is_some_and(|accepted| accepted.model_checkpoint_id == checkpoint_id)
+        {
+            None
+        } else {
+            let model_path =
+                Self::cache_model(cache_dir, &manifest.onnx.sha256, &model_bytes).await?;
+            Some(model_spec.load(&model_path)?)
+        };
+
+        let latest_bytes = Self::get_required(client, bucket, &run_head_key).await?;
+        let latest: RunHeadV2 = parse_canonical_json("S3 current run head", &latest_bytes)?;
+        validate_run_head(&latest)?;
+        if latest != run_head {
+            debug!(
+                candidate = %run_head.checkpoint_id,
+                current = %latest.checkpoint_id,
+                "Discarding stale S3 checkpoint candidate"
+            );
+            return Ok(RemoteUpdate::Unchanged);
+        }
+
+        let mut accepted_guard = accepted_head
+            .write()
+            .map_err(|error| anyhow!("failed to lock accepted run head: {error}"))?;
+        if accepted_guard
+            .as_ref()
+            .is_some_and(|value| value.run_commit_id == run_head.run_commit_id)
+        {
+            return Ok(RemoteUpdate::Unchanged);
+        }
+        if *accepted_guard != accepted {
+            debug!(
+                candidate_checkpoint = %run_head.checkpoint_id,
+                candidate_run_commit = %run_head.run_commit_id,
+                "Discarding S3 candidate after an accepted-head race"
+            );
+            return Ok(RemoteUpdate::Unchanged);
+        }
+        let mut evaluator_guard = evaluator
+            .write()
+            .map_err(|error| anyhow!("failed to lock model evaluator: {error}"))?;
+        let mut info_guard = model_info
+            .write()
+            .map_err(|error| anyhow!("failed to lock model information: {error}"))?;
+        if new_evaluator.is_none()
+            && (accepted_guard
+                .as_ref()
+                .is_none_or(|accepted| accepted.model_checkpoint_id != checkpoint_id)
+                || evaluator_guard.is_none())
+        {
+            return Err(anyhow!(
+                "cannot reuse an evaluator that does not match the selected S3 checkpoint"
+            ));
+        }
+        let model_changed = new_evaluator.is_some();
+        if let Some(new_evaluator) = new_evaluator {
+            *evaluator_guard = Some(new_evaluator);
+        }
+        *accepted_guard = Some(AcceptedHead {
+            model_checkpoint_id: checkpoint_id.clone(),
+            run_commit_id: run_head.run_commit_id.clone(),
+        });
+        if model_changed {
+            *info_guard = ModelInfo {
                 loaded: true,
-                path: Some(format!("s3://{}/{}", self.bucket, self.key)),
-                file_modified: None, // S3 doesn't provide this easily
+                checkpoint_id: Some(checkpoint_id.clone()),
+                model_sha256: Some(manifest.onnx.sha256.clone()),
+                path: Some(format!("s3://{bucket}/{model_key}")),
                 loaded_at: Some(
                     SystemTime::now()
                         .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs())
+                        .map(|duration| duration.as_secs())
                         .unwrap_or(0),
                 ),
-                training_step,
+                training_step: Some(manifest.step),
             };
         }
-
-        info!("Model loaded successfully from S3");
-        Ok(())
+        info!(
+            checkpoint_id = %checkpoint_id,
+            run_commit_id = %run_head.run_commit_id,
+            model_sha256 = %manifest.onnx.sha256,
+            step = manifest.step,
+            model_changed,
+            "Content-addressed S3 RunHead accepted"
+        );
+        Ok(if model_changed {
+            RemoteUpdate::Loaded
+        } else {
+            RemoteUpdate::Advanced
+        })
     }
 
-    /// Start watching for model changes in S3.
-    ///
-    /// Returns a channel that receives `()` when a new model is loaded.
-    pub async fn start_watching(&self) -> Result<mpsc::Receiver<()>> {
-        let (tx, rx) = mpsc::channel(16);
+    pub async fn try_load_existing(&self) -> Result<bool> {
+        Ok(!matches!(
+            Self::load_current(S3LoadContext {
+                client: &self.client,
+                bucket: &self.bucket,
+                prefix: &self.prefix,
+                cache_dir: &self.cache_dir,
+                model_spec: &self.model_spec,
+                selection: self.selection,
+                evaluator: &self.evaluator,
+                accepted_head: &self.accepted_head,
+                model_info: &self.model_info,
+            })
+            .await?,
+            RemoteUpdate::Absent
+        ))
+    }
 
+    pub async fn start_watching(&self) -> Result<mpsc::Receiver<()>> {
+        let (updates_tx, updates_rx) = mpsc::channel(16);
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        let key = self.key.clone();
-        let obs_size = self.obs_size;
-        let evaluator = Arc::clone(&self.evaluator);
-        let last_etag = Arc::clone(&self.last_etag);
-        let poll_interval = self.poll_interval;
+        let prefix = self.prefix.clone();
         let cache_dir = self.cache_dir.clone();
-        #[cfg(feature = "metadata")]
+        let model_spec = self.model_spec.clone();
+        let selection = self.selection;
+        let evaluator = Arc::clone(&self.evaluator);
+        let accepted = Arc::clone(&self.accepted_head);
         let model_info = Arc::clone(&self.model_info);
+        let poll_interval = self.poll_interval;
 
         tokio::spawn(async move {
-            info!(
-                "Started S3 model watcher for s3://{}/{} (interval: {:?})",
-                bucket, key, poll_interval
-            );
-
             let mut interval = tokio::time::interval(poll_interval);
-
             loop {
                 interval.tick().await;
-
-                match Self::check_and_download_static(
-                    &client, &bucket, &key, &last_etag, &cache_dir,
-                )
+                match Self::load_current(S3LoadContext {
+                    client: &client,
+                    bucket: &bucket,
+                    prefix: &prefix,
+                    cache_dir: &cache_dir,
+                    model_spec: &model_spec,
+                    selection,
+                    evaluator: &evaluator,
+                    accepted_head: &accepted,
+                    model_info: &model_info,
+                })
                 .await
                 {
-                    Ok(Some(path)) => {
-                        #[cfg(feature = "metadata")]
-                        let result = Self::load_model_static(
-                            &path,
-                            obs_size,
-                            &evaluator,
-                            &bucket,
-                            &key,
-                            &model_info,
-                        );
-
-                        #[cfg(not(feature = "metadata"))]
-                        let result = Self::load_model_static(&path, obs_size, &evaluator);
-
-                        match result {
-                            Ok(()) => {
-                                let _ = tx.send(()).await;
-                            }
-                            Err(e) => {
-                                error!("Failed to load model from S3: {}", e);
-                            }
-                        }
+                    Ok(RemoteUpdate::Loaded) => {
+                        let _ = updates_tx.send(()).await;
                     }
-                    Ok(None) => {
-                        debug!("S3 model unchanged");
+                    Ok(RemoteUpdate::Absent | RemoteUpdate::Unchanged | RemoteUpdate::Advanced) => {
                     }
-                    Err(e) => {
-                        warn!("Failed to check S3 for model updates: {}", e);
-                    }
+                    Err(error) => error!("Rejected S3 model channel update: {error}"),
                 }
             }
         });
 
-        Ok(rx)
+        info!(
+            bucket = %self.bucket,
+            run_head = %Self::run_head_key(&self.prefix),
+            poll_interval = ?self.poll_interval,
+            "Started content-addressed S3 model watcher"
+        );
+        Ok(updates_rx)
     }
 }

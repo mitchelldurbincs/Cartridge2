@@ -1,326 +1,188 @@
-//! Tests for the game registry
-
-use super::*;
-use crate::adapter::GameAdapter;
+use crate::board_view::Presentation;
+use crate::erased::{ErasedEnvironment, ErasedEnvironmentError, ErasedTimestep};
+use crate::metadata::EnvironmentMetadata;
+use crate::registry::*;
 use crate::test_utils::REGISTRY_TEST_MUTEX;
-use crate::typed::{ActionSpace, Capabilities, DecodeError, EncodeError, Encoding, EngineId, Game};
-use rand_chacha::ChaCha20Rng;
-
-// Test game implementation
-#[derive(Debug, Default)]
-struct TestGame {
-    name: String,
-}
-
-impl TestGame {
-    fn new(name: String) -> Self {
-        Self { name }
-    }
-}
-
-impl Game for TestGame {
-    type State = u32;
-    type Action = u8;
-    type Obs = Vec<f32>;
-
-    fn engine_id(&self) -> EngineId {
-        EngineId {
-            env_id: self.name.clone(),
-            build_id: "0.1.0".to_string(),
-        }
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            id: self.engine_id(),
-            encoding: Encoding {
-                state: "u32:v1".to_string(),
-                action: "u8:v1".to_string(),
-                obs: "f32_vec:v1".to_string(),
-                schema_version: 1,
-            },
-            max_horizon: 100,
-            action_space: ActionSpace::Discrete(4),
-            preferred_batch: 32,
-        }
-    }
-
-    fn metadata(&self) -> crate::metadata::GameMetadata {
-        crate::metadata::GameMetadata::new(&self.name, "Test Game")
-            .with_board(2, 2)
-            .with_actions(4)
-            .with_observation(1, 0)
-    }
-
-    fn reset(&mut self, _rng: &mut ChaCha20Rng, _hint: &[u8]) -> (Self::State, Self::Obs) {
-        (0, vec![0.0])
-    }
-
-    fn step(
-        &mut self,
-        state: &mut Self::State,
-        action: Self::Action,
-        _rng: &mut ChaCha20Rng,
-    ) -> (Self::Obs, f32, bool, u64) {
-        *state += action as u32;
-        (vec![*state as f32], 1.0, *state >= 10, *state as u64)
-    }
-
-    fn encode_state(
-        state: &Self::State,
-        out: &mut Vec<u8>,
-    ) -> Result<(), crate::typed::EncodeError> {
-        out.extend_from_slice(&state.to_le_bytes());
-        Ok(())
-    }
-
-    fn decode_state(buf: &[u8]) -> Result<Self::State, crate::typed::DecodeError> {
-        if buf.len() != 4 {
-            return Err(crate::typed::DecodeError::InvalidLength {
-                expected: 4,
-                actual: buf.len(),
-            });
-        }
-        Ok(u32::from_le_bytes(buf.try_into().unwrap()))
-    }
-
-    fn encode_action(
-        action: &Self::Action,
-        out: &mut Vec<u8>,
-    ) -> Result<(), crate::typed::EncodeError> {
-        out.push(*action);
-        Ok(())
-    }
-
-    fn decode_action(buf: &[u8]) -> Result<Self::Action, crate::typed::DecodeError> {
-        if buf.len() != 1 {
-            return Err(crate::typed::DecodeError::InvalidLength {
-                expected: 1,
-                actual: buf.len(),
-            });
-        }
-        Ok(buf[0])
-    }
-
-    fn encode_obs(obs: &Self::Obs, out: &mut Vec<u8>) -> Result<(), crate::typed::EncodeError> {
-        for &value in obs {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-        Ok(())
-    }
-}
+use crate::typed::{
+    ActionSpace, AgentId, AgentModel, Capabilities, Encoding, EngineId, EnvironmentSemantics,
+    InformationModel,
+};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 #[derive(Debug)]
-struct OverrideTestGame {
-    env_id: &'static str,
+struct RegistryEnvironment {
     build_id: &'static str,
+    preferred_batch: u32,
+    descriptor_variant: u32,
 }
 
-impl OverrideTestGame {
-    const fn new(env_id: &'static str, build_id: &'static str) -> Self {
-        Self { env_id, build_id }
-    }
-}
-
-impl Game for OverrideTestGame {
-    type State = u8;
-    type Action = u8;
-    type Obs = ();
-
+impl ErasedEnvironment for RegistryEnvironment {
     fn engine_id(&self) -> EngineId {
         EngineId {
-            env_id: self.env_id.to_string(),
-            build_id: self.build_id.to_string(),
+            env_id: "registered".into(),
+            build_id: if self.descriptor_variant == 1 {
+                "changed-build".into()
+            } else {
+                self.build_id.into()
+            },
         }
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
+        let mut capabilities = Capabilities {
             id: self.engine_id(),
-            encoding: Encoding {
-                state: "u8:v1".into(),
-                action: "u8:v1".into(),
-                obs: "unit".into(),
-                schema_version: 1,
-            },
-            max_horizon: 1,
-            action_space: ActionSpace::Discrete(2),
-            preferred_batch: 1,
+            contract_version: 1,
+            encoding: Encoding::custom("state:v1", "action:v1", "obs:v1"),
+            semantics: EnvironmentSemantics::deterministic_single_agent_general_reward(),
+            max_horizon: None,
+            agents: AgentModel::fixed_homogeneous([AgentId(1)], ActionSpace::discrete(1)),
+            preferred_batch: self.preferred_batch,
+        };
+        match self.descriptor_variant {
+            2 => capabilities.contract_version = 2,
+            3 => {
+                capabilities.agents =
+                    AgentModel::fixed_homogeneous([AgentId(1)], ActionSpace::discrete(2));
+            }
+            4 => capabilities.encoding.state = "state:v2".into(),
+            5 => {
+                capabilities.semantics.information_model = InformationModel::PartiallyObserved;
+            }
+            _ => {}
+        }
+        capabilities
+    }
+
+    fn metadata(&self) -> EnvironmentMetadata {
+        let metadata = EnvironmentMetadata::new("registered", "Registered");
+        if self.descriptor_variant == 6 {
+            metadata.with_description("changed metadata")
+        } else {
+            metadata
         }
     }
 
-    fn metadata(&self) -> crate::metadata::GameMetadata {
-        crate::metadata::GameMetadata::new(self.env_id, "Override Test Game")
-            .with_board(1, 1)
-            .with_actions(2)
-            .with_observation(0, 0)
-    }
-
-    fn reset(&mut self, _rng: &mut ChaCha20Rng, _hint: &[u8]) -> (Self::State, Self::Obs) {
-        (0, ())
+    fn reset(
+        &mut self,
+        _seed: u64,
+        _hint: &[u8],
+        _out_state: &mut Vec<u8>,
+        _out_timestep: &mut ErasedTimestep,
+    ) -> Result<(), ErasedEnvironmentError> {
+        Ok(())
     }
 
     fn step(
         &mut self,
-        state: &mut Self::State,
-        action: Self::Action,
-        _rng: &mut ChaCha20Rng,
-    ) -> (Self::Obs, f32, bool, u64) {
-        *state = state.wrapping_add(action);
-        ((), 0.0, true, *state as u64)
-    }
-
-    fn encode_state(state: &Self::State, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        out.push(*state);
+        _state: &[u8],
+        _action: &[u8],
+        _out_state: &mut Vec<u8>,
+        _out_timestep: &mut ErasedTimestep,
+    ) -> Result<(), ErasedEnvironmentError> {
         Ok(())
     }
 
-    fn decode_state(buf: &[u8]) -> Result<Self::State, DecodeError> {
-        if buf.len() != 1 {
-            return Err(DecodeError::InvalidLength {
-                expected: 1,
-                actual: buf.len(),
-            });
+    fn presentation(&self, _state: &[u8]) -> Result<Option<Presentation>, ErasedEnvironmentError> {
+        Ok(None)
+    }
+}
+
+fn factory_a() -> Result<Box<dyn ErasedEnvironment>, ErasedEnvironmentError> {
+    Ok(Box::new(RegistryEnvironment {
+        build_id: "a",
+        preferred_batch: 1,
+        descriptor_variant: 0,
+    }))
+}
+
+fn factory_b() -> Result<Box<dyn ErasedEnvironment>, ErasedEnvironmentError> {
+    Ok(Box::new(RegistryEnvironment {
+        build_id: "b",
+        preferred_batch: 1,
+        descriptor_variant: 0,
+    }))
+}
+
+static DESCRIPTOR_VARIANT: AtomicU32 = AtomicU32::new(0);
+
+fn descriptor_drifting_factory() -> Result<Box<dyn ErasedEnvironment>, ErasedEnvironmentError> {
+    Ok(Box::new(RegistryEnvironment {
+        build_id: "stable-build",
+        preferred_batch: if DESCRIPTOR_VARIANT.load(Ordering::SeqCst) == 7 {
+            2
+        } else {
+            1
+        },
+        descriptor_variant: DESCRIPTOR_VARIANT.load(Ordering::SeqCst),
+    }))
+}
+
+#[test]
+fn registry_constructs_and_lists_environments() {
+    let _guard = REGISTRY_TEST_MUTEX.lock().unwrap();
+    clear_registry();
+    register_factory(factory_a).unwrap();
+
+    assert!(is_registered("registered"));
+    assert_eq!(list_registered_environments(), vec!["registered"]);
+    assert_eq!(
+        create_environment("registered")
+            .unwrap()
+            .engine_id()
+            .build_id,
+        "a"
+    );
+    assert_eq!(
+        create_environment("missing").unwrap_err(),
+        RegistryError::NotRegistered {
+            env_id: "missing".into()
         }
-        Ok(buf[0])
-    }
-
-    fn encode_action(action: &Self::Action, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        out.push(*action);
-        Ok(())
-    }
-
-    fn decode_action(buf: &[u8]) -> Result<Self::Action, DecodeError> {
-        if buf.len() != 1 {
-            return Err(DecodeError::InvalidLength {
-                expected: 1,
-                actual: buf.len(),
-            });
-        }
-        Ok(buf[0])
-    }
-
-    fn encode_obs(_obs: &Self::Obs, _out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        Ok(())
-    }
+    );
 }
 
 #[test]
-fn test_register_and_create_game() {
+fn duplicate_registration_is_rejected_without_replacement() {
     let _guard = REGISTRY_TEST_MUTEX.lock().unwrap();
     clear_registry();
-
-    fn test_factory() -> Box<dyn ErasedGame> {
-        Box::new(GameAdapter::new(TestGame::new("test_game".to_string())))
-    }
-
-    register_game("test_game".to_string(), test_factory);
-
-    let game = create_game("test_game");
-    assert!(game.is_some());
-
-    let game = game.unwrap();
-    assert_eq!(game.engine_id().env_id, "test_game");
+    register_factory(factory_a).unwrap();
+    assert_eq!(
+        register_factory(factory_b),
+        Err(RegistryError::AlreadyRegistered {
+            env_id: "registered".into()
+        })
+    );
+    assert_eq!(
+        create_environment("registered")
+            .unwrap()
+            .engine_id()
+            .build_id,
+        "a"
+    );
 }
 
 #[test]
-fn test_create_nonexistent_game() {
+fn every_factory_descriptor_field_is_pinned_at_registration() {
     let _guard = REGISTRY_TEST_MUTEX.lock().unwrap();
-    clear_registry();
+    for (descriptor_name, descriptor_variant) in [
+        ("engine ID", 1),
+        ("contract version", 2),
+        ("action space", 3),
+        ("encoding", 4),
+        ("semantics", 5),
+        ("metadata", 6),
+        ("preferred batch", 7),
+    ] {
+        clear_registry();
+        DESCRIPTOR_VARIANT.store(0, Ordering::SeqCst);
+        register_factory(descriptor_drifting_factory).unwrap();
+        DESCRIPTOR_VARIANT.store(descriptor_variant, Ordering::SeqCst);
 
-    let game = create_game("nonexistent");
-    assert!(game.is_none());
-}
-
-#[test]
-fn test_list_registered_games() {
-    let _guard = REGISTRY_TEST_MUTEX.lock().unwrap();
-    clear_registry();
-
-    fn factory1() -> Box<dyn ErasedGame> {
-        Box::new(GameAdapter::new(TestGame::new("game1".to_string())))
+        assert_eq!(
+            create_environment("registered").unwrap_err(),
+            RegistryError::FactoryDescriptorsChanged {
+                env_id: "registered".into(),
+            },
+            "{descriptor_name} drift was not rejected"
+        );
     }
-    fn factory2() -> Box<dyn ErasedGame> {
-        Box::new(GameAdapter::new(TestGame::new("game2".to_string())))
-    }
-
-    register_game("game1".to_string(), factory1);
-    register_game("game2".to_string(), factory2);
-
-    let mut games = list_registered_games();
-    games.sort();
-
-    assert_eq!(games, vec!["game1".to_string(), "game2".to_string()]);
-}
-
-#[test]
-fn test_is_registered() {
-    let _guard = REGISTRY_TEST_MUTEX.lock().unwrap();
-    clear_registry();
-
-    fn factory() -> Box<dyn ErasedGame> {
-        Box::new(GameAdapter::new(TestGame::new(
-            "registered_game".to_string(),
-        )))
-    }
-
-    assert!(!is_registered("registered_game"));
-
-    register_game("registered_game".to_string(), factory);
-    assert!(is_registered("registered_game"));
-    assert!(!is_registered("unregistered_game"));
-}
-
-#[test]
-fn test_clear_registry() {
-    let _guard = REGISTRY_TEST_MUTEX.lock().unwrap();
-    clear_registry();
-
-    fn factory() -> Box<dyn ErasedGame> {
-        Box::new(GameAdapter::new(TestGame::new("temp_game".to_string())))
-    }
-
-    register_game("temp_game".to_string(), factory);
-    assert!(is_registered("temp_game"));
-
-    clear_registry();
-    assert!(!is_registered("temp_game"));
-    assert!(list_registered_games().is_empty());
-}
-
-#[test]
-fn test_register_game_overrides_existing_factory() {
-    let _guard = REGISTRY_TEST_MUTEX.lock().unwrap();
-    clear_registry();
-
-    fn factory_old() -> Box<dyn ErasedGame> {
-        Box::new(GameAdapter::new(OverrideTestGame::new(
-            "override_env",
-            "build_old",
-        )))
-    }
-
-    fn factory_new() -> Box<dyn ErasedGame> {
-        Box::new(GameAdapter::new(OverrideTestGame::new(
-            "override_env",
-            "build_new",
-        )))
-    }
-
-    register_game("override_env".to_string(), factory_old);
-    let initial_build = create_game("override_env")
-        .expect("initial factory should produce a game")
-        .engine_id()
-        .build_id;
-    assert_eq!(initial_build, "build_old");
-
-    register_game("override_env".to_string(), factory_new);
-    let updated_build = create_game("override_env")
-        .expect("overridden factory should still produce a game")
-        .engine_id()
-        .build_id;
-    assert_eq!(updated_build, "build_new");
-
-    let registered = list_registered_games();
-    assert_eq!(registered, vec!["override_env".to_string()]);
 }

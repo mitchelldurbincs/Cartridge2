@@ -1,440 +1,468 @@
-"""PostgreSQL backend for replay buffer storage.
-
-This is the primary backend for all deployments (local and cloud).
-Supports concurrent access from multiple actors and trainers.
-
-Requires: psycopg2
-
-Environment variables:
-    CARTRIDGE_STORAGE_POSTGRES_URL: PostgreSQL connection string
-        Format: postgresql://user:password@host:port/database
-"""
+"""PostgreSQL persistence for opaque, exact-selection-bound replay records."""
 
 import logging
+import random
 from contextlib import contextmanager
-from pathlib import Path
+from importlib.resources import files
 from typing import TYPE_CHECKING, Generator
 
-from trainer.storage.base import GameMetadata, ReplayBufferBase, Transition
-
-# Path to shared SQL schema file (relative to project root)
-# postgres.py -> storage -> trainer -> src -> trainer -> cartridge2/
-_SCHEMA_PATH = Path(__file__).parent.parent.parent.parent.parent / "sql" / "schema.sql"
+from trainer.storage.base import (
+    EmptyReplaySelectionError,
+    ReplayRecord,
+    ReplaySelection,
+    ReplayStore,
+)
 
 if TYPE_CHECKING:
     from psycopg2.extensions import connection as PgConnection
 
 logger = logging.getLogger(__name__)
 
+REPLAY_SCHEMA_VERSION = 3
+_REPLAY_SCHEMA_TABLES = {"cartridge_schema_versions", "replay_records"}
+_EXPECTED_SCHEMA_MARKER_COLUMNS = (
+    ("component", "text", "NO"),
+    ("schema_version", "integer", "NO"),
+)
+_EXPECTED_SCHEMA_MARKER_PRIMARY_KEY = ("component",)
+_EXPECTED_SCHEMA_MARKER_ROWS = (("replay", REPLAY_SCHEMA_VERSION),)
+_EXPECTED_RECORD_COLUMNS = (
+    ("id", "text", "NO"),
+    ("env_id", "text", "NO"),
+    ("env_contract_version", "bigint", "NO"),
+    ("algorithm_id", "text", "NO"),
+    ("experience_schema", "text", "NO"),
+    ("collection_scope_id", "text", "NO"),
+    ("source_checkpoint_id", "text", "YES"),
+    ("episode_id", "text", "NO"),
+    ("step_number", "bigint", "NO"),
+    ("payload", "bytea", "NO"),
+    ("created_at", "timestamp without time zone", "NO"),
+)
+_EXPECTED_RECORD_PRIMARY_KEY = (
+    "env_id",
+    "env_contract_version",
+    "algorithm_id",
+    "experience_schema",
+    "collection_scope_id",
+    "id",
+)
+_SELECTION_WHERE = """
+    env_id = %s AND env_contract_version = %s
+    AND algorithm_id = %s AND experience_schema = %s
+    AND collection_scope_id = %s
+    AND source_checkpoint_id IS NOT DISTINCT FROM %s
+"""
+
+
+def _format_columns(columns: tuple[tuple[str, str, str], ...]) -> str:
+    return ", ".join(
+        f"{name} {data_type} {'NULL' if nullable == 'YES' else 'NOT NULL'}"
+        for name, data_type, nullable in columns
+    )
+
+
+def _validate_schema_tables(tables: set[str]) -> None:
+    if tables == _REPLAY_SCHEMA_TABLES:
+        return
+    missing = sorted(_REPLAY_SCHEMA_TABLES - tables)
+    extra = sorted(tables - _REPLAY_SCHEMA_TABLES)
+    details = []
+    if missing:
+        details.append(f"missing tables: {', '.join(missing)}")
+    if extra:
+        details.append(f"unexpected tables: {', '.join(extra)}")
+    raise RuntimeError(
+        "Replay database has an unsupported schema; "
+        f"{'; '.join(details)}. Recreate the database from sql/schema.sql."
+    )
+
+
+def _validate_table_schema(
+    table: str,
+    columns: tuple[tuple[str, str, str], ...],
+    primary_key: tuple[str, ...],
+    expected_columns: tuple[tuple[str, str, str], ...],
+    expected_primary_key: tuple[str, ...],
+) -> None:
+    if columns != expected_columns:
+        raise RuntimeError(
+            f"Replay database uses an unsupported {table} schema; columns are "
+            f"({_format_columns(columns)}), expected "
+            f"({_format_columns(expected_columns)}). Recreate the database "
+            "from sql/schema.sql."
+        )
+    if primary_key != expected_primary_key:
+        actual = ", ".join(primary_key) or "none"
+        expected = ", ".join(expected_primary_key)
+        raise RuntimeError(
+            f"Replay database uses an unsupported {table} schema; "
+            f"primary key is ({actual}), expected ({expected}). Recreate the "
+            "database from sql/schema.sql."
+        )
+
+
+def _validate_record_schema(
+    columns: tuple[tuple[str, str, str], ...], primary_key: tuple[str, ...]
+) -> None:
+    _validate_table_schema(
+        "replay_records",
+        columns,
+        primary_key,
+        _EXPECTED_RECORD_COLUMNS,
+        _EXPECTED_RECORD_PRIMARY_KEY,
+    )
+
+
+def _validate_schema_marker(
+    columns: tuple[tuple[str, str, str], ...],
+    primary_key: tuple[str, ...],
+    rows: tuple[tuple[str, int], ...],
+) -> None:
+    _validate_table_schema(
+        "cartridge_schema_versions",
+        columns,
+        primary_key,
+        _EXPECTED_SCHEMA_MARKER_COLUMNS,
+        _EXPECTED_SCHEMA_MARKER_PRIMARY_KEY,
+    )
+    if not rows:
+        raise RuntimeError(
+            "Replay database is missing its schema version marker. Recreate the "
+            "database from sql/schema.sql."
+        )
+    if rows != _EXPECTED_SCHEMA_MARKER_ROWS:
+        raise RuntimeError(
+            f"Replay database schema marker rows are {rows!r}, expected "
+            f"{_EXPECTED_SCHEMA_MARKER_ROWS!r}. Recreate the database from "
+            "sql/schema.sql."
+        )
+
 
 def _load_schema() -> str:
-    """Load the shared SQL schema file."""
-    if not _SCHEMA_PATH.exists():
-        raise FileNotFoundError(
-            f"Schema file not found: {_SCHEMA_PATH}. "
-            "Ensure you're running from the project root."
-        )
-    return _SCHEMA_PATH.read_text()
+    """Load the replay DDL bundled with the installed trainer package."""
+    return files("trainer.storage").joinpath("schema.sql").read_text(encoding="utf-8")
 
 
-def split_sql_statements(sql: str) -> list[str]:
-    """Split a SQL script into executable statements.
-
-    Strips ``--`` line comments, splits on ``;``, and drops empty statements.
-    This intentionally does not handle ``;`` inside string literals or
-    dollar-quoted bodies -- the shared schema file contains neither.
-
-    Comment lines must be removed *before* splitting. Splitting first leaves
-    each statement's leading comment attached to it, so a "does this chunk
-    start with ``--``?" test discards the statement along with its comment.
-    That is not hypothetical: it silently dropped both ``CREATE TABLE``s in
-    ``sql/schema.sql`` while still reporting success.
-
-    Kept byte-for-byte equivalent to ``split_sql_statements`` in
-    ``actor/src/storage/postgres.rs``; both are pinned to the same statement
-    count by tests so they cannot diverge again unnoticed.
-    """
-    without_comments = "\n".join(
-        line for line in sql.splitlines() if not line.lstrip().startswith("--")
-    )
-    return [
-        statement
-        for statement in (raw.strip() for raw in without_comments.split(";"))
-        if statement
-    ]
-
-
-class PostgresReplayBuffer(ReplayBufferBase):
-    """PostgreSQL-backed replay buffer implementation.
-
-    This backend supports:
-    - Concurrent writes from multiple actors
-    - Concurrent reads from multiple trainers
-    - Efficient random sampling using TABLESAMPLE or ORDER BY RANDOM()
-    - Connection pooling for high throughput
-    """
+class PostgresReplayStore(ReplayStore):
+    """Concurrent PostgreSQL store bound to one exact replay selection."""
 
     def __init__(
         self,
         connection_string: str,
+        selection: ReplaySelection,
         validate_schema: bool = True,
         pool_size: int = 5,
     ):
-        """Initialize PostgreSQL replay buffer.
-
-        Args:
-            connection_string: PostgreSQL connection URL.
-            validate_schema: Whether to validate/create schema on connect.
-            pool_size: Connection pool size (for future pooling support).
-
-        Raises:
-            ImportError: If psycopg2 is not installed.
-            ConnectionError: If database connection fails.
-        """
         try:
             import psycopg2
             from psycopg2 import pool
-        except ImportError as e:
+        except ImportError as exc:
             raise ImportError(
-                "PostgreSQL backend requires psycopg2. "
-                "Install with: pip install psycopg2-binary"
-            ) from e
+                "PostgreSQL replay requires psycopg2; install psycopg2-binary"
+            ) from exc
 
         self.connection_string = connection_string
+        if not isinstance(selection, ReplaySelection):
+            raise TypeError("selection must be ReplaySelection")
+        self._selection = selection
         self._pool_size = pool_size
-
-        # Create connection pool
         try:
             self._pool = pool.ThreadedConnectionPool(
                 minconn=1,
                 maxconn=pool_size,
                 dsn=connection_string,
             )
-        except psycopg2.Error as e:
-            raise ConnectionError(f"Failed to connect to PostgreSQL: {e}") from e
+        except psycopg2.Error as exc:
+            raise ConnectionError(f"Failed to connect to PostgreSQL: {exc}") from exc
 
         if validate_schema:
             self._ensure_schema()
 
+    @property
+    def selection(self) -> ReplaySelection:
+        return self._selection
+
+    @property
+    def _selection_params(self) -> tuple[object, ...]:
+        return (
+            self.selection.profile.env_id,
+            self.selection.profile.env_contract_version,
+            self.selection.profile.algorithm_id,
+            self.selection.profile.experience_schema,
+            self.selection.collection_scope_id,
+            self.selection.source_checkpoint_id,
+        )
+
     def _get_conn(self) -> "PgConnection":
-        """Get a connection from the pool."""
         return self._pool.getconn()
 
     def _put_conn(self, conn: "PgConnection") -> None:
-        """Return a connection to the pool."""
         self._pool.putconn(conn)
 
     @contextmanager
     def _connection(self) -> Generator["PgConnection", None, None]:
-        """Context manager for connection pool access."""
         conn = self._get_conn()
         try:
             yield conn
+        except BaseException:
+            conn.rollback()
+            raise
         finally:
             self._put_conn(conn)
 
     def close(self) -> None:
-        """Close all connections in the pool."""
         self._pool.closeall()
 
+    @staticmethod
+    def _table_contract(cur, table: str):
+        cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = %s
+            ORDER BY ordinal_position
+            """,
+            (table,),
+        )
+        columns = tuple((row[0], row[1], row[2]) for row in cur.fetchall())
+        cur.execute(
+            """
+            SELECT kcu.column_name
+            FROM information_schema.table_constraints AS tc
+            JOIN information_schema.key_column_usage AS kcu
+              ON tc.constraint_name = kcu.constraint_name
+             AND tc.constraint_schema = kcu.constraint_schema
+            WHERE tc.table_schema = current_schema()
+              AND tc.table_name = %s
+              AND tc.constraint_type = 'PRIMARY KEY'
+            ORDER BY kcu.ordinal_position
+            """,
+            (table,),
+        )
+        return columns, tuple(row[0] for row in cur.fetchall())
+
     def _ensure_schema(self) -> None:
-        """Create tables if they don't exist using the shared schema file.
-
-        Every statement in the schema is ``IF NOT EXISTS``, so this is safe to
-        run on every connect and safe to race with the Rust actor, which
-        applies the same file at startup.
-        """
-        statements = split_sql_statements(_load_schema())
+        """Create only an empty schema, then require the exact v3 protocol."""
         with self._connection() as conn:
             with conn.cursor() as cur:
-                for statement in statements:
-                    cur.execute(statement)
-
-                conn.commit()
-                logger.info(
-                    "PostgreSQL schema validated/created (%d statements)",
-                    len(statements),
-                )
-
-    def count(self, env_id: str | None = None) -> int:
-        """Get total number of transitions in the buffer."""
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                if env_id is not None:
-                    cur.execute(
-                        "SELECT COUNT(*) FROM transitions WHERE env_id = %s", (env_id,)
+                cur.execute("SELECT pg_advisory_xact_lock(745472510202)")
+                cur.execute("""
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = current_schema()
+                      AND table_type = 'BASE TABLE'
+                    """)
+                existing_tables = {row[0] for row in cur.fetchall()}
+                if not existing_tables:
+                    executable_sql = "\n".join(
+                        line
+                        for line in _load_schema().splitlines()
+                        if not line.lstrip().startswith("--")
                     )
+                    for statement in executable_sql.split(";"):
+                        if statement.strip():
+                            cur.execute(statement.strip())
                 else:
-                    cur.execute("SELECT COUNT(*) FROM transitions")
+                    _validate_schema_tables(existing_tables)
+
+                marker_columns, marker_primary_key = self._table_contract(
+                    cur, "cartridge_schema_versions"
+                )
+                cur.execute("""
+                    SELECT component, schema_version
+                    FROM cartridge_schema_versions
+                    ORDER BY component
+                    """)
+                marker_rows = tuple((row[0], row[1]) for row in cur.fetchall())
+                _validate_schema_marker(marker_columns, marker_primary_key, marker_rows)
+
+                record_columns, record_primary_key = self._table_contract(cur, "replay_records")
+                _validate_record_schema(record_columns, record_primary_key)
+                conn.commit()
+                logger.info("PostgreSQL replay schema v3 validated/created")
+
+    def _count_selection(self, cur) -> int:
+        cur.execute(
+            f"SELECT COUNT(*) FROM replay_records WHERE {_SELECTION_WHERE}",
+            self._selection_params,
+        )
+        return cur.fetchone()[0]
+
+    def count(self) -> int:
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                return self._count_selection(cur)
+
+    def count_episodes(self) -> int:
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(DISTINCT episode_id) FROM replay_records "
+                    f"WHERE {_SELECTION_WHERE}",
+                    self._selection_params,
+                )
                 return cur.fetchone()[0]
 
-    def get_metadata(self, env_id: str | None = None) -> GameMetadata | None:
-        """Get game metadata from the database."""
+    def sample(self, batch_size: int) -> list[ReplayRecord]:
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer")
         with self._connection() as conn:
             with conn.cursor() as cur:
-                if env_id:
-                    cur.execute(
-                        """SELECT env_id, display_name, board_width, board_height,
-                                  num_actions, obs_size, legal_mask_offset, player_count
-                           FROM game_metadata WHERE env_id = %s""",
-                        (env_id,),
+                selection_count = self._count_selection(cur)
+                if selection_count == 0:
+                    raise EmptyReplaySelectionError(
+                        "cannot sample from an empty exact replay selection"
                     )
-                else:
-                    cur.execute(
-                        """SELECT env_id, display_name, board_width, board_height,
-                                  num_actions, obs_size, legal_mask_offset, player_count
-                           FROM game_metadata LIMIT 1"""
-                    )
-
-                row = cur.fetchone()
-                if row is None:
-                    return None
-
-                return GameMetadata(
-                    env_id=row[0],
-                    display_name=row[1],
-                    board_width=row[2],
-                    board_height=row[3],
-                    num_actions=row[4],
-                    obs_size=row[5],
-                    legal_mask_offset=row[6],
-                    player_count=row[7],
-                )
-
-    def list_metadata(self) -> list[GameMetadata]:
-        """List all game metadata in the database."""
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""SELECT env_id, display_name, board_width, board_height,
-                              num_actions, obs_size, legal_mask_offset, player_count
-                       FROM game_metadata""")
-
-                return [
-                    GameMetadata(
-                        env_id=row[0],
-                        display_name=row[1],
-                        board_width=row[2],
-                        board_height=row[3],
-                        num_actions=row[4],
-                        obs_size=row[5],
-                        legal_mask_offset=row[6],
-                        player_count=row[7],
-                    )
-                    for row in cur.fetchall()
-                ]
-
-    def sample(self, batch_size: int, env_id: str | None = None) -> list[Transition]:
-        """Sample random transitions for training.
-
-        Uses PostgreSQL's TABLESAMPLE for efficient random sampling on large tables,
-        falling back to ORDER BY RANDOM() for smaller tables or when TABLESAMPLE
-        doesn't return enough rows.
-        """
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                # Try TABLESAMPLE first (efficient for large tables)
-                # SYSTEM samples pages, so we oversample and limit
+                # Keep database work bounded by the minibatch. If the exact
+                # selection is smaller, fill the remainder with replacement
+                # after decoding the selected immutable rows.
+                sample_size = min(batch_size, selection_count)
                 sample_pct = min(
-                    100.0, (batch_size * 10.0) / max(1, self.count(env_id))
+                    100.0,
+                    (sample_size * 10.0 * 100.0) / selection_count,
                 )
-
-                if env_id is not None:
-                    cur.execute(
-                        """
-                        SELECT id, env_id, episode_id, step_number, state, action,
-                               next_state, observation, next_observation, reward,
-                               done, timestamp, policy_probs, mcts_value, game_outcome
-                        FROM transitions TABLESAMPLE SYSTEM(%s)
-                        WHERE env_id = %s
-                        LIMIT %s
-                        """,
-                        (sample_pct, env_id, batch_size),
-                    )
-                else:
-                    cur.execute(
-                        """
-                        SELECT id, env_id, episode_id, step_number, state, action,
-                               next_state, observation, next_observation, reward,
-                               done, timestamp, policy_probs, mcts_value, game_outcome
-                        FROM transitions TABLESAMPLE SYSTEM(%s)
-                        LIMIT %s
-                        """,
-                        (sample_pct, batch_size),
-                    )
-
+                cur.execute(
+                    f"""
+                    SELECT id, env_id, env_contract_version, algorithm_id,
+                           experience_schema, collection_scope_id,
+                           source_checkpoint_id, episode_id, step_number, payload
+                    FROM replay_records TABLESAMPLE SYSTEM(%s)
+                    WHERE {_SELECTION_WHERE}
+                    LIMIT %s
+                    """,
+                    (sample_pct, *self._selection_params, sample_size),
+                )
                 rows = cur.fetchall()
-
-                # If TABLESAMPLE didn't return enough, fall back to ORDER BY RANDOM()
-                if len(rows) < batch_size:
-                    if env_id is not None:
-                        cur.execute(
-                            """
-                            SELECT id, env_id, episode_id, step_number, state, action,
-                                   next_state, observation, next_observation, reward,
-                                   done, timestamp, policy_probs, mcts_value, game_outcome
-                            FROM transitions
-                            WHERE env_id = %s
-                            ORDER BY RANDOM()
-                            LIMIT %s
-                            """,
-                            (env_id, batch_size),
-                        )
-                    else:
-                        cur.execute(
-                            """
-                            SELECT id, env_id, episode_id, step_number, state, action,
-                                   next_state, observation, next_observation, reward,
-                                   done, timestamp, policy_probs, mcts_value, game_outcome
-                            FROM transitions
-                            ORDER BY RANDOM()
-                            LIMIT %s
-                            """,
-                            (batch_size,),
-                        )
+                if len(rows) < sample_size:
+                    cur.execute(
+                        f"""
+                        SELECT id, env_id, env_contract_version, algorithm_id,
+                               experience_schema, collection_scope_id,
+                               source_checkpoint_id, episode_id, step_number, payload
+                        FROM replay_records
+                        WHERE {_SELECTION_WHERE}
+                        ORDER BY RANDOM()
+                        LIMIT %s
+                        """,
+                        (*self._selection_params, sample_size),
+                    )
                     rows = cur.fetchall()
+                records = self._rows_to_records(rows)
+        if not records:
+            raise EmptyReplaySelectionError("cannot sample from an empty exact replay selection")
+        if len(records) < batch_size:
+            records.extend(random.choices(records, k=batch_size - len(records)))
+        return records
 
-                return self._rows_to_transitions(rows)
-
-    def _rows_to_transitions(self, rows: list) -> list[Transition]:
-        """Convert database rows to Transition objects."""
+    @staticmethod
+    def _rows_to_records(rows: list) -> list[ReplayRecord]:
         return [
-            Transition(
+            ReplayRecord(
                 id=row[0],
                 env_id=row[1],
-                episode_id=row[2],
-                step_number=row[3],
-                state=bytes(row[4]) if row[4] else b"",
-                action=bytes(row[5]) if row[5] else b"",
-                next_state=bytes(row[6]) if row[6] else b"",
-                observation=bytes(row[7]) if row[7] else b"",
-                next_observation=bytes(row[8]) if row[8] else b"",
-                reward=row[9],
-                done=bool(row[10]),
-                timestamp=row[11],
-                policy_probs=bytes(row[12]) if row[12] else None,
-                mcts_value=row[13] or 0.0,
-                game_outcome=row[14],
+                env_contract_version=row[2],
+                algorithm_id=row[3],
+                experience_schema=row[4],
+                collection_scope_id=row[5],
+                source_checkpoint_id=row[6],
+                episode_id=row[7],
+                step_number=row[8],
+                payload=bytes(row[9]),
             )
             for row in rows
         ]
 
-    def clear_transitions(self) -> int:
-        """Delete all transitions from the buffer."""
+    def clear(self) -> int:
         with self._connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM transitions")
+                cur.execute(
+                    f"DELETE FROM replay_records WHERE {_SELECTION_WHERE}",
+                    self._selection_params,
+                )
                 count = cur.rowcount
                 conn.commit()
                 return count
 
     def cleanup(self, window_size: int) -> int:
-        """Delete old transitions to maintain a sliding window.
-
-        Returns the number of deleted transitions.
-        """
+        if window_size < 0:
+            raise ValueError("window_size cannot be negative")
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    DELETE FROM transitions
-                    WHERE id NOT IN (
-                        SELECT id FROM transitions
-                        ORDER BY created_at DESC
+                    f"""
+                    DELETE FROM replay_records
+                    WHERE {_SELECTION_WHERE}
+                      AND id NOT IN (
+                        SELECT id FROM replay_records
+                        WHERE {_SELECTION_WHERE}
+                        ORDER BY created_at DESC, id DESC
                         LIMIT %s
-                    )
+                      )
                     """,
-                    (window_size,),
+                    (
+                        *self._selection_params,
+                        *self._selection_params,
+                        window_size,
+                    ),
                 )
                 count = cur.rowcount
                 conn.commit()
                 return count
 
     def vacuum(self) -> None:
-        """Run VACUUM to reclaim storage space.
-
-        Note: PostgreSQL VACUUM cannot run inside a transaction,
-        so we need autocommit mode.
-        """
         with self._connection() as conn:
             old_autocommit = conn.autocommit
             conn.autocommit = True
             try:
                 with conn.cursor() as cur:
-                    cur.execute("VACUUM transitions")
+                    cur.execute("VACUUM replay_records")
             finally:
                 conn.autocommit = old_autocommit
 
-    def store_batch(self, transitions: list[Transition]) -> None:
-        """Store multiple transitions in a batch.
+    def _require_selection(self, records: list[ReplayRecord]) -> None:
+        if not isinstance(records, list):
+            raise TypeError("Replay record batch must be a list")
+        if any(not isinstance(record, ReplayRecord) for record in records):
+            raise TypeError("Replay record batch must contain only ReplayRecord values")
+        mismatched = [record.id for record in records if not self.selection.matches(record)]
+        if mismatched:
+            raise ValueError(
+                f"Replay records do not match replay selection {self.selection}: "
+                + ", ".join(mismatched)
+            )
 
-        This method is provided for actors that need to write to the buffer.
-        Uses executemany for efficient batch inserts.
-        """
+    def store(self, record: ReplayRecord) -> None:
+        self.store_batch([record])
+
+    def store_batch(self, records: list[ReplayRecord]) -> None:
+        self._require_selection(records)
+        if not records:
+            return
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.executemany(
                     """
-                    INSERT INTO transitions
-                    (id, env_id, episode_id, step_number, state, action, next_state,
-                     observation, next_observation, reward, done, timestamp,
-                     policy_probs, mcts_value, game_outcome)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (id) DO UPDATE SET
-                        game_outcome = EXCLUDED.game_outcome,
-                        mcts_value = EXCLUDED.mcts_value
+                    INSERT INTO replay_records
+                    (id, env_id, env_contract_version, algorithm_id,
+                     experience_schema, collection_scope_id, source_checkpoint_id,
+                     episode_id, step_number, payload)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     [
                         (
-                            t.id,
-                            t.env_id,
-                            t.episode_id,
-                            t.step_number,
-                            t.state,
-                            t.action,
-                            t.next_state,
-                            t.observation,
-                            t.next_observation,
-                            t.reward,
-                            t.done,
-                            t.timestamp,
-                            t.policy_probs,
-                            t.mcts_value,
-                            t.game_outcome,
+                            record.id,
+                            record.env_id,
+                            record.env_contract_version,
+                            record.algorithm_id,
+                            record.experience_schema,
+                            record.collection_scope_id,
+                            record.source_checkpoint_id,
+                            record.episode_id,
+                            record.step_number,
+                            record.payload,
                         )
-                        for t in transitions
+                        for record in records
                     ],
-                )
-                conn.commit()
-
-    def store_metadata(self, metadata: GameMetadata) -> None:
-        """Store or update game metadata (upsert)."""
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO game_metadata
-                    (env_id, display_name, board_width, board_height, num_actions,
-                     obs_size, legal_mask_offset, player_count, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-                    ON CONFLICT (env_id) DO UPDATE SET
-                        display_name = EXCLUDED.display_name,
-                        board_width = EXCLUDED.board_width,
-                        board_height = EXCLUDED.board_height,
-                        num_actions = EXCLUDED.num_actions,
-                        obs_size = EXCLUDED.obs_size,
-                        legal_mask_offset = EXCLUDED.legal_mask_offset,
-                        player_count = EXCLUDED.player_count,
-                        updated_at = CURRENT_TIMESTAMP
-                    """,
-                    (
-                        metadata.env_id,
-                        metadata.display_name,
-                        metadata.board_width,
-                        metadata.board_height,
-                        metadata.num_actions,
-                        metadata.obs_size,
-                        metadata.legal_mask_offset,
-                        metadata.player_count,
-                    ),
                 )
                 conn.commit()

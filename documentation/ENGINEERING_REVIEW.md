@@ -565,7 +565,7 @@ actor/ (binary)                          web/ (binary)                          
 - **Location:** `.github/workflows/ci.yml` — `rust-fmt` and `python-lint` jobs
 - **Current behavior:** `rust-fmt` runs `cargo fmt` (not `--check`) across all three
   workspaces and then `stefanzweifel/git-auto-commit-action@v5` pushes a `style:` commit
-  back to the PR branch. `python-lint` does the same with `ruff check --fix` and `black`.
+  back to the PR branch. `python-lint` does the same with Ruff's lint and format fixers.
   The workflow declares `permissions: contents: write` and triggers on `pull_request`, and
   the checkout uses `ref: ${{ github.head_ref }}`.
 - **Why it is a problem:** Three distinct issues. (1) `CLAUDE.md` documents
@@ -579,7 +579,7 @@ actor/ (binary)                          web/ (binary)                          
   they cannot fix. Maintainers develop the habit of ignoring that job, which is exactly the
   job that should be trustworthy.
 - **Recommended change:** Replace the format jobs with verification: `cargo fmt --check`,
-  `ruff check`, `black --check`. Fixing formatting is a two-second local command and belongs
+  `ruff check`, `ruff format --check`. Fixing formatting is a two-second local command and belongs
   to the author. If auto-fixing is genuinely wanted, move it to a manually-dispatched
   workflow or a bot comment, not the PR gate.
 - **Why better:** Makes CI a gate rather than a mutator, unblocks forks, stops post-approval

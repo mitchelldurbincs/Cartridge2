@@ -1,41 +1,52 @@
--- Cartridge2 PostgreSQL Schema
--- This schema is shared by both the Rust actor and Python trainer.
--- Any changes here must be compatible with both components.
+-- Cartridge2 replay schema v3.
+--
+-- Storage owns only the immutable replay envelope. The payload is opaque and
+-- is decoded by the algorithm cartridge named by algorithm_id and
+-- experience_schema. Every operation is fenced to one exact collection scope
+-- and source checkpoint. Changing an algorithm payload never changes this table.
 
--- Transitions table: stores game episode data for training
-CREATE TABLE IF NOT EXISTS transitions (
-    id TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS cartridge_schema_versions (
+    component TEXT PRIMARY KEY,
+    schema_version INTEGER NOT NULL CHECK (schema_version > 0)
+);
+
+INSERT INTO cartridge_schema_versions (component, schema_version)
+VALUES ('replay', 3)
+ON CONFLICT (component) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS replay_records (
+    id TEXT NOT NULL,
     env_id TEXT NOT NULL,
+    env_contract_version BIGINT NOT NULL
+        CHECK (env_contract_version BETWEEN 1 AND 4294967295),
+    algorithm_id TEXT NOT NULL,
+    experience_schema TEXT NOT NULL,
+    collection_scope_id TEXT NOT NULL
+        CHECK (collection_scope_id ~ '^[0-9a-f]{64}$'),
+    source_checkpoint_id TEXT
+        CHECK (
+            source_checkpoint_id IS NULL
+            OR source_checkpoint_id ~ '^[0-9a-f]{64}$'
+        ),
     episode_id TEXT NOT NULL,
-    step_number INTEGER NOT NULL,
-    state BYTEA NOT NULL,
-    action BYTEA NOT NULL,
-    next_state BYTEA NOT NULL,
-    observation BYTEA NOT NULL,
-    next_observation BYTEA NOT NULL,
-    reward REAL NOT NULL,
-    done BOOLEAN NOT NULL,
-    timestamp BIGINT NOT NULL,
-    policy_probs BYTEA,
-    mcts_value REAL DEFAULT 0.0,
-    game_outcome REAL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    step_number BIGINT NOT NULL
+        CHECK (step_number BETWEEN 0 AND 4294967295),
+    payload BYTEA NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (
+        env_id, env_contract_version, algorithm_id, experience_schema,
+        collection_scope_id, id
+    )
 );
 
--- Indices for efficient querying
-CREATE INDEX IF NOT EXISTS idx_transitions_timestamp ON transitions(timestamp);
-CREATE INDEX IF NOT EXISTS idx_transitions_episode ON transitions(episode_id);
-CREATE INDEX IF NOT EXISTS idx_transitions_env_id ON transitions(env_id);
+CREATE INDEX IF NOT EXISTS idx_replay_records_selection_created
+    ON replay_records(
+        env_id, env_contract_version, algorithm_id, experience_schema,
+        collection_scope_id, source_checkpoint_id, created_at DESC
+    );
 
--- Game metadata table: stores configuration for each game type
-CREATE TABLE IF NOT EXISTS game_metadata (
-    env_id TEXT PRIMARY KEY,
-    display_name TEXT NOT NULL,
-    board_width INTEGER NOT NULL,
-    board_height INTEGER NOT NULL,
-    num_actions INTEGER NOT NULL,
-    obs_size INTEGER NOT NULL,
-    legal_mask_offset INTEGER NOT NULL,
-    player_count INTEGER NOT NULL,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+CREATE INDEX IF NOT EXISTS idx_replay_records_selection_episode
+    ON replay_records(
+        env_id, env_contract_version, algorithm_id, experience_schema,
+        collection_scope_id, source_checkpoint_id, episode_id, step_number
+    );

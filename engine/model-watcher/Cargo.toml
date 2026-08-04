@@ -12,6 +12,8 @@ metadata = []
 s3 = ["aws-sdk-s3", "aws-config"]
 
 [dependencies]
+algorithm-core = { path = "../algorithm-core" }
+
 # MCTS crate for OnnxEvaluator
 mcts = { path = "../mcts", features = ["onnx"] }
 
@@ -23,6 +25,11 @@ notify = "7"
 
 # Error handling
 anyhow = "1.0"
+
+# Strict content-addressed checkpoint manifests
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+sha2 = "0.10"
 
 # Logging
 tracing = "0.1"

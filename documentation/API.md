@@ -12,8 +12,7 @@
    - [Game Session](#53-game-session)
    - [Training Statistics](#54-training-statistics)
    - [Model Information](#55-model-information)
-   - [Actor Statistics](#56-actor-statistics)
-   - [Prometheus Metrics](#57-prometheus-metrics)
+   - [Prometheus Metrics](#56-prometheus-metrics)
 6. [Type Definitions](#6-type-definitions)
 7. [Error Handling](#7-error-handling)
 8. [Game-Specific Behavior](#8-game-specific-behavior)
@@ -207,6 +206,11 @@ curl http://localhost:8080/games
 
 Get detailed metadata for a specific game.
 
+This is a board-serving DTO, not the generic engine manifest shape. The web
+cartridge requires `EnvironmentMetadata.board` and flattens that nested profile
+to the fields below; an environment without the board profile is valid in the
+engine but cannot start under `alphazero_mcts_web_v1`.
+
 **Path Parameters**
 
 | Parameter | Type | Description |
@@ -254,7 +258,7 @@ Host: localhost:8080
 | `player_names` | string[] | Player names for display |
 | `player_symbols` | string[] | Player symbols for board rendering |
 | `description` | string | Game description |
-| `board_type` | string | `"grid"` or `"drop_column"` |
+| `board_type` | string | `"grid"`, `"drop_column"`, or `"generals"` |
 
 **Board Types**
 
@@ -262,12 +266,12 @@ Host: localhost:8080
 |------|-------|-------------|
 | `grid` | TicTacToe, Othello | Click any empty cell |
 | `drop_column` | Connect4 | Click column, piece drops to bottom |
+| `generals` | Generals 8x8 | Click a source tile, then an adjacent target |
 
-> `generals_8x8` also reports `board_type: "grid"`, but is **not playable through
-> this API**: the web server cannot decode its state layout
-> (`web/src/game.rs::parse_state` assumes `[board][player][winner]`, while
-> Generals encodes a 12-byte header plus 64 x 6-byte tiles). Configuring it as
-> the current game will not produce a usable session.
+> `generals_8x8` actions are `(tile * 4) + direction` (direction 0=up, 1=right,
+> 2=down, 3=left) plus a wait action at index 256, so a single click is not a
+> move; the frontend selects a source tile first. This is also why `position`
+> in `POST /move` is not limited to a byte.
 
 **Status Codes**
 
@@ -308,7 +312,17 @@ Host: localhost:8080
 
 ```json
 {
-  "board": [0, 0, 0, 0, 1, 0, 0, 0, 2],
+  "cells": [
+    {"owner": 0, "kind": "normal", "value": 0},
+    {"owner": 0, "kind": "normal", "value": 0},
+    {"owner": 0, "kind": "normal", "value": 0},
+    {"owner": 0, "kind": "normal", "value": 0},
+    {"owner": 1, "kind": "normal", "value": 0},
+    {"owner": 0, "kind": "normal", "value": 0},
+    {"owner": 0, "kind": "normal", "value": 0},
+    {"owner": 0, "kind": "normal", "value": 0},
+    {"owner": 2, "kind": "normal", "value": 0}
+  ],
   "current_player": 1,
   "human_player": 1,
   "winner": 0,
@@ -322,12 +336,22 @@ Host: localhost:8080
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `board` | number[] | Board cells (0=empty, 1=player1, 2=player2) |
+| `cells` | Cell[] | Board cells, row-major (see below) |
 | `current_player` | number | Whose turn: 1 or 2 |
 | `human_player` | number | Which player is human: 1 or 2 |
 | `winner` | number | Game result: 0=ongoing, 1=P1 wins, 2=P2 wins, 3=draw |
 | `game_over` | boolean | Is the game finished? |
-| `legal_moves` | number[] | Valid positions/columns for next move |
+| `legal_moves` | number[] | Valid action indices for the next move |
+
+Each entry of `cells` is the engine's own projection of that board square
+(`engine_core::board_profile::CellView`), so the server never has to decode a game's private
+state encoding:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `owner` | number | 0=empty/neutral, 1=player1, 2=player2 |
+| `kind` | string | `"normal"`, `"general"`, `"city"`, or `"mountain"` |
+| `value` | number | Per-cell quantity (Generals' army count); 0 elsewhere |
 | `message` | string | Human-readable status message |
 
 **Board Layout**
@@ -397,7 +421,7 @@ Content-Type: application/json
 When `first: "player"`:
 ```json
 {
-  "board": [0, 0, 0, 0, 0, 0, 0, 0, 0],
+  "cells": [ /* 9 cells, all {"owner": 0, "kind": "normal", "value": 0} */ ],
   "current_player": 1,
   "human_player": 1,
   "winner": 0,
@@ -410,7 +434,7 @@ When `first: "player"`:
 When `first: "bot"`:
 ```json
 {
-  "board": [0, 0, 0, 0, 1, 0, 0, 0, 0],
+  "cells": [ /* 9 cells; index 4 is {"owner": 1, "kind": "normal", "value": 0} */ ],
   "current_player": 2,
   "human_player": 2,
   "winner": 0,
@@ -490,7 +514,7 @@ Content-Type: application/json
 
 ```json
 {
-  "board": [0, 0, 0, 0, 1, 2, 0, 0, 0],
+  "cells": [ /* 9 cells; index 4 owner 1, index 5 owner 2 */ ],
   "current_player": 1,
   "human_player": 1,
   "winner": 0,
@@ -553,7 +577,7 @@ curl -X POST http://localhost:8080/move \
 
 #### GET /stats
 
-Get current training statistics from `stats.json`.
+Get current training statistics from the server's selected runtime profile.
 
 **Request**
 
@@ -568,30 +592,39 @@ Host: localhost:8080
 {
   "step": 1500,
   "total_steps": 5000,
-  "total_loss": 0.2345,
-  "policy_loss": 0.1234,
-  "value_loss": 0.1111,
-  "replay_buffer_size": 125000,
+  "metrics": {
+    "loss/total": 0.2345,
+    "loss/policy": 0.1234,
+    "loss/value": 0.1111
+  },
+  "samples_seen": 192000,
+  "replay_record_count": 125000,
+  "last_checkpoint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "learning_rate": 0.0001,
   "timestamp": 1704067200.0,
   "env_id": "tictactoe",
-  "last_eval": {
+  "last_evaluation": {
     "step": 1500,
-    "win_rate": 0.72,
-    "draw_rate": 0.15,
-    "loss_rate": 0.13,
-    "games_played": 50,
-    "avg_game_length": 7.2,
+    "metrics": {
+      "outcome/win_rate": 0.72,
+      "outcome/draw_rate": 0.15,
+      "outcome/loss_rate": 0.13
+    },
+    "episodes": 50,
+    "mean_episode_length": 7.2,
     "timestamp": 1704067200.0
   },
-  "eval_history": [...],
+  "evaluation_history": [...],
   "history": [
     {
       "step": 100,
-      "total_loss": 0.8,
-      "policy_loss": 0.4,
-      "value_loss": 0.4,
-      "learning_rate": 0.001
+      "metrics": {
+        "loss/total": 0.8,
+        "loss/policy": 0.4,
+        "loss/value": 0.4
+      },
+      "learning_rate": 0.001,
+      "grad_norm": 0.73
     }
   ]
 }
@@ -603,27 +636,25 @@ Host: localhost:8080
 |-------|------|-------------|
 | `step` | number | Current training step |
 | `total_steps` | number | Total planned training steps |
-| `total_loss` | number | Combined loss (policy + value) |
-| `policy_loss` | number | Policy head loss |
-| `value_loss` | number | Value head loss |
-| `replay_buffer_size` | number | Number of transitions in buffer |
+| `metrics` | object | Finite algorithm-owned metric names and values |
+| `samples_seen` | number | Total learner samples consumed through this checkpoint |
+| `replay_record_count` | number | Number of records in the exact sealed replay selection |
+| `last_checkpoint` | string | SHA-256 identity of the latest committed checkpoint |
 | `learning_rate` | number | Current learning rate |
 | `timestamp` | number | Unix timestamp of last update |
 | `env_id` | string | Game being trained |
-| `last_eval` | EvalStats \| null | Most recent evaluation results |
-| `eval_history` | EvalStats[] | History of all evaluations |
-| `history` | HistoryEntry[] | Training loss history (downsampled) |
+| `last_evaluation` | EvaluationStats \| null | Most recent evaluation results |
+| `evaluation_history` | EvaluationStats[] | History of all evaluations |
+| `history` | HistoryEntry[] | Training metric history (downsampled) |
 
-**EvalStats Fields**
+**EvaluationStats Fields**
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `step` | number | Training step when evaluated |
-| `win_rate` | number | Win rate (0.0 - 1.0) |
-| `draw_rate` | number | Draw rate (0.0 - 1.0) |
-| `loss_rate` | number | Loss rate (0.0 - 1.0) |
-| `games_played` | number | Games in evaluation |
-| `avg_game_length` | number | Average moves per game |
+| `metrics` | object | Algorithm-owned metrics (for example win rate or mean return) |
+| `episodes` | number | Episodes in evaluation |
+| `mean_episode_length` | number | Average transitions per episode |
 | `timestamp` | number | Unix timestamp |
 
 **HistoryEntry Fields**
@@ -631,15 +662,19 @@ Host: localhost:8080
 | Field | Type | Description |
 |-------|------|-------------|
 | `step` | number | Training step |
-| `total_loss` | number | Total loss at step |
-| `policy_loss` | number | Policy loss at step |
-| `value_loss` | number | Value loss at step |
+| `metrics` | object | Algorithm-owned metrics at the step |
 | `learning_rate` | number | Learning rate at step |
+| `grad_norm` | number \| null | Gradient norm when recorded |
 
 **Notes**
 
-- Returns empty/default stats if `stats.json` doesn't exist
-- File is read from `{data_dir}/stats.json`
+- This endpoint reads the web projection from
+  `{data_root}/profiles/{algorithm_id}/{env_id}/v{env_contract_version}/stats.json`
+- Returns empty/default stats only while that projection does not exist
+- A present non-regular, unreadable, malformed, partial, or extra-field
+  projection is a contract error and returns HTTP 500
+- Learner resume does not trust this projection; its authoritative snapshot is
+  embedded in the immutable `RunCommitV1` selected by the sole RunHead
 - History is downsampled for large training runs
 
 **Example**
@@ -668,8 +703,9 @@ Host: localhost:8080
 ```json
 {
   "loaded": true,
-  "path": "/app/data/models/latest.onnx",
-  "file_modified": 1704067200,
+  "checkpoint_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "model_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "path": "/app/data/profiles/alphazero_board_v1/connect4/v1/models/blobs/sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.onnx",
   "loaded_at": 1704067210,
   "training_step": 1500,
   "status": "Model loaded (step 1500)"
@@ -681,8 +717,9 @@ Host: localhost:8080
 ```json
 {
   "loaded": false,
+  "checkpoint_id": null,
+  "model_sha256": null,
   "path": null,
-  "file_modified": null,
   "loaded_at": null,
   "training_step": null,
   "status": "No model loaded - bot plays randomly"
@@ -694,17 +731,35 @@ Host: localhost:8080
 | Field | Type | Description |
 |-------|------|-------------|
 | `loaded` | boolean | Is a model currently loaded? |
-| `path` | string \| null | Path to model file |
-| `file_modified` | number \| null | File modification time (Unix timestamp) |
+| `checkpoint_id` | string \| null | SHA-256 identity of the canonical checkpoint manifest |
+| `model_sha256` | string \| null | SHA-256 identity of the immutable ONNX blob |
+| `path` | string \| null | Local cache path or S3 URI of the loaded immutable ONNX blob |
 | `loaded_at` | number \| null | When model was loaded (Unix timestamp) |
-| `training_step` | number \| null | Training step (parsed from filename) |
+| `training_step` | number \| null | Training step declared by the verified manifest |
 | `status` | string | Human-readable status message |
 
 **Model Loading**
 
-- Server watches `{data_dir}/models/latest.onnx` for changes
-- Hot-reloads model automatically when file changes
-- Bot plays randomly if no model is loaded
+- Filesystem mode watches
+  `{data_root}/profiles/{algorithm_id}/{env_id}/v{env_contract_version}/models/channels/current.json`;
+  S3 mode polls the equivalent object key
+- This sole mutable `RunHeadV2` selects a fully validated immutable
+  RunCommit/checkpoint chain. Learner continuation and bounded collection use
+  the latest checkpoint, while web inference uses the champion stored in the
+  latest RunCommit, falling back to latest before the first promotion
+- Hot reload tracks accepted RunHead generations, not only checkpoint-ID
+  changes. A generation is accepted even when promotion retains the same
+  champion; the selected manifest and ONNX blob are still fully revalidated
+- Requires ONNX custom metadata `cartridge.schema_version=1` plus exact
+  `cartridge.algorithm_id`, `cartridge.model_contract`, `cartridge.env_id`,
+  and `cartridge.env_contract_version` values for the
+  configured profile
+- Bot plays randomly only when the `current` channel is absent (or no valid
+  checkpoint has yet been loaded)
+- A present invalid pointer, manifest, blob, or model fails initial server
+  startup; an invalid hot reload is logged and leaves the last valid checkpoint
+  active
+- Mutable legacy model files are not discovered or migrated
 
 **Example**
 
@@ -714,67 +769,7 @@ curl http://localhost:8080/model
 
 ---
 
-### 5.6 Actor Statistics
-
-#### GET /actor-stats
-
-Get self-play statistics written by the actor to `{data_dir}/actor_stats.json`.
-Returns zeroed defaults if the file doesn't exist yet.
-
-**Request**
-
-```http
-GET /actor-stats HTTP/1.1
-Host: localhost:8080
-```
-
-**Response**
-
-```json
-{
-  "env_id": "connect4",
-  "episodes_completed": 1250,
-  "total_steps": 31875,
-  "player1_wins": 640,
-  "player2_wins": 545,
-  "draws": 65,
-  "episodes_abandoned": 0,
-  "transitions_discarded": 0,
-  "avg_episode_length": 25.5,
-  "episodes_per_second": 3.2,
-  "runtime_seconds": 390.6,
-  "mcts_avg_inference_us": 850.0,
-  "timestamp": 1704067200
-}
-```
-
-**Response Fields**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `env_id` | string | Game being self-played |
-| `episodes_completed` | number | Episodes finished |
-| `total_steps` | number | Total game steps across all episodes |
-| `player1_wins` | number | Episodes won by player 1 |
-| `player2_wins` | number | Episodes won by player 2 |
-| `draws` | number | Episodes ending in a draw |
-| `episodes_abandoned` | number | Episodes that ended without reaching a terminal state (wall-clock timeout or step guard). Their transitions were **discarded** — non-zero means self-play data is being lost, biased toward the longest episodes. |
-| `transitions_discarded` | number | Transitions discarded with those episodes |
-| `avg_episode_length` | number | Average moves per episode |
-| `episodes_per_second` | number | Self-play throughput |
-| `runtime_seconds` | number | Total actor runtime |
-| `mcts_avg_inference_us` | number | Average MCTS inference time (µs) |
-| `timestamp` | number | Unix timestamp of last update |
-
-**Example**
-
-```bash
-curl http://localhost:8080/actor-stats
-```
-
----
-
-### 5.7 Prometheus Metrics
+### 5.6 Prometheus Metrics
 
 #### GET /metrics
 
@@ -817,12 +812,18 @@ interface GameInfo {
   player_names: string[];
   player_symbols: string[];
   description: string;
-  board_type: 'grid' | 'drop_column';
+  board_type: 'grid' | 'drop_column' | 'generals';
 }
 
 // Game session
+interface Cell {
+  owner: number;
+  kind: 'normal' | 'general' | 'city' | 'mountain';
+  value: number;
+}
+
 interface GameState {
-  board: number[];
+  cells: Cell[];
   current_player: number;
   human_player: number;
   winner: number;
@@ -848,62 +849,44 @@ interface MoveRequest {
 interface TrainingStats {
   step: number;
   total_steps: number;
-  total_loss: number;
-  policy_loss: number;
-  value_loss: number;
-  replay_buffer_size: number;
+  metrics: Record<string, number>;
+  samples_seen: number;
+  replay_record_count: number;
+  last_checkpoint: string;
   learning_rate: number;
   timestamp: number;
   env_id: string;
-  last_eval: EvalStats | null;
-  eval_history: EvalStats[];
+  last_evaluation: EvaluationStats | null;
+  evaluation_history: EvaluationStats[];
   history: HistoryEntry[];
 }
 
-interface EvalStats {
+interface EvaluationStats {
   step: number;
-  win_rate: number;
-  draw_rate: number;
-  loss_rate: number;
-  games_played: number;
-  avg_game_length: number;
+  metrics: Record<string, number>;
+  episodes: number;
+  mean_episode_length: number;
   timestamp: number;
 }
 
 interface HistoryEntry {
   step: number;
-  total_loss: number;
-  policy_loss: number;
-  value_loss: number;
+  metrics: Record<string, number>;
   learning_rate: number;
+  grad_norm: number | null;
 }
 
 // Model info
 interface ModelInfo {
   loaded: boolean;
+  checkpoint_id: string | null;
+  model_sha256: string | null;
   path: string | null;
-  file_modified: number | null;
   loaded_at: number | null;
   training_step: number | null;
   status: string;
 }
 
-// Actor self-play statistics
-interface ActorStats {
-  env_id: string;
-  episodes_completed: number;
-  total_steps: number;
-  player1_wins: number;
-  player2_wins: number;
-  draws: number;
-  episodes_abandoned: number;
-  transitions_discarded: number;
-  avg_episode_length: number;
-  episodes_per_second: number;
-  runtime_seconds: number;
-  mcts_avg_inference_us: number;
-  timestamp: number;
-}
 ```
 
 ### Rust Definitions
@@ -1078,30 +1061,23 @@ The server handles requests as fast as possible. For production deployments, con
 ### Complete Game Flow
 
 ```bash
-# 1. Check available games
-curl http://localhost:8080/games
-# Response: {"games":["connect4"]}   <- only the configured game
+# 1. Resolve the one configured game
+GAME="$(curl -s http://localhost:8080/games | jq -r '.games[0]')"
 
 # 2. Get game info
-curl http://localhost:8080/game-info/tictactoe
-# Response: {"env_id":"tictactoe","display_name":"Tic-Tac-Toe",...}
+curl "http://localhost:8080/game-info/$GAME"
 
 # 3. Start new game (player first)
 curl -X POST http://localhost:8080/game/new \
   -H "Content-Type: application/json" \
-  -d '{"first": "player", "game": "tictactoe"}'
-# Response: {"board":[0,0,0,0,0,0,0,0,0],"current_player":1,...}
+  -d "{\"first\": \"player\", \"game\": \"$GAME\"}"
+# Response: {"cells":[{"owner":0,"kind":"normal","value":0},...],"current_player":1,...}
 
-# 4. Make moves until game ends
+# 4. Submit an action index advertised in legal_moves
 curl -X POST http://localhost:8080/move \
   -H "Content-Type: application/json" \
   -d '{"position": 4}'
-# Response: {"board":[0,0,0,0,1,2,0,0,0],"bot_move":5,...}
-
-curl -X POST http://localhost:8080/move \
-  -H "Content-Type: application/json" \
-  -d '{"position": 0}'
-# Response: {"board":[1,0,2,0,1,2,0,0,0],"bot_move":2,...}
+# Response: {"cells":[...],"bot_move":5,...}
 
 # 5. Continue until winner != 0 or game_over == true
 ```
@@ -1115,7 +1091,7 @@ curl http://localhost:8080/model
 
 # Get training stats
 curl http://localhost:8080/stats
-# Response: {"step":1500,"total_loss":0.234,...}
+# Response: {"step":1500,"metrics":{"loss/total":0.234},...}
 
 # Monitor training progress
 watch -n 5 'curl -s http://localhost:8080/stats | jq .step'
@@ -1298,7 +1274,6 @@ curl -s http://localhost:8080/game/state | jq '.board | . as $b | [range(0;9)] |
 | POST | `/game/new` | Start new game |
 | POST | `/move` | Make a move |
 | GET | `/stats` | Get training statistics |
-| GET | `/actor-stats` | Get actor self-play statistics |
 | GET | `/model` | Get model info |
 
 ### Status Code Quick Reference

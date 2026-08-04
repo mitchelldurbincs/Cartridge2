@@ -20,6 +20,7 @@ static DEFAULTS: Lazy<DefaultsConfig> =
 #[derive(Debug, Deserialize)]
 struct DefaultsConfig {
     common: CommonDefaults,
+    algorithm: AlgorithmDefaults,
     training: TrainingDefaults,
     evaluation: EvaluationDefaults,
     actor: ActorDefaults,
@@ -27,6 +28,7 @@ struct DefaultsConfig {
     mcts: MctsDefaults,
     logging: LoggingDefaults,
     storage: StorageDefaults,
+    wandb: WandbDefaults,
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,37 +39,43 @@ struct CommonDefaults {
 }
 
 #[derive(Debug, Deserialize)]
+struct AlgorithmDefaults {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct TrainingDefaults {
-    iterations: i32,
-    start_iteration: i32,
-    episodes_per_iteration: i32,
-    steps_per_iteration: i32,
-    batch_size: i32,
+    iterations: u64,
+    episodes_per_iteration: u32,
+    steps_per_iteration: u64,
+    batch_size: u64,
     learning_rate: f64,
     weight_decay: f64,
     grad_clip_norm: f64,
     device: String,
-    checkpoint_interval: i32,
-    max_checkpoints: i32,
-    num_actors: i32,
+    checkpoint_interval: u64,
+    num_actors: u32,
 }
 
 #[derive(Debug, Deserialize)]
 struct EvaluationDefaults {
-    interval: i32,
-    games: i32,
+    interval: u64,
+    games: u32,
     win_threshold: f64,
     eval_vs_random: bool,
+    simulations: u32,
+    temperature: f32,
+    solver_games: u32,
+    evaluation_seed: u64,
+    promotion_metric: String,
+    promotion_margin: f64,
 }
 
 #[derive(Debug, Deserialize)]
 struct ActorDefaults {
     actor_id: String,
-    max_episodes: i32,
     episode_timeout_secs: u64,
-    flush_interval_secs: u64,
     log_interval: u32,
-    health_port: u16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,14 +88,14 @@ struct WebDefaults {
 
 #[derive(Debug, Deserialize)]
 struct MctsDefaults {
-    num_simulations: u32,
-    c_puct: f64,
-    temperature: f64,
+    c_puct: f32,
+    temperature: f32,
+    late_temperature: f32,
     temp_threshold: u32,
-    dirichlet_alpha: f64,
-    dirichlet_weight: f64,
-    eval_batch_size: usize,
-    onnx_intra_threads: usize,
+    dirichlet_alpha: f32,
+    dirichlet_weight: f32,
+    eval_batch_size: u32,
+    onnx_intra_threads: u32,
     start_sims: u32,
     max_sims: u32,
     sim_ramp_rate: u32,
@@ -109,6 +117,17 @@ struct StorageDefaults {
     pool_idle_timeout: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct WandbDefaults {
+    enabled: bool,
+    required: bool,
+    project: String,
+    entity: String,
+    group: String,
+    tags: Vec<String>,
+    init_timeout_seconds: f64,
+}
+
 // ============================================================================
 // Public accessor functions
 // ============================================================================
@@ -124,20 +143,22 @@ pub fn log_level() -> &'static str {
     &DEFAULTS.common.log_level
 }
 
+// Algorithm
+pub fn algorithm_id() -> &'static str {
+    &DEFAULTS.algorithm.id
+}
+
 // Training
-pub fn iterations() -> i32 {
+pub fn iterations() -> u64 {
     DEFAULTS.training.iterations
 }
-pub fn start_iteration() -> i32 {
-    DEFAULTS.training.start_iteration
-}
-pub fn episodes_per_iteration() -> i32 {
+pub fn episodes_per_iteration() -> u32 {
     DEFAULTS.training.episodes_per_iteration
 }
-pub fn steps_per_iteration() -> i32 {
+pub fn steps_per_iteration() -> u64 {
     DEFAULTS.training.steps_per_iteration
 }
-pub fn batch_size() -> i32 {
+pub fn batch_size() -> u64 {
     DEFAULTS.training.batch_size
 }
 pub fn learning_rate() -> f64 {
@@ -152,21 +173,18 @@ pub fn grad_clip_norm() -> f64 {
 pub fn device() -> &'static str {
     &DEFAULTS.training.device
 }
-pub fn checkpoint_interval() -> i32 {
+pub fn checkpoint_interval() -> u64 {
     DEFAULTS.training.checkpoint_interval
 }
-pub fn max_checkpoints() -> i32 {
-    DEFAULTS.training.max_checkpoints
-}
-pub fn num_actors() -> i32 {
+pub fn num_actors() -> u32 {
     DEFAULTS.training.num_actors
 }
 
 // Evaluation
-pub fn eval_interval() -> i32 {
+pub fn eval_interval() -> u64 {
     DEFAULTS.evaluation.interval
 }
-pub fn eval_games() -> i32 {
+pub fn eval_games() -> u32 {
     DEFAULTS.evaluation.games
 }
 pub fn win_threshold() -> f64 {
@@ -175,25 +193,34 @@ pub fn win_threshold() -> f64 {
 pub fn eval_vs_random() -> bool {
     DEFAULTS.evaluation.eval_vs_random
 }
+pub fn eval_simulations() -> u32 {
+    DEFAULTS.evaluation.simulations
+}
+pub fn eval_temperature() -> f32 {
+    DEFAULTS.evaluation.temperature
+}
+pub fn solver_games() -> u32 {
+    DEFAULTS.evaluation.solver_games
+}
+pub fn evaluation_seed() -> u64 {
+    DEFAULTS.evaluation.evaluation_seed
+}
+pub fn promotion_metric() -> &'static str {
+    &DEFAULTS.evaluation.promotion_metric
+}
+pub fn promotion_margin() -> f64 {
+    DEFAULTS.evaluation.promotion_margin
+}
 
 // Actor
 pub fn actor_id() -> &'static str {
     &DEFAULTS.actor.actor_id
 }
-pub fn max_episodes() -> i32 {
-    DEFAULTS.actor.max_episodes
-}
 pub fn episode_timeout_secs() -> u64 {
     DEFAULTS.actor.episode_timeout_secs
 }
-pub fn flush_interval_secs() -> u64 {
-    DEFAULTS.actor.flush_interval_secs
-}
 pub fn log_interval() -> u32 {
     DEFAULTS.actor.log_interval
-}
-pub fn health_port() -> u16 {
-    DEFAULTS.actor.health_port
 }
 
 // Web
@@ -208,28 +235,28 @@ pub fn allowed_origins() -> &'static [String] {
 }
 
 // MCTS
-pub fn num_simulations() -> u32 {
-    DEFAULTS.mcts.num_simulations
-}
-pub fn c_puct() -> f64 {
+pub fn c_puct() -> f32 {
     DEFAULTS.mcts.c_puct
 }
-pub fn temperature() -> f64 {
+pub fn temperature() -> f32 {
     DEFAULTS.mcts.temperature
+}
+pub fn late_temperature() -> f32 {
+    DEFAULTS.mcts.late_temperature
 }
 pub fn temp_threshold() -> u32 {
     DEFAULTS.mcts.temp_threshold
 }
-pub fn dirichlet_alpha() -> f64 {
+pub fn dirichlet_alpha() -> f32 {
     DEFAULTS.mcts.dirichlet_alpha
 }
-pub fn dirichlet_weight() -> f64 {
+pub fn dirichlet_weight() -> f32 {
     DEFAULTS.mcts.dirichlet_weight
 }
-pub fn eval_batch_size() -> usize {
+pub fn eval_batch_size() -> u32 {
     DEFAULTS.mcts.eval_batch_size
 }
-pub fn onnx_intra_threads() -> usize {
+pub fn onnx_intra_threads() -> u32 {
     DEFAULTS.mcts.onnx_intra_threads
 }
 pub fn start_sims() -> u32 {
@@ -270,6 +297,30 @@ pub fn pool_idle_timeout() -> u64 {
     DEFAULTS.storage.pool_idle_timeout
 }
 
+// W&B (parsed by Rust so the canonical config has one strict schema even
+// though only the Python orchestration component consumes these values).
+pub fn wandb_enabled() -> bool {
+    DEFAULTS.wandb.enabled
+}
+pub fn wandb_required() -> bool {
+    DEFAULTS.wandb.required
+}
+pub fn wandb_project() -> &'static str {
+    &DEFAULTS.wandb.project
+}
+pub fn wandb_entity() -> &'static str {
+    &DEFAULTS.wandb.entity
+}
+pub fn wandb_group() -> &'static str {
+    &DEFAULTS.wandb.group
+}
+pub fn wandb_tags() -> &'static [String] {
+    &DEFAULTS.wandb.tags
+}
+pub fn wandb_init_timeout_seconds() -> f64 {
+    DEFAULTS.wandb.init_timeout_seconds
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +331,7 @@ mod tests {
         assert_eq!(data_dir(), "./data");
         assert_eq!(env_id(), "tictactoe");
         assert_eq!(log_level(), "info");
+        assert_eq!(algorithm_id(), "alphazero_board_v1");
     }
 
     #[test]
@@ -292,8 +344,8 @@ mod tests {
 
     #[test]
     fn test_mcts_defaults() {
-        assert_eq!(num_simulations(), 800);
-        assert!((c_puct() - 1.4).abs() < f64::EPSILON);
+        assert!((c_puct() - 1.4).abs() < f32::EPSILON);
+        assert!((late_temperature() - 1.0).abs() < f32::EPSILON);
         assert_eq!(temp_threshold(), 0);
         assert_eq!(start_sims(), 50);
         assert_eq!(max_sims(), 400);
@@ -306,6 +358,7 @@ mod tests {
         assert_eq!(eval_games(), 50);
         assert!((win_threshold() - 0.55).abs() < f64::EPSILON);
         assert!(eval_vs_random());
+        assert!((eval_temperature() - 0.2).abs() < f32::EPSILON);
     }
 
     #[test]

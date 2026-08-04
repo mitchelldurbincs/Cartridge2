@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { GameInfo } from './lib/api';
+  import type { CellView, GameInfo } from './lib/api';
 
   // ============================================================================
   // Layout Constants
@@ -46,7 +46,7 @@
   // ============================================================================
 
   interface Props {
-    board: number[];
+    cells: CellView[];
     legalMoves: number[];
     gameOver: boolean;
     lastBotMove: number | null;
@@ -56,7 +56,7 @@
   }
 
   let {
-    board,
+    cells,
     legalMoves,
     gameOver,
     lastBotMove,
@@ -64,6 +64,11 @@
     currentPlayer,
     onCellClick
   }: Props = $props();
+
+  // The grid and drop-column renderers only care about occupancy, and both
+  // predate the engine's richer cell projection. Deriving the flat owner array
+  // here keeps them untouched rather than threading CellView through both.
+  let board = $derived(cells.map((cell) => cell.owner));
 
   // Extract dimensions from metadata
   let width = $derived(gameInfo.board_width);
@@ -245,6 +250,114 @@
     return cellTop + holeOffset + pieceOffset;
   }
 
+  // ============================================================================
+  // Generals Board
+  // ============================================================================
+  //
+  // A Generals move is (tile, direction), encoded as `tile * 4 + dir` with
+  // dir 0=up, 1=right, 2=down, 3=left (see games-generals/src/action.rs), plus
+  // a wait action at the end. So a click cannot be a move on its own: pick a
+  // source tile first, then an adjacent target.
+
+  /** Direction offsets in the engine's canonical order: up, right, down, left. */
+  const GEN_DIR_DX = [0, 1, 0, -1];
+  const GEN_DIR_DY = [-1, 0, 1, 0];
+
+  const GENERALS_MAX_SIZE = 440;
+
+  let generalsCellSize = $derived(
+    Math.floor(Math.min(GENERALS_MAX_SIZE / width, GENERALS_MAX_SIZE / height))
+  );
+  let generalsStyle = $derived(`grid-template-columns: repeat(${width}, ${generalsCellSize}px)`);
+
+  let selectedTile: number | null = $state(null);
+
+  /** The wait action is the last index; every other action is a (tile, dir) move. */
+  let waitAction = $derived(gameInfo.num_actions - 1);
+
+  function generalsAction(from: number, dir: number): number {
+    return from * 4 + dir;
+  }
+
+  /** A tile can be picked when at least one of its four moves is legal. */
+  function isSourceTile(index: number): boolean {
+    if (gameOver) return false;
+    return [0, 1, 2, 3].some((dir) => legalMoves.includes(generalsAction(index, dir)));
+  }
+
+  /** Direction from `selectedTile` to `index`, or null if not adjacent. */
+  function directionTo(from: number, to: number): number | null {
+    const fx = from % width;
+    const fy = Math.floor(from / width);
+    for (let dir = 0; dir < 4; dir++) {
+      const nx = fx + GEN_DIR_DX[dir];
+      const ny = fy + GEN_DIR_DY[dir];
+      if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+      if (ny * width + nx === to) return dir;
+    }
+    return null;
+  }
+
+  function isTargetTile(index: number): boolean {
+    if (selectedTile === null) return false;
+    const dir = directionTo(selectedTile, index);
+    return dir !== null && legalMoves.includes(generalsAction(selectedTile, dir));
+  }
+
+  function handleGeneralsClick(index: number) {
+    if (gameOver) return;
+
+    if (selectedTile !== null) {
+      const dir = directionTo(selectedTile, index);
+      if (dir !== null && legalMoves.includes(generalsAction(selectedTile, dir))) {
+        const action = generalsAction(selectedTile, dir);
+        selectedTile = null;
+        onCellClick(action);
+        return;
+      }
+      // Clicking elsewhere re-picks (or clears) the source rather than
+      // silently doing nothing.
+      selectedTile = index === selectedTile || !isSourceTile(index) ? null : index;
+      return;
+    }
+
+    if (isSourceTile(index)) selectedTile = index;
+  }
+
+  function handleGeneralsWait() {
+    if (gameOver || !legalMoves.includes(waitAction)) return;
+    selectedTile = null;
+    onCellClick(waitAction);
+  }
+
+  // A move by either side invalidates the pending selection.
+  $effect(() => {
+    void cells;
+    selectedTile = null;
+  });
+
+  function getGeneralsCellClass(index: number, cell: CellView): string {
+    let classes = `gen-cell gen-${cell.kind}`;
+    if (cell.owner === 1) classes += ' player1';
+    if (cell.owner === 2) classes += ' player2';
+    if (index === selectedTile) classes += ' selected';
+    else if (isTargetTile(index)) classes += ' target';
+    else if (selectedTile === null && isSourceTile(index)) classes += ' selectable';
+    return classes;
+  }
+
+  /** Terrain marker; a general or city keeps it alongside its army count. */
+  function terrainGlyph(cell: CellView): string {
+    if (cell.kind === 'mountain') return '▲';
+    if (cell.kind === 'general') return '★';
+    if (cell.kind === 'city') return '◉';
+    return '';
+  }
+
+  function armyLabel(cell: CellView): string {
+    return cell.value > 0 ? String(cell.value) : '';
+  }
+
   function getDropX(col: number): number {
     const paddingOffset = DROP_FRAME_PADDING + DROP_GRID_PADDING;
     // Position at cell left + offset to center of hole + offset to center piece within hole
@@ -348,6 +461,42 @@
 
       <!-- Board stand -->
       <div class="board-stand"></div>
+    </div>
+  </div>
+{:else if boardType === 'generals'}
+  <!-- Generals: terrain grid, select a source tile then an adjacent target -->
+  <div class="generals-container">
+    <div class="generals-board" style={generalsStyle}>
+      {#each cells as cell, i}
+        <button
+          class={getGeneralsCellClass(i, cell)}
+          style="width: {generalsCellSize}px; height: {generalsCellSize}px;"
+          onclick={() => handleGeneralsClick(i)}
+          disabled={gameOver}
+          aria-label={`Tile ${i % width},${Math.floor(i / width)}`}
+        >
+          <span class="gen-terrain">{terrainGlyph(cell)}</span>
+          <span class="gen-army">{armyLabel(cell)}</span>
+        </button>
+      {/each}
+    </div>
+    <div class="generals-controls">
+      <span class="generals-hint">
+        {#if gameOver}
+          Game over
+        {:else if selectedTile === null}
+          Pick one of your tiles to move from
+        {:else}
+          Now pick an adjacent tile — or click again to cancel
+        {/if}
+      </span>
+      <button
+        class="generals-wait"
+        onclick={handleGeneralsWait}
+        disabled={gameOver || !legalMoves.includes(waitAction)}
+      >
+        Wait
+      </button>
     </div>
   </div>
 {:else}
@@ -600,6 +749,117 @@
     box-shadow:
       0 4px 8px rgba(0, 0, 0, 0.3),
       inset 0 1px 2px rgba(255, 255, 255, 0.1);
+  }
+
+  /* ============================================================================
+   * Generals Board Styles
+   * ============================================================================ */
+  .generals-container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.75rem;
+    user-select: none;
+  }
+
+  .generals-board {
+    display: grid;
+    gap: 2px;
+    padding: 8px;
+    background: #2a2a4a;
+    border-radius: 12px;
+  }
+
+  .gen-cell {
+    position: relative;
+    background: #3a3a5a;
+    border: 2px solid transparent;
+    border-radius: 4px;
+    cursor: default;
+    transition: all 0.15s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #cfcfe6;
+    font-size: 0.8rem;
+    font-weight: bold;
+    padding: 0;
+  }
+
+  .gen-terrain {
+    position: absolute;
+    top: 1px;
+    left: 3px;
+    font-size: 0.6rem;
+    opacity: 0.85;
+  }
+
+  .gen-cell.gen-mountain {
+    background: #23233a;
+    color: #6a6a8a;
+  }
+
+  .gen-cell.gen-city {
+    background: #45456a;
+  }
+
+  .gen-cell.player1 {
+    background: #1c5f70;
+    color: #d6f7ff;
+  }
+
+  .gen-cell.player2 {
+    background: #7a2f2f;
+    color: #ffe0e0;
+  }
+
+  .gen-cell.selectable {
+    cursor: pointer;
+    border-color: #4a4a6a;
+  }
+
+  .gen-cell.selectable:hover {
+    border-color: #00d9ff;
+  }
+
+  .gen-cell.selected {
+    cursor: pointer;
+    border-color: #ffd34d;
+    box-shadow: 0 0 8px rgba(255, 211, 77, 0.6);
+  }
+
+  .gen-cell.target {
+    cursor: pointer;
+    border-color: #6be36b;
+  }
+
+  .gen-cell.target:hover {
+    background: #3f6a3f;
+  }
+
+  .generals-controls {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+  }
+
+  .generals-hint {
+    color: #9a9ab8;
+    font-size: 0.85rem;
+  }
+
+  .generals-wait {
+    background: #3a3a5a;
+    border: 1px solid #4a4a6a;
+    border-radius: 6px;
+    color: #cfcfe6;
+    cursor: pointer;
+    padding: 0.35rem 0.9rem;
+  }
+
+  .generals-wait:disabled {
+    cursor: default;
+    opacity: 0.5;
   }
 
   /* ============================================================================

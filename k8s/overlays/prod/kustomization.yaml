@@ -1,5 +1,5 @@
 # Production overlay
-# Higher replicas, production-grade settings, external storage
+# Production-sized synchronized-run resources
 #
 # Deploy with: kubectl apply -k k8s/overlays/prod
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -9,38 +9,14 @@ namespace: cartridge
 
 resources:
   - ../../base
+  - filestore-storageclass.yaml
 
 # Production-specific patches
 patches:
-  # Scale up actors for production
+  # Production resource limits for the loop and its collector subprocesses.
   - patch: |-
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: actor
-      spec:
-        replicas: 8
-    target:
-      kind: Deployment
-      name: actor
-
-  # Higher HPA limits for production
-  - patch: |-
-      apiVersion: autoscaling/v2
-      kind: HorizontalPodAutoscaler
-      metadata:
-        name: actor-hpa
-      spec:
-        minReplicas: 4
-        maxReplicas: 32
-    target:
-      kind: HorizontalPodAutoscaler
-      name: actor-hpa
-
-  # Production resource limits
-  - patch: |-
-      apiVersion: apps/v1
-      kind: Deployment
+      apiVersion: batch/v1
+      kind: Job
       metadata:
         name: trainer
       spec:
@@ -56,34 +32,50 @@ patches:
                     memory: "8Gi"
                     cpu: "4000m"
     target:
-      kind: Deployment
+      kind: Job
       name: trainer
 
-  # Larger storage for production
+  # Current GKE Basic HDD Filestore supports claims beginning at 100 GiB.
   - patch: |-
       apiVersion: v1
       kind: PersistentVolumeClaim
       metadata:
-        name: models-shared
+        name: runtime-data
       spec:
         resources:
           requests:
-            storage: 50Gi
+            storage: 100Gi
     target:
       kind: PersistentVolumeClaim
-      name: models-shared
+      name: runtime-data
 
-  # Use EFS storage class for ReadWriteMany (AWS)
+  # Production training settings
+  - patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: cartridge-config
+      data:
+        EPISODES_PER_ITERATION: "1000"
+        STEPS_PER_ITERATION: "800"
+        NUM_ACTORS: "8"
+        MCTS_MAX_SIMS: "800"
+    target:
+      kind: ConfigMap
+      name: cartridge-config
+
+  # GKE Autopilot enables the Filestore CSI driver. This overlay's custom class
+  # targets the Terraform-managed production VPC rather than the default VPC.
   - patch: |-
       apiVersion: v1
       kind: PersistentVolumeClaim
       metadata:
-        name: models-shared
+        name: runtime-data
       spec:
-        storageClassName: efs-sc
+        storageClassName: cartridge-prod-filestore-rwx
     target:
       kind: PersistentVolumeClaim
-      name: models-shared
+      name: runtime-data
 
 # Use registry images for production
 images:
@@ -96,14 +88,3 @@ images:
   - name: cartridge-frontend
     newName: your-registry.example.com/cartridge/frontend
     newTag: v1.0.0
-
-# Production ConfigMap patches
-configMapGenerator:
-  - name: cartridge-config
-    behavior: merge
-    literals:
-      # Production training settings
-      - TRAINING_ITERATIONS=1000
-      - EPISODES_PER_ITERATION=1000
-      - STEPS_PER_ITERATION=800
-      - MCTS_MAX_SIMS=800

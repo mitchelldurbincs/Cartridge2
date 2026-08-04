@@ -1,7 +1,19 @@
 // API client for the Cartridge2 backend
 
+/** Terrain of a cell. Mirrors engine_core::board_profile::CellKind. */
+export type CellKind = 'normal' | 'general' | 'city' | 'mountain';
+
+/** One board cell, straight from the engine's BoardView. */
+export interface CellView {
+  /** 0 = empty/neutral, 1/2 = owning player. */
+  owner: number;
+  kind: CellKind;
+  /** Per-cell quantity (Generals' army count); 0 for the flat games. */
+  value: number;
+}
+
 export interface GameState {
-  board: number[];
+  cells: CellView[];
   current_player: number;
   human_player: number;
   winner: number;
@@ -20,7 +32,7 @@ export interface GameInfo {
   player_names: string[];
   player_symbols: string[];
   description: string;
-  board_type: 'grid' | 'drop_column';
+  board_type: 'grid' | 'drop_column' | 'generals';
 }
 
 export interface GamesListResponse {
@@ -33,20 +45,11 @@ export interface MoveResponse extends GameState {
 
 export interface EvalStats {
   step: number;
-  current_iteration: number;
-  // Model vs Best (gatekeeper) results
-  opponent: 'best' | 'random';
-  opponent_iteration: number | null;
   win_rate: number;
   draw_rate: number;
   loss_rate: number;
-  became_new_best: boolean;
-  // Model vs Random results (optional)
-  vs_random_win_rate: number | null;
-  vs_random_draw_rate: number | null;
-  // Metadata
   games_played: number;
-  avg_game_length?: number;
+  avg_game_length: number;
   timestamp: number;
 }
 
@@ -56,7 +59,7 @@ export interface HistoryEntry {
   value_loss: number;
   policy_loss: number;
   learning_rate: number;
-  grad_norm?: number;  // Optional: only present when gradient clipping is enabled
+  grad_norm: number | null;
 }
 
 export interface TrainingStats {
@@ -65,7 +68,9 @@ export interface TrainingStats {
   total_loss: number;
   policy_loss: number;
   value_loss: number;
-  replay_buffer_size: number;
+  samples_seen: number;
+  replay_record_count: number;
+  last_checkpoint: string;
   learning_rate: number;
   timestamp: number;
   env_id: string;
@@ -81,8 +86,9 @@ export interface HealthResponse {
 
 export interface ModelInfo {
   loaded: boolean;
+  checkpoint_id: string | null;
+  model_sha256: string | null;
   path: string | null;
-  file_modified: number | null;
   loaded_at: number | null;
   training_step: number | null;
   status: string;
@@ -141,26 +147,6 @@ export async function getStats(): Promise<TrainingStats> {
 export async function getModelInfo(): Promise<ModelInfo> {
   const res = await fetch(`${API_BASE}/model`);
   if (!res.ok) throw new Error('Failed to get model info');
-  return res.json();
-}
-
-export interface ActorStats {
-  env_id: string;
-  episodes_completed: number;
-  total_steps: number;
-  player1_wins: number;
-  player2_wins: number;
-  draws: number;
-  avg_episode_length: number;
-  episodes_per_second: number;
-  runtime_seconds: number;
-  mcts_avg_inference_us: number;
-  timestamp: number;
-}
-
-export async function getActorStats(): Promise<ActorStats> {
-  const res = await fetch(`${API_BASE}/actor-stats`);
-  if (!res.ok) throw new Error('Failed to get actor stats');
   return res.json();
 }
 

@@ -24,12 +24,29 @@ spec:
         app.kubernetes.io/name: web
         app.kubernetes.io/component: api
         app.kubernetes.io/part-of: cartridge2
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "8080"
     spec:
+      securityContext:
+        # Match the explicit image identity and preserve read access to files
+        # projected by the trainer into the shared runtime-data claim.
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: web
-          # Build with: docker build -f web/Dockerfile -t cartridge-web .
+          # Build with S3 support; see k8s/README.md.
           image: cartridge-web:latest
           imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           ports:
             - containerPort: 8080
               name: http
@@ -50,6 +67,38 @@ spec:
                 configMapKeyRef:
                   name: cartridge-config
                   key: ENV_ID
+            - name: CARTRIDGE_ALGORITHM_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: cartridge-config
+                  key: ALGORITHM_ID
+            - name: CARTRIDGE_STORAGE_MODEL_BACKEND
+              value: "s3"
+            - name: CARTRIDGE_STORAGE_S3_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: cartridge-config
+                  key: S3_ENDPOINT
+            - name: CARTRIDGE_STORAGE_S3_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: cartridge-config
+                  key: S3_BUCKET
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: cartridge-config
+                  key: AWS_REGION
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: AWS_SECRET_ACCESS_KEY
           volumeMounts:
             - name: data
               mountPath: /data
@@ -76,7 +125,7 @@ spec:
       volumes:
         - name: data
           persistentVolumeClaim:
-            claimName: models-shared
+            claimName: runtime-data
 ---
 # Frontend Deployment - Nginx serving Svelte app
 apiVersion: apps/v1

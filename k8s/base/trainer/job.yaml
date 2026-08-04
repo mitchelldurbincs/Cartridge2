@@ -1,0 +1,188 @@
+# Synchronized AlphaZero run.
+#
+# One process owns every collection scope and runs the complete immutable
+# recipe: bounded collectors -> learner -> evaluation -> RunHead commit.  It is
+# a Job because reaching the configured global iteration target is success,
+# not a reason for Kubernetes to restart the process forever.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: trainer
+  namespace: cartridge
+  labels:
+    app.kubernetes.io/name: trainer
+    app.kubernetes.io/component: training
+    app.kubernetes.io/part-of: cartridge2
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: trainer
+        app.kubernetes.io/component: training
+        app.kubernetes.io/part-of: cartridge2
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "9090"
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        # The image pins the cartridge user/group to 1000. Grant that group
+        # write access to the profile projection PVC on first mount.
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z postgres 5432; do
+                echo "PostgreSQL not ready, waiting..."
+                sleep 2
+              done
+        - name: wait-for-minio
+          image: minio/mc:RELEASE.2024-11-05T11-29-45Z
+          command:
+            - sh
+            - -c
+            - |
+              until mc alias set cartridge http://minio:9000 "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" \
+                && mc ls cartridge/cartridge-models >/dev/null; do
+                echo "MinIO bucket not ready, waiting..."
+                sleep 2
+              done
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+      containers:
+        - name: trainer
+          # This image contains the Python orchestrator plus the bounded Rust
+          # collector and evaluator binaries it launches.
+          image: cartridge-alphazero:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - name: metrics
+              containerPort: 9090
+          command:
+            - python
+            - -m
+            - trainer
+            - --algorithm=$(CARTRIDGE_ALGORITHM_ID)
+            - loop
+          args:
+            - --env-id=$(CARTRIDGE_COMMON_ENV_ID)
+            - --data-dir=/data
+            - --iterations=$(TOTAL_ITERATIONS)
+            - --episodes=$(EPISODES_PER_ITERATION)
+            - --steps=$(STEPS_PER_ITERATION)
+            - --num-actors=$(NUM_ACTORS)
+            - --actor-log-interval=$(ACTOR_LOG_INTERVAL)
+            - --actor-episode-timeout-seconds=$(ACTOR_EPISODE_TIMEOUT_SECONDS)
+            - --actor-eval-batch-size=$(ACTOR_EVAL_BATCH_SIZE)
+            - --actor-onnx-intra-threads=$(ACTOR_ONNX_INTRA_THREADS)
+            - --mcts-start-sims=$(MCTS_START_SIMS)
+            - --mcts-max-sims=$(MCTS_MAX_SIMS)
+            - --mcts-sim-ramp-rate=$(MCTS_SIM_RAMP_RATE)
+            - --c-puct=$(MCTS_C_PUCT)
+            - --temperature=$(MCTS_TEMPERATURE)
+            - --late-temperature=$(MCTS_LATE_TEMPERATURE)
+            - --temp-threshold=$(MCTS_TEMP_THRESHOLD)
+            - --dirichlet-alpha=$(MCTS_DIRICHLET_ALPHA)
+            - --dirichlet-weight=$(MCTS_DIRICHLET_WEIGHT)
+            - --batch-size=$(BATCH_SIZE)
+            - --lr=$(LEARNING_RATE)
+            - --weight-decay=$(WEIGHT_DECAY)
+            - --grad-clip=$(GRAD_CLIP)
+            - --device=$(DEVICE)
+            - --eval-interval=$(EVALUATION_INTERVAL)
+            - --eval-games=$(EVALUATION_GAMES)
+            - --eval-simulations=$(EVALUATION_SIMULATIONS)
+            - --eval-temperature=$(EVALUATION_TEMPERATURE)
+            - --eval-win-threshold=$(EVALUATION_WIN_THRESHOLD)
+            - --eval-vs-random=$(EVALUATION_VS_RANDOM)
+            - --solver-games=$(SOLVER_GAMES)
+            - --evaluation-seed=$(EVALUATION_SEED)
+            - --promotion-metric=$(PROMOTION_METRIC)
+            - --promotion-margin=$(PROMOTION_MARGIN)
+            - --log-level=$(LOG_LEVEL)
+          envFrom:
+            - configMapRef:
+                name: cartridge-config
+          env:
+            - name: CARTRIDGE_ALGORITHM_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: cartridge-config
+                  key: ALGORITHM_ID
+            - name: CARTRIDGE_COMMON_ENV_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: cartridge-config
+                  key: ENV_ID
+            - name: CARTRIDGE_STORAGE_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_URL
+            - name: CARTRIDGE_COMMON_DATA_DIR
+              value: /data
+            - name: CARTRIDGE_STORAGE_MODEL_BACKEND
+              value: s3
+            - name: CARTRIDGE_STORAGE_S3_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: cartridge-config
+                  key: S3_ENDPOINT
+            - name: CARTRIDGE_STORAGE_S3_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: cartridge-config
+                  key: S3_BUCKET
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: cartridge-config
+                  key: AWS_REGION
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              memory: 1Gi
+              cpu: "1000m"
+            limits:
+              memory: 4Gi
+              cpu: "2000m"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: runtime-data

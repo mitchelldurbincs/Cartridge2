@@ -6,13 +6,3 @@ project_id = "your-project-id"
 
 # Optional: GCP region (defaults to us-central1)
 region = "us-central1"
-
-# Optional: Environment name (defaults to prod)
-environment = "prod"
-
-# Optional: Database tier (defaults to db-custom-2-4096)
-# See: https://cloud.google.com/sql/docs/postgres/instance-settings
-db_tier = "db-custom-2-4096"
-
-# Optional: Database disk size in GB (defaults to 50)
-db_disk_size_gb = 50

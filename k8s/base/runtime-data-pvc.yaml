@@ -1,0 +1,25 @@
+# Shared profile runtime data.
+#
+# Model distribution uses S3/MinIO. This volume persists profile-scoped trainer
+# checkpoints and statistics and lets the web service read the selected
+# profile's stats from:
+#   /data/profiles/{algorithm_id}/{env_id}/v{env_contract_version}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: runtime-data
+  namespace: cartridge
+  labels:
+    app.kubernetes.io/name: runtime-data
+    app.kubernetes.io/component: storage
+    app.kubernetes.io/part-of: cartridge2
+spec:
+  # Trainer writes while web replicas read, so multi-node clusters need RWX.
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi
+  # Set this to an RWX-capable storage class. The GKE overlays define custom
+  # Filestore classes for their Terraform-managed VPCs; other providers must
+  # supply their own equivalent.

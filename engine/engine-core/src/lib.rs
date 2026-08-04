@@ -1,34 +1,56 @@
 //! Core traits and types for the Cartridge game engine
 //!
 //! This crate provides the fundamental abstractions for game simulation:
-//! - `Game`: Typed trait for ergonomic game development
-//! - `ErasedGame`: Runtime interface that works only with bytes
-//! - `GameAdapter`: Automatic conversion from typed to erased interface
-//! - `Registry`: Static registration system for games
-//! - `EngineContext`: High-level API for running game simulations
+//! - `Environment`: generic typed environment contract
+//! - a sealed, validated bytes-only runtime boundary
+//! - `BoardGame`: explicitly narrow adapter contract for bundled board games
+//! - `EngineContext`: high-level API for running environments
 
-pub mod adapter;
-pub mod board_game;
+mod adapter;
+mod board_game;
+mod board_game_utils;
+mod board_view;
 pub mod context;
-pub mod erased;
-pub mod game_utils;
-pub mod legal_mask;
-pub mod metadata;
-pub mod registry;
+mod contract;
+mod erased;
+mod legal_mask;
+mod metadata;
+mod registry;
 pub mod typed;
 
 // Re-export main types for convenience
-pub use adapter::GameAdapter;
-pub use board_game::TwoPlayerObs;
-pub use context::{EngineContext, ResetResult, StepResult};
-pub use erased::ErasedGame;
-pub use game_utils::GameOutcome;
+pub use board_view::Presentation;
+pub use context::{EngineContext, EngineContextError, ResetResult, StepResult};
+pub use erased::{EncodedObservation, ErasedEnvironmentError, ErasedTimestep};
 pub use legal_mask::LegalMask;
-pub use metadata::GameMetadata;
+pub use metadata::EnvironmentMetadata;
 pub use registry::{
-    clear_registry, create_game, is_registered, list_registered_games, register_game, GameFactory,
+    is_registered, list_registered_environments, register_environment, RegistryError,
 };
-pub use typed::{ActionSpace, Game};
+pub use typed::{
+    ActionAvailability, ActionAvailabilityContract, ActionEncoding, ActionSpace, AgentDecision,
+    AgentId, AgentModel, AgentObservation, AgentOutcome, AgentSpec, Capabilities, ChanceModel,
+    Decision, DecodeError, EncodeError, Encoding, EngineId, Environment, EnvironmentError,
+    EnvironmentSemantics, EpisodeStatus, InformationModel, ObservationEncoding, PlanningStateModel,
+    RewardModel, SequentialTurnOrder, TensorDType, TensorDimension, TensorSpec, Timestep,
+    TimestepAccessError, TransitionDynamics, TransitionSource, TurnModel,
+    WIRE_ENCODING_SCHEMA_VERSION,
+};
+
+/// Explicitly narrow types and helpers for the bundled two-seat board profile.
+pub mod board_profile {
+    pub use crate::board_game::{BoardGame, BoardTransition, TwoPlayerObs, TwoPlayerObsError};
+    pub use crate::board_game_utils::{
+        calculate_reward, decode_action_u32, encode_f32_slices, opponent, validate_board_cells,
+        validate_player_and_winner,
+    };
+    pub use crate::board_view::{BoardView, CellKind, CellView};
+    pub use crate::legal_mask::LegalMask;
+    pub use crate::metadata::{
+        BoardGameMetadata, BoardPlayerMetadata, BoardRenderer, MetadataError,
+    };
+    pub use crate::registry::register_board_game;
+}
 
 /// Test utilities (internal use only)
 #[cfg(test)]

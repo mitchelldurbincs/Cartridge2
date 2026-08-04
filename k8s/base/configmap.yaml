@@ -9,73 +9,60 @@ metadata:
     app.kubernetes.io/name: cartridge
     app.kubernetes.io/part-of: cartridge2
 data:
-  # Game environment (tictactoe, connect4)
+  # Algorithm cartridge selected by the synchronized run and web.
+  ALGORITHM_ID: "alphazero_board_v1"
+
+  # Registered environment ID. The selected algorithm must report compatible.
   ENV_ID: "connect4"
 
   # Logging
-  LOG_LEVEL: "info"
+  # The trainer CLI's explicit --log-level enum is uppercase. Rust's RUST_LOG
+  # filter accepts this value as well.
+  LOG_LEVEL: "INFO"
 
-  # Training settings
-  TRAINING_ITERATIONS: "100"
+  # Immutable synchronized-run recipe. TOTAL_ITERATIONS is the global target,
+  # not an additional number of iterations after a restart.
+  TOTAL_ITERATIONS: "100"
   EPISODES_PER_ITERATION: "500"
   STEPS_PER_ITERATION: "400"
+  NUM_ACTORS: "4"
   BATCH_SIZE: "128"
   LEARNING_RATE: "0.001"
+  WEIGHT_DECAY: "0.0001"
+  GRAD_CLIP: "1.0"
   DEVICE: "cpu"
 
-  # MCTS settings
+  # Collector and MCTS settings
+  ACTOR_LOG_INTERVAL: "50"
+  ACTOR_EPISODE_TIMEOUT_SECONDS: "180"
+  ACTOR_EVAL_BATCH_SIZE: "32"
+  ACTOR_ONNX_INTRA_THREADS: "1"
   MCTS_START_SIMS: "50"
   MCTS_MAX_SIMS: "400"
   MCTS_SIM_RAMP_RATE: "20"
+  MCTS_C_PUCT: "1.4"
+  MCTS_TEMPERATURE: "1.0"
+  MCTS_LATE_TEMPERATURE: "0.1"
   MCTS_TEMP_THRESHOLD: "15"
+  MCTS_DIRICHLET_ALPHA: "0.3"
+  MCTS_DIRICHLET_WEIGHT: "0.25"
 
-  # Evaluation
-  EVAL_INTERVAL: "5"
-  EVAL_GAMES: "50"
+  # Evaluation and promotion settings
+  EVALUATION_INTERVAL: "1"
+  EVALUATION_GAMES: "50"
+  EVALUATION_SIMULATIONS: "0"
+  EVALUATION_TEMPERATURE: "0.2"
+  EVALUATION_WIN_THRESHOLD: "0.55"
+  EVALUATION_VS_RANDOM: "true"
+  SOLVER_GAMES: "100"
+  EVALUATION_SEED: "42"
+  PROMOTION_METRIC: "win_rate"
+  PROMOTION_MARGIN: "0.0"
 
-  # Actor settings
-  ACTOR_LOG_INTERVAL: "50"
-  ACTOR_EPISODE_TIMEOUT: "90"
-
-  # Storage - PostgreSQL
-  # Note: Actual credentials should be in a Secret, not ConfigMap
-  POSTGRES_HOST: "postgres"
-  POSTGRES_PORT: "5432"
+  # PostgreSQL StatefulSet database name (credentials remain in Secret).
   POSTGRES_DB: "cartridge"
 
   # Storage - S3/MinIO
   S3_ENDPOINT: "http://minio:9000"
   S3_BUCKET: "cartridge-models"
   AWS_REGION: "us-east-1"
----
-# PostgreSQL credentials (should use sealed-secrets or external secrets in production)
-apiVersion: v1
-kind: Secret
-metadata:
-  name: postgres-credentials
-  namespace: cartridge
-  labels:
-    app.kubernetes.io/name: cartridge
-    app.kubernetes.io/part-of: cartridge2
-type: Opaque
-stringData:
-  POSTGRES_USER: "cartridge"
-  POSTGRES_PASSWORD: "cartridge"
-  # Full connection string for convenience
-  POSTGRES_URL: "postgresql://cartridge:cartridge@postgres:5432/cartridge"
----
-# MinIO/S3 credentials
-apiVersion: v1
-kind: Secret
-metadata:
-  name: minio-credentials
-  namespace: cartridge
-  labels:
-    app.kubernetes.io/name: cartridge
-    app.kubernetes.io/part-of: cartridge2
-type: Opaque
-stringData:
-  AWS_ACCESS_KEY_ID: "cartridge"
-  AWS_SECRET_ACCESS_KEY: "cartridge123"
-  MINIO_ROOT_USER: "cartridge"
-  MINIO_ROOT_PASSWORD: "cartridge123"

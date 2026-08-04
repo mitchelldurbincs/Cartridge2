@@ -12,6 +12,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "algorithm-core"
+version = "0.1.0"
+dependencies = [
+ "engine-core",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -944,6 +953,7 @@ version = "0.1.0"
 dependencies = [
  "once_cell",
  "serde",
+ "thiserror",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -966,13 +976,23 @@ dependencies = [
 name = "engine-games"
 version = "0.1.0"
 dependencies = [
+ "algorithm-core",
  "engine-core",
+ "envs-counter",
  "games-connect4",
  "games-generals",
  "games-othello",
  "games-tictactoe",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "envs-counter"
+version = "0.1.0"
+dependencies = [
+ "engine-core",
+ "rand_chacha",
 ]
 
 [[package]]
@@ -1756,6 +1776,7 @@ dependencies = [
 name = "mcts"
 version = "0.1.0"
 dependencies = [
+ "algorithm-core",
  "engine-core",
  "ndarray 0.16.1",
  "ort",
@@ -1821,11 +1842,15 @@ dependencies = [
 name = "model-watcher"
 version = "0.1.0"
 dependencies = [
+ "algorithm-core",
  "anyhow",
  "aws-config",
  "aws-sdk-s3",
  "mcts",
  "notify",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
 ]
@@ -3264,6 +3289,7 @@ dependencies = [
 name = "web"
 version = "0.1.0"
 dependencies = [
+ "algorithm-core",
  "anyhow",
  "axum",
  "engine-config",

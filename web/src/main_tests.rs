@@ -3,6 +3,7 @@
 use super::*;
 use crate::types::{
     GameInfoResponse, GameStateResponse, GamesListResponse, HealthResponse, MoveResponse,
+    TrainingStats,
 };
 use axum::{
     body::Body,
@@ -11,6 +12,11 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use tower::ServiceExt;
+
+/// Owner byte of every cell, for assertions that only care about occupancy.
+fn owners(response: &GameStateResponse) -> Vec<u8> {
+    response.cells.iter().map(|cell| cell.owner).collect()
+}
 
 /// Helper to make a GET request and return response body as string
 async fn get(app: Router, uri: &str) -> (StatusCode, String) {
@@ -56,6 +62,102 @@ async fn test_health_endpoint() {
 }
 
 #[tokio::test]
+async fn test_stats_endpoint_returns_default_only_when_projection_is_absent() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut state = create_test_state();
+    Arc::get_mut(&mut state).unwrap().data_dir = directory.path().display().to_string();
+
+    let (status, body) = get(create_app(state), "/stats").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let stats: TrainingStats = serde_json::from_str(&body).unwrap();
+    assert_eq!(stats.step, 0);
+    assert_eq!(stats.samples_seen, 0);
+    assert!(stats.last_checkpoint.is_empty());
+}
+
+#[tokio::test]
+async fn test_stats_endpoint_accepts_the_exact_projection_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let expected = TrainingStats {
+        step: 12,
+        total_steps: 12,
+        samples_seen: 768,
+        last_checkpoint: "a".repeat(64),
+        env_id: "tictactoe".to_string(),
+        ..TrainingStats::default()
+    };
+    tokio::fs::write(
+        directory.path().join("stats.json"),
+        serde_json::to_vec(&expected).unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut state = create_test_state();
+    Arc::get_mut(&mut state).unwrap().data_dir = directory.path().display().to_string();
+
+    let (status, body) = get(create_app(state), "/stats").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let stats: TrainingStats = serde_json::from_str(&body).unwrap();
+    assert_eq!(stats.step, expected.step);
+    assert_eq!(stats.samples_seen, expected.samples_seen);
+    assert_eq!(stats.last_checkpoint, expected.last_checkpoint);
+}
+
+#[tokio::test]
+async fn test_stats_endpoint_rejects_malformed_or_legacy_projection() {
+    for contents in [
+        b"{not-json".as_slice(),
+        br#"{"step": 12, "replay_buffer_size": 99}"#,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        tokio::fs::write(directory.path().join("stats.json"), contents)
+            .await
+            .unwrap();
+        let mut state = create_test_state();
+        Arc::get_mut(&mut state).unwrap().data_dir = directory.path().display().to_string();
+
+        let (status, body) = get(create_app(state), "/stats").await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("Training stats projection"));
+        assert!(body.contains("invalid"));
+    }
+}
+
+#[tokio::test]
+async fn test_stats_endpoint_rejects_non_regular_projection() {
+    let directory = tempfile::tempdir().unwrap();
+    tokio::fs::create_dir(directory.path().join("stats.json"))
+        .await
+        .unwrap();
+    let mut state = create_test_state();
+    Arc::get_mut(&mut state).unwrap().data_dir = directory.path().display().to_string();
+
+    let (status, body) = get(create_app(state), "/stats").await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body.contains("not a regular file"));
+}
+
+#[tokio::test]
+async fn test_model_endpoint_does_not_hide_a_poisoned_model_state() {
+    let state = create_test_state();
+    let model_info = Arc::clone(&state.model_info);
+    let _ = std::thread::spawn(move || {
+        let _guard = model_info.write().unwrap();
+        panic!("poison model information for the route test");
+    })
+    .join();
+
+    let (status, body) = get(create_app(state), "/model").await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body.contains("Model information is unavailable"));
+}
+
+#[tokio::test]
 async fn test_game_state_returns_initial_board() {
     let state = create_test_state();
     let app = create_app(state);
@@ -65,7 +167,7 @@ async fn test_game_state_returns_initial_board() {
     assert_eq!(status, StatusCode::OK);
     let response: GameStateResponse = serde_json::from_str(&body).unwrap();
     assert_eq!(
-        response.board,
+        owners(&response),
         vec![0u8; 9],
         "Initial board should be empty"
     );
@@ -85,7 +187,7 @@ async fn test_new_game_player_first() {
     assert_eq!(status, StatusCode::OK);
     let response: GameStateResponse = serde_json::from_str(&body).unwrap();
     assert_eq!(
-        response.board,
+        owners(&response),
         vec![0u8; 9],
         "Board should be empty when player goes first"
     );
@@ -103,7 +205,7 @@ async fn test_new_game_bot_first() {
     assert_eq!(status, StatusCode::OK);
     let response: GameStateResponse = serde_json::from_str(&body).unwrap();
     // Bot should have made one move (one cell is non-zero)
-    let moves_made: usize = response.board.iter().filter(|&&x| x != 0).count();
+    let moves_made: usize = response.cells.iter().filter(|c| c.owner != 0).count();
     assert_eq!(moves_made, 1, "Bot should have made exactly one move");
     // When bot goes "first", it plays as X (since X always starts in TicTacToe)
     // After bot's move as X, it's O's turn (current_player = 2)
@@ -124,7 +226,7 @@ async fn test_new_game_default_player_first() {
     assert_eq!(status, StatusCode::OK);
     let response: GameStateResponse = serde_json::from_str(&body).unwrap();
     assert_eq!(
-        response.board,
+        owners(&response),
         vec![0u8; 9],
         "Board should be empty with default"
     );
@@ -163,7 +265,7 @@ async fn test_new_game_allows_same_game_type() {
 
     assert_eq!(status, StatusCode::OK);
     let response: GameStateResponse = serde_json::from_str(&body).unwrap();
-    assert_eq!(response.board, vec![0u8; 9]);
+    assert_eq!(owners(&response), vec![0u8; 9]);
 }
 
 #[tokio::test]
@@ -176,12 +278,18 @@ async fn test_move_valid() {
 
     assert_eq!(status, StatusCode::OK);
     let response: MoveResponse = serde_json::from_str(&body).unwrap();
-    assert_eq!(response.state.board[4], 1, "Player X should be at center");
+    assert_eq!(
+        response.state.cells[4].owner, 1,
+        "Player X should be at center"
+    );
     // Bot should have made a move (unless game over)
     if !response.state.game_over {
         assert!(response.bot_move.is_some(), "Bot should make a move");
         let bot_pos = response.bot_move.unwrap() as usize;
-        assert_eq!(response.state.board[bot_pos], 2, "Bot should have placed O");
+        assert_eq!(
+            response.state.cells[bot_pos].owner, 2,
+            "Bot should have placed O"
+        );
     }
 }
 
@@ -293,7 +401,7 @@ async fn test_state_updates_after_move() {
         get(app, "/game/state").await
     };
     let initial: GameStateResponse = serde_json::from_str(&initial_body).unwrap();
-    assert_eq!(initial.board, vec![0u8; 9]);
+    assert_eq!(owners(&initial), vec![0u8; 9]);
 
     // Make a move
     {
@@ -310,8 +418,11 @@ async fn test_state_updates_after_move() {
     let updated: GameStateResponse = serde_json::from_str(&updated_body).unwrap();
 
     // Verify board changed
-    assert_ne!(updated.board, vec![0u8; 9], "Board should have changed");
-    assert_eq!(updated.board[0], 1, "Player X should be at position 0");
+    assert_ne!(owners(&updated), vec![0u8; 9], "Board should have changed");
+    assert_eq!(
+        updated.cells[0].owner, 1,
+        "Player X should be at position 0"
+    );
 }
 
 #[tokio::test]
@@ -330,7 +441,7 @@ async fn test_new_game_resets_state() {
         get(app, "/game/state").await
     };
     let mid_game: GameStateResponse = serde_json::from_str(&body).unwrap();
-    assert_ne!(mid_game.board, vec![0u8; 9], "Board should have moves");
+    assert_ne!(owners(&mid_game), vec![0u8; 9], "Board should have moves");
 
     // Start new game
     {
@@ -344,7 +455,7 @@ async fn test_new_game_resets_state() {
         get(app, "/game/state").await
     };
     let new_game: GameStateResponse = serde_json::from_str(&body).unwrap();
-    assert_eq!(new_game.board, vec![0u8; 9], "Board should be reset");
+    assert_eq!(owners(&new_game), vec![0u8; 9], "Board should be reset");
     assert_eq!(new_game.current_player, 1);
     assert_eq!(new_game.winner, 0);
 }
@@ -450,7 +561,7 @@ async fn test_get_game_info_not_found_for_invalid_game() {
 async fn test_cors_allows_configured_origin() {
     let state = create_test_state();
     let allowed = vec!["https://allowed.example.com".to_string()];
-    let app = create_app_with_cors(state, &allowed);
+    let app = create_app_with_cors(state, &allowed).unwrap();
 
     let response = app
         .oneshot(
@@ -477,7 +588,7 @@ async fn test_cors_allows_configured_origin() {
 async fn test_cors_rejects_unknown_origin_in_production() {
     let state = create_test_state();
     let allowed = vec!["https://allowed.example.com".to_string()];
-    let app = create_app_with_cors(state, &allowed);
+    let app = create_app_with_cors(state, &allowed).unwrap();
 
     let response = app
         .oneshot(
@@ -503,7 +614,7 @@ async fn test_cors_allows_localhost_in_development_mode() {
     let state = create_test_state();
     // Empty allowed_origins = development mode (localhost only)
     let allowed: Vec<String> = vec![];
-    let app = create_app_with_cors(state, &allowed);
+    let app = create_app_with_cors(state, &allowed).unwrap();
 
     let response = app
         .oneshot(
@@ -531,7 +642,7 @@ async fn test_cors_allows_localhost_in_development_mode() {
 async fn test_cors_preflight_request() {
     let state = create_test_state();
     let allowed = vec!["https://allowed.example.com".to_string()];
-    let app = create_app_with_cors(state, &allowed);
+    let app = create_app_with_cors(state, &allowed).unwrap();
 
     let response = app
         .oneshot(
@@ -552,4 +663,19 @@ async fn test_cors_preflight_request() {
         .headers()
         .get("access-control-allow-methods")
         .is_some());
+}
+
+#[test]
+fn test_cors_rejects_an_invalid_configured_origin() {
+    let state = create_test_state();
+    let error = match create_app_with_cors(
+        state,
+        &["https://valid.example\r\nmalicious: value".to_string()],
+    ) {
+        Ok(_) => panic!("invalid configured origin must fail startup"),
+        Err(error) => error.to_string(),
+    };
+
+    assert!(error.contains("web.allowed_origins"));
+    assert!(error.contains("invalid HTTP origin"));
 }

@@ -1,6 +1,7 @@
 # games-connect4
 
-Connect 4 implementation for Cartridge2. A complete two-player strategy game demonstrating the engine-core Game trait pattern.
+Connect 4 implementation for Cartridge2. A complete two-player strategy game
+using the narrow `BoardGame` profile and generic environment adapter.
 
 ## Overview
 
@@ -14,7 +15,7 @@ A complete Connect 4 game with:
 ## Usage
 
 ```rust
-use engine_core::EngineContext;
+use engine_core::{AgentId, EngineContext};
 use games_connect4::register_connect4;
 
 // Register the game
@@ -30,8 +31,9 @@ let reset = ctx.reset(42, &[]).unwrap();
 let action = 3u32.to_le_bytes().to_vec();
 let step = ctx.step(&reset.state, &action).unwrap();
 
-// Check result
-println!("Done: {}, Reward: {}", step.done, step.reward);
+// Read the generic per-agent outcome and episode status.
+println!("Episode: {:?}", step.timestep.episode);
+println!("P1 reward: {:?}", step.timestep.reward_for(AgentId(1)));
 ```
 
 ## Game Specification
@@ -78,9 +80,13 @@ Integer 0-6 representing which column to drop a piece into.
 - **-1.0**: Loss
 - **0.0**: Draw or game continues
 
-### Info Bits
+### Board adapter info
 
-The `info` field (u64) encodes:
+The narrow `BoardGame` transition packs an internal `u64` with this layout. The
+generic ABI exposes auxiliary data as opaque `timestep.info` bytes; algorithms
+must use the observation's declared legal-mask offset instead of depending on
+these bits.
+
 - Bits 0-6: Legal move mask (7 columns)
 - Bits 16-19: Current player (1 = Red, 2 = Yellow)
 - Bits 20-23: Winner (0 = none, 1 = Red, 2 = Yellow, 3 = draw)
@@ -98,7 +104,7 @@ Action is encoded as 4 bytes (little-endian u32).
 ## Testing
 
 ```bash
-cargo test -p games-connect4
+cargo test --manifest-path engine/Cargo.toml -p games-connect4
 ```
 
 20 tests covering:

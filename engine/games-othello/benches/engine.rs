@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use engine_core::Game;
+use engine_core::board_profile::BoardGame;
 use games_othello::{observation_from_state, Othello, State};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -26,7 +26,7 @@ fn bench_step(c: &mut Criterion) {
     group.bench_function("step_opening", |b| {
         let mut game = Othello::new();
         let mut rng = ChaCha20Rng::seed_from_u64(7);
-        let (base_state, _) = game.reset(&mut rng, &[]);
+        let (base_state, _) = game.reset(&mut rng, &[]).unwrap();
         b.iter_batched(
             || base_state.clone(),
             |mut state| {
@@ -41,7 +41,7 @@ fn bench_step(c: &mut Criterion) {
     group.bench_function("step_midgame", |b| {
         let mut game = Othello::new();
         let mut rng = ChaCha20Rng::seed_from_u64(7);
-        let (mut state, _) = game.reset(&mut rng, &[]);
+        let (mut state, _) = game.reset(&mut rng, &[]).unwrap();
 
         // Play a few moves to reach a mid-game state
         let opening_moves = [19u32, 18, 10, 11, 2, 34];
@@ -177,11 +177,11 @@ fn bench_encode_decode(c: &mut Criterion) {
     });
 
     group.bench_function("observation_encode", |b| {
-        let obs = observation_from_state(&State::new());
+        let obs = observation_from_state(&State::new()).unwrap();
         b.iter_batched(
             || Vec::with_capacity(1024),
             |mut buffer| {
-                Othello::encode_obs(&obs, &mut buffer).unwrap();
+                Othello::encode_observation(&obs, &mut buffer).unwrap();
                 buffer
             },
             BatchSize::SmallInput,

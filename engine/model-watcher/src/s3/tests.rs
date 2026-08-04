@@ -1,27 +1,46 @@
 use super::*;
 
 #[test]
-fn test_s3_config() {
-    let config = S3Config {
-        bucket: "test-bucket".to_string(),
-        key: "models/latest.onnx".to_string(),
-        endpoint_url: Some("http://localhost:9000".to_string()),
-        region: Some("us-east-1".to_string()),
-        cache_dir: PathBuf::from("/tmp/models"),
-    };
-
-    assert_eq!(config.bucket, "test-bucket");
-    assert_eq!(config.key, "models/latest.onnx");
+fn object_keys_follow_the_content_addressed_protocol() {
+    assert_eq!(
+        S3ModelWatcher::run_head_key("profiles/example/models"),
+        "profiles/example/models/channels/current.json"
+    );
+    assert_eq!(
+        S3ModelWatcher::manifest_key("profiles/example/models", "a"),
+        "profiles/example/models/manifests/sha256/a.json"
+    );
+    assert_eq!(
+        S3ModelWatcher::run_commit_key("profiles/example/models", "c"),
+        "profiles/example/models/run-commits/sha256/c.json"
+    );
+    assert_eq!(
+        S3ModelWatcher::model_key("profiles/example/models", "b"),
+        "profiles/example/models/blobs/sha256/b.onnx"
+    );
 }
 
-#[cfg(feature = "metadata")]
-#[test]
-fn test_extract_training_step() {
-    let path = PathBuf::from("/tmp/model_step_000100.onnx");
-    let step = S3ModelWatcher::extract_training_step(&path);
-    assert_eq!(step, Some(100));
+#[tokio::test]
+async fn concurrent_cache_publication_is_create_or_verify() {
+    let directory = tempfile::tempdir().unwrap();
+    let bytes = b"immutable model";
+    let digest = sha256_hex(bytes);
+    let first = S3ModelWatcher::cache_model(directory.path(), &digest, bytes);
+    let second = S3ModelWatcher::cache_model(directory.path(), &digest, bytes);
+    let (first, second) = tokio::join!(first, second);
 
-    let path = PathBuf::from("/tmp/latest.onnx");
-    let step = S3ModelWatcher::extract_training_step(&path);
-    assert!(step.is_none());
+    let first = first.unwrap();
+    assert_eq!(second.unwrap(), first);
+    assert_eq!(tokio::fs::read(&first).await.unwrap(), bytes);
+    let entries = std::fs::read_dir(first.parent().unwrap())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+}
+
+#[test]
+fn structured_absence_detection_is_narrow() {
+    let missing = GetObjectError::NoSuchKey(aws_sdk_s3::types::error::NoSuchKey::builder().build());
+    assert!(S3ModelWatcher::is_absent(&missing));
 }

@@ -3,7 +3,7 @@
 //! Each node represents a game state reached by taking an action from the parent.
 //! Nodes store visit statistics used for UCB selection and policy improvement.
 
-use engine_core::LegalMask;
+use engine_core::board_profile::LegalMask;
 
 /// Index into the node arena. Using a newtype for type safety.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -1,669 +1,571 @@
-"""Tests for stats module.
+"""Exact learner-stats schema, binding, and snapshot tests."""
 
-Tests cover:
-- History bounds (TrainerStats.append_history, append_eval)
-- Serialization round-trip (to_dict/from_dict)
-- Atomic writes (write_stats)
-- File loading (load_stats)
-"""
+from __future__ import annotations
 
 import json
-import tempfile
 import threading
 import time
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
 from trainer.stats import (
-    DEFAULT_MAX_EVAL_HISTORY,
+    DEFAULT_MAX_HISTORY,
     MEDIUM_RESOLUTION,
     MEDIUM_STEPS_THRESHOLD,
     OLD_RESOLUTION,
     RECENT_STEPS_THRESHOLD,
-    EvalStats,
+    EvaluationStats,
+    LoadedStatsSnapshotV3,
+    PreparedStatsSnapshotV3,
+    StatsArtifactError,
+    StatsBindingV1,
     TrainerStats,
-    _downsample_history,
-    load_stats,
-    write_stats,
+    decode_stats_snapshot,
+    prepare_stats_snapshot,
+    retain_training_history,
+    write_ephemeral_stats_projection,
+    write_stats_projection,
+)
+from trainer.storage.publisher import (
+    BlobDescriptorV1,
+    CheckpointManifestV1,
+    CheckpointProfileV1,
+    CheckpointRef,
+    canonical_json_bytes,
+    sha256_bytes,
 )
 
+PROFILE = CheckpointProfileV1(
+    algorithm_id="alphazero_board_v1",
+    env_id="tictactoe",
+    env_contract_version=1,
+    model_artifact_schema_version=1,
+    model_contract="onnx_policy_value_v1",
+)
+CONFIG_SHA256 = "c" * 64
 
-class TestEvalStats:
-    """Tests for EvalStats dataclass."""
 
-    def test_default_values(self):
-        """Test default initialization."""
-        stats = EvalStats()
-        assert stats.step == 0
-        assert stats.win_rate == 0.0
-        assert stats.draw_rate == 0.0
-        assert stats.loss_rate == 0.0
-        assert stats.games_played == 0
-        assert stats.avg_game_length == 0.0
-        assert stats.timestamp > 0  # Should have current time
+def checkpoint_ref(
+    step: int,
+    *,
+    profile: CheckpointProfileV1 = PROFILE,
+    config_sha256: str = CONFIG_SHA256,
+    parent_checkpoint_id: str | None = None,
+) -> CheckpointRef:
+    manifest = CheckpointManifestV1(
+        profile=profile,
+        step=step,
+        parent_checkpoint_id=parent_checkpoint_id,
+        config_sha256=config_sha256,
+        onnx=BlobDescriptorV1("a" * 64, 1),
+        learner_state=BlobDescriptorV1("b" * 64, 1),
+    )
+    return CheckpointRef(
+        checkpoint_id=manifest.checkpoint_id,
+        manifest=manifest,
+        onnx_path=Path("unused.onnx"),
+        learner_state_path=Path("unused.pt"),
+    )
 
-    def test_to_dict(self):
-        """Test serialization to dictionary."""
-        stats = EvalStats(
-            step=100,
-            win_rate=0.75,
-            draw_rate=0.15,
-            loss_rate=0.10,
-            games_played=50,
-            avg_game_length=8.5,
-            timestamp=1234567890.0,
-        )
 
-        d = stats.to_dict()
+def history_entry(step: int, loss: float | int = 0.0) -> dict[str, object]:
+    return {
+        "step": step,
+        "metrics": {
+            "loss/total": loss,
+            "loss/value": float(loss) / 3.0,
+            "loss/policy": float(loss) * 2.0 / 3.0,
+        },
+        "learning_rate": 0.001,
+        "grad_norm": None,
+    }
 
-        assert d["step"] == 100
-        assert d["win_rate"] == 0.75
-        assert d["draw_rate"] == 0.15
-        assert d["loss_rate"] == 0.10
-        assert d["games_played"] == 50
-        assert d["avg_game_length"] == 8.5
-        assert d["timestamp"] == 1234567890.0
 
-    def test_from_dict(self):
-        """Test deserialization from dictionary."""
-        data = {
-            "step": 200,
-            "win_rate": 0.80,
-            "draw_rate": 0.10,
-            "loss_rate": 0.10,
-            "games_played": 100,
-            "avg_game_length": 9.2,
-            "timestamp": 9876543210.0,
+def eval_stats(step: int, win_rate: float, *, timestamp: float = 1.0) -> EvaluationStats:
+    return EvaluationStats(
+        step=step,
+        metrics={
+            "outcome/win_rate": win_rate,
+            "outcome/draw_rate": 0.0,
+            "outcome/loss_rate": 1.0 - win_rate,
+        },
+        episodes=10,
+        mean_episode_length=1.0,
+        timestamp=timestamp,
+    )
+
+
+def bound_stats(
+    step: int,
+    *,
+    checkpoint: CheckpointRef | None = None,
+    timestamp: float = 1.0,
+    total_loss: float | int = 0.5,
+) -> tuple[TrainerStats, CheckpointRef]:
+    checkpoint = checkpoint or checkpoint_ref(step)
+    stats = TrainerStats(
+        step=step,
+        total_steps=step + 10,
+        metrics={"loss/total": total_loss, "loss/value": 0.2, "loss/policy": 0.3},
+        learning_rate=0.001,
+        samples_seen=step * 4,
+        replay_record_count=step * 8,
+        last_checkpoint=checkpoint.checkpoint_id,
+        timestamp=timestamp,
+        history=[history_entry(step, total_loss)],
+        env_id=checkpoint.manifest.profile.env_id,
+    )
+    return stats, checkpoint
+
+
+class TestEvaluationStatsContract:
+    def test_default_is_the_only_valid_zero_episode_record(self):
+        stats = EvaluationStats(timestamp=0)
+
+        assert stats.to_dict() == {
+            "step": 0,
+            "metrics": {},
+            "episodes": 0,
+            "mean_episode_length": 0.0,
+            "timestamp": 0.0,
         }
 
-        stats = EvalStats.from_dict(data)
+    def test_exact_schema_round_trip(self):
+        original = eval_stats(5, 0.7, timestamp=2.0)
 
-        assert stats.step == 200
-        assert stats.win_rate == 0.80
-        assert stats.draw_rate == 0.10
-        assert stats.loss_rate == 0.10
-        assert stats.games_played == 100
-        assert stats.avg_game_length == 9.2
-        assert stats.timestamp == 9876543210.0
+        assert EvaluationStats.from_dict(original.to_dict()) == original
+        with pytest.raises(StatsArtifactError, match="fields must be exact"):
+            EvaluationStats.from_dict({**original.to_dict(), "extra": 1})
+        missing = original.to_dict()
+        del missing["metrics"]
+        with pytest.raises(StatsArtifactError, match="fields must be exact"):
+            EvaluationStats.from_dict(missing)
 
-    def test_from_dict_missing_fields(self):
-        """Test deserialization with missing fields uses defaults."""
-        stats = EvalStats.from_dict({})
-
-        assert stats.step == 0
-        assert stats.win_rate == 0.0
-        assert stats.games_played == 0
-
-    def test_round_trip(self):
-        """Test serialization round-trip preserves data."""
-        original = EvalStats(
-            step=500,
-            win_rate=0.65,
-            draw_rate=0.20,
-            loss_rate=0.15,
-            games_played=200,
-            avg_game_length=7.3,
-            timestamp=1111111111.0,
-        )
-
-        restored = EvalStats.from_dict(original.to_dict())
-
-        assert restored.step == original.step
-        assert restored.win_rate == original.win_rate
-        assert restored.draw_rate == original.draw_rate
-        assert restored.loss_rate == original.loss_rate
-        assert restored.games_played == original.games_played
-        assert restored.avg_game_length == original.avg_game_length
-        assert restored.timestamp == original.timestamp
-
-
-class TestTrainerStats:
-    """Tests for TrainerStats dataclass."""
-
-    def test_default_values(self):
-        """Test default initialization."""
-        stats = TrainerStats()
-        assert stats.step == 0
-        assert stats.total_steps == 0
-        assert stats.total_loss == 0.0
-        assert stats.value_loss == 0.0
-        assert stats.policy_loss == 0.0
-        assert stats.learning_rate == 0.0
-        assert stats.samples_seen == 0
-        assert stats.replay_buffer_size == 0
-        assert stats.last_checkpoint == ""
-        assert stats.timestamp > 0
-        assert stats.history == []
-        assert stats.env_id == ""
-        assert stats.last_eval is None
-        assert stats.eval_history == []
-        assert stats._max_eval_history == DEFAULT_MAX_EVAL_HISTORY
-
-    def test_append_history(self):
-        """Test appending to history."""
-        stats = TrainerStats()
-        stats.append_history({"step": 1, "loss": 0.5})
-        stats.append_history({"step": 2, "loss": 0.4})
-
-        assert len(stats.history) == 2
-        assert stats.history[0]["step"] == 1
-        assert stats.history[1]["step"] == 2
-
-    def test_history_tiered_retention_recent(self):
-        """Test that recent history is kept at full resolution."""
-        stats = TrainerStats()
-
-        # Append entries within the recent threshold
-        current_step = 1000
-        for i in range(0, current_step + 1, 10):
-            stats.append_history({"step": i, "loss": float(i)})
-
-        # All entries should be kept (all within RECENT_STEPS_THRESHOLD of current_step)
-        assert len(stats.history) == 101  # 0, 10, 20, ..., 1000
-
-    def test_history_tiered_retention_downsamples_old(self):
-        """Test that old history is downsampled appropriately."""
-        stats = TrainerStats()
-
-        # Append entries spanning a large range
-        # This simulates a long training run
-        current_step = 15000
-        for step in range(0, current_step + 1, 10):
-            stats.append_history({"step": step, "loss": float(step)})
-
-        # Verify old entries are downsampled:
-        # - Recent (14000-15000): all entries kept
-        # - Medium (5000-14000): every 100th step
-        # - Old (0-5000): every 500th step
-        steps_in_history = [e["step"] for e in stats.history]
-
-        # Check some old entries (should only have 500-multiples)
-        old_entries = [
-            s for s in steps_in_history if s < (current_step - MEDIUM_STEPS_THRESHOLD)
-        ]
-        for step in old_entries:
-            assert (
-                step % OLD_RESOLUTION == 0
-            ), f"Old step {step} should be multiple of {OLD_RESOLUTION}"
-
-        # Check medium entries (should only have 100-multiples)
-        medium_entries = [
-            s
-            for s in steps_in_history
-            if (current_step - MEDIUM_STEPS_THRESHOLD)
-            <= s
-            < (current_step - RECENT_STEPS_THRESHOLD)
-        ]
-        for step in medium_entries:
-            assert (
-                step % MEDIUM_RESOLUTION == 0
-            ), f"Medium step {step} should be multiple of {MEDIUM_RESOLUTION}"
-
-        # Verify we have fewer entries than a naive approach would have
-        naive_count = (current_step // 10) + 1  # Would be 1501 entries
-        assert len(stats.history) < naive_count
-
-    def test_append_eval(self):
-        """Test appending evaluation results."""
-        stats = TrainerStats()
-        eval1 = EvalStats(step=100, win_rate=0.5)
-        eval2 = EvalStats(step=200, win_rate=0.6)
-
-        stats.append_eval(eval1)
-        assert stats.last_eval == eval1
-        assert len(stats.eval_history) == 1
-
-        stats.append_eval(eval2)
-        assert stats.last_eval == eval2
-        assert len(stats.eval_history) == 2
-
-    def test_eval_history_bounded(self):
-        """Test that eval_history stays bounded."""
-        stats = TrainerStats()
-        stats._max_eval_history = 5
-
-        for i in range(10):
-            stats.append_eval(EvalStats(step=i * 100, win_rate=i * 0.1))
-
-        assert len(stats.eval_history) == 5
-        # Should have most recent entries
-        assert stats.eval_history[0]["step"] == 500
-        assert stats.eval_history[-1]["step"] == 900
-
-    def test_to_dict(self):
-        """Test serialization to dictionary."""
-        stats = TrainerStats(
-            step=100,
-            total_steps=1000,
-            total_loss=0.5,
-            value_loss=0.2,
-            policy_loss=0.3,
-            learning_rate=0.001,
-            samples_seen=5000,
-            replay_buffer_size=10000,
-            last_checkpoint="model_100.onnx",
-            timestamp=1234567890.0,
-            env_id="tictactoe",
-        )
-        stats.append_history({"step": 100, "loss": 0.5})
-        stats.append_eval(EvalStats(step=100, win_rate=0.7, timestamp=1234567890.0))
-
-        d = stats.to_dict()
-
-        assert d["step"] == 100
-        assert d["total_steps"] == 1000
-        assert d["total_loss"] == 0.5
-        assert d["value_loss"] == 0.2
-        assert d["policy_loss"] == 0.3
-        assert d["learning_rate"] == 0.001
-        assert d["samples_seen"] == 5000
-        assert d["replay_buffer_size"] == 10000
-        assert d["last_checkpoint"] == "model_100.onnx"
-        assert d["timestamp"] == 1234567890.0
-        assert d["env_id"] == "tictactoe"
-        assert len(d["history"]) == 1
-        assert d["last_eval"]["step"] == 100
-        assert d["last_eval"]["win_rate"] == 0.7
-        assert len(d["eval_history"]) == 1
-
-    def test_to_dict_no_eval(self):
-        """Test serialization with no eval data."""
-        stats = TrainerStats()
-        d = stats.to_dict()
-
-        assert d["last_eval"] is None
-        assert d["eval_history"] == []
-
-    def test_from_dict(self):
-        """Test deserialization from dictionary."""
-        data = {
-            "step": 200,
-            "total_steps": 500,
-            "total_loss": 0.3,
-            "value_loss": 0.1,
-            "policy_loss": 0.2,
-            "learning_rate": 0.0005,
-            "samples_seen": 10000,
-            "replay_buffer_size": 20000,
-            "last_checkpoint": "model_200.onnx",
-            "timestamp": 9876543210.0,
-            "history": [{"step": 100}, {"step": 200}],
-            "env_id": "connect4",
-            "last_eval": {"step": 200, "win_rate": 0.8, "timestamp": 9876543210.0},
-            "eval_history": [
-                {"step": 100, "win_rate": 0.6},
-                {"step": 200, "win_rate": 0.8},
-            ],
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({"episodes": 0, "metrics": {"return/mean": 1.0}}, "zero-episode"),
+            (
+                {
+                    "episodes": 2,
+                    "metrics": {"return/mean": 1.0},
+                    "mean_episode_length": 0.0,
+                },
+                "positive mean episode length",
+            ),
+            ({"metrics": {"return/mean": float("nan")}}, "finite"),
+            ({"metrics": {" bad": 1.0}}, "trimmed"),
+            ({"episodes": -1}, "nonnegative integer"),
+            ({"timestamp": -1.0}, "nonnegative"),
+        ],
+    )
+    def test_semantic_invariants(self, overrides, message):
+        values = {
+            "step": 1,
+            "metrics": {},
+            "episodes": 0,
+            "mean_episode_length": 0.0,
+            "timestamp": 1.0,
         }
+        values.update(overrides)
 
-        stats = TrainerStats.from_dict(data)
+        with pytest.raises(StatsArtifactError, match=message):
+            EvaluationStats(**values)
 
-        assert stats.step == 200
-        assert stats.total_steps == 500
-        assert stats.total_loss == 0.3
-        assert stats.value_loss == 0.1
-        assert stats.policy_loss == 0.2
-        assert stats.learning_rate == 0.0005
-        assert stats.samples_seen == 10000
-        assert stats.replay_buffer_size == 20000
-        assert stats.last_checkpoint == "model_200.onnx"
-        assert stats.timestamp == 9876543210.0
-        assert len(stats.history) == 2
-        assert stats.env_id == "connect4"
-        assert stats.last_eval is not None
-        assert stats.last_eval.step == 200
-        assert stats.last_eval.win_rate == 0.8
-        assert len(stats.eval_history) == 2
-
-    def test_from_dict_missing_fields(self):
-        """Test deserialization with missing fields uses defaults."""
-        stats = TrainerStats.from_dict({})
-
-        assert stats.step == 0
-        assert stats.total_steps == 0
-        assert stats.history == []
-        assert stats.last_eval is None
-
-    def test_round_trip(self):
-        """Test serialization round-trip preserves data."""
-        original = TrainerStats(
-            step=300,
-            total_steps=1000,
-            total_loss=0.4,
-            value_loss=0.15,
-            policy_loss=0.25,
-            learning_rate=0.001,
-            samples_seen=15000,
-            replay_buffer_size=30000,
-            last_checkpoint="model_300.onnx",
-            timestamp=5555555555.0,
-            env_id="tictactoe",
+    def test_numeric_normalization_collapses_signed_zero(self):
+        stats = EvaluationStats(
+            metrics={},
+            episodes=0,
+            mean_episode_length=-0.0,
+            timestamp=0,
         )
-        original.append_history({"step": 300, "loss": 0.4})
-        original.append_eval(EvalStats(step=300, win_rate=0.75, timestamp=5555555555.0))
 
-        restored = TrainerStats.from_dict(original.to_dict())
+        assert canonical_json_bytes(stats.to_dict()).count(b"-0.0") == 0
+        assert isinstance(stats.to_dict()["mean_episode_length"], float)
+        assert isinstance(stats.to_dict()["timestamp"], float)
 
-        assert restored.step == original.step
-        assert restored.total_steps == original.total_steps
-        assert restored.total_loss == original.total_loss
-        assert restored.value_loss == original.value_loss
-        assert restored.policy_loss == original.policy_loss
-        assert restored.learning_rate == original.learning_rate
-        assert restored.samples_seen == original.samples_seen
-        assert restored.replay_buffer_size == original.replay_buffer_size
-        assert restored.last_checkpoint == original.last_checkpoint
-        assert restored.timestamp == original.timestamp
-        assert restored.env_id == original.env_id
-        assert len(restored.history) == len(original.history)
-        assert restored.last_eval.step == original.last_eval.step
-        assert restored.last_eval.win_rate == original.last_eval.win_rate
+    def test_metrics_support_negative_single_agent_returns(self):
+        stats = EvaluationStats(
+            step=1,
+            metrics={"return/mean": -0.08},
+            episodes=10,
+            mean_episode_length=8.0,
+            timestamp=1.0,
+        )
+
+        assert stats.metrics["return/mean"] == -0.08
 
 
-class TestDownsampleHistory:
-    """Tests for _downsample_history function."""
+class TestTrainerStatsContract:
+    def test_exact_schema_round_trip(self):
+        stats, _ = bound_stats(10)
+        stats.append_evaluation(eval_stats(10, 0.7))
 
-    def test_empty_history(self):
-        """Test downsampling empty history returns empty."""
-        result = _downsample_history([], 1000)
-        assert result == []
+        restored = TrainerStats.from_dict(stats.to_dict())
 
-    def test_all_recent_kept(self):
-        """Test all entries within recent threshold are kept."""
-        history = [{"step": i} for i in range(100, 1100, 10)]
-        current_step = 1100
+        assert restored.to_dict() == stats.to_dict()
+        extra = stats.to_dict()
+        extra["extra"] = 1
+        with pytest.raises(StatsArtifactError, match="fields must be exact"):
+            TrainerStats.from_dict(extra)
+        with pytest.raises(StatsArtifactError, match="fields must be exact"):
+            TrainerStats.from_dict({})
 
-        result = _downsample_history(history, current_step)
+    @pytest.mark.parametrize("remove", [True, False])
+    def test_history_entries_have_one_exact_schema(self, remove):
+        entry = history_entry(1, 0.3)
+        if remove:
+            del entry["grad_norm"]
+        else:
+            entry["extra"] = 1
+        stats = TrainerStats(step=1, total_steps=1)
 
-        # All entries should be kept (within 1000 steps of current)
-        assert len(result) == len(history)
+        with pytest.raises(StatsArtifactError, match="fields must be exact"):
+            stats.append_history(entry)
 
-    def test_medium_age_downsampled(self):
-        """Test medium-age entries are downsampled to MEDIUM_RESOLUTION."""
-        # Create entries in the medium range (1000-10000 steps ago)
-        current_step = 12000
-        history = [{"step": i} for i in range(1000, 11000, 10)]
+    @pytest.mark.parametrize(
+        ("field_name", "value", "message"),
+        [
+            ("step", True, "nonnegative integer"),
+            ("metric", float("nan"), "finite"),
+            ("learning_rate", -0.1, "nonnegative"),
+            ("grad_norm", -0.1, "nonnegative"),
+        ],
+    )
+    def test_history_numeric_contract(self, field_name, value, message):
+        entry = history_entry(1, 0.3)
+        if field_name == "metric":
+            entry["metrics"]["loss/total"] = value
+        else:
+            entry[field_name] = value
+        stats = TrainerStats(step=1, total_steps=1)
 
-        result = _downsample_history(history, current_step)
+        with pytest.raises(StatsArtifactError, match=message):
+            stats.append_history(entry)
 
-        # Check that entries in medium range are filtered
-        for entry in result:
-            step = entry["step"]
-            age = current_step - step
-            if RECENT_STEPS_THRESHOLD < age <= MEDIUM_STEPS_THRESHOLD:
-                assert step % MEDIUM_RESOLUTION == 0
-
-    def test_old_entries_downsampled(self):
-        """Test old entries are downsampled to OLD_RESOLUTION."""
-        current_step = 20000
-        history = [{"step": i} for i in range(0, 9000, 10)]
-
-        result = _downsample_history(history, current_step)
-
-        # All entries are old (>10000 steps ago), should only keep 500-multiples
-        for entry in result:
-            assert entry["step"] % OLD_RESOLUTION == 0
-
-    def test_mixed_ages(self):
-        """Test history with entries of all ages is correctly tiered."""
-        current_step = 15000
-        # Create history with entries every 10 steps from 0 to 15000
-        history = [{"step": i} for i in range(0, current_step + 1, 10)]
-
-        result = _downsample_history(history, current_step)
-
-        # Count entries by tier
-        recent_count = 0
-        medium_count = 0
-        old_count = 0
-
-        for entry in result:
-            step = entry["step"]
-            age = current_step - step
-            if age <= RECENT_STEPS_THRESHOLD:
-                recent_count += 1
-            elif age <= MEDIUM_STEPS_THRESHOLD:
-                medium_count += 1
-            else:
-                old_count += 1
-
-        # Recent: 14000-15000 = 101 entries (every 10 steps)
-        assert recent_count == 101
-
-        # Medium: 5000-14000 = ~90 entries at resolution 100
-        # Steps 5000, 5100, 5200, ..., 13900 = 90 entries
-        assert medium_count == 90
-
-        # Old: 0-5000 = 10 entries at resolution 500
-        # Steps 0, 500, 1000, ..., 4500 = 10 entries
-        assert old_count == 10
-
-
-class TestLoadStats:
-    """Tests for load_stats function."""
-
-    def test_load_nonexistent_file(self):
-        """Test loading from non-existent file returns empty stats."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "nonexistent.json"
-            stats = load_stats(path)
-
-            assert isinstance(stats, TrainerStats)
-            assert stats.step == 0
-            assert stats.history == []
-
-    def test_load_existing_file(self):
-        """Test loading from existing file."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "stats.json"
-            data = {
-                "step": 100,
-                "total_steps": 1000,
-                "total_loss": 0.5,
-                "history": [{"step": 50}, {"step": 100}],
-                "env_id": "tictactoe",
-                "last_eval": {"step": 100, "win_rate": 0.7},
-                "eval_history": [{"step": 100, "win_rate": 0.7}],
-            }
-            with open(path, "w") as f:
-                json.dump(data, f)
-
-            stats = load_stats(path)
-
-            assert stats.step == 100
-            assert stats.total_steps == 1000
-            assert len(stats.history) == 2
-            assert stats.env_id == "tictactoe"
-            assert stats.last_eval is not None
-            assert stats.last_eval.win_rate == 0.7
-
-    def test_load_invalid_json(self):
-        """Test loading invalid JSON returns empty stats."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "stats.json"
-            with open(path, "w") as f:
-                f.write("not valid json {{{")
-
-            stats = load_stats(path)
-
-            assert isinstance(stats, TrainerStats)
-            assert stats.step == 0
-
-    def test_load_accepts_string_path(self):
-        """Test load_stats accepts string path."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = str(Path(tmpdir) / "stats.json")
-            stats = load_stats(path)
-            assert isinstance(stats, TrainerStats)
-
-
-class TestWriteStats:
-    """Tests for write_stats function."""
-
-    def test_write_creates_file(self):
-        """Test writing stats creates the file."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "stats.json"
-            stats = TrainerStats(step=100, total_loss=0.5)
-
-            write_stats(stats, path)
-
-            assert path.exists()
-            with open(path) as f:
-                data = json.load(f)
-            assert data["step"] == 100
-            assert data["total_loss"] == 0.5
-
-    def test_write_creates_parent_directories(self):
-        """Test writing stats creates parent directories if needed."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "subdir" / "nested" / "stats.json"
-            stats = TrainerStats(step=50)
-
-            write_stats(stats, path)
-
-            assert path.exists()
-
-    def test_write_overwrites_existing(self):
-        """Test writing stats overwrites existing file."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "stats.json"
-
-            # Write first version
-            stats1 = TrainerStats(step=100)
-            write_stats(stats1, path)
-
-            # Write second version
-            stats2 = TrainerStats(step=200)
-            write_stats(stats2, path)
-
-            with open(path) as f:
-                data = json.load(f)
-            assert data["step"] == 200
-
-    def test_write_is_atomic_no_temp_files(self):
-        """Test that no temp files are left after successful write."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "stats.json"
-            stats = TrainerStats(step=100)
-
-            write_stats(stats, path)
-
-            # Check no temp files remain
-            files = list(Path(tmpdir).iterdir())
-            temp_files = [
-                f for f in files if f.name.startswith("tmp") or ".tmp" in f.name
-            ]
-            assert len(temp_files) == 0
-
-    def test_write_cleans_up_on_failure(self):
-        """Test that temp files are cleaned up on write failure."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "stats.json"
-            stats = TrainerStats(step=100)
-
-            # Mock json.dump to fail
-            with patch("json.dump", side_effect=RuntimeError("Mock dump failure")):
-                with pytest.raises(RuntimeError, match="Mock dump failure"):
-                    write_stats(stats, path)
-
-            # Check no temp files remain
-            files = list(Path(tmpdir).iterdir())
-            assert len(files) == 0
-
-    def test_write_accepts_string_path(self):
-        """Test write_stats accepts string path."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = str(Path(tmpdir) / "stats.json")
-            stats = TrainerStats(step=100)
-
-            write_stats(stats, path)
-
-            assert Path(path).exists()
-
-    def test_write_round_trip(self):
-        """Test full write and load round-trip."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "stats.json"
-
-            original = TrainerStats(
-                step=500,
-                total_steps=1000,
-                total_loss=0.3,
-                value_loss=0.1,
-                policy_loss=0.2,
-                learning_rate=0.001,
-                samples_seen=25000,
-                replay_buffer_size=50000,
-                last_checkpoint="model_500.onnx",
-                env_id="connect4",
+    def test_history_is_strictly_ordered_and_not_in_the_future(self):
+        with pytest.raises(StatsArtifactError, match="strictly increasing"):
+            TrainerStats(
+                step=2,
+                total_steps=2,
+                history=[history_entry(2), history_entry(1)],
             )
-            original.append_history({"step": 500, "loss": 0.3})
-            original.append_eval(EvalStats(step=500, win_rate=0.85))
+        with pytest.raises(StatsArtifactError, match="beyond stats.step"):
+            TrainerStats(step=1, total_steps=2, history=[history_entry(2)])
 
-            write_stats(original, path)
-            loaded = load_stats(path)
+    def test_eval_history_order_time_and_last_record_are_exact(self):
+        first = eval_stats(1, 0.5, timestamp=2.0)
+        second = eval_stats(2, 0.6, timestamp=1.0)
+        with pytest.raises(StatsArtifactError, match="timestamps.*nondecreasing"):
+            TrainerStats(
+                step=2,
+                total_steps=2,
+                last_evaluation=second,
+                evaluation_history=[first.to_dict(), second.to_dict()],
+            )
+        with pytest.raises(StatsArtifactError, match="last_evaluation must equal"):
+            TrainerStats(
+                step=2,
+                total_steps=2,
+                last_evaluation=first,
+                evaluation_history=[
+                    first.to_dict(),
+                    eval_stats(2, 0.6, timestamp=3.0).to_dict(),
+                ],
+            )
+        with pytest.raises(StatsArtifactError, match="last_evaluation must be null"):
+            TrainerStats(step=1, total_steps=1, last_evaluation=first)
 
-            assert loaded.step == original.step
-            assert loaded.total_steps == original.total_steps
-            assert loaded.total_loss == original.total_loss
-            assert loaded.env_id == original.env_id
-            assert len(loaded.history) == len(original.history)
-            assert loaded.last_eval.win_rate == original.last_eval.win_rate
+    def test_top_level_counters_and_metrics_are_bounded(self):
+        with pytest.raises(StatsArtifactError, match="total_steps"):
+            TrainerStats(step=2, total_steps=1)
+        with pytest.raises(StatsArtifactError, match="finite"):
+            TrainerStats(metrics={"loss/total": float("nan")})
+        with pytest.raises(StatsArtifactError, match="within u64"):
+            TrainerStats(samples_seen=2**64)
+
+    def test_append_eval_and_history_require_current_stats_step(self):
+        stats = TrainerStats(step=1, total_steps=2)
+        stats.append_history(history_entry(1, 0.5))
+        stats.append_evaluation(eval_stats(1, 0.5))
+
+        with pytest.raises(StatsArtifactError, match="beyond stats.step"):
+            stats.append_history(history_entry(2, 0.4))
+        with pytest.raises(StatsArtifactError, match="beyond stats.step"):
+            stats.append_evaluation(eval_stats(2, 0.6, timestamp=2.0))
+
+    def test_numeric_normalization_is_recursive(self):
+        stats = TrainerStats(
+            metrics={"loss/total": -0.0, "return/mean": -1},
+            learning_rate=-0.0,
+            timestamp=0,
+            history=[
+                {
+                    **history_entry(0),
+                    "metrics": {"loss/total": -0.0},
+                    "learning_rate": -0.0,
+                    "grad_norm": -0.0,
+                }
+            ],
+        )
+
+        encoded = canonical_json_bytes(stats.to_dict())
+        assert b"-0.0" not in encoded
+        assert stats.metrics["loss/total"] == 0.0
+        assert isinstance(stats.metrics["loss/total"], float)
+        assert stats.metrics["return/mean"] == -1.0
+        assert stats.history[0]["grad_norm"] == 0.0
 
 
-class TestAtomicWriteSimulation:
-    """Tests simulating concurrent access to verify atomicity."""
+class TestHistoryRetention:
+    def test_empty_history_is_unchanged(self):
+        assert retain_training_history([], 1000) == []
 
-    def test_concurrent_reads_during_write(self):
-        """Test that reads don't see partial writes."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "stats.json"
+    def test_tiered_retention_preserves_expected_resolutions(self):
+        current_step = 15000
+        history = [{"step": step} for step in range(0, current_step + 1, 10)]
 
-            # Write initial version
-            initial = TrainerStats(step=0)
-            write_stats(initial, path)
+        result = retain_training_history(history, current_step)
 
-            read_results = []
-            errors = []
+        for entry in result:
+            age = current_step - entry["step"]
+            if age <= RECENT_STEPS_THRESHOLD:
+                continue
+            if age <= MEDIUM_STEPS_THRESHOLD:
+                assert entry["step"] % MEDIUM_RESOLUTION == 0
+            else:
+                assert entry["step"] % OLD_RESOLUTION == 0
 
-            def reader():
-                """Reader thread that continuously reads the file."""
-                for _ in range(50):
-                    try:
-                        if path.exists():
-                            with open(path) as f:
-                                data = json.load(f)
-                                read_results.append(data["step"])
-                    except json.JSONDecodeError as e:
-                        errors.append(str(e))
-                    time.sleep(0.001)
+    def test_append_enforces_absolute_bound(self):
+        last = DEFAULT_MAX_HISTORY + 4
+        history = [history_entry(last, float(index)) for index in range(last + 1)]
 
-            def writer():
-                """Writer thread that continuously updates the file."""
-                for i in range(1, 51):
-                    stats = TrainerStats(step=i * 10)
-                    write_stats(stats, path)
-                    time.sleep(0.001)
+        retained = retain_training_history(history, last)
 
-            reader_thread = threading.Thread(target=reader)
-            writer_thread = threading.Thread(target=writer)
+        assert len(retained) == DEFAULT_MAX_HISTORY
+        assert retained[-1]["step"] == last
 
-            reader_thread.start()
-            writer_thread.start()
+    def test_eval_history_enforces_absolute_bound(self):
+        stats = TrainerStats(step=9, total_steps=9)
+        stats._max_evaluation_history = 3
+        for step in range(10):
+            stats.append_evaluation(eval_stats(step, step / 10, timestamp=float(step)))
 
-            reader_thread.join()
-            writer_thread.join()
-
-            # Should have no JSON decode errors (would indicate partial writes)
-            assert len(errors) == 0, f"JSON errors during concurrent access: {errors}"
-
-            # All read values should be valid step values (multiples of 10 or 0)
-            for step in read_results:
-                assert step % 10 == 0, f"Invalid step value: {step}"
+        assert [entry["step"] for entry in stats.evaluation_history] == [7, 8, 9]
+        assert stats.last_evaluation is not None
+        assert stats.last_evaluation.step == 9
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+class TestPreparedStatsSnapshot:
+    def test_prepare_and_decode_bind_every_checkpoint_identity_field(self):
+        stats, checkpoint = bound_stats(10)
+
+        prepared = prepare_stats_snapshot(stats, checkpoint)
+        loaded = decode_stats_snapshot(
+            prepared.data,
+            expected_stats_id=prepared.stats_id,
+            expected_binding=StatsBindingV1.from_checkpoint(checkpoint),
+        )
+
+        assert isinstance(prepared, PreparedStatsSnapshotV3)
+        assert isinstance(loaded, LoadedStatsSnapshotV3)
+        assert prepared.stats_id == sha256_bytes(prepared.data)
+        assert loaded.binding.profile == checkpoint.manifest.profile
+        assert loaded.binding.config_sha256 == checkpoint.manifest.config_sha256
+        assert loaded.binding.checkpoint_id == checkpoint.checkpoint_id
+        assert loaded.binding.step == checkpoint.manifest.step
+        assert loaded.stats.to_dict() == stats.to_dict()
+        assert prepared.to_dict() == json.loads(prepared.data)
+
+    def test_snapshot_has_one_exact_nested_schema(self):
+        stats, checkpoint = bound_stats(10)
+        prepared = prepare_stats_snapshot(stats, checkpoint)
+        raw = prepared.to_dict()
+
+        assert set(raw) == {
+            "schema_version",
+            "profile",
+            "config_sha256",
+            "checkpoint_id",
+            "step",
+            "stats",
+        }
+        raw["extra"] = 1
+        data = canonical_json_bytes(raw)
+        with pytest.raises(StatsArtifactError, match="fields must be exact"):
+            decode_stats_snapshot(data, expected_stats_id=sha256_bytes(data))
+
+        raw = prepared.to_dict()
+        del raw["stats"]["history"]
+        data = canonical_json_bytes(raw)
+        with pytest.raises(StatsArtifactError, match="fields must be exact"):
+            decode_stats_snapshot(data, expected_stats_id=sha256_bytes(data))
+
+    def test_decode_rejects_id_and_run_commit_binding_mismatch(self):
+        stats, checkpoint = bound_stats(10)
+        prepared = prepare_stats_snapshot(stats, checkpoint)
+
+        with pytest.raises(StatsArtifactError, match="SHA-256 mismatch"):
+            decode_stats_snapshot(prepared.data, expected_stats_id="f" * 64)
+        other = checkpoint_ref(10, config_sha256="d" * 64)
+        with pytest.raises(StatsArtifactError, match="RunCommit binding"):
+            decode_stats_snapshot(
+                prepared.data,
+                expected_stats_id=prepared.stats_id,
+                expected_binding=StatsBindingV1.from_checkpoint(other),
+            )
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            lambda raw: raw["stats"]["metrics"].__setitem__("loss/total", 1),
+            lambda raw: raw["stats"]["metrics"].__setitem__("loss/total", -0.0),
+            lambda raw: raw["stats"]["history"][0].__setitem__("grad_norm", -0.0),
+        ],
+    )
+    def test_decode_rejects_alternate_numeric_spellings(self, mutation):
+        stats, checkpoint = bound_stats(10, total_loss=1.0)
+        prepared = prepare_stats_snapshot(stats, checkpoint)
+        raw = prepared.to_dict()
+        mutation(raw)
+        data = canonical_json_bytes(raw)
+
+        with pytest.raises(StatsArtifactError, match="normalized form"):
+            decode_stats_snapshot(data, expected_stats_id=sha256_bytes(data))
+
+    def test_integer_and_float_inputs_produce_one_content_id(self):
+        integer_stats, checkpoint = bound_stats(10, total_loss=1)
+        float_stats, _ = bound_stats(10, checkpoint=checkpoint, total_loss=1.0)
+
+        integer_snapshot = prepare_stats_snapshot(integer_stats, checkpoint)
+        float_snapshot = prepare_stats_snapshot(float_stats, checkpoint)
+
+        assert integer_snapshot.data == float_snapshot.data
+        assert integer_snapshot.stats_id == float_snapshot.stats_id
+
+    def test_prepare_rejects_cross_profile_and_config_relabeling(self):
+        stats, first = bound_stats(10)
+        prepare_stats_snapshot(stats, first)
+        other_profile = CheckpointProfileV1(
+            algorithm_id=PROFILE.algorithm_id,
+            env_id="connect4",
+            env_contract_version=1,
+            model_artifact_schema_version=1,
+            model_contract=PROFILE.model_contract,
+        )
+
+        for checkpoint in (
+            checkpoint_ref(11, profile=other_profile),
+            checkpoint_ref(11, config_sha256="d" * 64),
+        ):
+            stats.step = 11
+            stats.total_steps = 20
+            stats.env_id = checkpoint.manifest.profile.env_id
+            stats.last_checkpoint = checkpoint.checkpoint_id
+            with pytest.raises(StatsArtifactError, match="different.*profile or config"):
+                prepare_stats_snapshot(stats, checkpoint)
+
+    def test_prepare_rejects_checkpoint_step_regression(self):
+        first = checkpoint_ref(10)
+        stats, _ = bound_stats(10, checkpoint=first)
+        prepare_stats_snapshot(stats, first)
+        older = checkpoint_ref(9)
+        stats.step = 9
+        stats.total_steps = 20
+        stats.last_checkpoint = older.checkpoint_id
+
+        with pytest.raises(StatsArtifactError, match="older checkpoint step"):
+            prepare_stats_snapshot(stats, older)
+
+    def test_prepare_rejects_same_step_checkpoint_relabeling(self):
+        first = checkpoint_ref(10)
+        stats, _ = bound_stats(10, checkpoint=first)
+        prepare_stats_snapshot(stats, first)
+        replacement = checkpoint_ref(10, parent_checkpoint_id="d" * 64)
+        stats.last_checkpoint = replacement.checkpoint_id
+
+        with pytest.raises(StatsArtifactError, match="different checkpoint"):
+            prepare_stats_snapshot(stats, replacement)
+
+    @pytest.mark.parametrize(
+        ("field_name", "value", "message"),
+        [
+            ("step", 9, "checkpoint step"),
+            ("env_id", "connect4", "checkpoint profile"),
+            ("last_checkpoint", "", "bound checkpoint"),
+        ],
+    )
+    def test_prepare_rejects_stats_checkpoint_disagreement(self, field_name, value, message):
+        stats, checkpoint = bound_stats(10)
+        setattr(stats, field_name, value)
+
+        with pytest.raises(StatsArtifactError, match=message):
+            prepare_stats_snapshot(stats, checkpoint)
+        assert stats._binding is None
+
+
+class TestStatsProjection:
+    def test_projection_contains_only_rebuildable_stats(self, tmp_path):
+        stats, checkpoint = bound_stats(10)
+        prepared = prepare_stats_snapshot(stats, checkpoint)
+        path = tmp_path / "nested" / "stats.json"
+
+        write_stats_projection(prepared, path)
+
+        assert json.loads(path.read_bytes()) == stats.to_dict()
+        assert not (tmp_path / "nested" / "stats" / "channels").exists()
+        assert not (tmp_path / "nested" / "stats" / "manifests").exists()
+
+    def test_projection_accepts_verified_loaded_snapshot(self, tmp_path):
+        stats, checkpoint = bound_stats(10)
+        prepared = prepare_stats_snapshot(stats, checkpoint)
+        loaded = decode_stats_snapshot(prepared.data, expected_stats_id=prepared.stats_id)
+
+        write_stats_projection(loaded, tmp_path / "stats.json")
+
+        assert json.loads((tmp_path / "stats.json").read_bytes()) == stats.to_dict()
+
+    def test_ephemeral_projection_can_advance_beyond_selected_binding(self, tmp_path):
+        stats, checkpoint = bound_stats(10)
+        prepare_stats_snapshot(stats, checkpoint)
+        stats.step = 11
+        stats.total_steps = 20
+        stats.samples_seen += 4
+        stats.append_history(history_entry(11, 0.4))
+
+        write_ephemeral_stats_projection(stats, tmp_path / "stats.json")
+
+        projection = json.loads((tmp_path / "stats.json").read_bytes())
+        assert projection["step"] == 11
+        assert projection["last_checkpoint"] == checkpoint.checkpoint_id
+
+    def test_concurrent_projection_reads_never_observe_partial_json(self, tmp_path):
+        path = tmp_path / "stats.json"
+        initial_stats, initial_checkpoint = bound_stats(0)
+        write_stats_projection(prepare_stats_snapshot(initial_stats, initial_checkpoint), path)
+        errors: list[str] = []
+        observed: list[int] = []
+
+        def reader() -> None:
+            for _ in range(50):
+                try:
+                    observed.append(json.loads(path.read_bytes())["step"])
+                except json.JSONDecodeError as exc:
+                    errors.append(str(exc))
+                time.sleep(0.001)
+
+        def writer() -> None:
+            for step in range(1, 31):
+                stats, checkpoint = bound_stats(step)
+                write_stats_projection(prepare_stats_snapshot(stats, checkpoint), path)
+                time.sleep(0.001)
+
+        threads = [threading.Thread(target=reader), threading.Thread(target=writer)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert not errors
+        assert all(isinstance(step, int) and 0 <= step <= 30 for step in observed)

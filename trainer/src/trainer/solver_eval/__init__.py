@@ -11,24 +11,21 @@ bitbully perfect solver to classify the chosen move:
 - exact-best: the move is in the argmax set of solver scores
   (fastest win / slowest loss)
 
-Results are aggregated overall, by ply bucket, and by seat, then appended
-to data/solver_stats.json. Unlike win-rate-vs-random, these metrics have a
-fixed, objective yardstick, so they are comparable across checkpoints.
+Results are aggregated overall, by ply bucket, and by seat. The standalone
+command is diagnostic and writes no mutable authority; synchronized solver
+evidence is persisted only inside immutable evaluation artifacts.
 
 Usage (defaults assume running from the repo root):
-    python -m trainer solver-eval --model ./data/models/latest.onnx --games 100
+    python -m trainer solver-eval --model ./candidate.onnx --games 100
     python -m trainer solver-eval --all-checkpoints --games 100
 
-This module was split into a package; every name that was importable from
-``trainer.solver_eval`` is re-exported here to keep existing imports working.
+The package exports its command, scoring, judgment, and result contracts from
+this canonical surface.
 """
 
 from .cli import (
     add_solver_eval_arguments,
-    append_solver_stats,
-    discover_checkpoints,
     format_progression_table,
-    main,
     run_solver_evaluation,
 )
 from .judgment import (
@@ -45,19 +42,13 @@ from .judgment import (
     judge_move,
     ply_bucket,
 )
-from .results import (
-    CHECKPOINT_PATTERN,
-    BucketStats,
-    SolverEvalResults,
-    infer_step_from_filename,
-)
+from .results import BucketStats, SolverEvalResults
 from .scorer import SolverScorer, solver_evaluate
 
 __all__ = [
     "BLUNDER_DRAW_TO_LOSS",
     "BLUNDER_WIN_TO_DRAW",
     "BLUNDER_WIN_TO_LOSS",
-    "CHECKPOINT_PATTERN",
     "CLASS_DRAW",
     "CLASS_LOSS",
     "CLASS_WIN",
@@ -68,13 +59,9 @@ __all__ = [
     "SolverEvalResults",
     "SolverScorer",
     "add_solver_eval_arguments",
-    "append_solver_stats",
     "classify_score",
-    "discover_checkpoints",
     "format_progression_table",
-    "infer_step_from_filename",
     "judge_move",
-    "main",
     "ply_bucket",
     "run_solver_evaluation",
     "solver_evaluate",

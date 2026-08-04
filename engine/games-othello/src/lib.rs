@@ -34,20 +34,25 @@
 //! let reset = ctx.reset(42, &[]).unwrap();
 //! ```
 
-use engine_core::game_utils::{
-    calculate_reward, decode_action_u32, info_bits, opponent, validate_board_cells,
-    validate_player_and_winner,
+use engine_core::board_profile::{
+    calculate_reward, decode_action_u32, opponent, register_board_game, validate_board_cells,
+    validate_player_and_winner, BoardGame, BoardGameMetadata, BoardPlayerMetadata, BoardTransition,
+    BoardView, TwoPlayerObs, TwoPlayerObsError,
 };
 use engine_core::typed::{
-    ActionSpace, Capabilities, DecodeError, EncodeError, Encoding, EngineId, Game,
+    ActionSpace, AgentId, AgentModel, Capabilities, DecodeError, EncodeError, Encoding, EngineId,
+    EnvironmentSemantics, TensorSpec,
 };
-use engine_core::{register_game, GameAdapter, GameMetadata};
+use engine_core::{EnvironmentError, EnvironmentMetadata, LegalMask};
 use rand_chacha::ChaCha20Rng;
 
 /// Board dimensions
 pub const COLS: usize = 8;
 pub const ROWS: usize = 8;
 pub const BOARD_SIZE: usize = COLS * ROWS; // 64
+
+/// Immutable environment contract revision for wire formats and semantics.
+pub const ENV_CONTRACT_VERSION: u32 = 2;
 
 /// Number of actions: 64 board positions + 1 pass
 pub const NUM_ACTIONS: usize = 65;
@@ -72,9 +77,7 @@ const DIRECTIONS: [(isize, isize); 8] = [
 /// Call this function once at startup to make Othello available
 /// via `EngineContext::new("othello")`.
 pub fn register_othello() {
-    register_game("othello".to_string(), || {
-        Box::new(GameAdapter::new(Othello::new()))
-    });
+    register_board_game::<Othello>().expect("othello environment must only be registered once");
 }
 
 /// Othello game state
@@ -216,12 +219,6 @@ impl State {
         !self.has_any_legal_moves()
     }
 
-    /// Get legal actions mask including pass.
-    /// Returns (board_mask: u64, pass_legal: bool)
-    pub fn legal_actions(&self) -> (u64, bool) {
-        (self.legal_moves_mask(), self.is_pass_legal())
-    }
-
     /// Make a move and return the new state
     pub fn make_move(&self, action: u32) -> State {
         if self.is_done() {
@@ -356,94 +353,12 @@ impl Default for State {
 /// Othello action - board position (0-63) or pass (64)
 pub type Action = u32;
 
-/// Custom observation type for Othello with 65 actions.
-///
-/// Unlike TwoPlayerObs which uses u64 for legal mask, this supports
-/// more than 64 actions by using a separate array.
-#[derive(Debug, Clone, PartialEq)]
-pub struct OthelloObs {
-    /// Board encoding: [64 Black positions, 64 White positions]
-    pub board_view: [f32; 128],
-    /// Legal moves: [64 board positions, 1 pass action]
-    pub legal_moves: [f32; 65],
-    /// Current player indicator: [is_black, is_white]
-    pub current_player: [f32; 2],
-}
-
-impl OthelloObs {
-    /// Create a new empty observation.
-    pub fn new() -> Self {
-        Self {
-            board_view: [0.0; 128],
-            legal_moves: [0.0; 65],
-            current_player: [0.0; 2],
-        }
-    }
-
-    /// Create observation from game state.
-    ///
-    /// - `board`: Board array (0=empty, 1=Black, 2=White)
-    /// - `legal_mask`: u64 bitmask of legal board positions (0-63)
-    /// - `pass_legal`: Whether pass action (64) is legal
-    /// - `current_player`: Current player (1=Black, 2=White)
-    pub fn from_board(board: &[u8], legal_mask: u64, pass_legal: bool, current_player: u8) -> Self {
-        let mut obs = Self::new();
-
-        // Encode board state (one-hot for each player)
-        for (i, &cell) in board.iter().enumerate() {
-            if cell == 1 {
-                obs.board_view[i] = 1.0; // Black in first 64 positions
-            } else if cell == 2 {
-                obs.board_view[i + 64] = 1.0; // White in second 64 positions
-            }
-        }
-
-        // Encode legal moves for board positions (0-63)
-        for pos in 0..64 {
-            if (legal_mask & (1u64 << pos)) != 0 {
-                obs.legal_moves[pos] = 1.0;
-            }
-        }
-
-        // Encode pass action (64)
-        if pass_legal {
-            obs.legal_moves[64] = 1.0;
-        }
-
-        // Encode current player
-        if current_player == 1 {
-            obs.current_player[0] = 1.0;
-        } else {
-            obs.current_player[1] = 1.0;
-        }
-
-        obs
-    }
-
-    /// Encode observation as bytes for neural network input.
-    pub fn encode(&self, out: &mut Vec<u8>) {
-        use engine_core::game_utils::encode_f32_slices;
-        encode_f32_slices(
-            out,
-            [
-                &self.board_view[..],
-                &self.legal_moves[..],
-                &self.current_player[..],
-            ],
-        );
-    }
-}
-
-impl Default for OthelloObs {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Player-relative Othello observation: two 8x8 occupancy planes.
+pub type OthelloObs = TwoPlayerObs<128>;
 
 /// Create observation from game state
-pub fn observation_from_state(state: &State) -> OthelloObs {
-    let (legal_mask, pass_legal) = state.legal_actions();
-    OthelloObs::from_board(&state.board, legal_mask, pass_legal, state.current_player)
+pub fn observation_from_state(state: &State) -> Result<OthelloObs, TwoPlayerObsError> {
+    OthelloObs::from_board(&state.board, state.current_player)
 }
 
 /// Othello game implementation
@@ -455,34 +370,6 @@ impl Othello {
     pub fn new() -> Self {
         Self
     }
-
-    /// Pack auxiliary information about the state into a u64 bit-field.
-    ///
-    /// Uses `engine_core::game_utils::info_bits`, which ORs the legal move mask
-    /// with the current player (bits 16-19), winner (bits 20-23), and pass count
-    /// (bits 24-31) fields.
-    ///
-    /// CAVEAT: Othello's legal move mask spans all 64 board positions, so mask
-    /// bits 16 and above collide with the player/winner/pass fields. **While
-    /// the game is in progress** the packed info value is therefore ambiguous
-    /// and cannot be reliably decoded with `info_bits::extract_*`. Consumers
-    /// should read legal moves and the current player from the observation
-    /// instead (see `GameMetadata::extract_legal_moves`).
-    ///
-    /// The one exception is a **terminal** state: `legal_moves_mask()` returns
-    /// 0 once `is_done()`, so nothing collides and the winner field at bits
-    /// 20-23 is exact. `info_bits::outcome_from_info` relies on precisely that,
-    /// and `engine_games::tests::test_terminal_info_bits_report_the_true_winner`
-    /// asserts it for every registered game — so if this ever stops holding,
-    /// that test fails rather than self-play win attribution silently rotting.
-    fn compute_info_bits(state: &State) -> u64 {
-        let legal_mask = state.legal_moves_mask();
-        let player = state.current_player;
-        let winner = state.winner;
-        let passes = state.pass_count as u64;
-
-        info_bits::compute_info_bits(legal_mask, player, winner, passes)
-    }
 }
 
 impl Default for Othello {
@@ -491,13 +378,11 @@ impl Default for Othello {
     }
 }
 
-/// Observation size: 64 (Black) + 64 (White) + 65 (legal) + 2 (player) = 195
-const OBS_SIZE: usize = BOARD_SIZE * 2 + NUM_ACTIONS + 2;
-
-impl Game for Othello {
+/// Observation size: two player-relative board planes.
+impl BoardGame for Othello {
     type State = State;
     type Action = Action;
-    type Obs = OthelloObs;
+    type Observation = OthelloObs;
 
     fn engine_id(&self) -> EngineId {
         EngineId {
@@ -509,42 +394,46 @@ impl Game for Othello {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             id: self.engine_id(),
-            encoding: Encoding {
-                state: "othello_state:v1".to_string(),
-                action: "discrete_position:v1".to_string(),
-                obs: format!("f32x{}:v1", OBS_SIZE), // 195 floats
-                schema_version: 1,
-            },
-            max_horizon: BOARD_SIZE as u32, // Maximum 64 moves (unlikely in practice)
-            action_space: ActionSpace::Discrete(NUM_ACTIONS as u32), // 65 possible actions
+            contract_version: ENV_CONTRACT_VERSION,
+            encoding: Encoding::discrete_u32_le(
+                "othello_state:v1",
+                TensorSpec::f32_fixed([
+                    ("channel", 2),
+                    ("row", ROWS as u32),
+                    ("column", COLS as u32),
+                ]),
+            ),
+            semantics:
+                EnvironmentSemantics::deterministic_alternating_perfect_information_terminal_zero_sum(),
+            max_horizon: Some(BOARD_SIZE as u32),
+            agents: AgentModel::fixed_homogeneous_masked(
+                [AgentId(1), AgentId(2)],
+                ActionSpace::discrete(NUM_ACTIONS as u32),
+            ),
             preferred_batch: 64,
         }
     }
 
-    fn metadata(&self) -> GameMetadata {
-        GameMetadata::new("othello", "Othello")
-            .with_board(COLS, ROWS)
-            .with_actions(NUM_ACTIONS)
-            .with_observation(OBS_SIZE, BOARD_SIZE * 2) // legal mask starts after board views
-            .with_obs_encoding(2, false) // one absolute plane per player
-            // A forced pass is an explicit action (PASS_ACTION) and consumes
-            // a step, so the acting player still alternates every step.
-            .with_alternating_turns(true)
-            .with_players(
-                2,
-                vec!["Black".to_string(), "White".to_string()],
-                vec!['⚫', '⚪'], // Black circle, White circle emoji
-            )
+    fn metadata(&self) -> EnvironmentMetadata {
+        EnvironmentMetadata::new("othello", "Othello")
             .with_description("Flip opponent pieces to dominate the board!")
-            .with_board_type("grid")
+            .with_board(BoardGameMetadata::new(COLS, ROWS).with_players(vec![
+                BoardPlayerMetadata::new("Black", "⚫"),
+                BoardPlayerMetadata::new("White", "⚪"),
+            ]))
     }
 
-    // reset/step mirror games-tictactoe and games-connect4; the shared pieces
-    // (reward, info bits, validation) live in engine_core::game_utils.
-    fn reset(&mut self, _rng: &mut ChaCha20Rng, _hint: &[u8]) -> (Self::State, Self::Obs) {
+    // reset/step mirror games-tictactoe and games-connect4; shared reward and
+    // Validation helpers live in the explicit engine_core::board_profile API.
+    fn reset(
+        &mut self,
+        _rng: &mut ChaCha20Rng,
+        _hint: &[u8],
+    ) -> Result<(Self::State, Self::Observation), EnvironmentError> {
         let state = State::new();
-        let obs = observation_from_state(&state);
-        (state, obs)
+        let obs = observation_from_state(&state)
+            .map_err(|error| EnvironmentError::InvalidState(error.to_string()))?;
+        Ok((state, obs))
     }
 
     fn step(
@@ -552,16 +441,33 @@ impl Game for Othello {
         state: &mut Self::State,
         action: Self::Action,
         _rng: &mut ChaCha20Rng,
-    ) -> (Self::Obs, f32, bool, u64) {
+    ) -> Result<BoardTransition<Self::Observation>, EnvironmentError> {
+        let legal = !state.is_done()
+            && if action == PASS_ACTION {
+                state.is_pass_legal()
+            } else {
+                usize::try_from(action)
+                    .ok()
+                    .filter(|&position| position < BOARD_SIZE)
+                    .is_some_and(|position| state.is_valid_move(position))
+            };
+        if !legal {
+            return Err(EnvironmentError::InvalidAction(format!(
+                "action {action} is not legal in the current Othello state"
+            )));
+        }
         let previous_player = state.current_player;
         *state = state.make_move(action);
 
-        let obs = observation_from_state(state);
+        let obs = observation_from_state(state)
+            .map_err(|error| EnvironmentError::InvalidState(error.to_string()))?;
         let reward = calculate_reward(state.winner, previous_player);
         let done = state.is_done();
-        let info = Self::compute_info_bits(state);
-
-        (obs, reward, done, info)
+        Ok(BoardTransition {
+            observation: obs,
+            actor_reward: reward,
+            terminated: done,
+        })
     }
 
     fn encode_state(state: &Self::State, out: &mut Vec<u8>) -> Result<(), EncodeError> {
@@ -635,9 +541,21 @@ impl Game for Othello {
         Ok(action)
     }
 
-    fn encode_obs(obs: &Self::Obs, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn encode_observation(obs: &Self::Observation, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         obs.encode(out);
         Ok(())
+    }
+
+    fn legal_actions(state: &Self::State) -> Result<LegalMask, EnvironmentError> {
+        let mut mask = LegalMask::new(NUM_ACTIONS);
+        for action in state.legal_moves() {
+            mask.set(action as usize);
+        }
+        Ok(mask)
+    }
+
+    fn view(state: &Self::State) -> BoardView {
+        BoardView::from_owners(&state.board, state.current_player, state.winner)
     }
 }
 

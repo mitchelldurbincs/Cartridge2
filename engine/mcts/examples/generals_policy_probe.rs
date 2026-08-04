@@ -8,7 +8,10 @@
 //! Run: cargo run -p mcts --features onnx --example generals_policy_probe \
 //!        --release -- <model.onnx> [num_sims]
 
-use engine_core::EngineContext;
+use algorithm_core::{resolve_algorithm, ALPHAZERO_BOARD_V1_ID};
+use engine_core::{
+    ActionAvailability, ActionSpace, AgentId, EngineContext, ErasedTimestep, ObservationEncoding,
+};
 use mcts::{run_mcts, MctsConfig, OnnxEvaluator, UniformEvaluator};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -34,26 +37,51 @@ fn print_policy(label: &str, policy: &[f32]) {
     );
 }
 
+fn active_legal_mask(timestep: &ErasedTimestep) -> &engine_core::LegalMask {
+    let active = timestep.decision.sole_agent().expect("expected one agent");
+    let ActionAvailability::DiscreteMask { mask } = &active.availability else {
+        panic!("expected a discrete legal-action mask");
+    };
+    mask
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let model_path = args.get(1).expect("usage: probe <model.onnx> [sims]");
     let sims: u32 = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(35);
 
-    engine_games::register_all_games();
+    engine_games::register_all_environments();
     let mut ctx = EngineContext::new("generals_8x8").unwrap();
-    let meta = ctx.metadata();
+    let capabilities = ctx.capabilities();
+    let ObservationEncoding::Tensor { spec } = &capabilities.encoding.observation else {
+        panic!("expected tensor observations");
+    };
+    let obs_size = spec.fixed_elements().expect("fixed observation shape");
+    let ActionSpace::Discrete { size: action_count } = capabilities
+        .action_space(AgentId(1))
+        .expect("agent 1 action space")
+    else {
+        panic!("expected discrete actions");
+    };
+    let action_count = usize::try_from(*action_count).expect("action count fits usize");
 
     let config = MctsConfig::for_training()
         .with_simulations(sims)
         .with_eval_batch_size(64)
         .with_temperature(1.0);
 
-    let evaluator = OnnxEvaluator::load(model_path, meta.obs_size, 1).unwrap();
+    let model_contract = resolve_algorithm(ALPHAZERO_BOARD_V1_ID)
+        .unwrap()
+        .descriptor()
+        .model_artifact_contract("generals_8x8", ctx.capabilities().contract_version);
+    let evaluator =
+        OnnxEvaluator::load_from_file(model_path, obs_size, action_count, 1, &model_contract)
+            .unwrap();
     let uniform = UniformEvaluator::new();
 
     for seed in [42u64, 7, 13] {
         let reset = ctx.reset(seed, &[]).unwrap();
-        let mask = meta.legal_mask_from_obs(&reset.obs);
+        let mask = active_legal_mask(&reset.timestep);
         println!("--- seed {seed}: {} legal actions ---", mask.count_ones());
 
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
@@ -62,8 +90,7 @@ fn main() {
             &evaluator,
             config.clone(),
             reset.state.clone(),
-            reset.obs.clone(),
-            mask.clone(),
+            reset.timestep.clone(),
             &mut rng,
         )
         .unwrap();
@@ -75,8 +102,7 @@ fn main() {
             &uniform,
             config.clone(),
             reset.state,
-            reset.obs,
-            mask,
+            reset.timestep,
             &mut rng,
         )
         .unwrap();

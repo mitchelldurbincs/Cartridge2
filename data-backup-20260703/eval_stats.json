@@ -1,0 +1,100 @@
+{
+  "evaluations": [
+    {
+      "iteration": 5,
+      "step": 2000,
+      "vs_best_win_rate": 1.0,
+      "vs_best_draw_rate": 0.0,
+      "vs_best_opponent_iteration": 5,
+      "became_new_best": true,
+      "vs_random_win_rate": 0.81,
+      "vs_random_draw_rate": 0.0,
+      "games": 200,
+      "timestamp": "2026-03-29T15:44:10.217331"
+    },
+    {
+      "iteration": 10,
+      "step": 4000,
+      "vs_best_win_rate": 0.41,
+      "vs_best_draw_rate": 0.025,
+      "vs_best_opponent_iteration": 5,
+      "became_new_best": false,
+      "vs_random_win_rate": 0.76,
+      "vs_random_draw_rate": 0.0,
+      "games": 200,
+      "timestamp": "2026-03-29T15:49:32.769952"
+    },
+    {
+      "iteration": 15,
+      "step": 6000,
+      "vs_best_win_rate": 0.395,
+      "vs_best_draw_rate": 0.0,
+      "vs_best_opponent_iteration": 5,
+      "became_new_best": false,
+      "vs_random_win_rate": 0.72,
+      "vs_random_draw_rate": 0.0,
+      "games": 200,
+      "timestamp": "2026-03-29T15:55:50.537692"
+    },
+    {
+      "iteration": 20,
+      "step": 8000,
+      "vs_best_win_rate": 0.42,
+      "vs_best_draw_rate": 0.0,
+      "vs_best_opponent_iteration": 5,
+      "became_new_best": false,
+      "vs_random_win_rate": 0.71,
+      "vs_random_draw_rate": 0.0,
+      "games": 200,
+      "timestamp": "2026-03-29T16:03:30.217846"
+    },
+    {
+      "iteration": 25,
+      "step": 10000,
+      "vs_best_win_rate": 0.35,
+      "vs_best_draw_rate": 0.0,
+      "vs_best_opponent_iteration": 5,
+      "became_new_best": false,
+      "vs_random_win_rate": 0.73,
+      "vs_random_draw_rate": 0.0,
+      "games": 200,
+      "timestamp": "2026-03-29T16:11:17.237534"
+    },
+    {
+      "iteration": 30,
+      "step": 12000,
+      "vs_best_win_rate": 0.405,
+      "vs_best_draw_rate": 0.0,
+      "vs_best_opponent_iteration": 5,
+      "became_new_best": false,
+      "vs_random_win_rate": 0.64,
+      "vs_random_draw_rate": 0.0,
+      "games": 200,
+      "timestamp": "2026-03-29T16:19:11.538752"
+    },
+    {
+      "iteration": 35,
+      "step": 14000,
+      "vs_best_win_rate": 0.415,
+      "vs_best_draw_rate": 0.0,
+      "vs_best_opponent_iteration": 5,
+      "became_new_best": false,
+      "vs_random_win_rate": 0.74,
+      "vs_random_draw_rate": 0.0,
+      "games": 200,
+      "timestamp": "2026-03-29T16:26:58.741396"
+    },
+    {
+      "iteration": 40,
+      "step": 16000,
+      "vs_best_win_rate": 0.335,
+      "vs_best_draw_rate": 0.0,
+      "vs_best_opponent_iteration": 5,
+      "became_new_best": false,
+      "vs_random_win_rate": 0.705,
+      "vs_random_draw_rate": 0.0,
+      "games": 200,
+      "timestamp": "2026-03-29T16:34:43.447815"
+    }
+  ]
+}

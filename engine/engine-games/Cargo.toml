@@ -5,20 +5,17 @@ edition = "2021"
 description = "Game registration for Cartridge engine"
 
 [dependencies]
+algorithm-core = { path = "../algorithm-core" }
 engine-core = { path = "../engine-core" }
+envs-counter = { path = "../envs-counter" }
 games-tictactoe = { path = "../games-tictactoe" }
 games-connect4 = { path = "../games-connect4" }
 games-othello = { path = "../games-othello" }
 games-generals = { path = "../games-generals" }
 
-# Used by the game-metadata manifest generator (src/manifest.rs). Kept a real
+# Used by the environment/algorithm manifest generator (src/manifest.rs). Kept a real
 # dependency rather than feature-gated: `required-features` binaries are
 # excluded from `cargo clippy --all-targets`, which is the wrong trade for a
 # build tool that must stay lint-clean.
 serde = { workspace = true }
 serde_json = { workspace = true }
-
-[dev-dependencies]
-# Random playouts for the cross-game terminal-state invariant test.
-rand = { workspace = true }
-rand_chacha = { workspace = true }

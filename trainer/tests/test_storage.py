@@ -1,733 +1,642 @@
-"""Tests for storage backends (replay buffer and model store).
-
-PostgreSQL tests are integration tests requiring PostgreSQL.
-Set CARTRIDGE_STORAGE_POSTGRES_URL environment variable to run them.
-
-Filesystem tests run without any external dependencies.
-
-Example:
-    export CARTRIDGE_STORAGE_POSTGRES_URL=postgresql://user:pass@localhost:5432/db
-    pytest tests/test_storage.py -v
-"""
+"""Tests for the opaque, exact-selection replay v3 storage contract."""
 
 import os
-import tempfile
+from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 
-import numpy as np
 import pytest
 
-from trainer.storage.base import GameMetadata, Transition
-from trainer.storage.factory import create_model_store, create_replay_buffer
-from trainer.storage.postgres import _load_schema, split_sql_statements
+import trainer.storage as storage
+from trainer.storage.base import (
+    EmptyReplaySelectionError,
+    ReplayProfile,
+    ReplayRecord,
+    ReplaySelection,
+)
+from trainer.storage.factory import create_replay_store
+from trainer.storage.postgres import (
+    _EXPECTED_RECORD_COLUMNS,
+    _EXPECTED_RECORD_PRIMARY_KEY,
+    _EXPECTED_SCHEMA_MARKER_COLUMNS,
+    _EXPECTED_SCHEMA_MARKER_PRIMARY_KEY,
+    REPLAY_SCHEMA_VERSION,
+    PostgresReplayStore,
+    _load_schema,
+    _validate_record_schema,
+    _validate_schema_marker,
+    _validate_schema_tables,
+)
 
-# Check PostgreSQL availability for integration tests
+TEST_PROFILE = ReplayProfile(
+    env_id="testgame",
+    env_contract_version=1,
+    algorithm_id="alphazero_board_v1",
+    experience_schema="alphazero_transition_v1",
+)
+TEST_SELECTION = ReplaySelection(TEST_PROFILE, "a" * 64, None)
+
 postgres_available = bool(os.environ.get("CARTRIDGE_STORAGE_POSTGRES_URL"))
-
-# Skip decorator for PostgreSQL tests only
 requires_postgres = pytest.mark.skipif(
     not postgres_available,
     reason="PostgreSQL not configured (set CARTRIDGE_STORAGE_POSTGRES_URL)",
 )
 
 
-@pytest.fixture
-def replay_buffer():
-    """Create a PostgreSQL replay buffer for testing."""
-    url = os.environ.get("CARTRIDGE_STORAGE_POSTGRES_URL")
-    buffer = create_replay_buffer(url)
-
-    # Clean up any existing data
-    buffer.clear_transitions()
-
-    yield buffer
-
-    # Cleanup after test
-    buffer.clear_transitions()
-    buffer.close()
-
-
-@pytest.fixture
-def sample_metadata():
-    """Create sample game metadata."""
-    return GameMetadata(
-        env_id="testgame",
-        display_name="Test Game",
-        board_width=3,
-        board_height=3,
-        num_actions=9,
-        obs_size=29,
-        legal_mask_offset=18,
-        player_count=2,
-    )
-
-
-@pytest.fixture
-def sample_transition():
-    """Create a sample transition."""
-    obs = np.random.randn(29).astype(np.float32).tobytes()
-    next_obs = np.random.randn(29).astype(np.float32).tobytes()
-    policy = np.random.randn(9).astype(np.float32)
-    policy = policy / policy.sum()  # Normalize
-
-    return Transition(
-        id="test-001",
-        env_id="testgame",
+def make_record(
+    selection: ReplaySelection = TEST_SELECTION,
+    *,
+    record_id: str = "test-001",
+    step_number: int = 0,
+    payload: bytes | None = None,
+) -> ReplayRecord:
+    return selection.record(
+        id=record_id,
         episode_id="ep-001",
-        step_number=0,
-        state=b"state_data",
-        action=b"\x00\x00\x00\x00",  # action 0 as bytes
-        next_state=b"next_state_data",
-        observation=obs,
-        next_observation=next_obs,
-        reward=0.0,
-        done=False,
-        timestamp=1234567890,
-        policy_probs=policy.tobytes(),
-        mcts_value=0.5,
-        game_outcome=None,
+        step_number=step_number,
+        payload=payload if payload is not None else f"payload-{step_number}".encode(),
     )
 
 
-class TestSchemaStatementSplitting:
-    """The schema splitter, which needs no database.
+@pytest.fixture
+def replay_store():
+    url = os.environ["CARTRIDGE_STORAGE_POSTGRES_URL"]
+    store = create_replay_store(TEST_SELECTION, connection_string=url)
+    store.clear()
+    try:
+        yield store
+    finally:
+        store.clear()
+        store.close()
 
-    These are the regression tests for a bug where `_ensure_schema` split
-    `sql/schema.sql` on ';' first and then discarded any chunk starting with
-    '--'. Because every statement in that file has a comment line above it,
-    the comment led its own chunk and took the statement with it: both
-    CREATE TABLEs were dropped while the method logged success.
 
-    The Rust actor applies the same file via its own splitter and asserts the
-    same counts in `actor/src/storage/postgres.rs`. Keep the two in step.
-    """
+class _RecordingCursor:
+    def __init__(self, *, fetchone=(0,), fetchall=None, rowcount=0):
+        self.calls: list[tuple[str, tuple | list | None]] = []
+        self._fetchone = fetchone
+        self._fetchall = [] if fetchall is None else fetchall
+        self.rowcount = rowcount
 
-    def test_no_statement_is_a_comment(self):
-        statements = split_sql_statements(_load_schema())
+    def __enter__(self):
+        return self
 
-        assert statements, "schema.sql must yield statements"
-        for statement in statements:
-            assert not statement.startswith("--")
-            assert "--" not in statement
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
 
-    def test_schema_yields_every_table_and_index(self):
-        statements = split_sql_statements(_load_schema())
+    def execute(self, sql, params=None):
+        self.calls.append((sql, params))
 
-        tables = [s for s in statements if s.startswith("CREATE TABLE")]
-        indices = [s for s in statements if s.startswith("CREATE INDEX")]
+    def executemany(self, sql, params):
+        self.calls.append((sql, list(params)))
 
-        assert len(tables) == 2, "expected transitions + game_metadata tables"
-        assert len(indices) == 3, "expected three transitions indices"
-        assert len(statements) == len(tables) + len(indices)
+    def fetchone(self):
+        return self._fetchone
 
-    def test_both_tables_are_created(self):
-        # The exact failure: these two statements were silently dropped.
-        statements = split_sql_statements(_load_schema())
-        created = {s.split("(")[0].strip() for s in statements}
+    def fetchall(self):
+        return self._fetchall
 
-        assert "CREATE TABLE IF NOT EXISTS transitions" in created
-        assert "CREATE TABLE IF NOT EXISTS game_metadata" in created
 
-    def test_comment_above_statement_is_stripped_not_the_statement(self):
-        sql = (
-            "-- leading comment\n"
-            "CREATE TABLE a (x INT);\n"
-            "-- another\n"
-            "CREATE INDEX i ON a(x);"
+class _RecordingConnection:
+    def __init__(self, cursor: _RecordingCursor):
+        self._cursor = cursor
+        self.commits = 0
+        self.checkouts = 0
+        self.checked_out = False
+
+    def cursor(self):
+        return self._cursor
+
+    def commit(self):
+        self.commits += 1
+
+
+def store_with_recording_cursor(
+    *, fetchone=(0,), fetchall=None, rowcount=0
+) -> tuple[PostgresReplayStore, _RecordingCursor, _RecordingConnection]:
+    cursor = _RecordingCursor(
+        fetchone=fetchone,
+        fetchall=fetchall,
+        rowcount=rowcount,
+    )
+    connection = _RecordingConnection(cursor)
+    store = PostgresReplayStore.__new__(PostgresReplayStore)
+    store._selection = TEST_SELECTION
+
+    @contextmanager
+    def connection_scope():
+        if connection.checked_out:
+            raise AssertionError("nested replay connection checkout")
+        connection.checked_out = True
+        connection.checkouts += 1
+        try:
+            yield connection
+        finally:
+            connection.checked_out = False
+
+    store._connection = connection_scope
+    return store, cursor, connection
+
+
+class TestReplayV3Contract:
+    @pytest.mark.parametrize(
+        "legacy_name",
+        [
+            "ExperienceProfile",
+            "GameMetadata",
+            "Transition",
+            "ReplayBufferBase",
+            "PostgresReplayBuffer",
+            "create_replay_buffer",
+        ],
+    )
+    def test_legacy_storage_names_are_not_exported(self, legacy_name):
+        assert not hasattr(storage, legacy_name)
+
+    def test_replay_store_has_no_algorithm_specific_tensor_or_metadata_api(self):
+        for method in (
+            "sample_batch_tensors",
+            "get_metadata",
+            "list_metadata",
+            "store_metadata",
+            "clear_transitions",
+        ):
+            assert not hasattr(PostgresReplayStore, method)
+
+    def test_all_deployment_schemas_match_shared_schema_byte_for_byte(self):
+        shared_schema = Path(__file__).parents[2] / "sql" / "schema.sql"
+        expected = shared_schema.read_text()
+        assert _load_schema() == expected
+        assert (Path(__file__).parents[2] / "scripts" / "init-postgres.sql").read_text() == expected
+
+        configmap = (
+            Path(__file__).parents[2] / "k8s" / "base" / "postgres" / "init-configmap.yaml"
+        ).read_text()
+        marker = "  01-schema.sql: |\n"
+        yaml_body = configmap.split(marker, maxsplit=1)[1]
+        embedded = "\n".join(
+            line[4:] if line.startswith("    ") else line for line in yaml_body.splitlines()
+        )
+        assert f"{embedded}\n" == expected
+
+    def test_schema_validation_requires_only_v3_tables(self):
+        exact = {"cartridge_schema_versions", "replay_records"}
+        _validate_schema_tables(exact)
+        with pytest.raises(RuntimeError, match="missing tables: replay_records"):
+            _validate_schema_tables({"cartridge_schema_versions"})
+        with pytest.raises(RuntimeError, match="unexpected tables: game_metadata, transitions"):
+            _validate_schema_tables(exact | {"transitions", "game_metadata"})
+
+    def test_record_schema_accepts_only_exact_columns_and_profile_primary_key(self):
+        _validate_record_schema(
+            _EXPECTED_RECORD_COLUMNS,
+            _EXPECTED_RECORD_PRIMARY_KEY,
+        )
+        with pytest.raises(RuntimeError, match="replay_records.*primary key"):
+            _validate_record_schema(_EXPECTED_RECORD_COLUMNS, ("id",))
+        for columns in (
+            _EXPECTED_RECORD_COLUMNS[:-1],
+            _EXPECTED_RECORD_COLUMNS + (("observation", "bytea", "YES"),),
+            tuple(
+                (
+                    name,
+                    "integer" if name == "env_contract_version" else sql_type,
+                    nullable,
+                )
+                for name, sql_type, nullable in _EXPECTED_RECORD_COLUMNS
+            ),
+            tuple(
+                (name, sql_type, "YES" if name == "payload" else nullable)
+                for name, sql_type, nullable in _EXPECTED_RECORD_COLUMNS
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="replay_records.*columns"):
+                _validate_record_schema(columns, _EXPECTED_RECORD_PRIMARY_KEY)
+
+    def test_schema_marker_requires_exact_v3_shape_and_single_row(self):
+        with pytest.raises(RuntimeError, match="missing.*version marker"):
+            _validate_schema_marker(
+                _EXPECTED_SCHEMA_MARKER_COLUMNS,
+                _EXPECTED_SCHEMA_MARKER_PRIMARY_KEY,
+                (),
+            )
+        for rows in (
+            (("replay", REPLAY_SCHEMA_VERSION - 1),),
+            (("replay", REPLAY_SCHEMA_VERSION), ("legacy", 1)),
+        ):
+            with pytest.raises(RuntimeError, match="marker rows.*expected"):
+                _validate_schema_marker(
+                    _EXPECTED_SCHEMA_MARKER_COLUMNS,
+                    _EXPECTED_SCHEMA_MARKER_PRIMARY_KEY,
+                    rows,
+                )
+        _validate_schema_marker(
+            _EXPECTED_SCHEMA_MARKER_COLUMNS,
+            _EXPECTED_SCHEMA_MARKER_PRIMARY_KEY,
+            (("replay", REPLAY_SCHEMA_VERSION),),
         )
 
-        statements = split_sql_statements(sql)
+    @pytest.mark.parametrize("field", ["env_id", "algorithm_id", "experience_schema"])
+    def test_profile_rejects_blank_identifiers(self, field):
+        with pytest.raises(ValueError, match=field):
+            replace(TEST_PROFILE, **{field: "  "})
 
-        assert len(statements) == 2
-        assert statements[0].startswith("CREATE TABLE a")
-        assert statements[1].startswith("CREATE INDEX i")
+    @pytest.mark.parametrize("value", [True, 1.5, 0, -1, 1 << 32])
+    def test_profile_requires_positive_u32_contract_version(self, value):
+        with pytest.raises(ValueError, match="env_contract_version.*inclusive range"):
+            replace(TEST_PROFILE, env_contract_version=value)
 
-    def test_empty_and_comment_only_input_yields_nothing(self):
-        assert split_sql_statements("  ;; \n -- only a comment\n ;") == []
-        assert split_sql_statements("") == []
+    def test_selection_wraps_and_matches_opaque_bytes(self):
+        record = make_record(payload=b"\x00\xff")
+        assert TEST_SELECTION.matches(record)
+        assert record.payload == b"\x00\xff"
+        assert not TEST_SELECTION.matches(replace(record, algorithm_id="other_v1"))
 
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("collection_scope_id", "A" * 64),
+            ("collection_scope_id", "a" * 63),
+            ("source_checkpoint_id", "not-a-digest"),
+        ],
+    )
+    def test_selection_rejects_noncanonical_fences(self, field, value):
+        with pytest.raises(ValueError, match="64-character SHA-256"):
+            replace(TEST_SELECTION, **{field: value})
 
-@requires_postgres
-class TestPostgresConnection:
-    """Tests for PostgreSQL connection and schema."""
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("id", "", "id"),
+            ("episode_id", " ", "episode_id"),
+            ("env_contract_version", 0, "inclusive range"),
+            ("step_number", -1, "inclusive range"),
+            ("payload", bytearray(b"x"), "must be bytes"),
+            ("collection_scope_id", "bad", "64-character SHA-256"),
+            ("source_checkpoint_id", "bad", "64-character SHA-256"),
+        ],
+    )
+    def test_record_rejects_invalid_envelope(self, field, value, message):
+        error = TypeError if field == "payload" else ValueError
+        with pytest.raises(error, match=message):
+            replace(make_record(), **{field: value})
 
-    def test_postgres_connection_success(self):
-        """Test that we can connect to PostgreSQL."""
-        url = os.environ.get("CARTRIDGE_STORAGE_POSTGRES_URL")
-        buffer = create_replay_buffer(url)
+    @pytest.mark.parametrize("value", [True, 1.5, 1 << 32])
+    def test_record_requires_positive_u32_contract_version(self, value):
+        with pytest.raises(ValueError, match="env_contract_version.*inclusive range"):
+            replace(make_record(), env_contract_version=value)
 
-        # Should be able to count (basic operation)
-        count = buffer.count()
-        assert isinstance(count, int)
-        assert count >= 0
+    @pytest.mark.parametrize("value", [True, 1.5, -1, 1 << 32])
+    def test_record_requires_u32_step_number(self, value):
+        with pytest.raises(ValueError, match="step_number.*inclusive range"):
+            replace(make_record(), step_number=value)
 
-        buffer.close()
+    def test_record_accepts_u32_wire_boundaries(self):
+        assert replace(TEST_PROFILE, env_contract_version=(1 << 32) - 1)
+        assert replace(make_record(), step_number=(1 << 32) - 1)
 
-    def test_schema_created_on_init(self, replay_buffer):
-        """Test that schema is created automatically."""
-        # Schema should already exist from fixture
-        # Try to access metadata table
-        metadata = replay_buffer.get_metadata()
-        # Returns None if no data, but shouldn't error
-        assert metadata is None or isinstance(metadata, GameMetadata)
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("env_id", "othergame"),
+            ("env_contract_version", 2),
+            ("algorithm_id", "other_algorithm_v1"),
+            ("experience_schema", "other_transition_v1"),
+            ("collection_scope_id", "b" * 64),
+            ("source_checkpoint_id", "c" * 64),
+        ],
+    )
+    def test_store_rejects_every_profile_mismatch(self, field, value):
+        store = PostgresReplayStore.__new__(PostgresReplayStore)
+        store._selection = TEST_SELECTION
+        record = replace(make_record(), **{field: value})
+        with pytest.raises(ValueError, match="do not match replay selection"):
+            store.store_batch([record])
 
-    def test_multiple_connections(self):
-        """Test that multiple connections work."""
-        url = os.environ.get("CARTRIDGE_STORAGE_POSTGRES_URL")
+    @pytest.mark.parametrize("records", [(), iter(())])
+    def test_store_batch_rejects_non_list_batches(self, records):
+        store = PostgresReplayStore.__new__(PostgresReplayStore)
+        store._selection = TEST_SELECTION
+        with pytest.raises(TypeError, match="batch must be a list"):
+            store.store_batch(records)
 
-        # Create multiple buffers
-        buffers = [create_replay_buffer(url) for _ in range(3)]
+    def test_store_batch_rejects_non_record_members(self):
+        store = PostgresReplayStore.__new__(PostgresReplayStore)
+        store._selection = TEST_SELECTION
+        with pytest.raises(TypeError, match="only ReplayRecord"):
+            store.store_batch([object()])
 
-        # All should work
-        for buf in buffers:
-            count = buf.count()
-            assert isinstance(count, int)
+    def test_factory_forwards_exact_selection(self, monkeypatch):
+        captured = {}
 
-        # Close all
-        for buf in buffers:
-            buf.close()
-
-
-@requires_postgres
-class TestMetadataOperations:
-    """Tests for game metadata CRUD."""
-
-    def test_save_and_get_metadata(self, replay_buffer, sample_metadata):
-        """Test saving and retrieving metadata."""
-        # Save metadata
-        with replay_buffer._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """INSERT INTO game_metadata
-                       (env_id, display_name, board_width, board_height,
-                        num_actions, obs_size, legal_mask_offset, player_count)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                       ON CONFLICT (env_id) DO UPDATE SET
-                       display_name = EXCLUDED.display_name""",
-                    (
-                        sample_metadata.env_id,
-                        sample_metadata.display_name,
-                        sample_metadata.board_width,
-                        sample_metadata.board_height,
-                        sample_metadata.num_actions,
-                        sample_metadata.obs_size,
-                        sample_metadata.legal_mask_offset,
-                        sample_metadata.player_count,
-                    ),
+        class StubPostgresReplayStore:
+            def __init__(self, connection_string, selection, **kwargs):
+                captured.update(
+                    connection_string=connection_string,
+                    selection=selection,
+                    kwargs=kwargs,
                 )
-                conn.commit()
 
-        # Retrieve
-        retrieved = replay_buffer.get_metadata("testgame")
-
-        assert retrieved is not None
-        assert retrieved.env_id == sample_metadata.env_id
-        assert retrieved.display_name == sample_metadata.display_name
-        assert retrieved.board_width == sample_metadata.board_width
-
-    def test_get_metadata_missing_returns_none(self, replay_buffer):
-        """Test that missing metadata returns None."""
-        result = replay_buffer.get_metadata("nonexistent_game")
-        assert result is None
-
-    def test_list_metadata(self, replay_buffer, sample_metadata):
-        """Test listing all metadata."""
-        # Insert multiple games
-        with replay_buffer._connection() as conn:
-            with conn.cursor() as cur:
-                for i, game_id in enumerate(["game1", "game2", "game3"]):
-                    cur.execute(
-                        """INSERT INTO game_metadata
-                           (env_id, display_name, board_width, board_height,
-                            num_actions, obs_size, legal_mask_offset, player_count)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                           ON CONFLICT (env_id) DO NOTHING""",
-                        (game_id, f"Game {i}", 3, 3, 9, 29, 18, 2),
-                    )
-                conn.commit()
-
-        # List all
-        all_metadata = replay_buffer.list_metadata()
-
-        assert isinstance(all_metadata, list)
-        assert len(all_metadata) >= 3
-
-        # Check structure
-        for meta in all_metadata:
-            assert isinstance(meta, GameMetadata)
-            assert meta.env_id
+        monkeypatch.setattr(
+            "trainer.storage.postgres.PostgresReplayStore",
+            StubPostgresReplayStore,
+        )
+        result = create_replay_store(
+            TEST_SELECTION,
+            connection_string="postgresql://example/test",
+            validate_schema=False,
+            pool_size=2,
+        )
+        assert isinstance(result, StubPostgresReplayStore)
+        assert captured == {
+            "connection_string": "postgresql://example/test",
+            "selection": TEST_SELECTION,
+            "kwargs": {"validate_schema": False, "pool_size": 2},
+        }
 
 
-@requires_postgres
-class TestTransitionOperations:
-    """Tests for transition CRUD."""
+class TestSelectionScopedSql:
+    def test_count_filters_exact_selection(self):
+        store, cursor, _ = store_with_recording_cursor(fetchone=(7,))
+        assert store.count() == 7
+        sql, params = cursor.calls[-1]
+        assert "SELECT COUNT(*) FROM replay_records" in sql
+        assert params == (
+            TEST_PROFILE.env_id,
+            TEST_PROFILE.env_contract_version,
+            TEST_PROFILE.algorithm_id,
+            TEST_PROFILE.experience_schema,
+            TEST_SELECTION.collection_scope_id,
+            TEST_SELECTION.source_checkpoint_id,
+        )
 
-    def test_add_single_transition(self, replay_buffer, sample_transition):
-        """Test adding a single transition."""
-        # PostgresReplayBuffer doesn't have add_transition,
-        # it likely receives from actor
-        # Skip this test if method doesn't exist
-        if not hasattr(replay_buffer, "add_transition"):
-            pytest.skip("add_transition not implemented in PostgresReplayBuffer")
+    def test_count_episodes_filters_exact_selection(self):
+        store, cursor, _ = store_with_recording_cursor(fetchone=(3,))
+        assert store.count_episodes() == 3
+        sql, params = cursor.calls[-1]
+        assert "COUNT(DISTINCT episode_id)" in sql
+        assert "source_checkpoint_id IS NOT DISTINCT FROM %s" in sql
+        assert params == store._selection_params
 
-    def test_count_increases_with_data(self, replay_buffer):
-        """Test that count reflects added transitions."""
-        initial_count = replay_buffer.count()
+    def test_clear_filters_exact_selection(self):
+        store, cursor, connection = store_with_recording_cursor(rowcount=4)
+        assert store.clear() == 4
+        sql, params = cursor.calls[-1]
+        assert sql.lstrip().startswith("DELETE FROM replay_records")
+        assert params == (
+            TEST_PROFILE.env_id,
+            TEST_PROFILE.env_contract_version,
+            TEST_PROFILE.algorithm_id,
+            TEST_PROFILE.experience_schema,
+            TEST_SELECTION.collection_scope_id,
+            TEST_SELECTION.source_checkpoint_id,
+        )
+        assert connection.commits == 1
 
-        # Insert data manually
-        with replay_buffer._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """INSERT INTO transitions
-                       (id, env_id, episode_id, step_number, state, action,
-                        next_state, observation, next_observation, reward, done,
-                        timestamp, policy_probs, mcts_value, game_outcome)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                    (
-                        "test-id",
-                        "testgame",
-                        "ep-001",
-                        0,
-                        b"state",
-                        b"\x00",
-                        b"next",
-                        b"obs",
-                        b"next_obs",
-                        0.0,
-                        False,
-                        1234567890,
-                        None,
-                        0.5,
-                        None,
-                    ),
-                )
-                conn.commit()
+    def test_large_selection_sampling_is_bounded_and_exactly_fenced(self):
+        record = make_record()
+        row = (
+            record.id,
+            record.env_id,
+            record.env_contract_version,
+            record.algorithm_id,
+            record.experience_schema,
+            record.collection_scope_id,
+            record.source_checkpoint_id,
+            record.episode_id,
+            record.step_number,
+            memoryview(record.payload),
+        )
+        store, cursor, connection = store_with_recording_cursor(fetchone=(1000,), fetchall=[row])
 
-        new_count = replay_buffer.count()
-        assert new_count == initial_count + 1
+        assert store.sample(3) == [record, record, record]
 
-    def test_sample_returns_transitions(self, replay_buffer):
-        """Test that sampling returns transitions."""
-        # Insert test data
-        with replay_buffer._connection() as conn:
-            with conn.cursor() as cur:
-                for i in range(10):
-                    cur.execute(
-                        """INSERT INTO transitions
-                           (id, env_id, episode_id, step_number, state, action,
-                            next_state, observation, next_observation, reward, done,
-                            timestamp, policy_probs, mcts_value, game_outcome)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (
-                            f"test-{i}",
-                            "testgame",
-                            "ep-001",
-                            i,
-                            b"state",
-                            b"\x00",
-                            b"next",
-                            b"obs",
-                            b"next_obs",
-                            0.0,
-                            i == 9,
-                            1234567890,
-                            None,
-                            0.5,
-                            1.0,
-                        ),
-                    )
-                conn.commit()
+        count_call, sampled_call, fallback_call = cursor.calls
+        selection_key = (
+            TEST_PROFILE.env_id,
+            TEST_PROFILE.env_contract_version,
+            TEST_PROFILE.algorithm_id,
+            TEST_PROFILE.experience_schema,
+            TEST_SELECTION.collection_scope_id,
+            TEST_SELECTION.source_checkpoint_id,
+        )
+        assert "replay_records" in count_call[0]
+        assert count_call[1] == selection_key
+        assert "FROM replay_records TABLESAMPLE" in sampled_call[0]
+        assert sampled_call[1] == (3.0, *selection_key, 3)
+        assert "FROM replay_records" in fallback_call[0]
+        assert fallback_call[1] == (*selection_key, 3)
+        assert all("ARRAY_AGG" not in sql and "MATERIALIZED" not in sql for sql, _ in cursor.calls)
+        assert connection.checkouts == 1
 
-        # Sample
-        batch = replay_buffer.sample(5, env_id="testgame")
+    def test_empty_selection_sample_fails_loudly(self):
+        store, _, connection = store_with_recording_cursor(fetchall=[])
 
-        assert isinstance(batch, list)
-        assert len(batch) == 5
+        with pytest.raises(EmptyReplaySelectionError, match="empty exact"):
+            store.sample(3)
 
-        # Check structure
-        for t in batch:
-            assert isinstance(t, Transition)
-            assert t.id.startswith("test-")
+        assert connection.checkouts == 1
 
-    def test_sample_respects_batch_size(self, replay_buffer):
-        """Test that sample respects requested batch size."""
-        # Insert data
-        with replay_buffer._connection() as conn:
-            with conn.cursor() as cur:
-                for i in range(20):
-                    cur.execute(
-                        """INSERT INTO transitions
-                           (id, env_id, episode_id, step_number, state, action,
-                            next_state, observation, next_observation, reward, done,
-                            timestamp, policy_probs, mcts_value, game_outcome)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (
-                            f"test-{i}",
-                            "testgame",
-                            "ep-001",
-                            i,
-                            b"state",
-                            b"\x00",
-                            b"next",
-                            b"obs",
-                            b"next_obs",
-                            0.0,
-                            False,
-                            1234567890,
-                            None,
-                            0.5,
-                            None,
-                        ),
-                    )
-                conn.commit()
+    def test_cleanup_scopes_delete_and_window_to_exact_selection(self):
+        store, cursor, connection = store_with_recording_cursor(rowcount=3)
+        assert store.cleanup(window_size=100) == 3
+        sql, params = cursor.calls[-1]
+        for column in (
+            "env_id = %s",
+            "env_contract_version = %s",
+            "algorithm_id = %s",
+            "experience_schema = %s",
+            "collection_scope_id = %s",
+            "source_checkpoint_id IS NOT DISTINCT FROM %s",
+        ):
+            assert sql.count(column) == 2
+        selection_key = (
+            TEST_PROFILE.env_id,
+            TEST_PROFILE.env_contract_version,
+            TEST_PROFILE.algorithm_id,
+            TEST_PROFILE.experience_schema,
+            TEST_SELECTION.collection_scope_id,
+            TEST_SELECTION.source_checkpoint_id,
+        )
+        assert params == (*selection_key, *selection_key, 100)
+        assert connection.commits == 1
 
-        # Sample different sizes
-        batch_3 = replay_buffer.sample(3)
-        batch_10 = replay_buffer.sample(10)
+    def test_store_is_a_plain_immutable_insert(self):
+        store, cursor, connection = store_with_recording_cursor()
+        records = [make_record(record_id="one"), make_record(record_id="two")]
+        store.store_batch(records)
+        sql, params = cursor.calls[-1]
+        assert "INSERT INTO replay_records" in sql
+        assert "ON CONFLICT" not in sql
+        assert "UPDATE" not in sql
+        assert params == [
+            (
+                record.id,
+                record.env_id,
+                record.env_contract_version,
+                record.algorithm_id,
+                record.experience_schema,
+                record.collection_scope_id,
+                record.source_checkpoint_id,
+                record.episode_id,
+                record.step_number,
+                record.payload,
+            )
+            for record in records
+        ]
+        assert connection.commits == 1
 
-        assert len(batch_3) == 3
-        assert len(batch_10) == 10
+    def test_store_one_and_empty_batch_have_clean_semantics(self):
+        store, cursor, connection = store_with_recording_cursor()
+        store.store(make_record())
+        assert len(cursor.calls) == 1
+        assert connection.commits == 1
 
-    def test_sample_filters_by_env_id(self, replay_buffer):
-        """Test that sample can filter by environment."""
-        # Insert data for multiple games
-        with replay_buffer._connection() as conn:
-            with conn.cursor() as cur:
-                for i in range(5):
-                    cur.execute(
-                        """INSERT INTO transitions
-                           (id, env_id, episode_id, step_number, state, action,
-                            next_state, observation, next_observation, reward, done,
-                            timestamp, policy_probs, mcts_value, game_outcome)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (
-                            f"game1-{i}",
-                            "game1",
-                            "ep-001",
-                            i,
-                            b"state",
-                            b"\x00",
-                            b"next",
-                            b"obs",
-                            b"next_obs",
-                            0.0,
-                            False,
-                            1234567890,
-                            None,
-                            0.5,
-                            None,
-                        ),
-                    )
-                    cur.execute(
-                        """INSERT INTO transitions
-                           (id, env_id, episode_id, step_number, state, action,
-                            next_state, observation, next_observation, reward, done,
-                            timestamp, policy_probs, mcts_value, game_outcome)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (
-                            f"game2-{i}",
-                            "game2",
-                            "ep-001",
-                            i,
-                            b"state",
-                            b"\x00",
-                            b"next",
-                            b"obs",
-                            b"next_obs",
-                            0.0,
-                            False,
-                            1234567890,
-                            None,
-                            0.5,
-                            None,
-                        ),
-                    )
-                conn.commit()
+        store, cursor, connection = store_with_recording_cursor()
+        store.store_batch([])
+        assert cursor.calls == []
+        assert connection.checkouts == 0
+        assert connection.commits == 0
 
-        # Sample from specific game
-        game1_batch = replay_buffer.sample(10, env_id="game1")
+    def test_database_rows_become_opaque_records(self):
+        row = (
+            "id",
+            *(
+                TEST_PROFILE.env_id,
+                TEST_PROFILE.env_contract_version,
+                TEST_PROFILE.algorithm_id,
+                TEST_PROFILE.experience_schema,
+            ),
+            TEST_SELECTION.collection_scope_id,
+            TEST_SELECTION.source_checkpoint_id,
+            "ep-001",
+            4,
+            memoryview(b"opaque"),
+        )
+        assert PostgresReplayStore._rows_to_records([row]) == [
+            make_record(record_id="id", step_number=4, payload=b"opaque")
+        ]
 
-        # All should be from game1
-        for t in game1_batch:
-            assert t.env_id == "game1"
-
-    def test_count_filters_by_env_id(self, replay_buffer):
-        """Test that count can filter by environment."""
-        # Insert data
-        with replay_buffer._connection() as conn:
-            with conn.cursor() as cur:
-                for i in range(5):
-                    cur.execute(
-                        """INSERT INTO transitions
-                           (id, env_id, episode_id, step_number, state, action,
-                            next_state, observation, next_observation, reward, done,
-                            timestamp, policy_probs, mcts_value, game_outcome)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (
-                            f"game1-{i}",
-                            "game1",
-                            "ep-001",
-                            i,
-                            b"state",
-                            b"\x00",
-                            b"next",
-                            b"obs",
-                            b"next_obs",
-                            0.0,
-                            False,
-                            1234567890,
-                            None,
-                            0.5,
-                            None,
-                        ),
-                    )
-                    cur.execute(
-                        """INSERT INTO transitions
-                           (id, env_id, episode_id, step_number, state, action,
-                            next_state, observation, next_observation, reward, done,
-                            timestamp, policy_probs, mcts_value, game_outcome)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (
-                            f"game2-{i}",
-                            "game2",
-                            "ep-001",
-                            i,
-                            b"state",
-                            b"\x00",
-                            b"next",
-                            b"obs",
-                            b"next_obs",
-                            0.0,
-                            False,
-                            1234567890,
-                            None,
-                            0.5,
-                            None,
-                        ),
-                    )
-                conn.commit()
-
-        game1_count = replay_buffer.count(env_id="game1")
-        game2_count = replay_buffer.count(env_id="game2")
-        total_count = replay_buffer.count()
-
-        assert game1_count == 5
-        assert game2_count == 5
-        assert total_count >= 10
+    def test_invalid_sample_and_cleanup_sizes_fail_before_sql(self):
+        store, _, connection = store_with_recording_cursor()
+        for batch_size in (0, -1, True, 1.5, "1"):
+            with pytest.raises(ValueError, match="batch_size"):
+                store.sample(batch_size)
+        with pytest.raises(ValueError, match="window_size"):
+            store.cleanup(-1)
+        assert connection.checkouts == 0
 
 
 @requires_postgres
-class TestBufferManagement:
-    """Tests for buffer operations (clear, cleanup, vacuum)."""
+class TestPostgresReplayStore:
+    def test_connection_and_schema(self, replay_store):
+        assert replay_store.selection == TEST_SELECTION
+        assert isinstance(replay_store.count(), int)
 
-    def test_clear_transitions(self, replay_buffer):
-        """Test clearing all transitions."""
-        # Insert data
-        with replay_buffer._connection() as conn:
-            with conn.cursor() as cur:
-                for i in range(10):
-                    cur.execute(
-                        """INSERT INTO transitions
-                           (id, env_id, episode_id, step_number, state, action,
-                            next_state, observation, next_observation, reward, done,
-                            timestamp, policy_probs, mcts_value, game_outcome)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (
-                            f"test-{i}",
-                            "testgame",
-                            "ep-001",
-                            i,
-                            b"state",
-                            b"\x00",
-                            b"next",
-                            b"obs",
-                            b"next_obs",
-                            0.0,
-                            False,
-                            1234567890,
-                            None,
-                            0.5,
-                            None,
-                        ),
-                    )
-                conn.commit()
-
-        initial_count = replay_buffer.count()
-        assert initial_count >= 10
-
-        # Clear
-        deleted = replay_buffer.clear_transitions()
-
-        assert deleted >= 10
-        assert replay_buffer.count() == 0
-
-    def test_clear_preserves_metadata(self, replay_buffer, sample_metadata):
-        """Test that clear_transitions preserves metadata."""
-        # Insert metadata
-        with replay_buffer._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """INSERT INTO game_metadata
-                       (env_id, display_name, board_width, board_height,
-                        num_actions, obs_size, legal_mask_offset, player_count)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                    (
-                        sample_metadata.env_id,
-                        sample_metadata.display_name,
-                        sample_metadata.board_width,
-                        sample_metadata.board_height,
-                        sample_metadata.num_actions,
-                        sample_metadata.obs_size,
-                        sample_metadata.legal_mask_offset,
-                        sample_metadata.player_count,
-                    ),
-                )
-                conn.commit()
-
-        # Clear transitions
-        replay_buffer.clear_transitions()
-
-        # Metadata should still exist
-        metadata = replay_buffer.get_metadata("testgame")
-        assert metadata is not None
-        assert metadata.env_id == "testgame"
-
-    def test_vacuum_runs_without_error(self, replay_buffer):
-        """VACUUM must run outside a transaction; exercise the autocommit toggle."""
-        replay_buffer.vacuum()
-
-        # Buffer is still usable afterwards
-        assert replay_buffer.count() == 0
-
-
-@requires_postgres
-class TestSampleBatchTensors:
-    """Tests for sample_batch_tensors helper."""
-
-    def test_sample_batch_tensors_returns_numpy(self, replay_buffer):
-        """Test that sample_batch_tensors returns numpy arrays."""
-        # Insert test data with proper observations
-        obs1 = np.random.randn(29).astype(np.float32).tobytes()
-        obs2 = np.random.randn(29).astype(np.float32).tobytes()
-
-        with replay_buffer._connection() as conn:
-            with conn.cursor() as cur:
-                for i in range(5):
-                    cur.execute(
-                        """INSERT INTO transitions
-                           (id, env_id, episode_id, step_number, state, action,
-                            next_state, observation, next_observation, reward, done,
-                            timestamp, policy_probs, mcts_value, game_outcome)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (
-                            f"test-{i}",
-                            "testgame",
-                            "ep-001",
-                            i,
-                            b"state",
-                            b"\x00",
-                            b"next",
-                            obs1 if i % 2 == 0 else obs2,
-                            b"next_obs",
-                            0.0,
-                            False,
-                            1234567890,
-                            None,
-                            0.5,
-                            1.0,
-                        ),
-                    )
-                conn.commit()
-
-        # Sample
-        result = replay_buffer.sample_batch_tensors(3, num_actions=9, env_id="testgame")
-
-        if result is not None:
-            observations, policy_targets, value_targets = result
-
-            assert isinstance(observations, np.ndarray)
-            assert isinstance(policy_targets, np.ndarray)
-            assert isinstance(value_targets, np.ndarray)
-
-            assert observations.shape[0] == 3
-            assert policy_targets.shape[0] == 3
-            assert value_targets.shape[0] == 3
-
-    def test_sample_batch_tensors_not_enough_data(self, replay_buffer):
-        """Test that sample_batch_tensors returns None if not enough data."""
-        # Clear buffer
-        replay_buffer.clear_transitions()
-
-        # Try to sample more than available
-        result = replay_buffer.sample_batch_tensors(100, num_actions=9)
-
-        assert result is None
-
-
-class TestFilesystemStorage:
-    """Tests for filesystem model storage (no PostgreSQL needed)."""
-
-    def test_filesystem_model_store_creation(self):
-        """Test creating a filesystem model store."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = create_model_store("filesystem", path=Path(tmpdir))
-
-            assert store is not None
-
-            # Cleanup
-            if hasattr(store, "close"):
+    def test_multiple_selection_bound_connections(self):
+        url = os.environ["CARTRIDGE_STORAGE_POSTGRES_URL"]
+        stores = [create_replay_store(TEST_SELECTION, connection_string=url) for _ in range(3)]
+        try:
+            assert all(isinstance(store.count(), int) for store in stores)
+        finally:
+            for store in stores:
                 store.close()
 
-    def test_filesystem_save_and_load_latest(self):
-        """Test saving and loading latest model via filesystem."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = create_model_store("filesystem", path=Path(tmpdir))
+    def test_store_count_and_sample_round_trip(self, replay_store):
+        records = [
+            make_record(record_id=f"round-trip-{index}", step_number=index) for index in range(10)
+        ]
+        replay_store.store_batch(records)
+        assert replay_store.count() == 10
+        batch = replay_store.sample(5)
+        assert len(batch) == 5
+        assert all(isinstance(item, ReplayRecord) for item in batch)
+        assert all(TEST_SELECTION.matches(item) for item in batch)
 
-            # Save model
-            model_bytes = b"fake onnx model data"
-            info = store.save_onnx(model_bytes, step=100)
+    def test_one_record_fills_a_minibatch_with_replacement(self, replay_store):
+        record = make_record(record_id="only-record")
+        replay_store.store(record)
 
-            assert info.step == 100
-            assert Path(info.path).exists()
+        assert replay_store.sample(8) == [record] * 8
 
-            # Load latest
-            latest = store.load_latest_onnx()
-            assert latest == model_bytes
+    def test_empty_selection_sample_fails_loudly(self, replay_store):
+        with pytest.raises(EmptyReplaySelectionError, match="empty exact"):
+            replay_store.sample(1)
 
-    def test_filesystem_list_checkpoints(self):
-        """Test listing checkpoints in filesystem store."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = create_model_store("filesystem", path=Path(tmpdir))
+    def test_duplicate_identity_is_rejected_not_updated(self, replay_store):
+        original = make_record(record_id="immutable", payload=b"first")
+        replay_store.store(original)
+        with pytest.raises(Exception):
+            replay_store.store(replace(original, payload=b"second"))
+        assert replay_store.count() == 1
+        [stored] = replay_store.sample(1)
+        assert stored.payload == b"first"
 
-            # Save multiple
-            for step in [50, 100, 150]:
-                store.save_onnx(b"model", step=step)
+    def test_exact_selection_isolation_for_count_and_sample(self):
+        url = os.environ["CARTRIDGE_STORAGE_POSTGRES_URL"]
+        profiles = [
+            TEST_PROFILE,
+            replace(TEST_PROFILE, env_id="othergame"),
+            replace(TEST_PROFILE, env_contract_version=2),
+            replace(TEST_PROFILE, algorithm_id="other_algorithm_v1"),
+            replace(TEST_PROFILE, experience_schema="other_transition_v1"),
+        ]
+        selections = [
+            ReplaySelection(profile, f"{index + 1:064x}", None)
+            for index, profile in enumerate(profiles)
+        ]
+        stores = [create_replay_store(selection, connection_string=url) for selection in selections]
+        try:
+            for store in stores:
+                store.clear()
+            for index, (selection, store) in enumerate(zip(selections, stores)):
+                store.store(
+                    make_record(
+                        selection,
+                        record_id="shared-id",
+                        step_number=index,
+                    )
+                )
+            for selection, store in zip(selections, stores):
+                assert store.count() == 1
+                [record] = store.sample(1)
+                assert selection.matches(record)
+        finally:
+            for store in stores:
+                store.clear()
+                store.close()
 
-            # List
-            checkpoints = store.list_checkpoints()
+    def test_clear_and_cleanup_preserve_other_selections(self, replay_store):
+        url = os.environ["CARTRIDGE_STORAGE_POSTGRES_URL"]
+        other_selection = replace(TEST_SELECTION, collection_scope_id="b" * 64)
+        other = create_replay_store(other_selection, connection_string=url)
+        try:
+            other.clear()
+            replay_store.store_batch(
+                [make_record(record_id=f"primary-{index}", step_number=index) for index in range(5)]
+            )
+            other.store_batch(
+                [
+                    make_record(
+                        other_selection,
+                        record_id=f"other-{index}",
+                        step_number=index,
+                    )
+                    for index in range(3)
+                ]
+            )
+            assert replay_store.cleanup(2) == 3
+            assert replay_store.count() == 2
+            assert other.count() == 3
+            assert replay_store.clear() == 2
+            assert replay_store.count() == 0
+            assert other.count() == 3
+        finally:
+            other.clear()
+            other.close()
 
-            assert len(checkpoints) >= 3
-
-            # Should be sorted by step
-            steps = [c.step for c in checkpoints]
-            assert steps == sorted(steps)
-
-    def test_filesystem_cleanup_old_checkpoints(self):
-        """Test cleaning up old checkpoints."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = create_model_store("filesystem", path=Path(tmpdir))
-
-            # Save multiple
-            for step in range(1, 11):
-                store.save_onnx(b"model", step=step)
-
-            # Keep only 5
-            deleted = store.cleanup_old_checkpoints(max_keep=5)
-
-            assert deleted == 5  # 10 - 5 = 5 deleted
-
-            remaining = store.list_checkpoints()
-            assert len(remaining) == 5
+    def test_vacuum_keeps_store_usable(self, replay_store):
+        replay_store.vacuum()
+        assert replay_store.count() == 0
 
 
 if __name__ == "__main__":

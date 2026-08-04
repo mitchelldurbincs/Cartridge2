@@ -1,7 +1,10 @@
 //! Response types for the web API.
 
-use engine_core::GameMetadata;
+use anyhow::{anyhow, Result};
+use engine_core::board_profile::{BoardRenderer, CellView};
+use engine_core::{ActionSpace, AgentId, Capabilities, EnvironmentMetadata};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Health check response.
 #[derive(Serialize, Deserialize)]
@@ -17,46 +20,82 @@ pub struct GamesListResponse {
 }
 
 /// Game metadata response.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GameInfoResponse {
     pub env_id: String,
     pub display_name: String,
     pub board_width: usize,
     pub board_height: usize,
     pub num_actions: usize,
-    pub obs_size: usize,
-    pub legal_mask_offset: usize,
     pub player_count: usize,
     pub player_names: Vec<String>,
-    pub player_symbols: Vec<char>,
+    pub player_symbols: Vec<String>,
     pub description: String,
     pub board_type: String,
 }
 
-impl From<GameMetadata> for GameInfoResponse {
-    fn from(meta: GameMetadata) -> Self {
-        Self {
-            env_id: meta.env_id,
-            display_name: meta.display_name,
-            board_width: meta.board_width,
-            board_height: meta.board_height,
-            num_actions: meta.num_actions,
-            obs_size: meta.obs_size,
-            legal_mask_offset: meta.legal_mask_offset,
-            player_count: meta.player_count,
-            player_names: meta.player_names,
-            player_symbols: meta.player_symbols,
-            description: meta.description,
-            board_type: meta.board_type,
+impl GameInfoResponse {
+    pub fn from_environment(
+        meta: EnvironmentMetadata,
+        capabilities: &Capabilities,
+    ) -> Result<Self> {
+        let board = meta.board.ok_or_else(|| {
+            anyhow!(
+                "environment '{}' has no board presentation profile",
+                meta.id
+            )
+        })?;
+        if board.players.len() != 2 {
+            return Err(anyhow!(
+                "AlphaZero web serving requires exactly two board players, got {}",
+                board.players.len()
+            ));
         }
+
+        let board_type = match board.renderer {
+            BoardRenderer::Grid => "grid",
+            BoardRenderer::DropColumn => "drop_column",
+            BoardRenderer::Generals => "generals",
+        };
+        let num_actions = match capabilities.action_space(AgentId(1)) {
+            Some(ActionSpace::Discrete { size }) => *size as usize,
+            other => {
+                return Err(anyhow!(
+                    "board serving requires discrete actions, got {other:?}"
+                ))
+            }
+        };
+
+        Ok(Self {
+            env_id: meta.id,
+            display_name: meta.display_name,
+            board_width: board.width,
+            board_height: board.height,
+            num_actions,
+            player_count: board.players.len(),
+            player_names: board
+                .players
+                .iter()
+                .map(|player| player.name.clone())
+                .collect(),
+            player_symbols: board
+                .players
+                .iter()
+                .map(|player| player.symbol.clone())
+                .collect(),
+            description: meta.description,
+            board_type: board_type.to_string(),
+        })
     }
 }
 
 /// Current game state.
 #[derive(Serialize, Deserialize)]
 pub struct GameStateResponse {
-    /// Board cells: 0=empty, 1=X (player), 2=O (bot)
-    pub board: Vec<u8>,
+    /// Board cells, row-major, straight from the engine's `BoardView`. Each
+    /// carries owner (0=empty, 1=player, 2=bot), terrain, and any per-cell
+    /// quantity — the flat games leave the latter two at their defaults.
+    pub cells: Vec<CellView>,
     /// Current player: 1=X, 2=O
     pub current_player: u8,
     /// Which player the human is: 1 or 2 (depends on who went first)
@@ -65,8 +104,8 @@ pub struct GameStateResponse {
     pub winner: u8,
     /// Is the game over?
     pub game_over: bool,
-    /// Legal moves (positions)
-    pub legal_moves: Vec<u8>,
+    /// Legal moves (action indices; Generals has 257 of them, so not a u8)
+    pub legal_moves: Vec<u32>,
     /// Status message
     pub message: String,
 }
@@ -78,69 +117,45 @@ pub struct MoveResponse {
     #[serde(flatten)]
     pub state: GameStateResponse,
     /// Bot's move position (if bot moved)
-    pub bot_move: Option<u8>,
+    pub bot_move: Option<u32>,
 }
 
-/// Training history entry for loss visualization.
-#[derive(Deserialize, Serialize, Clone, Default)]
+/// One algorithm-neutral training-metric sample.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryEntry {
-    #[serde(default)]
-    pub step: u32,
-    #[serde(default)]
-    pub total_loss: f64,
-    #[serde(default)]
-    pub value_loss: f64,
-    #[serde(default)]
-    pub policy_loss: f64,
-    #[serde(default)]
+    pub step: u64,
+    pub metrics: BTreeMap<String, f64>,
     pub learning_rate: f64,
+    pub grad_norm: Option<f64>,
 }
 
 /// Evaluation stats from a single evaluation run.
-#[derive(Deserialize, Serialize, Clone, Default)]
-pub struct EvalStats {
-    #[serde(default)]
-    pub step: u32,
-    #[serde(default)]
-    pub win_rate: f64,
-    #[serde(default)]
-    pub draw_rate: f64,
-    #[serde(default)]
-    pub loss_rate: f64,
-    #[serde(default)]
-    pub games_played: u32,
-    #[serde(default)]
-    pub avg_game_length: f64,
-    #[serde(default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationStats {
+    pub step: u64,
+    pub metrics: BTreeMap<String, f64>,
+    pub episodes: u64,
+    pub mean_episode_length: f64,
     pub timestamp: f64,
 }
 
 /// Training stats read from Python trainer and sent to frontend.
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TrainingStats {
-    #[serde(default)]
-    pub step: u32,
-    #[serde(default)]
-    pub total_steps: u32,
-    #[serde(default)]
-    pub total_loss: f64,
-    #[serde(default)]
-    pub policy_loss: f64,
-    #[serde(default)]
-    pub value_loss: f64,
-    #[serde(default)]
-    pub replay_buffer_size: u64,
-    #[serde(default)]
+    pub step: u64,
+    pub total_steps: u64,
+    pub metrics: BTreeMap<String, f64>,
+    pub samples_seen: u64,
+    pub replay_record_count: u64,
+    pub last_checkpoint: String,
     pub learning_rate: f64,
-    #[serde(default)]
     pub timestamp: f64,
-    #[serde(default)]
     pub env_id: String,
-    #[serde(default)]
-    pub last_eval: Option<EvalStats>,
-    #[serde(default)]
-    pub eval_history: Vec<EvalStats>,
-    #[serde(default)]
+    pub last_evaluation: Option<EvaluationStats>,
+    pub evaluation_history: Vec<EvaluationStats>,
     pub history: Vec<HistoryEntry>,
 }
 
@@ -149,61 +164,18 @@ pub struct TrainingStats {
 pub struct ModelInfoResponse {
     /// Whether a model is currently loaded
     pub loaded: bool,
+    /// Content identity of the checkpoint manifest.
+    pub checkpoint_id: Option<String>,
+    /// SHA-256 digest of the immutable ONNX blob.
+    pub model_sha256: Option<String>,
     /// Path to the loaded model file
     pub path: Option<String>,
-    /// When the model file was last modified (Unix timestamp)
-    pub file_modified: Option<u64>,
     /// When the model was loaded into memory (Unix timestamp)
     pub loaded_at: Option<u64>,
-    /// Training step from filename (if parseable)
-    pub training_step: Option<u32>,
+    /// Training step declared by the verified checkpoint manifest.
+    pub training_step: Option<u64>,
     /// Human-readable status message
     pub status: String,
-}
-
-/// Actor self-play statistics (from actor_stats.json).
-#[derive(Serialize, Deserialize, Default)]
-pub struct ActorStats {
-    /// Environment being used for self-play
-    #[serde(default)]
-    pub env_id: String,
-    /// Number of episodes completed
-    #[serde(default)]
-    pub episodes_completed: u32,
-    /// Total game steps across all episodes
-    #[serde(default)]
-    pub total_steps: u64,
-    /// Episodes that ended in player 1 win
-    #[serde(default)]
-    pub player1_wins: u32,
-    /// Episodes that ended in player 2 win
-    #[serde(default)]
-    pub player2_wins: u32,
-    /// Episodes that ended in draw
-    #[serde(default)]
-    pub draws: u32,
-    /// Episodes abandoned before reaching a terminal state; their
-    /// transitions never reached the replay buffer
-    #[serde(default)]
-    pub episodes_abandoned: u32,
-    /// Transitions discarded with those abandoned episodes
-    #[serde(default)]
-    pub transitions_discarded: u64,
-    /// Average episode length
-    #[serde(default)]
-    pub avg_episode_length: f64,
-    /// Episodes completed per second
-    #[serde(default)]
-    pub episodes_per_second: f64,
-    /// Total runtime in seconds
-    #[serde(default)]
-    pub runtime_seconds: f64,
-    /// Average MCTS inference time in microseconds
-    #[serde(default)]
-    pub mcts_avg_inference_us: f64,
-    /// When these stats were last updated (Unix timestamp)
-    #[serde(default)]
-    pub timestamp: u64,
 }
 
 // ============================================================================

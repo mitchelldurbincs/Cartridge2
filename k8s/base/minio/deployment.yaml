@@ -1,5 +1,5 @@
 # MinIO Deployment for S3-compatible model storage
-# For production, consider using AWS S3, GCS, or a managed MinIO service
+# For production, consider AWS S3 or a managed S3-compatible service
 apiVersion: apps/v1
 kind: Deployment
 metadata:

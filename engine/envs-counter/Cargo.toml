@@ -1,0 +1,9 @@
+[package]
+name = "envs-counter"
+version = "0.1.0"
+edition = "2021"
+description = "Non-board reference environment for the Cartridge engine contract"
+
+[dependencies]
+engine-core = { path = "../engine-core" }
+rand_chacha = { workspace = true }

@@ -9,7 +9,9 @@ use rand_chacha::ChaCha20Rng;
 use super::*;
 use crate::action::{encode_move, move_target};
 use crate::board::{idx, new_board};
+use crate::obs::OBS_SIZE;
 use crate::params::{CITY_RATIO, CITY_START_ARMY, GENERAL_START_ARMY, HEIGHT, WAIT_ACTION, WIDTH};
+use engine_core::ObservationEncoding;
 
 fn rng(seed: u64) -> ChaCha20Rng {
     ChaCha20Rng::seed_from_u64(seed)
@@ -162,11 +164,11 @@ fn test_general_capture_transfers_all_tiles() {
 
     let mut game = Generals::new();
     let action = encode_move(attacker_idx, 1); // right, onto g2
-    let (_obs, reward, done, _info) = game.step(&mut state, action, &mut rng(0));
+    let transition = game.step(&mut state, action, &mut rng(0)).unwrap();
 
-    assert!(done);
+    assert!(transition.terminated);
     assert_eq!(state.winner, 1);
-    assert!((reward - 1.0).abs() < f32::EPSILON); // from player 1's perspective
+    assert!((transition.actor_reward - 1.0).abs() < f32::EPSILON);
     assert!(!state.alive[1]);
     // All of player 2's tiles (including the extra one) belong to player 1
     assert_eq!(state.tiles[p2_extra].owner, 1);
@@ -183,16 +185,30 @@ fn test_general_capture_transfers_all_tiles() {
 fn test_legal_mask_matches_brute_force() {
     let mut game = Generals::new();
     let mut r = rng(7);
-    let (state, obs) = game.reset(&mut r, &[]);
+    let (state, _) = game.reset(&mut r, &[]).unwrap();
+    let mask = Generals::legal_actions(&state).unwrap();
 
     for action in 0..NUM_ACTIONS as u32 {
         let expected = rules::is_action_legal(&state.tiles, state.current_player, action);
-        let in_mask = obs.legal_moves[action as usize] > 0.5;
+        let in_mask = mask.is_legal(action as usize);
         assert_eq!(
             in_mask, expected,
             "action {} mask disagreement (mask={}, brute={})",
             action, in_mask, expected
         );
+
+        let mut candidate = state.clone();
+        let before = candidate.clone();
+        let accepted = Generals::new()
+            .step(&mut candidate, action, &mut rng(8))
+            .is_ok();
+        assert_eq!(
+            in_mask, accepted,
+            "action {action} mask disagrees with BoardGame::step acceptance"
+        );
+        if !accepted {
+            assert_eq!(candidate, before, "rejected action mutated the state");
+        }
     }
 }
 
@@ -349,7 +365,7 @@ fn test_mapgen_general_spacing() {
 fn test_state_encode_decode_roundtrip() {
     let mut game = Generals::new();
     let mut r = rng(99);
-    let (mut state, _obs) = game.reset(&mut r, &[]);
+    let (mut state, _obs) = game.reset(&mut r, &[]).unwrap();
 
     // Mutate into a mid-game-looking state
     state.round = 42;
@@ -373,7 +389,7 @@ fn test_state_decode_rejects_garbage() {
 
     // Corrupt current_player
     let mut game = Generals::new();
-    let (state, _) = game.reset(&mut rng(1), &[]);
+    let (state, _) = game.reset(&mut rng(1), &[]).unwrap();
     let mut buf = Vec::new();
     Generals::encode_state(&state, &mut buf).unwrap();
     buf[4] = 9;
@@ -394,33 +410,43 @@ fn test_action_encode_decode_roundtrip() {
 #[test]
 fn test_obs_shape_and_metadata_agree() {
     let game = Generals::new();
+    let capabilities = game.capabilities();
     let meta = game.metadata();
-    assert_eq!(meta.num_actions, NUM_ACTIONS);
-    assert_eq!(meta.obs_size, OBS_SIZE);
-    assert_eq!(meta.legal_mask_offset, LEGAL_MASK_OFFSET);
+    let board = meta.require_board().unwrap();
+    assert_eq!(capabilities.contract_version, ENV_CONTRACT_VERSION);
+    assert_eq!(ENV_CONTRACT_VERSION, 3);
+    assert_eq!(capabilities.max_horizon, Some(MAX_TURNS * 2));
+    assert_eq!(board.width, WIDTH);
+    assert_eq!(board.height, HEIGHT);
+    assert!(matches!(
+        capabilities.action_space(AgentId(1)),
+        Some(ActionSpace::Discrete { size }) if *size == NUM_ACTIONS as u32
+    ));
+    let ObservationEncoding::Tensor { spec } = &capabilities.encoding.observation else {
+        panic!("Generals observations must be tensors");
+    };
+    assert_eq!(spec.fixed_elements(), Some(OBS_SIZE));
 
     let mut g = Generals::new();
-    let (_state, obs) = g.reset(&mut rng(5), &[]);
+    let (_state, obs) = g.reset(&mut rng(5), &[]).unwrap();
     let mut buf = Vec::new();
-    Generals::encode_obs(&obs, &mut buf).unwrap();
+    Generals::encode_observation(&obs, &mut buf).unwrap();
     assert_eq!(buf.len(), OBS_SIZE * 4);
 
-    // The advertised legal_mask_offset must point at the legal plane
-    let mask = meta.legal_mask_from_obs(&buf);
+    let mask = Generals::legal_actions(&_state).unwrap();
     assert!(mask.is_legal(WAIT_ACTION as usize));
-    for a in mask.iter_ones() {
-        assert!(obs.legal_moves[a] > 0.5);
-    }
 }
 
 #[test]
 fn test_obs_is_player_relative() {
-    let state = flat_state();
-    let obs_p1 = GeneralsObs::from_tiles(&state.tiles, 1, state.alive, 0);
-    let obs_p2 = GeneralsObs::from_tiles(&state.tiles, 2, state.alive, 0);
+    let state_p1 = flat_state();
+    let mut state_p2 = state_p1.clone();
+    state_p2.current_player = 2;
+    let obs_p1 = GeneralsObs::from_state(&state_p1);
+    let obs_p2 = GeneralsObs::from_state(&state_p2);
 
-    let g1 = state.generals[0] as usize;
-    let g2 = state.generals[1] as usize;
+    let g1 = state_p1.generals[0] as usize;
+    let g2 = state_p1.generals[1] as usize;
     // Player 1's view: own territory at g1, enemy at g2
     assert!(obs_p1.channels[g1] > 0.5); // ch0 own
     assert!(obs_p1.channels[BOARD_SIZE + g2] > 0.5); // ch1 enemy
@@ -433,6 +459,56 @@ fn test_obs_is_player_relative() {
     assert!(obs_p2.channels[7 * BOARD_SIZE + g1] < -0.5);
 }
 
+#[test]
+fn test_observation_exposes_exact_adjudication_countdown() {
+    let even_cap = flat_state();
+    let mut odd_cap = even_cap.clone();
+    odd_cap.cap_plies -= 1;
+
+    let even_obs = GeneralsObs::from_state(&even_cap);
+    let odd_obs = GeneralsObs::from_state(&odd_cap);
+    let countdown = 9 * BOARD_SIZE;
+
+    assert_eq!(even_obs.channels[countdown], 1.0);
+    assert_eq!(
+        odd_obs.channels[countdown],
+        (MAX_TURNS * 2 - 1) as f32 / (MAX_TURNS * 2) as f32
+    );
+    assert_ne!(even_obs.channels, odd_obs.channels);
+
+    for tile in 0..BOARD_SIZE {
+        assert_eq!(even_obs.channels[countdown + tile], 1.0);
+        assert_eq!(
+            odd_obs.channels[countdown + tile],
+            odd_obs.channels[countdown]
+        );
+    }
+}
+
+#[test]
+fn test_observation_countdown_advances_each_ply() {
+    let mut game = Generals::new();
+    let mut r = rng(17);
+    let (mut state, initial) = game.reset(&mut r, &[]).unwrap();
+    let countdown = 9 * BOARD_SIZE;
+
+    let after_one = game.step(&mut state, WAIT_ACTION, &mut r).unwrap();
+    let after_two = game.step(&mut state, WAIT_ACTION, &mut r).unwrap();
+    let expected_delta = 1.0 / (MAX_TURNS * 2) as f32;
+    assert!(
+        (initial.channels[countdown] - after_one.observation.channels[countdown] - expected_delta)
+            .abs()
+            < 1e-6
+    );
+    assert!(
+        (after_one.observation.channels[countdown]
+            - after_two.observation.channels[countdown]
+            - expected_delta)
+            .abs()
+            < 1e-6
+    );
+}
+
 // ==========================================================================
 // Step semantics
 // ==========================================================================
@@ -441,13 +517,13 @@ fn test_obs_is_player_relative() {
 fn test_alternating_turns_and_round_clock() {
     let mut game = Generals::new();
     let mut r = rng(3);
-    let (mut state, _) = game.reset(&mut r, &[]);
+    let (mut state, _) = game.reset(&mut r, &[]).unwrap();
 
     assert_eq!(state.current_player, 1);
-    game.step(&mut state, WAIT_ACTION, &mut r);
+    game.step(&mut state, WAIT_ACTION, &mut r).unwrap();
     assert_eq!(state.current_player, 2);
     assert_eq!(state.round, 0); // round not over yet
-    game.step(&mut state, WAIT_ACTION, &mut r);
+    game.step(&mut state, WAIT_ACTION, &mut r).unwrap();
     assert_eq!(state.current_player, 1);
     assert_eq!(state.round, 1); // both moved: round ticked, production ran
 }
@@ -456,32 +532,33 @@ fn test_alternating_turns_and_round_clock() {
 fn test_production_runs_at_round_end() {
     let mut game = Generals::new();
     let mut r = rng(3);
-    let (mut state, _) = game.reset(&mut r, &[]);
+    let (mut state, _) = game.reset(&mut r, &[]).unwrap();
     let g1 = state.generals[0] as usize;
     let before = state.tiles[g1].army;
 
-    game.step(&mut state, WAIT_ACTION, &mut r); // P1
+    game.step(&mut state, WAIT_ACTION, &mut r).unwrap(); // P1
     assert_eq!(state.tiles[g1].army, before); // not yet
-    game.step(&mut state, WAIT_ACTION, &mut r); // P2 -> round end
+    game.step(&mut state, WAIT_ACTION, &mut r).unwrap(); // P2 -> round end
     assert_eq!(state.tiles[g1].army, before + params::GENERAL_PRODUCTION);
 }
 
 #[test]
-fn test_illegal_action_degrades_to_wait() {
+fn test_illegal_action_is_rejected_without_mutating_state() {
     let mut game = Generals::new();
     let mut r = rng(3);
-    let (mut state, _) = game.reset(&mut r, &[]);
-    let snapshot = state.tiles.clone();
+    let (mut state, _) = game.reset(&mut r, &[]).unwrap();
+    let snapshot = state.clone();
 
-    // Move from an unowned tile: must change nothing but the turn
+    // Moving from an unowned tile is outside the advertised legal mask.
     let unowned = (0..BOARD_SIZE)
         .find(|&i| state.tiles[i].is_neutral())
         .unwrap();
-    let (_obs, reward, done, _info) = game.step(&mut state, encode_move(unowned, 1), &mut r);
-    assert_eq!(state.tiles, snapshot);
-    assert_eq!(state.current_player, 2);
-    assert!(!done);
-    assert!(reward.abs() < f32::EPSILON);
+    let result = game.step(&mut state, encode_move(unowned, 1), &mut r);
+    assert!(matches!(
+        result,
+        Err(engine_core::EnvironmentError::InvalidAction(_))
+    ));
+    assert_eq!(state, snapshot);
 }
 
 #[test]
@@ -493,11 +570,11 @@ fn test_max_turns_symmetric_position_is_draw() {
     let mut state = flat_state();
     state.round = MAX_TURNS - 1;
 
-    game.step(&mut state, WAIT_ACTION, &mut r); // P1
-    let (_obs, reward, done, _info) = game.step(&mut state, WAIT_ACTION, &mut r); // P2
-    assert!(done);
+    game.step(&mut state, WAIT_ACTION, &mut r).unwrap(); // P1
+    let transition = game.step(&mut state, WAIT_ACTION, &mut r).unwrap(); // P2
+    assert!(transition.terminated);
     assert_eq!(state.winner, 3);
-    assert!(reward.abs() < f32::EPSILON); // draw reward is 0
+    assert!(transition.actor_reward.abs() < f32::EPSILON); // draw reward is 0
 }
 
 #[test]
@@ -513,11 +590,11 @@ fn test_max_turns_adjudicates_by_territory() {
     };
     state.round = MAX_TURNS - 1;
 
-    game.step(&mut state, WAIT_ACTION, &mut r); // P1
-    let (_obs, reward, done, _info) = game.step(&mut state, WAIT_ACTION, &mut r); // P2
-    assert!(done);
+    game.step(&mut state, WAIT_ACTION, &mut r).unwrap(); // P1
+    let transition = game.step(&mut state, WAIT_ACTION, &mut r).unwrap(); // P2
+    assert!(transition.terminated);
     assert_eq!(state.winner, 2);
-    assert!((reward - 1.0).abs() < f32::EPSILON); // P2 moved last and wins
+    assert!((transition.actor_reward - 1.0).abs() < f32::EPSILON);
 }
 
 #[test]
@@ -536,10 +613,13 @@ fn test_odd_cap_gives_player1_the_last_move() {
         kind: TileKind::Normal,
     };
 
-    let (_obs, reward, done, _info) = game.step(&mut state, WAIT_ACTION, &mut r); // P1's last ply
-    assert!(done, "game must end after P1's ply at an odd cap");
+    let transition = game.step(&mut state, WAIT_ACTION, &mut r).unwrap(); // P1's last ply
+    assert!(
+        transition.terminated,
+        "game must end after P1's ply at an odd cap"
+    );
     assert_eq!(state.winner, 1);
-    assert!((reward - 1.0).abs() < f32::EPSILON);
+    assert!((transition.actor_reward - 1.0).abs() < f32::EPSILON);
 }
 
 #[test]
@@ -547,7 +627,7 @@ fn test_reset_samples_both_cap_parities() {
     let mut game = Generals::new();
     let mut seen = [false, false];
     for seed in 0..40 {
-        let (state, _) = game.reset(&mut rng(seed), &[]);
+        let (state, _) = game.reset(&mut rng(seed), &[]).unwrap();
         let cap = state.cap_plies as u32;
         assert!(cap == MAX_TURNS * 2 || cap == MAX_TURNS * 2 - 1);
         seen[(MAX_TURNS * 2 - cap) as usize] = true;
@@ -579,22 +659,22 @@ fn test_random_playout_terminates_cleanly() {
     for seed in 0..10 {
         let mut game = Generals::new();
         let mut r = rng(seed);
-        let (mut state, mut obs) = game.reset(&mut r, &[]);
+        let (mut state, _) = game.reset(&mut r, &[]).unwrap();
         let mut plies = 0u32;
 
         loop {
-            // Pick a uniformly random legal action from the obs mask
-            let legal: Vec<u32> = (0..NUM_ACTIONS as u32)
-                .filter(|&a| obs.legal_moves[a as usize] > 0.5)
+            let legal: Vec<u32> = Generals::legal_actions(&state)
+                .unwrap()
+                .iter_ones()
+                .map(|action| action as u32)
                 .collect();
             assert!(!legal.is_empty(), "seed {}: no legal actions", seed);
             let action = legal[r.gen_range(0..legal.len())];
 
-            let (new_obs, _reward, done, _info) = game.step(&mut state, action, &mut r);
-            obs = new_obs;
+            let transition = game.step(&mut state, action, &mut r).unwrap();
             plies += 1;
             assert!(
-                plies <= MAX_TURNS * 2 + 2,
+                plies <= MAX_TURNS * 2,
                 "seed {}: game exceeded the horizon",
                 seed
             );
@@ -602,7 +682,7 @@ fn test_random_playout_terminates_cleanly() {
             // Army conservation sanity: no tile ever has armies on a mountain
             debug_assert!(state.tiles.iter().all(|t| !t.is_mountain() || t.army == 0));
 
-            if done {
+            if transition.terminated {
                 assert!(state.winner >= 1 && state.winner <= 3, "seed {}", seed);
                 break;
             }
@@ -621,16 +701,25 @@ fn test_register_and_play_via_context() {
 
     let mut ctx = EngineContext::new("generals_8x8").expect("registered");
     let reset = ctx.reset(42, &[]).unwrap();
-    assert_eq!(reset.obs.len(), OBS_SIZE * 4);
+    assert_eq!(
+        reset.timestep.sole_observation().unwrap().data.len(),
+        OBS_SIZE * 4
+    );
 
     // Step a wait action through the byte interface
     let action = WAIT_ACTION.to_le_bytes().to_vec();
     let step = ctx.step(&reset.state, &action).unwrap();
-    assert!(!step.done);
-    assert_eq!(step.obs.len(), OBS_SIZE * 4);
+    assert!(!step.timestep.episode.is_done());
+    assert_eq!(
+        step.timestep.sole_observation().unwrap().data.len(),
+        OBS_SIZE * 4
+    );
 
     // Metadata round-trip through the erased layer
     let meta = ctx.metadata();
-    assert_eq!(meta.env_id, "generals_8x8");
-    assert_eq!(meta.num_actions, NUM_ACTIONS);
+    assert_eq!(meta.id, "generals_8x8");
+    assert_eq!(
+        meta.require_board().unwrap().board_size().unwrap(),
+        BOARD_SIZE
+    );
 }

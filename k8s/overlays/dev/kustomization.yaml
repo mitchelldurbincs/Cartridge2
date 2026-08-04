@@ -1,5 +1,5 @@
-# Development overlay
-# Minimal resources, single replicas, local storage
+# GKE development overlay
+# Minimal compute resources with multi-node shared storage.
 #
 # Deploy with: kubectl apply -k k8s/overlays/dev
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -9,57 +9,14 @@ namespace: cartridge
 
 resources:
   - ../../base
+  - ../../development-secrets
+  - filestore-storageclass.yaml
 
-# Development-specific patches
 patches:
-  # Reduce actor replicas for local development
+  # Reduce synchronized-run resource requests.
   - patch: |-
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: actor
-      spec:
-        replicas: 2
-    target:
-      kind: Deployment
-      name: actor
-
-  # Disable HPA in dev
-  - patch: |-
-      $patch: delete
-      apiVersion: autoscaling/v2
-      kind: HorizontalPodAutoscaler
-      metadata:
-        name: actor-hpa
-    target:
-      kind: HorizontalPodAutoscaler
-      name: actor-hpa
-
-  # Reduce resource requests for local clusters
-  - patch: |-
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: actor
-      spec:
-        template:
-          spec:
-            containers:
-              - name: actor
-                resources:
-                  requests:
-                    memory: "256Mi"
-                    cpu: "100m"
-                  limits:
-                    memory: "512Mi"
-                    cpu: "500m"
-    target:
-      kind: Deployment
-      name: actor
-
-  - patch: |-
-      apiVersion: apps/v1
-      kind: Deployment
+      apiVersion: batch/v1
+      kind: Job
       metadata:
         name: trainer
       spec:
@@ -75,37 +32,26 @@ patches:
                     memory: "2Gi"
                     cpu: "1000m"
     target:
-      kind: Deployment
+      kind: Job
       name: trainer
 
-  # Use ReadWriteOnce for models PVC (works on single-node clusters)
+  # Current GKE Basic HDD Filestore supports claims beginning at 100 GiB.
   - patch: |-
       apiVersion: v1
       kind: PersistentVolumeClaim
       metadata:
-        name: models-shared
+        name: runtime-data
       spec:
-        accessModes:
-          - ReadWriteOnce
-    target:
-      kind: PersistentVolumeClaim
-      name: models-shared
-
-  # Smaller storage for dev
-  - patch: |-
-      apiVersion: v1
-      kind: PersistentVolumeClaim
-      metadata:
-        name: models-shared
-      spec:
+        storageClassName: cartridge-dev-filestore-rwx
         resources:
           requests:
-            storage: 1Gi
+            storage: 100Gi
     target:
       kind: PersistentVolumeClaim
-      name: models-shared
+      name: runtime-data
 
-# Override images to use local builds (no registry prefix)
+# Terraform's deployment instructions replace these image names immediately
+# after applying the overlay.
 images:
   - name: cartridge-alphazero
     newTag: latest

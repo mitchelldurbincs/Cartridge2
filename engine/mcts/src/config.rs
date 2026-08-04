@@ -1,5 +1,28 @@
 //! MCTS configuration parameters.
 
+use thiserror::Error;
+
+/// Configuration errors rejected before a search allocates or evaluates a tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum MctsConfigError {
+    #[error("num_simulations must be greater than zero")]
+    ZeroSimulations,
+    #[error("c_puct must be finite and non-negative")]
+    InvalidCPuct,
+    #[error("dirichlet_alpha must be finite and non-negative")]
+    InvalidDirichletAlpha,
+    #[error("dirichlet_epsilon must be finite and between zero and one")]
+    InvalidDirichletEpsilon,
+    #[error("dirichlet_alpha and dirichlet_epsilon must both be zero to disable noise")]
+    InconsistentDirichletNoise,
+    #[error("temperature must be finite and non-negative")]
+    InvalidTemperature,
+    #[error("virtual_loss must be finite and non-negative")]
+    InvalidVirtualLoss,
+    #[error("eval_batch_size must be greater than zero")]
+    ZeroEvalBatchSize,
+}
+
 /// Configuration for Monte Carlo Tree Search.
 #[derive(Debug, Clone)]
 pub struct MctsConfig {
@@ -13,7 +36,7 @@ pub struct MctsConfig {
 
     /// Dirichlet noise alpha for root node exploration.
     /// Scaled by 10/avg_legal_moves. For games with ~10 legal moves, use ~0.3.
-    /// Set to 0.0 to disable noise (for evaluation/inference).
+    /// Set this and `dirichlet_epsilon` to 0.0 to disable noise.
     pub dirichlet_alpha: f32,
 
     /// Fraction of prior that comes from Dirichlet noise at root.
@@ -34,9 +57,10 @@ pub struct MctsConfig {
     /// parent. Restored before backpropagation.
     pub virtual_loss: f32,
 
-    /// Batch size for neural network evaluation.
-    /// Leaves are collected until this batch size is reached, then evaluated together.
-    /// Higher values improve throughput but increase latency per batch.
+    /// Upper bound for neural-network evaluation batches.
+    /// Search may reduce this to one quarter of the simulation budget so
+    /// evaluated values feed back into later selection rounds. Higher values
+    /// can improve throughput but increase latency per effective batch.
     /// Set to 1 to disable batching (original behavior).
     pub eval_batch_size: usize,
 }
@@ -56,6 +80,35 @@ impl Default for MctsConfig {
 }
 
 impl MctsConfig {
+    /// Reject values that make search undefined or numerically invalid.
+    pub fn validate(&self) -> Result<(), MctsConfigError> {
+        if self.num_simulations == 0 {
+            return Err(MctsConfigError::ZeroSimulations);
+        }
+        if !self.c_puct.is_finite() || self.c_puct < 0.0 {
+            return Err(MctsConfigError::InvalidCPuct);
+        }
+        if !self.dirichlet_alpha.is_finite() || self.dirichlet_alpha < 0.0 {
+            return Err(MctsConfigError::InvalidDirichletAlpha);
+        }
+        if !self.dirichlet_epsilon.is_finite() || !(0.0..=1.0).contains(&self.dirichlet_epsilon) {
+            return Err(MctsConfigError::InvalidDirichletEpsilon);
+        }
+        if (self.dirichlet_alpha == 0.0) != (self.dirichlet_epsilon == 0.0) {
+            return Err(MctsConfigError::InconsistentDirichletNoise);
+        }
+        if !self.temperature.is_finite() || self.temperature < 0.0 {
+            return Err(MctsConfigError::InvalidTemperature);
+        }
+        if !self.virtual_loss.is_finite() || self.virtual_loss < 0.0 {
+            return Err(MctsConfigError::InvalidVirtualLoss);
+        }
+        if self.eval_batch_size == 0 {
+            return Err(MctsConfigError::ZeroEvalBatchSize);
+        }
+        Ok(())
+    }
+
     /// Create config for training (with exploration noise).
     pub fn for_training() -> Self {
         Self::default()
@@ -138,5 +191,52 @@ mod tests {
         let config = MctsConfig::for_evaluation();
         assert!((config.dirichlet_alpha).abs() < 1e-6);
         assert!((config.temperature).abs() < 1e-6);
+    }
+
+    #[test]
+    fn validation_rejects_zero_search_and_batch_budgets() {
+        let mut config = MctsConfig::for_training();
+        config.num_simulations = 0;
+        assert_eq!(config.validate(), Err(MctsConfigError::ZeroSimulations));
+
+        config.num_simulations = 1;
+        config.eval_batch_size = 0;
+        assert_eq!(config.validate(), Err(MctsConfigError::ZeroEvalBatchSize));
+    }
+
+    #[test]
+    fn validation_rejects_invalid_float_domains() {
+        let mut config = MctsConfig::for_training();
+        config.c_puct = f32::NAN;
+        assert_eq!(config.validate(), Err(MctsConfigError::InvalidCPuct));
+
+        config = MctsConfig::for_training();
+        config.dirichlet_alpha = -0.1;
+        assert_eq!(
+            config.validate(),
+            Err(MctsConfigError::InvalidDirichletAlpha)
+        );
+
+        config = MctsConfig::for_training();
+        config.dirichlet_epsilon = 1.1;
+        assert_eq!(
+            config.validate(),
+            Err(MctsConfigError::InvalidDirichletEpsilon)
+        );
+
+        config = MctsConfig::for_training();
+        config.dirichlet_alpha = 0.0;
+        assert_eq!(
+            config.validate(),
+            Err(MctsConfigError::InconsistentDirichletNoise)
+        );
+
+        config = MctsConfig::for_training();
+        config.temperature = f32::INFINITY;
+        assert_eq!(config.validate(), Err(MctsConfigError::InvalidTemperature));
+
+        config = MctsConfig::for_training();
+        config.virtual_loss = -1.0;
+        assert_eq!(config.validate(), Err(MctsConfigError::InvalidVirtualLoss));
     }
 }

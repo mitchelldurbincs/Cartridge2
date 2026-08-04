@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .game_config import GameConfig, get_config
+from .algorithms.alphazero_board_v1 import AlphaZeroGameConfig, get_game_config
 
 
 class BasePolicyValueNetwork(nn.Module):
@@ -182,9 +182,7 @@ class AlphaZeroLoss:
         return total_loss, metrics
 
 
-def create_network(
-    env_id: str = "tictactoe", config: GameConfig | None = None
-) -> nn.Module:
+def create_network(env_id: str, config: AlphaZeroGameConfig | None = None) -> nn.Module:
     """Factory function to create a network for the specified environment.
 
     Automatically selects the appropriate architecture based on the game's
@@ -206,7 +204,7 @@ def create_network(
     Raises:
         ValueError: If the game is not registered or network_type is invalid.
     """
-    config = config if config is not None else get_config(env_id)
+    config = config if config is not None else get_game_config(env_id)
 
     if config.network_type == "resnet":
         from .resnet import ConvPolicyValueNetwork

@@ -1,5 +1,5 @@
 # Ingress for external access
-# Routes traffic to frontend, with /api/* going to backend
+# Routes known API paths to the backend and everything else to the frontend.
 #
 # Requires an Ingress controller (nginx-ingress, traefik, etc.)
 #

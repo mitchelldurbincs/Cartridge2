@@ -18,6 +18,8 @@ name = "generals_strength_probe"
 required-features = ["onnx"]
 
 [dependencies]
+algorithm-core = { path = "../algorithm-core" }
+
 # Engine core for game abstraction
 engine-core = { path = "../engine-core" }
 
@@ -39,6 +41,7 @@ ndarray = { version = "0.16", optional = true }
 [dev-dependencies]
 # For testing with actual games
 engine-games = { path = "../engine-games" }
+tempfile = "3"
 
 # Benchmarking
 criterion = { workspace = true }

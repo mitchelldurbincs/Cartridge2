@@ -9,48 +9,26 @@ Groups:
 
 import argparse
 import json
-import random
+import shutil
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from trainer.game_config import GameConfig
-from trainer.games import create_game_state
-from trainer.policies import Policy, RandomPolicy
+from trainer.algorithms.alphazero_board_v1 import ALGORITHM_ID
+from trainer.players import ModelPlayer, RandomPlayer
 from trainer.solver_eval import (
     BucketStats,
     SolverEvalResults,
-    append_solver_stats,
     classify_score,
-    discover_checkpoints,
     format_progression_table,
-    infer_step_from_filename,
     judge_move,
     ply_bucket,
     run_solver_evaluation,
     solver_evaluate,
 )
 
-
-class MockPolicy(Policy):
-    """Mock policy playing a predetermined sequence, falling back to first legal."""
-
-    def __init__(self, name: str, actions: list[int] | None = None):
-        self._name = name
-        self._actions = actions or []
-        self._action_idx = 0
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    def select_action(self, state, config) -> int:
-        legal = state.legal_moves()
-        if self._action_idx < len(self._actions):
-            action = self._actions[self._action_idx]
-            self._action_idx += 1
-            if action in legal:
-                return action
-        return legal[0] if legal else 0
+WIDTH, HEIGHT = 7, 6
 
 
 class MockScorer:
@@ -62,7 +40,7 @@ class MockScorer:
         self.solve_time_seconds = 0.0
         self.resets = 0
         self.mirrored_moves = []
-        self.scored_states = []
+        self.scored_positions = []
 
     def reset(self) -> None:
         self.resets += 1
@@ -70,36 +48,103 @@ class MockScorer:
     def mirror_move(self, col: int) -> None:
         self.mirrored_moves.append(col)
 
-    def scores_for(self, state) -> dict[int, int]:
+    def scores_for(self, board, current_player, legal) -> dict[int, int]:
         self.queries += 1
-        self.scored_states.append(len(state.legal_moves()))
-        legal = state.legal_moves()
-        return {move: (1 if i == 0 else -1) for i, move in enumerate(legal)}
+        self.scored_positions.append((tuple(board), current_player))
+        return {move: (1 if i == 0 else -1) for i, move in enumerate(sorted(legal))}
 
 
-def create_test_config(env_id: str = "connect4") -> GameConfig:
-    """Create a test GameConfig with all required fields."""
-    configs = {
-        "tictactoe": GameConfig(
-            env_id="tictactoe",
-            display_name="Tic Tac Toe",
-            board_width=3,
-            board_height=3,
-            num_actions=9,
-            obs_size=27,
-            legal_mask_offset=27,
-        ),
-        "connect4": GameConfig(
-            env_id="connect4",
-            display_name="Connect 4",
-            board_width=7,
-            board_height=6,
-            num_actions=7,
-            obs_size=84,
-            legal_mask_offset=84,
-        ),
+def engine_board(moves: list[int]) -> tuple[list[int], list[int], int]:
+    """Board, legal columns and side to move after playing ``moves``.
+
+    A fixture builder, not a rules implementation: it drops pieces and tracks
+    column heights, with no win detection. The layout is the engine's —
+    row-major, ``row * WIDTH + col``, row 0 at the bottom — which is what
+    ``scores_for`` is given.
+    """
+    board = [0] * (WIDTH * HEIGHT)
+    heights = [0] * WIDTH
+    player = 1
+    for col in moves:
+        board[heights[col] * WIDTH + col] = player
+        heights[col] += 1
+        player = 3 - player
+    legal = [col for col in range(WIDTH) if heights[col] < HEIGHT]
+    return board, legal, player
+
+
+def fake_dump(num_games: int, plies_per_game: int = 6) -> list[dict]:
+    """Synthetic position records shaped like the ones cartridge-eval writes.
+
+    The model is player 1 and, like the binary, holds seat 1 for the first half
+    of the games and seat 2 for the rest.
+    """
+    records = []
+    for game in range(num_games):
+        p1_first = game < num_games // 2
+        moves: list[int] = []
+        for ply in range(plies_per_game):
+            seat = 1 + ply % 2
+            board, legal, _ = engine_board(moves)
+            records.append(
+                {
+                    "game": game,
+                    "ply": ply,
+                    "player": seat,
+                    "by": "p1" if (seat == 1) == p1_first else "p2",
+                    "action": legal[ply % len(legal)],
+                    "board": board,
+                    "legal": legal,
+                }
+            )
+            moves.append(records[-1]["action"])
+    return records
+
+
+def fake_summary(num_games: int, plies_per_game: int = 6) -> dict:
+    return {
+        "env_id": "connect4",
+        "player1_name": "ONNX(candidate.onnx)",
+        "player2_name": "Random",
+        "games_played": num_games,
+        "player1_wins": num_games,
+        "player2_wins": 0,
+        "draws": 0,
+        "player1_wins_as_first": num_games // 2,
+        "player1_wins_as_second": num_games - num_games // 2,
+        "player2_wins_as_first": 0,
+        "player2_wins_as_second": 0,
+        "avg_game_length": float(plies_per_game),
     }
-    return configs.get(env_id, configs["connect4"])
+
+
+@pytest.fixture
+def stub_eval_binary(monkeypatch, tmp_path):
+    """Answer cartridge-eval invocations with canned output.
+
+    The Python CI job has no Rust toolchain, so the driver is exercised against
+    the binary's *contract* — its argument vector and the two files it writes —
+    rather than the binary itself, which engine/evaluator tests cover.
+    """
+    from trainer import evaluator
+    from trainer.solver_eval import scorer as scorer_module
+
+    binary = tmp_path / "cartridge-eval"
+    binary.write_text("#!/bin/sh\n")
+    monkeypatch.setenv(evaluator.EVAL_BINARY_ENV, str(binary))
+
+    calls = []
+
+    def fake_run(command):
+        calls.append(command)
+        games = int(command[command.index("--games") + 1])
+        out = Path(command[command.index("--output") + 1])
+        dump = Path(command[command.index("--dump-positions") + 1])
+        out.write_text(json.dumps(fake_summary(games)))
+        dump.write_text("\n".join(json.dumps(record) for record in fake_dump(games)) + "\n")
+
+    monkeypatch.setattr(scorer_module, "run_eval_binary", fake_run)
+    return calls
 
 
 class TestClassifyScore:
@@ -183,18 +228,6 @@ class TestPlyBucket:
         assert ply_bucket(42) == "ply_21_plus"
 
 
-class TestInferStep:
-    """Test checkpoint filename parsing."""
-
-    def test_infer_step_from_filename(self):
-        assert infer_step_from_filename("model_step_016000.onnx") == 16000
-        assert infer_step_from_filename("model_step_015450.onnx") == 15450
-        assert infer_step_from_filename("data/models/model_step_000100.onnx") == 100
-        assert infer_step_from_filename("latest.onnx") is None
-        assert infer_step_from_filename("best.onnx") is None
-        assert infer_step_from_filename("model_step_16000.pt") is None
-
-
 class TestBucketStats:
     """Test aggregation and metric invariants."""
 
@@ -250,8 +283,9 @@ class TestSolverEvalResults:
     def _results(self) -> SolverEvalResults:
         results = SolverEvalResults(
             env_id="connect4",
-            model_name="ONNX(latest.onnx)",
-            model_path="data/models/latest.onnx",
+            model_name="ONNX(candidate.onnx)",
+            model_path="data/models/candidate.onnx",
+            checkpoint_id=None,
             step=None,
             opponent_name="Random",
             games=10,
@@ -265,6 +299,7 @@ class TestSolverEvalResults:
         d = self._results().to_dict()
         for key in (
             "model",
+            "checkpoint_id",
             "step",
             "games",
             "seed",
@@ -285,45 +320,100 @@ class TestSolverEvalResults:
 
     def test_summary_contains_metrics(self):
         summary = self._results().summary()
-        assert "ONNX(latest.onnx)" in summary
+        assert "ONNX(candidate.onnx)" in summary
         assert "Random" in summary
         assert "overall" in summary
         assert "%" in summary
 
 
 class TestSolverEvaluateDriver:
-    """End-to-end driver tests with MockScorer + MockPolicy (no bitbully)."""
+    """Driver tests with a stubbed binary and MockScorer (no bitbully, no Rust)."""
 
-    def test_scores_only_model_moves(self):
+    def test_scores_only_model_moves(self, stub_eval_binary):
         scorer = MockScorer()
-        model = MockPolicy("model")
-        opponent = MockPolicy("opponent")
 
         results = solver_evaluate(
-            model=model,
-            opponent=opponent,
+            model=ModelPlayer("/models/candidate.onnx"),
+            opponent=RandomPlayer(),
             scorer=scorer,
+            algorithm_id=ALGORITHM_ID,
             env_id="connect4",
-            config=create_test_config("connect4"),
             num_games=2,
             seed=42,
         )
 
         total_moves = len(scorer.mirrored_moves)
         assert results.overall.positions == scorer.queries
-        assert 0 < scorer.queries < total_moves  # model's share only
-        assert scorer.resets == 2
-        # avg_game_length reflects mirrored move count across the 2 games
-        assert results.avg_game_length == pytest.approx(total_moves / 2)
+        assert 0 < scorer.queries < total_moves  # the model's share only
+        assert scorer.resets == 2  # one fresh mirrored board per game
 
-    def test_seat_split_and_ply_buckets(self):
+    def test_checkpoint_identity_and_step_are_explicit_metadata(self, stub_eval_binary):
+        checkpoint_id = "a" * 64
+        results = solver_evaluate(
+            model=ModelPlayer("/models/a.onnx"),
+            opponent=RandomPlayer(),
+            scorer=MockScorer(),
+            algorithm_id=ALGORITHM_ID,
+            env_id="connect4",
+            num_games=2,
+            checkpoint_id=checkpoint_id,
+            checkpoint_step=16000,
+        )
+        assert results.checkpoint_id == checkpoint_id
+        assert results.step == 16000
+
+        direct = solver_evaluate(
+            model=ModelPlayer("/models/b.onnx"),
+            opponent=RandomPlayer(),
+            scorer=MockScorer(),
+            algorithm_id=ALGORITHM_ID,
+            env_id="connect4",
+            num_games=2,
+        )
+        assert direct.checkpoint_id is None
+        assert direct.step is None
+
+    def test_every_move_is_mirrored_even_when_not_scored(self, stub_eval_binary):
+        # The solver board has to follow the whole game, not just the model's
+        # half, or it desyncs on the very next query.
+        scorer = MockScorer()
+        solver_evaluate(
+            model=ModelPlayer("/models/candidate.onnx"),
+            opponent=RandomPlayer(),
+            scorer=scorer,
+            algorithm_id=ALGORITHM_ID,
+            env_id="connect4",
+            num_games=2,
+            seed=42,
+        )
+
+        assert len(scorer.mirrored_moves) == len(fake_dump(2))
+
+    def test_outcome_counts_come_from_the_binary_summary(self, stub_eval_binary):
+        results = solver_evaluate(
+            model=ModelPlayer("/models/candidate.onnx"),
+            opponent=RandomPlayer(),
+            scorer=MockScorer(),
+            algorithm_id=ALGORITHM_ID,
+            env_id="connect4",
+            num_games=4,
+            seed=42,
+        )
+
+        expected = fake_summary(4)
+        assert results.model_wins == expected["player1_wins"]
+        assert results.model_losses == expected["player2_wins"]
+        assert results.draws == expected["draws"]
+        assert results.avg_game_length == expected["avg_game_length"]
+
+    def test_seat_split_and_ply_buckets(self, stub_eval_binary):
         scorer = MockScorer()
         results = solver_evaluate(
-            model=MockPolicy("model"),
-            opponent=MockPolicy("opponent"),
+            model=ModelPlayer("/models/candidate.onnx"),
+            opponent=RandomPlayer(),
             scorer=scorer,
+            algorithm_id=ALGORITHM_ID,
             env_id="connect4",
-            config=create_test_config("connect4"),
             num_games=4,
             seed=42,
         )
@@ -337,22 +427,34 @@ class TestSolverEvaluateDriver:
         by_ply_total = sum(s.positions for s in results.by_ply.values())
         assert by_ply_total == results.overall.positions
 
-    def test_seed_reproducibility(self):
+    def test_seed_is_passed_through_to_the_binary(self, stub_eval_binary):
+        solver_evaluate(
+            model=ModelPlayer("/models/candidate.onnx"),
+            opponent=RandomPlayer(),
+            scorer=MockScorer(),
+            algorithm_id=ALGORITHM_ID,
+            env_id="connect4",
+            num_games=2,
+            seed=1234,
+        )
+
+        command = stub_eval_binary[0]
+        assert command[command.index("--seed") + 1] == "1234"
+
+    def test_seed_reproducibility(self, stub_eval_binary):
         volatile_keys = {"timestamp", "wall_time_seconds", "solver_time_seconds"}
 
         def run(seed: int) -> dict:
             results = solver_evaluate(
-                model=MockPolicy("model"),
-                opponent=RandomPolicy(),
+                model=ModelPlayer("/models/candidate.onnx"),
+                opponent=RandomPlayer(),
                 scorer=MockScorer(),
+                algorithm_id=ALGORITHM_ID,
                 env_id="connect4",
-                config=create_test_config("connect4"),
                 num_games=4,
                 seed=seed,
             )
-            return {
-                k: v for k, v in results.to_dict().items() if k not in volatile_keys
-            }
+            return {k: v for k, v in results.to_dict().items() if k not in volatile_keys}
 
         assert run(42) == run(42)
 
@@ -362,60 +464,53 @@ class TestSolverEvaluateDriver:
         # namespace is sufficient.
         assert run_solver_evaluation(args) == 1
 
+    def test_default_model_resolves_the_current_checkpoint_channel(self, tmp_path, monkeypatch):
+        from trainer.solver_eval import cli as solver_cli
 
-class TestStatsFile:
-    """Test solver_stats.json append behavior."""
+        checkpoint = SimpleNamespace(
+            checkpoint_id="a" * 64,
+            onnx_path=tmp_path / "blobs" / "sha256" / f"{'b' * 64}.onnx",
+            manifest=SimpleNamespace(step=123),
+        )
+        repository = SimpleNamespace(resolve_head=lambda: checkpoint)
+        calls = []
 
-    def test_append_creates_and_appends(self, tmp_path):
-        output = tmp_path / "solver_stats.json"
+        class Result:
+            bitbully_version = None
 
-        append_solver_stats({"model": "a"}, output)
-        with open(output) as f:
-            stats = json.load(f)
-        assert stats["solver_evaluations"] == [{"model": "a"}]
+            @staticmethod
+            def summary():
+                return "summary"
 
-        append_solver_stats({"model": "b"}, output)
-        with open(output) as f:
-            stats = json.load(f)
-        assert len(stats["solver_evaluations"]) == 2
+            @staticmethod
+            def to_dict():
+                return {"checkpoint_id": checkpoint.checkpoint_id, "step": 123}
 
-    def test_append_recovers_from_corrupt_file(self, tmp_path):
-        output = tmp_path / "solver_stats.json"
-        output.write_text("{not json")
+        monkeypatch.setattr(solver_cli, "create_checkpoint_publisher", lambda *_: repository)
+        monkeypatch.setattr(solver_cli, "SolverScorer", object)
+        monkeypatch.setattr(
+            solver_cli,
+            "solver_evaluate",
+            lambda **kwargs: calls.append(kwargs) or Result(),
+        )
+        args = SimpleNamespace(
+            all_checkpoints=False,
+            models_dir=str(tmp_path),
+            env_id="connect4",
+            algorithm=ALGORITHM_ID,
+            games=2,
+            seed=42,
+            temperature=0.0,
+            verbose=False,
+        )
 
-        append_solver_stats({"model": "a"}, output)
-        with open(output) as f:
-            stats = json.load(f)
-        assert len(stats["solver_evaluations"]) == 1
+        assert solver_cli.run_solver_evaluation(args) == 0
+        assert calls[0]["checkpoint_id"] == checkpoint.checkpoint_id
+        assert calls[0]["checkpoint_step"] == 123
 
 
 class TestCheckpointDiscovery:
-    """Test checkpoint discovery and progression table."""
-
-    def test_discover_checkpoints_ordering(self, tmp_path):
-        for name in (
-            "model_step_016000.onnx",
-            "model_step_009000.onnx",
-            "model_step_015450.onnx",
-            "latest.onnx",
-            "best.onnx",
-            "unrelated.pt",
-        ):
-            (tmp_path / name).touch()
-
-        found = [p.name for p in discover_checkpoints(tmp_path)]
-        assert found == [
-            "model_step_009000.onnx",
-            "model_step_015450.onnx",
-            "model_step_016000.onnx",
-            "latest.onnx",
-            "best.onnx",
-        ]
-
-    def test_discover_checkpoints_missing_latest_best(self, tmp_path):
-        (tmp_path / "model_step_000100.onnx").touch()
-        found = [p.name for p in discover_checkpoints(tmp_path)]
-        assert found == ["model_step_000100.onnx"]
+    """Test manifest-derived progression metadata."""
 
     def test_format_progression_table(self):
         def make(step, name):
@@ -423,6 +518,7 @@ class TestCheckpointDiscovery:
                 env_id="connect4",
                 model_name=name,
                 model_path=name,
+                checkpoint_id=f"{step:064x}" if step is not None else None,
                 step=step,
                 opponent_name="Random",
                 games=10,
@@ -431,7 +527,7 @@ class TestCheckpointDiscovery:
             )
 
         table = format_progression_table(
-            [make(None, "latest.onnx"), make(16000, "b.onnx"), make(15450, "a.onnx")]
+            [make(None, "candidate.onnx"), make(16000, "b.onnx"), make(15450, "a.onnx")]
         )
         lines = table.splitlines()
         assert "value-opt" in lines[0]
@@ -455,90 +551,142 @@ class TestSolverScorerIntegration:
         return SolverScorer()
 
     def test_calibration_and_empty_board(self, scorer):
-        state = create_game_state("connect4")
+        board, legal, player = engine_board([])
         scorer.reset()
-        scores = scorer.scores_for(state)
+        scores = scorer.scores_for(board, player, legal)
 
-        assert set(scores) == set(range(7))
+        assert set(scores) == set(range(WIDTH))
         assert classify_score(scores[3]) == "win"
         assert classify_score(scores[2]) == "draw"
         assert classify_score(scores[0]) == "loss"
         assert all(scores[i] == scores[6 - i] for i in range(3))
 
-    def test_mirror_random_playout_agrees_with_connect4state(self, scorer):
-        for seed in (1, 2, 3):
-            rng = random.Random(seed)
-            state = create_game_state("connect4")
-            scorer.reset()
-
-            while not state.done:
-                # Cross-check legality before every move (raises on desync).
-                scores = scorer.scores_for(state)
-                assert sorted(scores) == sorted(state.legal_moves())
-                move = rng.choice(state.legal_moves())
-                scorer.mirror_move(move)
-                state.make_move(move)
-
-            assert scorer._board.is_game_over() == state.done
+    def test_mirrored_board_matches_the_engines_row_major_layout(self, scorer):
+        # bitbully's array is column-major and the engine's board view is
+        # row-major; if the reindex between them were wrong, scores_for would
+        # raise on the first non-symmetric position rather than agree.
+        moves = [3, 3, 4, 0, 4, 1]
+        scorer.reset()
+        for i, col in enumerate(moves):
+            board, legal, player = engine_board(moves[:i])
+            scores = scorer.scores_for(board, player, legal)
+            assert sorted(scores) == sorted(legal)
+            scorer.mirror_move(col)
 
     def test_cache_hit_counting(self, scorer):
-        state = create_game_state("connect4")
+        board, legal, player = engine_board([])
         scorer.reset()
 
         queries_before = scorer.queries
         hits_before = scorer.cache_hits
-        first = scorer.scores_for(state)
-        second = scorer.scores_for(state)
+        first = scorer.scores_for(board, player, legal)
+        second = scorer.scores_for(board, player, legal)
 
         assert scorer.queries == queries_before + 2
         assert scorer.cache_hits >= hits_before + 1
         assert first == second
 
     def test_full_column_filtered(self, scorer):
-        state = create_game_state("connect4")
-        scorer.reset()
         # Alternating colors stack column 3 full without a win.
-        for _ in range(6):
-            scorer.mirror_move(3)
-            state.make_move(3)
+        moves = [3] * HEIGHT
+        scorer.reset()
+        for col in moves:
+            scorer.mirror_move(col)
 
-        scores = scorer.scores_for(state)
+        board, legal, player = engine_board(moves)
+        scores = scorer.scores_for(board, player, legal)
         assert 3 not in scores
-        assert sorted(scores) == sorted(state.legal_moves())
+        assert sorted(scores) == sorted(legal)
 
     def test_detects_desync(self, scorer):
-        state = create_game_state("connect4")
         scorer.reset()
-        scorer.mirror_move(3)  # mirrored but not applied to state
+        scorer.mirror_move(3)  # mirrored, but the position says nothing played
 
-        with pytest.raises(RuntimeError):
-            scorer.scores_for(state)
+        board, legal, player = engine_board([])
+        with pytest.raises(RuntimeError, match="desynced"):
+            scorer.scores_for(board, player, legal)
         scorer.reset()
 
     def test_immediate_win_classified(self, scorer):
-        # FIRST has three stacked in column 3 and is to move: 3 wins now.
+        # Player 1 has three stacked in column 3 and is to move: 3 wins now.
         moves = [3, 0, 3, 1, 3, 2]
-        state = create_game_state("connect4")
         scorer.reset()
-        for move in moves:
-            scorer.mirror_move(move)
-            state.make_move(move)
+        for col in moves:
+            scorer.mirror_move(col)
 
-        scores = scorer.scores_for(state)
+        board, legal, player = engine_board(moves)
+        scores = scorer.scores_for(board, player, legal)
         assert classify_score(scores[3]) == "win"
         assert scores[3] == max(scores.values())
 
-    def test_solver_evaluate_end_to_end_random_model(self, scorer):
-        """Full driver run against the real solver with a random 'model'."""
+    def test_solver_evaluate_end_to_end(self, scorer, stub_eval_binary):
         results = solver_evaluate(
-            model=MockPolicy("model"),
-            opponent=MockPolicy("opponent"),
+            model=ModelPlayer("/models/candidate.onnx"),
+            opponent=RandomPlayer(),
             scorer=scorer,
+            algorithm_id=ALGORITHM_ID,
             env_id="connect4",
-            config=create_test_config("connect4"),
             num_games=2,
             seed=7,
         )
         assert results.overall.positions > 0
         assert 0.0 <= results.overall.value_optimal_rate <= 1.0
         assert results.overall.exact_best_rate <= results.overall.value_optimal_rate
+
+
+def _eval_binary() -> Path | None:
+    """The built cartridge-eval binary, if this checkout has one."""
+    from trainer.evaluator import EvalBinaryNotFound, find_eval_binary
+
+    try:
+        return find_eval_binary()
+    except EvalBinaryNotFound:
+        found = shutil.which("cartridge-eval")
+        return Path(found) if found else None
+
+
+@pytest.mark.skipif(
+    _eval_binary() is None,
+    reason="cartridge-eval not built (Rust toolchain absent in the Python CI job)",
+)
+class TestSolverAgainstRealEngineGames:
+    """The mirrored solver board must agree with the engine's own positions.
+
+    This is the check the old driver could not make: it played against a Python
+    reimplementation of Connect 4 and compared bitbully to *that*. Here the
+    engine plays, dumps every position it saw, and the solver is replayed
+    through them — so a disagreement between solver and engine is a failure
+    rather than something nobody was looking at.
+    """
+
+    def test_replaying_an_engine_dump_never_desyncs(self, tmp_path):
+        from trainer.evaluator import build_eval_command, run_eval_binary
+        from trainer.solver_eval import SolverScorer
+
+        output = tmp_path / "eval.json"
+        dump = tmp_path / "positions.jsonl"
+        run_eval_binary(
+            build_eval_command(
+                RandomPlayer(),
+                RandomPlayer(),
+                ALGORITHM_ID,
+                "connect4",
+                4,
+                11,
+                output,
+                dump_positions=dump,
+            )
+        )
+        records = [json.loads(line) for line in dump.read_text().splitlines() if line]
+        assert records
+
+        scorer = SolverScorer()
+        game = None
+        for record in records:
+            if record["game"] != game:
+                game = record["game"]
+                scorer.reset()
+            # Raises on any disagreement with the engine's board.
+            scores = scorer.scores_for(record["board"], record["player"], record["legal"])
+            assert sorted(scores) == sorted(record["legal"])
+            scorer.mirror_move(record["action"])

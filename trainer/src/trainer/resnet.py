@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .game_config import GameConfig
+from .algorithms.alphazero_board_v1 import AlphaZeroGameConfig
 from .network import BasePolicyValueNetwork
 
 
@@ -57,32 +57,22 @@ class ConvPolicyValueNetwork(BasePolicyValueNetwork):
     The observation is expected to be a flat tensor that will be reshaped
     to (batch, input_channels, board_height, board_width).
 
-    Input channels include the game's spatial board planes (the count is
-    taken from ``config.obs_channels``, e.g. 2 for one plane per player)
-    and a derived plane that encodes the current player (1 for first
-    player, -1 for second player).
+    Input channels are exactly the environment-declared observation tensor.
     """
 
-    def __init__(self, config: GameConfig):
+    def __init__(self, config: AlphaZeroGameConfig):
         super().__init__()
 
         # Only plain ints are retained, never the config object itself: the
         # network is then independent of which config type it was built from,
         # and callers cannot accidentally pass one that lacks the accessor
-        # methods (storage.GameMetadata describes the same games but has none).
+        # methods (the generated environment catalog remains authoritative).
         self.obs_size = config.obs_size
         self.action_size = config.num_actions
         self.board_height = config.board_height
         self.board_width = config.board_width
-        self.player_indicator_offset = config.player_indicator_offset
-        # Spatial board planes from the game config, plus a derived
-        # player-to-move plane for games with absolute (seat-fixed) board
-        # encodings. Player-relative observations must not see the seat:
-        # it is a side channel the value head can exploit (see
-        # GameConfig.player_relative_obs).
         self.board_planes = config.obs_channels
-        self.player_relative_obs = config.player_relative_obs
-        self.input_channels = self.board_planes + (0 if self.player_relative_obs else 1)
+        self.input_channels = self.board_planes
         self.num_filters = config.num_filters
 
         # Initial convolutional block
@@ -135,13 +125,9 @@ class ConvPolicyValueNetwork(BasePolicyValueNetwork):
         Returns:
             Spatial tensor of shape (batch, input_channels, height, width)
 
-        The observation encoding is game-specific:
-        - First board_planes * board_size elements: one spatial plane per
-          channel (e.g. one plane per player's pieces for 2-channel games)
-        - Legal mask elements follow, then a 2-element one-hot player indicator
-          (current player first/second). The CNN consumes the board planes plus
-          a derived plane indicating the current player (1 or -1) broadcast over
-          the board.
+        The environment contract declares a dense ``[channel,row,column]``
+        tensor. Action availability is carried separately by the decision
+        envelope and is never part of this input.
         """
         batch_size = x.shape[0]
         board_size = self.board_height * self.board_width
@@ -152,21 +138,8 @@ class ConvPolicyValueNetwork(BasePolicyValueNetwork):
         for i in range(self.board_planes):
             start = i * board_size
             end = start + board_size
-            plane = x[:, start:end].reshape(
-                batch_size, self.board_height, self.board_width
-            )
+            plane = x[:, start:end].reshape(batch_size, self.board_height, self.board_width)
             planes.append(plane)
-
-        # Current player plane (absolute encodings only): 1 for first
-        # player, -1 for second. Skipped for player-relative observations.
-        if not self.player_relative_obs:
-            offset = self.player_indicator_offset
-            player_one_hot = x[:, offset : offset + 2]
-            current_player = player_one_hot[:, :1] - player_one_hot[:, 1:]
-            player_plane = current_player.view(batch_size, 1, 1).expand(
-                batch_size, self.board_height, self.board_width
-            )
-            planes.append(player_plane)
 
         # Stack planes along channel dimension: (batch, channels, height, width)
         spatial = torch.stack(planes, dim=1)

@@ -19,11 +19,6 @@ resource "google_container_cluster" "cluster" {
     services_secondary_range_name = var.services_range_name
   }
 
-  # Enable Workload Identity
-  workload_identity_config {
-    workload_pool = "${var.project_id}.svc.id.goog"
-  }
-
   # Private cluster configuration (optional)
   dynamic "private_cluster_config" {
     for_each = var.enable_private_cluster ? [1] : []
@@ -53,7 +48,4 @@ resource "google_container_cluster" "cluster" {
 
   # Resource labels
   resource_labels = var.labels
-
-  # Depends on private service connection for Cloud SQL access
-  depends_on = [var.private_vpc_connection]
 }

@@ -1,0 +1,13 @@
+{
+  "env_id": "connect4",
+  "episodes_completed": 50,
+  "total_steps": 989,
+  "player1_wins": 50,
+  "player2_wins": 0,
+  "draws": 0,
+  "avg_episode_length": 19.78,
+  "episodes_per_second": 0.660079553480869,
+  "runtime_seconds": 75.748445375,
+  "mcts_avg_inference_us": 74362.72497472195,
+  "timestamp": 1774816745
+}

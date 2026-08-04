@@ -26,6 +26,33 @@ fn test_legal_moves() {
 }
 
 #[test]
+fn test_observation_legal_mask_exactly_matches_step_acceptance() {
+    let mut full_column = State::new();
+    for _ in 0..ROWS {
+        full_column = full_column.drop_piece(0);
+    }
+
+    for state in [State::new(), full_column] {
+        let legal = Connect4::legal_actions(&state).unwrap();
+        for action in 0..COLS as u8 {
+            let mut candidate = state.clone();
+            let before = candidate.clone();
+            let accepted = Connect4::new()
+                .step(&mut candidate, action, &mut ChaCha20Rng::seed_from_u64(1))
+                .is_ok();
+            assert_eq!(
+                accepted,
+                legal.is_legal(action as usize),
+                "action {action} disagrees with the decision mask for {state:?}"
+            );
+            if !accepted {
+                assert_eq!(candidate, before, "rejected action mutated the state");
+            }
+        }
+    }
+}
+
+#[test]
 fn test_drop_piece() {
     let state = State::new();
     let new_state = state.drop_piece(3); // Red drops in center
@@ -206,14 +233,14 @@ fn test_draw_game() {
 #[test]
 fn test_observation_encoding() {
     let state = State::new();
-    let obs = observation_from_state(&state);
+    let obs = observation_from_state(&state).unwrap();
 
     // All board positions should be 0 initially
     assert_eq!(obs.board_view, [0.0; BOARD_SIZE * 2]);
-    // All columns should be legal
-    assert_eq!(obs.legal_moves, [1.0; COLS]);
-    // Red should be current player
-    assert_eq!(obs.current_player, [1.0, 0.0]);
+    assert_eq!(
+        Connect4::legal_actions(&state).unwrap().count_ones(),
+        COLS as u32
+    );
 }
 
 #[test]
@@ -221,21 +248,27 @@ fn test_game_trait_implementation() {
     let mut game = Connect4::new();
     let mut rng = ChaCha20Rng::seed_from_u64(42);
 
-    let (state, _obs) = game.reset(&mut rng, &[]);
+    let (state, _obs) = game.reset(&mut rng, &[]).unwrap();
     assert_eq!(state, State::new());
 
     let action: Action = 3;
-    let (_new_obs, reward, done, info) = game.step(&mut state.clone(), action, &mut rng);
+    let transition = game.step(&mut state.clone(), action, &mut rng).unwrap();
 
     // Should not be done after one move
-    assert!(!done);
+    assert!(!transition.terminated);
     // Reward should be 0 for ongoing game
-    assert_eq!(reward, 0.0);
+    assert_eq!(transition.actor_reward, 0.0);
 
-    // All columns should still be legal
-    assert_eq!(info & 0x7F, 0x7Fu64);
-    // Next player should be Yellow (value 2)
-    assert_eq!((info >> 16) & 0xF, 2);
+    assert_eq!(
+        transition.observation.board_view[BOARD_SIZE + State::pos(3, 0)],
+        1.0
+    );
+    assert_eq!(
+        Connect4::legal_actions(&state.drop_piece(3))
+            .unwrap()
+            .count_ones(),
+        COLS as u32
+    );
 }
 
 #[test]
@@ -270,13 +303,13 @@ fn test_observation_byte_encoding() {
     let mut state = State::new();
     state = state.drop_piece(3);
 
-    let obs = observation_from_state(&state);
+    let obs = observation_from_state(&state).unwrap();
 
     let mut buf = Vec::new();
-    Connect4::encode_obs(&obs, &mut buf).unwrap();
+    Connect4::encode_observation(&obs, &mut buf).unwrap();
 
-    // Should be OBS_SIZE * 4 bytes (OBS_SIZE f32 values)
-    assert_eq!(buf.len(), OBS_SIZE * 4);
+    // Two player-relative board planes.
+    assert_eq!(buf.len(), BOARD_SIZE * 2 * 4);
 }
 
 #[test]
@@ -285,10 +318,10 @@ fn test_engine_capabilities() {
     let caps = game.capabilities();
 
     assert_eq!(caps.id.env_id, "connect4");
-    assert_eq!(caps.max_horizon, BOARD_SIZE as u32);
+    assert_eq!(caps.max_horizon, Some(BOARD_SIZE as u32));
 
-    match caps.action_space {
-        ActionSpace::Discrete(n) => assert_eq!(n, COLS as u32),
+    match caps.action_space(AgentId(1)) {
+        Some(ActionSpace::Discrete { size }) => assert_eq!(*size, COLS as u32),
         ref other => {
             panic!("Expected discrete action space, but got {:?}", other);
         }
@@ -334,12 +367,12 @@ fn test_metadata() {
     let game = Connect4::new();
     let meta = game.metadata();
 
-    assert_eq!(meta.env_id, "connect4");
+    assert_eq!(meta.id, "connect4");
     assert_eq!(meta.display_name, "Connect 4");
-    assert_eq!(meta.board_width, COLS);
-    assert_eq!(meta.board_height, ROWS);
-    assert_eq!(meta.num_actions, COLS);
-    assert_eq!(meta.player_count, 2);
+    let board = meta.require_board().unwrap();
+    assert_eq!(board.width, COLS);
+    assert_eq!(board.height, ROWS);
+    assert_eq!(board.players.len(), 2);
 }
 
 /// (mirrors games-tictactoe's test of the same name; the game-specific
@@ -351,7 +384,7 @@ fn test_random_games_invariants() {
     for seed in 0..20 {
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
         let mut game = Connect4::new();
-        let (mut state, _) = game.reset(&mut rng, &[]);
+        let (mut state, _) = game.reset(&mut rng, &[]).unwrap();
 
         let mut move_count = 0;
         let max_moves = BOARD_SIZE;
@@ -369,7 +402,9 @@ fn test_random_games_invariants() {
             let action: Action = legal[rng.gen_range(0..legal.len())];
 
             let prev_player = state.current_player;
-            let (_, reward, done, info) = game.step(&mut state, action, &mut rng);
+            let transition = game.step(&mut state, action, &mut rng).unwrap();
+            let reward = transition.actor_reward;
+            let done = transition.terminated;
 
             move_count += 1;
 
@@ -405,12 +440,14 @@ fn test_random_games_invariants() {
                 );
             }
 
-            // Info bits should match state
-            let mask_from_info = (info & 0x7F) as u8;
+            let legal = Connect4::legal_actions(&state).unwrap();
+            let encoded = legal
+                .iter_ones()
+                .fold(0u8, |mask, index| mask | (1u8 << index));
             assert_eq!(
-                mask_from_info,
+                encoded,
                 state.legal_moves_mask(),
-                "Info mask should match state (seed={})",
+                "Decision mask should match state (seed={})",
                 seed
             );
         }

@@ -1,7 +1,7 @@
-"""Per-step metrics recording and stats.json persistence.
+"""Per-step metrics recording and content-addressed stats publication.
 
-Extracted from ``trainer.py`` as pure code motion. Functions take the owning
-``Trainer`` instance as their first argument and operate on its state.
+Functions take the owning ``AlphaZeroLearner`` as their first argument and
+operate on its state.
 """
 
 from __future__ import annotations
@@ -11,16 +11,16 @@ import time
 from typing import TYPE_CHECKING
 
 from . import metrics as prom_metrics
-from .stats import write_stats as write_stats_file
+from .stats import write_ephemeral_stats_projection
 
 if TYPE_CHECKING:
-    from .trainer import Trainer
+    from .trainer import AlphaZeroLearner
 
 logger = logging.getLogger(__name__)
 
 
 def record_step_metrics(
-    trainer: "Trainer",
+    trainer: "AlphaZeroLearner",
     step: int,
     global_step: int,
     metrics: dict[str, float],
@@ -32,22 +32,27 @@ def record_step_metrics(
     """Update stats, Prometheus metrics, rolling losses, and log progress.
 
     Args:
-        trainer: The owning Trainer instance.
+        trainer: The owning AlphaZero learner.
         step: Local step within this training run.
         global_step: Global step across all training runs.
         metrics: Loss metrics from the training step.
         step_duration: Wall-clock time for the training step.
         batch_size: Number of samples in the batch.
-        replay: Replay buffer (for periodic buffer size updates).
+        replay: Replay store (for periodic size updates).
         env_id: Environment identifier.
     """
     # Update stats
-    trainer.stats.total_loss = metrics["loss/total"]
-    trainer.stats.value_loss = metrics["loss/value"]
-    trainer.stats.policy_loss = metrics["loss/policy"]
+    trainer.stats.step = global_step
+    trainer.stats.metrics = {
+        "loss/total": metrics["loss/total"],
+        "loss/value": metrics["loss/value"],
+        "loss/policy": metrics["loss/policy"],
+    }
     trainer.stats.learning_rate = trainer.optimizer.param_groups[0]["lr"]
     trainer.stats.samples_seen = trainer.samples_seen
-    trainer.stats.timestamp = time.time()
+    # Wall clocks can move backwards across hosts or after NTP correction.
+    # Keep the persisted run chronology logical and nondecreasing.
+    trainer.stats.timestamp = max(time.time(), trainer.stats.timestamp)
 
     # Record Prometheus metrics
     prom_metrics.record_training_step(
@@ -60,12 +65,12 @@ def record_step_metrics(
         batch_size=batch_size,
     )
 
-    # Update cached buffer size periodically
-    if step % trainer._buffer_size_update_interval == 0:
-        trainer._buffer_size_cache = replay.count(env_id=env_id)
-        prom_metrics.update_replay_buffer_size(trainer._buffer_size_cache)
+    # Update the cached profile record count periodically.
+    if step % trainer._replay_record_count_update_interval == 0:
+        trainer._replay_record_count_cache = replay.count()
+        prom_metrics.update_replay_record_count(trainer._replay_record_count_cache)
         prom_metrics.update_gpu_memory()
-    trainer.stats.replay_buffer_size = trainer._buffer_size_cache
+    trainer.stats.replay_record_count = trainer._replay_record_count_cache
 
     # Track recent losses for rolling average
     trainer._recent_losses.append(
@@ -97,15 +102,19 @@ def record_step_metrics(
     if step % trainer.config.stats_interval == 0:
         history_entry = {
             "step": global_step,
-            "total_loss": metrics["loss/total"],
-            "value_loss": metrics["loss/value"],
-            "policy_loss": metrics["loss/policy"],
+            "metrics": {
+                "loss/total": metrics["loss/total"],
+                "loss/value": metrics["loss/value"],
+                "loss/policy": metrics["loss/policy"],
+            },
             "learning_rate": trainer.optimizer.param_groups[0]["lr"],
+            "grad_norm": metrics.get("grad_norm"),
         }
-        if "grad_norm" in metrics:
-            history_entry["grad_norm"] = metrics["grad_norm"]
         trainer.stats.append_history(history_entry)
-        write_stats(trainer)
+        write_ephemeral_stats_projection(
+            trainer.stats,
+            trainer.config.stats_path,
+        )
 
         if trainer.config.metrics_hook is not None:
             try:
@@ -114,8 +123,3 @@ def record_step_metrics(
                 trainer.config.metrics_hook(payload, global_step)
             except Exception as e:
                 logger.warning(f"metrics_hook failed: {e}")
-
-
-def write_stats(trainer: "Trainer") -> None:
-    """Write stats.json for web polling (atomic write)."""
-    write_stats_file(trainer.stats, trainer.config.stats_path)

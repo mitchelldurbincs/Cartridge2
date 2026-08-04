@@ -1,20 +1,21 @@
-# Kustomize base configuration
-# Deploy all resources with: kubectl apply -k k8s/base
+# Kustomize base configuration. Apply an overlay, not this credential-free base.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 namespace: cartridge
 
-# Common labels applied to all resources
-commonLabels:
-  app.kubernetes.io/managed-by: kustomize
-  app.kubernetes.io/part-of: cartridge2
+# Common labels applied to resources and their selectors.
+labels:
+  - pairs:
+      app.kubernetes.io/managed-by: kustomize
+      app.kubernetes.io/part-of: cartridge2
+    includeSelectors: true
 
 resources:
-  # Namespace and shared config
+  # Namespace and shared non-secret config
   - namespace.yaml
   - configmap.yaml
-  - models-pvc.yaml
+  - runtime-data-pvc.yaml
 
   # Infrastructure
   - postgres/init-configmap.yaml
@@ -24,9 +25,9 @@ resources:
   - minio/service.yaml
   - minio/setup-job.yaml
 
-  # Application components
-  - actor/deployment.yaml
-  - trainer/deployment.yaml
+  # Application components. The training Job owns its bounded collector
+  # subprocesses; independent replay producers are intentionally unsupported.
+  - trainer/job.yaml
   - web/deployment.yaml
   - web/service.yaml
   - web/ingress.yaml

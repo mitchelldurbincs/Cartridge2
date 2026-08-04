@@ -8,15 +8,7 @@
 //! Settings are loaded with the following priority (highest to lowest):
 //! 1. Environment variables (`CARTRIDGE_<SECTION>_<KEY>`)
 //! 2. config.toml file
-//! 3. Built-in defaults (a compile-time embed of `config.defaults.toml`)
-//!
-//! # Missing vs. broken config
-//!
-//! No `config.toml` at all is a normal state — the Kubernetes manifests mount
-//! none and the images ship only `config.defaults.toml` — and yields the
-//! built-in defaults. A `config.toml` that *exists but cannot be parsed* is an
-//! operator mistake and is reported by [`try_load_config`], which binaries
-//! should use so startup aborts instead of silently running on defaults.
+//! 3. Built-in defaults
 //!
 //! # Environment Variable Override Pattern
 //!
@@ -38,8 +30,7 @@ mod structs;
 
 pub use defaults::*;
 pub use loader::{
-    apply_env_overrides, load_config, load_from_path, try_load_config, ConfigError,
-    CONFIG_SEARCH_PATHS,
+    apply_env_overrides, load_config, load_from_path, ConfigError, CONFIG_SEARCH_PATHS,
 };
 pub use logging::init_tracing;
 pub use structs::*;

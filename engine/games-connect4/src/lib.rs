@@ -31,14 +31,16 @@
 //! let reset = ctx.reset(42, &[]).unwrap();
 //! ```
 
-use engine_core::game_utils::{
-    calculate_reward, decode_action_u32, info_bits, opponent, validate_board_cells,
-    validate_player_and_winner,
+use engine_core::board_profile::{
+    calculate_reward, decode_action_u32, opponent, register_board_game, validate_board_cells,
+    validate_player_and_winner, BoardGame, BoardGameMetadata, BoardPlayerMetadata, BoardRenderer,
+    BoardTransition, BoardView, TwoPlayerObs, TwoPlayerObsError,
 };
 use engine_core::typed::{
-    ActionSpace, Capabilities, DecodeError, EncodeError, Encoding, EngineId, Game,
+    ActionSpace, AgentId, AgentModel, Capabilities, DecodeError, EncodeError, Encoding, EngineId,
+    EnvironmentSemantics, TensorSpec,
 };
-use engine_core::{register_game, GameAdapter, GameMetadata, TwoPlayerObs};
+use engine_core::{EnvironmentError, EnvironmentMetadata, LegalMask};
 use rand_chacha::ChaCha20Rng;
 
 /// Board dimensions
@@ -46,14 +48,15 @@ pub const COLS: usize = 7;
 pub const ROWS: usize = 6;
 pub const BOARD_SIZE: usize = COLS * ROWS; // 42
 
+/// Immutable environment contract revision for wire formats and semantics.
+pub const ENV_CONTRACT_VERSION: u32 = 2;
+
 /// Register Connect4 with the global game registry
 ///
 /// Call this function once at startup to make Connect4 available
 /// via `EngineContext::new("connect4")`.
 pub fn register_connect4() {
-    register_game("connect4".to_string(), || {
-        Box::new(GameAdapter::new(Connect4::new()))
-    });
+    register_board_game::<Connect4>().expect("connect4 environment must only be registered once");
 }
 
 /// Connect4 game state
@@ -224,16 +227,12 @@ impl Default for State {
 /// Connect4 action - column to drop a piece in (0-6)
 pub type Action = u8;
 
-/// Connect4 observation (84 board view + 7 legal moves + 2 current player = 93 floats)
-pub type Observation = TwoPlayerObs<84, 7>;
+/// Player-relative Connect4 observation: two 6x7 occupancy planes.
+pub type Observation = TwoPlayerObs<84>;
 
 /// Create observation from game state
-pub fn observation_from_state(state: &State) -> Observation {
-    TwoPlayerObs::from_board(
-        &state.board,
-        state.legal_moves_mask() as u64,
-        state.current_player,
-    )
+pub fn observation_from_state(state: &State) -> Result<Observation, TwoPlayerObsError> {
+    TwoPlayerObs::from_board(&state.board, state.current_player)
 }
 
 /// Connect4 game implementation
@@ -245,23 +244,6 @@ impl Connect4 {
     pub fn new() -> Self {
         Self
     }
-
-    /// Pack auxiliary information about the state into a u64 bit-field.
-    ///
-    /// Uses the standard layout from `engine_core::game_utils::info_bits`:
-    /// * Bits 0-6  : Legal move mask (7 columns)
-    /// * Bits 16-19: Current player (1 = Red, 2 = Yellow)
-    /// * Bits 20-23: Winner (0 = none, 1 = Red, 2 = Yellow, 3 = draw)
-    /// * Bits 24-31: Moves played so far (0-42)
-    fn compute_info_bits(state: &State) -> u64 {
-        let moves_played: u64 = state.column_heights.iter().map(|&h| h as u64).sum();
-        info_bits::compute_info_bits(
-            state.legal_moves_mask() as u64,
-            state.current_player,
-            state.winner,
-            moves_played,
-        )
-    }
 }
 
 impl Default for Connect4 {
@@ -270,13 +252,11 @@ impl Default for Connect4 {
     }
 }
 
-/// Observation size: 42 (Red) + 42 (Yellow) + 7 (legal) + 2 (player) = 93
-const OBS_SIZE: usize = BOARD_SIZE * 2 + COLS + 2;
-
-impl Game for Connect4 {
+/// Observation size: two player-relative board planes.
+impl BoardGame for Connect4 {
     type State = State;
     type Action = Action;
-    type Obs = Observation;
+    type Observation = Observation;
 
     fn engine_id(&self) -> EngineId {
         EngineId {
@@ -288,40 +268,50 @@ impl Game for Connect4 {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             id: self.engine_id(),
-            encoding: Encoding {
-                state: "connect4_state:v1".to_string(),
-                action: "discrete_column:v1".to_string(),
-                obs: format!("f32x{}:v1", OBS_SIZE), // 93 floats
-                schema_version: 1,
-            },
-            max_horizon: BOARD_SIZE as u32, // Maximum 42 moves
-            action_space: ActionSpace::Discrete(COLS as u32), // 7 possible columns
+            contract_version: ENV_CONTRACT_VERSION,
+            encoding: Encoding::discrete_u32_le(
+                "connect4_state:v1",
+                TensorSpec::f32_fixed([
+                    ("channel", 2),
+                    ("row", ROWS as u32),
+                    ("column", COLS as u32),
+                ]),
+            ),
+            semantics:
+                EnvironmentSemantics::deterministic_alternating_perfect_information_terminal_zero_sum(),
+            max_horizon: Some(BOARD_SIZE as u32),
+            agents: AgentModel::fixed_homogeneous_masked(
+                [AgentId(1), AgentId(2)],
+                ActionSpace::discrete(COLS as u32),
+            ),
             preferred_batch: 64,
         }
     }
 
-    fn metadata(&self) -> GameMetadata {
-        GameMetadata::new("connect4", "Connect 4")
-            .with_board(COLS, ROWS)
-            .with_actions(COLS)
-            .with_observation(OBS_SIZE, BOARD_SIZE * 2) // legal mask starts after board views
-            .with_obs_encoding(2, false) // one absolute plane per player
-            .with_alternating_turns(true) // players strictly alternate drops
-            .with_players(
-                2,
-                vec!["Red".to_string(), "Yellow".to_string()],
-                vec!['\u{1F534}', '\u{1F7E1}'], // Red circle, Yellow circle emoji
-            )
+    fn metadata(&self) -> EnvironmentMetadata {
+        EnvironmentMetadata::new("connect4", "Connect 4")
             .with_description("Drop discs to connect four in a row!")
-            .with_board_type("drop_column")
+            .with_board(
+                BoardGameMetadata::new(COLS, ROWS)
+                    .with_players(vec![
+                        BoardPlayerMetadata::new("Red", "🔴"),
+                        BoardPlayerMetadata::new("Yellow", "🟡"),
+                    ])
+                    .with_renderer(BoardRenderer::DropColumn),
+            )
     }
 
-    // reset/step mirror games-tictactoe and games-othello; the shared pieces
-    // (reward, info bits, validation) live in engine_core::game_utils.
-    fn reset(&mut self, _rng: &mut ChaCha20Rng, _hint: &[u8]) -> (Self::State, Self::Obs) {
+    // reset/step mirror games-tictactoe and games-othello; shared reward and
+    // Validation helpers live in the explicit engine_core::board_profile API.
+    fn reset(
+        &mut self,
+        _rng: &mut ChaCha20Rng,
+        _hint: &[u8],
+    ) -> Result<(Self::State, Self::Observation), EnvironmentError> {
         let state = State::new();
-        let obs = observation_from_state(&state);
-        (state, obs)
+        let obs = observation_from_state(&state)
+            .map_err(|error| EnvironmentError::InvalidState(error.to_string()))?;
+        Ok((state, obs))
     }
 
     fn step(
@@ -329,16 +319,25 @@ impl Game for Connect4 {
         state: &mut Self::State,
         action: Self::Action,
         _rng: &mut ChaCha20Rng,
-    ) -> (Self::Obs, f32, bool, u64) {
+    ) -> Result<BoardTransition<Self::Observation>, EnvironmentError> {
+        let column = action as usize;
+        if state.is_done() || column >= COLS || state.column_heights[column] >= ROWS as u8 {
+            return Err(EnvironmentError::InvalidAction(format!(
+                "column {action} is not legal in the current Connect 4 state"
+            )));
+        }
         let previous_player = state.current_player;
         *state = state.drop_piece(action);
 
-        let obs = observation_from_state(state);
+        let obs = observation_from_state(state)
+            .map_err(|error| EnvironmentError::InvalidState(error.to_string()))?;
         let reward = calculate_reward(state.winner, previous_player);
         let done = state.is_done();
-        let info = Self::compute_info_bits(state);
-
-        (obs, reward, done, info)
+        Ok(BoardTransition {
+            observation: obs,
+            actor_reward: reward,
+            terminated: done,
+        })
     }
 
     fn encode_state(state: &Self::State, out: &mut Vec<u8>) -> Result<(), EncodeError> {
@@ -411,9 +410,17 @@ impl Game for Connect4 {
         Ok(column as u8)
     }
 
-    fn encode_obs(obs: &Self::Obs, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn encode_observation(obs: &Self::Observation, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         obs.encode(out);
         Ok(())
+    }
+
+    fn legal_actions(state: &Self::State) -> Result<LegalMask, EnvironmentError> {
+        Ok(LegalMask::from_u64(state.legal_moves_mask() as u64, COLS))
+    }
+
+    fn view(state: &Self::State) -> BoardView {
+        BoardView::from_owners(&state.board, state.current_player, state.winner)
     }
 }
 

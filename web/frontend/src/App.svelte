@@ -21,7 +21,15 @@
       // Load available games
       availableGames = await getGames();
 
-      // Check what game is currently being trained and use that as default
+      // The server exposes only the game it is configured for, and rejects
+      // requests for any other with a 403 — so start from what it offers
+      // rather than the hardcoded default, which otherwise makes a
+      // correctly-running backend look offline.
+      if (availableGames.length > 0) {
+        selectedGame = availableGames[0];
+      }
+
+      // Prefer the game currently being trained, when it is one on offer.
       try {
         const stats = await getStats();
         if (stats.env_id && availableGames.includes(stats.env_id)) {
@@ -153,7 +161,7 @@
       <div class="game-section">
         {#if gameState && gameInfo}
           <GenericBoard
-            board={gameState.board}
+            cells={gameState.cells}
             legalMoves={gameState.legal_moves}
             gameOver={gameState.game_over}
             {lastBotMove}

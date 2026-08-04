@@ -1,0 +1,32 @@
+[package]
+name = "evaluator"
+version = "0.1.0"
+edition = "2021"
+description = "Plays evaluation games through the engine and reports the result"
+
+[[bin]]
+name = "cartridge-eval"
+path = "src/main.rs"
+
+[features]
+default = []
+# Enable the CoreML execution provider for ONNX on Apple Silicon.
+coreml = ["mcts/coreml"]
+
+[dependencies]
+algorithm-core = { path = "../algorithm-core" }
+dqn-runtime = { path = "../dqn-runtime" }
+engine-core = { path = "../engine-core" }
+engine-games = { path = "../engine-games" }
+# Not optional: an evaluator that cannot load a model has nothing to evaluate.
+mcts = { path = "../mcts", features = ["onnx"] }
+
+clap = { version = "4.4", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"

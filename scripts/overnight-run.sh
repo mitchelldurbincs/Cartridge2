@@ -2,7 +2,7 @@
 #
 # Overnight synchronized AlphaZero training run (Connect4 by default).
 #
-# Runs `python -m trainer loop`: each iteration clears the replay buffer,
+# Runs the selected cartridge's `loop` command: each iteration clears the replay buffer,
 # generates self-play episodes with the current model, trains on them, and
 # (every eval-interval iterations) evaluates + scores moves against the
 # bitbully perfect solver.
@@ -11,7 +11,7 @@
 # run is interrupted you can just re-run this script to continue.
 #
 # Usage:
-#   scripts/overnight-run.sh                 # foreground, logs to data/logs/
+#   scripts/overnight-run.sh                 # foreground, logs under its runtime profile
 #   nohup scripts/overnight-run.sh &         # detached (survives logout)
 #   tmux new -s train 'scripts/overnight-run.sh'   # or run inside tmux
 #
@@ -22,6 +22,7 @@ set -euo pipefail
 
 # --- Tunables (env overrides; defaults mirror config.toml) --------------------
 ENV_ID="${ENV_ID:-connect4}"
+ALGORITHM_ID="${ALGORITHM_ID:-alphazero_board_v1}"
 ITERATIONS="${ITERATIONS:-400}"
 EPISODES="${EPISODES:-500}"
 STEPS="${STEPS:-400}"
@@ -57,10 +58,9 @@ else
 fi
 
 export CARTRIDGE_STORAGE_POSTGRES_URL="${POSTGRES_URL}"
-
-LOG_DIR="${REPO_ROOT}/data/logs"
-mkdir -p "${LOG_DIR}"
-LOG_FILE="${LOG_DIR}/overnight-${ENV_ID}-$(date +%Y%m%d-%H%M%S).log"
+export CARTRIDGE_ALGORITHM_ID="${ALGORITHM_ID}"
+export CARTRIDGE_COMMON_ENV_ID="${ENV_ID}"
+export CARTRIDGE_COMMON_DATA_DIR="${CARTRIDGE_COMMON_DATA_DIR:-${REPO_ROOT}/data}"
 
 log() { printf '\033[1;34m[overnight]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[overnight] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -96,6 +96,16 @@ log "Using Python interpreter: ${PY}"
   "${PY}" -m pip install -e ./trainer
 }
 
+# Resolve the immutable environment contract version from the installed
+# manifest instead of duplicating it in this script.
+PROFILE_PREFIX="$("${PY}" -c \
+  'import sys; from trainer.runtime_profile import resolve_runtime_profile; print(resolve_runtime_profile(sys.argv[1], sys.argv[2]).storage_prefix)' \
+  "${ALGORITHM_ID}" "${ENV_ID}")" \
+  || die "Unable to resolve runtime profile for ${ALGORITHM_ID}/${ENV_ID}."
+LOG_DIR="${CARTRIDGE_COMMON_DATA_DIR}/${PROFILE_PREFIX}/logs"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/overnight-$(date +%Y%m%d-%H%M%S).log"
+
 # 3. Actor binary built (release).
 if [ ! -x "${REPO_ROOT}/actor/target/release/actor" ]; then
   log "Building actor (release)..."
@@ -113,13 +123,13 @@ fi
 
 # --- Launch -------------------------------------------------------------------
 log "Starting overnight run:"
-log "  game=${ENV_ID} iterations=${ITERATIONS} episodes=${EPISODES} steps=${STEPS}"
+log "  algorithm=${ALGORITHM_ID} game=${ENV_ID} iterations=${ITERATIONS} episodes=${EPISODES} steps=${STEPS}"
 log "  device=${DEVICE} num_actors=${NUM_ACTORS} wandb=${WANDB}"
 log "  log file: ${LOG_FILE}"
 log "  (auto-resumes from last completed iteration if re-run)"
 
 set -x
-"${PY}" -m trainer loop \
+"${PY}" -m trainer --algorithm "${ALGORITHM_ID}" loop \
   --env-id "${ENV_ID}" \
   --iterations "${ITERATIONS}" \
   --episodes "${EPISODES}" \

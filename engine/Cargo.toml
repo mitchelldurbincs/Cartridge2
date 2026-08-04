@@ -1,8 +1,12 @@
 [workspace]
 members = [
+    "algorithm-core",
+    "dqn-runtime",
     "engine-core",
     "engine-config",
     "engine-games",
+    "envs-counter",
+    "evaluator",
     "games-tictactoe",
     "games-connect4",
     "games-othello",
@@ -29,7 +33,7 @@ once_cell = "1.19"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# Prometheus metrics plumbing shared by the actor and web binaries
+# Prometheus metrics plumbing for the long-running web service
 prometheus = "0.13"
 
 # Testing and benchmarking

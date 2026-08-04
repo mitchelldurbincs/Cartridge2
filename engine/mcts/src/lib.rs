@@ -1,7 +1,10 @@
 //! Monte Carlo Tree Search (MCTS) implementation for AlphaZero-style game playing.
 //!
-//! This crate provides a game-agnostic MCTS implementation that works with any
-//! game implementing the `engine-core` Game trait.
+//! This crate implements the search component of the
+//! `alphazero_board_v1` cartridge. Construction checks the environment's exact
+//! capability contract before search begins; discrete actions alone are not
+//! enough because value negation also requires alternating two-player,
+//! terminal zero-sum semantics.
 //!
 //! # Overview
 //!
@@ -21,7 +24,7 @@
 //!
 //! ```rust,ignore
 //! use mcts::{MctsConfig, UniformEvaluator, run_mcts};
-//! use engine_core::{EngineContext, LegalMask};
+//! use engine_core::EngineContext;
 //! use rand_chacha::ChaCha20Rng;
 //! use rand::SeedableRng;
 //!
@@ -35,9 +38,6 @@
 //! // Set up MCTS
 //! let evaluator = UniformEvaluator::new();
 //! let config = MctsConfig::for_testing();
-//! // All 9 positions legal at the start (read from the obs in real code)
-//! let legal_mask = LegalMask::all_legal(9);
-//!
 //! // Run search
 //! let mut rng = ChaCha20Rng::seed_from_u64(42);
 //! let result = run_mcts(
@@ -45,8 +45,7 @@
 //!     &evaluator,
 //!     config,
 //!     reset.state,
-//!     reset.obs,
-//!     legal_mask,
+//!     reset.timestep,
 //!     &mut rng,
 //! ).unwrap();
 //!
@@ -103,7 +102,7 @@ mod types;
 pub mod onnx;
 
 // Re-export main types
-pub use config::MctsConfig;
+pub use config::{MctsConfig, MctsConfigError};
 pub use evaluator::{EvalResult, Evaluator, EvaluatorError, UniformEvaluator};
 pub use node::{MctsNode, NodeId};
 pub use search::{run_mcts, MctsSearch, SearchError, SearchResult, SearchStats};

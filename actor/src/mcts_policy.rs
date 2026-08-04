@@ -4,15 +4,17 @@
 //! an ONNX neural network evaluator to select actions.
 
 use anyhow::{anyhow, Result};
-use engine_core::{EngineContext, LegalMask};
-use mcts::{run_mcts, MctsConfig, OnnxEvaluator, SearchResult, SearchStats};
+use engine_core::{EngineContext, ErasedTimestep};
+use mcts::{
+    run_mcts, MctsConfig, SearchResult, SearchStats, SharedOnnxEvaluator, UniformEvaluator,
+};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tracing::{debug, warn};
 
-/// Result from MCTS policy selection, including training data
+/// Result from MCTS policy selection, including the policy training target.
 pub struct MctsPolicyResult {
     /// Selected action as bytes
     pub action: Vec<u8>,
@@ -21,8 +23,6 @@ pub struct MctsPolicyResult {
     /// The raw root visit distribution, unaffected by the temperature
     /// schedule below — that only decides which action gets played.
     pub policy: Vec<f32>,
-    /// Value estimate from MCTS root
-    pub value: f32,
     /// Performance statistics from the MCTS search
     pub stats: SearchStats,
 }
@@ -44,7 +44,7 @@ pub struct MctsPolicy {
     /// Observation size for the neural network
     obs_size: usize,
     /// Shared evaluator that can be hot-swapped
-    evaluator: Arc<RwLock<Option<OnnxEvaluator>>>,
+    evaluator: Arc<RwLock<Option<SharedOnnxEvaluator>>>,
     /// RNG for action sampling
     rng: ChaCha20Rng,
     /// Reusable simulation context for MCTS (avoids repeated registry lookups)
@@ -69,21 +69,21 @@ impl std::fmt::Debug for MctsPolicy {
 impl MctsPolicy {
     /// Create a new MCTS policy without a model loaded
     pub fn new(env_id: String, num_actions: usize, obs_size: usize) -> Self {
-        // Pre-create the simulation context to avoid repeated registry lookups
-        let sim_ctx = EngineContext::new(&env_id);
         let config = MctsConfig::for_training();
         let base_temp = config.temperature;
         Self {
             env_id,
             base_temperature: base_temp,
-            late_temperature: 0.1, // More deterministic in late game
-            temp_threshold: 0,     // Disabled by default (0 = no threshold)
+            // Scheduling is disabled until the caller supplies an explicit
+            // threshold and late temperature.
+            late_temperature: base_temp,
+            temp_threshold: 0, // Disabled by default (0 = no threshold)
             config,
             num_actions,
             obs_size,
             evaluator: Arc::new(RwLock::new(None)),
             rng: ChaCha20Rng::from_entropy(),
-            sim_ctx,
+            sim_ctx: None,
         }
     }
 
@@ -125,7 +125,7 @@ impl MctsPolicy {
     }
 
     /// Get shared evaluator reference for hot-reloading
-    pub fn evaluator_ref(&self) -> Arc<RwLock<Option<OnnxEvaluator>>> {
+    pub fn evaluator_ref(&self) -> Arc<RwLock<Option<SharedOnnxEvaluator>>> {
         Arc::clone(&self.evaluator)
     }
 
@@ -133,8 +133,9 @@ impl MctsPolicy {
     ///
     /// # Arguments
     /// * `state` - Current game state bytes
-    /// * `obs` - Current observation bytes
-    /// * `legal_moves_mask` - Mask of legal actions (read from the observation)
+    /// * `timestep` - Current algorithm-neutral timestep; the MCTS cartridge
+    ///   validates and extracts its single active-agent observation (including
+    ///   the authoritative legal-action mask)
     /// * `move_number` - Current move number in the game (0-indexed)
     ///
     /// # Returns
@@ -142,34 +143,27 @@ impl MctsPolicy {
     pub fn select_action(
         &mut self,
         state: &[u8],
-        obs: &[u8],
-        legal_moves_mask: &LegalMask,
+        timestep: &ErasedTimestep,
         move_number: u32,
     ) -> Result<MctsPolicyResult> {
-        // Acquire read lock once and hold it through the operation to avoid TOCTOU race.
-        // This prevents the model from being swapped out between checking and using it.
-        let guard = self
+        // Snapshot the current model and release the reload lock before the
+        // search. The clone pins one model generation for this entire search
+        // even if a hot reload lands mid-way.
+        let evaluator = self
             .evaluator
             .read()
-            .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
+            .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?
+            .clone();
 
-        let evaluator = match guard.as_ref() {
-            Some(eval) => eval,
-            None => {
-                // No model loaded - fall back to random legal action
-                // Note: This is expected during early training before first model is exported
-                // Drop the lock before calling random_action since it needs &mut self
-                drop(guard);
-                debug!("No model loaded, using random policy");
-                return self.random_action(legal_moves_mask);
-            }
-        };
-
-        // Use the pre-created simulation context (avoids repeated registry lookups)
+        if self.sim_ctx.is_none() {
+            self.sim_ctx = Some(EngineContext::new(&self.env_id).map_err(|error| {
+                anyhow!("environment '{}' is unavailable: {error}", self.env_id)
+            })?);
+        }
         let sim_ctx = self
             .sim_ctx
             .as_mut()
-            .ok_or_else(|| anyhow!("Game '{}' not registered", self.env_id))?;
+            .expect("simulation context was initialized above");
 
         // Apply temperature schedule: use lower temperature for late-game moves
         let mut config = self.config.clone();
@@ -179,15 +173,30 @@ impl MctsPolicy {
 
         // Run MCTS search with timing
         let mcts_start = Instant::now();
-        let result: SearchResult = run_mcts(
-            sim_ctx,
-            evaluator,
-            config,
-            state.to_vec(),
-            obs.to_vec(),
-            legal_moves_mask.clone(),
-            &mut self.rng,
-        )
+        let result: SearchResult = match &evaluator {
+            Some(model) => run_mcts(
+                sim_ctx,
+                model,
+                config,
+                state.to_vec(),
+                timestep.clone(),
+                &mut self.rng,
+            ),
+            None => {
+                // Root collection has no RunHead model yet. Search with
+                // uniform priors so stored policy targets are real visit
+                // distributions instead of uniform placeholders.
+                debug!("No model loaded, running MCTS with the uniform evaluator");
+                run_mcts(
+                    sim_ctx,
+                    &UniformEvaluator::new(),
+                    config,
+                    state.to_vec(),
+                    timestep.clone(),
+                    &mut self.rng,
+                )
+            }
+        }
         .map_err(|e| anyhow!("MCTS search failed: {}", e))?;
         let mcts_elapsed_ms = mcts_start.elapsed().as_millis();
 
@@ -230,42 +239,7 @@ impl MctsPolicy {
         Ok(MctsPolicyResult {
             action: action_bytes,
             policy: result.policy,
-            value: result.value,
             stats: result.stats,
-        })
-    }
-
-    /// Fall back to random action selection when no model is available
-    fn random_action(&mut self, legal_moves_mask: &LegalMask) -> Result<MctsPolicyResult> {
-        use rand::Rng;
-
-        if legal_moves_mask.is_empty() {
-            return Err(anyhow!("No legal moves available"));
-        }
-
-        // Count legal moves and build uniform policy
-        let num_legal = legal_moves_mask.count_ones() as f32;
-        let mut policy = vec![0.0; self.num_actions];
-        let mut legal_actions = Vec::new();
-
-        for i in legal_moves_mask
-            .iter_ones()
-            .filter(|&i| i < self.num_actions)
-        {
-            policy[i] = 1.0 / num_legal;
-            legal_actions.push(i);
-        }
-
-        // Sample random legal action
-        let idx = self.rng.gen_range(0..legal_actions.len());
-        let action = legal_actions[idx];
-        let action_bytes = (action as u32).to_le_bytes().to_vec();
-
-        Ok(MctsPolicyResult {
-            action: action_bytes,
-            policy,
-            value: 0.0,                    // No value estimate without model
-            stats: SearchStats::default(), // No MCTS performed
         })
     }
 }
@@ -275,7 +249,7 @@ mod tests {
     use super::*;
 
     fn setup() {
-        engine_games::register_all_games();
+        engine_games::register_all_environments();
     }
 
     #[test]
@@ -286,60 +260,49 @@ mod tests {
     }
 
     #[test]
-    fn test_mcts_policy_without_model_uses_random() {
+    fn test_mcts_policy_without_model_runs_uniform_evaluator_mcts() {
         setup();
 
         let mut policy = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 42);
+        let mut context = EngineContext::new("tictactoe").unwrap();
+        let reset = context.reset(42, &[]).unwrap();
 
-        // Create a dummy state/obs - in practice these come from the game
-        let state = vec![0u8; 10]; // TicTacToe state is about 10 bytes
-        let obs = vec![0u8; 29 * 4]; // 29 floats = 116 bytes
-        let legal_mask = LegalMask::from_u64(0b111111111, 9); // All 9 positions legal
-
-        // Without a model, should return random action
-        let result = policy.select_action(&state, &obs, &legal_mask, 0);
-        assert!(result.is_ok());
-
-        let result = result.unwrap();
+        // Without a model, MCTS still runs, backed by the uniform evaluator.
+        let result = policy
+            .select_action(&reset.state, &reset.timestep, 0)
+            .unwrap();
         assert_eq!(result.action.len(), 4); // u32
 
         // Action should be in valid range
         let action = u32::from_le_bytes(result.action.try_into().unwrap());
         assert!(action < 9);
 
-        // Policy should be uniform
+        // Policy is a real visit distribution over the 9 legal opening moves.
         let sum: f32 = result.policy.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-6);
+        assert!((sum - 1.0).abs() < 1e-5);
+        assert!(result.stats.total_evals > 0, "search evaluated no leaves");
+        assert!(result.stats.game_steps > 0, "search never stepped the game");
     }
 
     #[test]
-    fn test_random_action_with_partial_legal_mask() {
+    fn test_mcts_without_model_assigns_no_mass_to_occupied_cells() {
+        setup();
+
         let mut policy = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 42);
+        let mut context = EngineContext::new("tictactoe").unwrap();
+        let reset = context.reset(42, &[]).unwrap();
+        // Occupy the center so action 4 becomes illegal.
+        let step = context.step(&reset.state, &4u32.to_le_bytes()).unwrap();
 
-        // Only positions 0, 2, 4 are legal
-        let legal_mask = LegalMask::from_u64(0b000010101, 9);
+        let result = policy
+            .select_action(&step.state, &step.timestep, 1)
+            .unwrap();
 
-        // Run multiple times to verify only legal actions selected
-        for _ in 0..20 {
-            let result = policy.random_action(&legal_mask).unwrap();
-            let action = u32::from_le_bytes(result.action.try_into().unwrap());
-            assert!(
-                action == 0 || action == 2 || action == 4,
-                "Action {} should be 0, 2, or 4",
-                action
-            );
-
-            // Illegal actions should have 0 probability
-            assert_eq!(result.policy[1], 0.0);
-            assert_eq!(result.policy[3], 0.0);
-        }
-    }
-
-    #[test]
-    fn test_random_action_no_legal_moves_fails() {
-        let mut policy = MctsPolicy::new("tictactoe".into(), 9, 29);
-        let result = policy.random_action(&LegalMask::new(9));
-        assert!(result.is_err());
+        let action = u32::from_le_bytes(result.action.try_into().unwrap());
+        assert_ne!(action, 4, "selected an occupied cell");
+        assert_eq!(result.policy[4], 0.0, "policy mass on an occupied cell");
+        let sum: f32 = result.policy.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5);
     }
 
     // ========================================
@@ -377,42 +340,6 @@ mod tests {
     // ========================================
 
     #[test]
-    fn test_action_byte_encoding_action_0() {
-        let mut policy = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 12345);
-
-        // Force only action 0 to be legal
-        let legal_mask = LegalMask::from_u64(0b000000001, 9);
-        let result = policy.random_action(&legal_mask).unwrap();
-
-        // Action 0 should encode to [0, 0, 0, 0] (little-endian u32)
-        assert_eq!(result.action, vec![0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn test_action_byte_encoding_action_4() {
-        let mut policy = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 12345);
-
-        // Force only action 4 (center) to be legal
-        let legal_mask = LegalMask::from_u64(0b000010000, 9);
-        let result = policy.random_action(&legal_mask).unwrap();
-
-        // Action 4 should encode to [4, 0, 0, 0] (little-endian u32)
-        assert_eq!(result.action, vec![4, 0, 0, 0]);
-    }
-
-    #[test]
-    fn test_action_byte_encoding_action_8() {
-        let mut policy = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 12345);
-
-        // Force only action 8 to be legal
-        let legal_mask = LegalMask::from_u64(0b100000000, 9);
-        let result = policy.random_action(&legal_mask).unwrap();
-
-        // Action 8 should encode to [8, 0, 0, 0] (little-endian u32)
-        assert_eq!(result.action, vec![8, 0, 0, 0]);
-    }
-
-    #[test]
     fn test_action_roundtrip_encoding() {
         // Test that we can encode and decode all possible TicTacToe actions
         for action in 0..9u32 {
@@ -420,54 +347,6 @@ mod tests {
             let decoded = u32::from_le_bytes(bytes.try_into().unwrap());
             assert_eq!(action, decoded);
         }
-    }
-
-    // ========================================
-    // Policy distribution tests
-    // ========================================
-
-    #[test]
-    fn test_policy_distribution_sums_to_one() {
-        let mut policy = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 42);
-
-        // Various legal mask patterns
-        let masks = [
-            0b111111111u64, // All legal
-            0b101010101u64, // Alternating
-            0b000010000u64, // Only center
-            0b100000001u64, // Corners only
-            0b000111000u64, // Middle row
-        ];
-
-        for mask in masks {
-            let result = policy.random_action(&LegalMask::from_u64(mask, 9)).unwrap();
-            let sum: f32 = result.policy.iter().sum();
-            assert!(
-                (sum - 1.0).abs() < 1e-5,
-                "Policy sum should be ~1.0, got {}",
-                sum
-            );
-        }
-    }
-
-    #[test]
-    fn test_policy_distribution_uniform_over_legal() {
-        let mut policy = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 42);
-
-        // 3 legal moves
-        let legal_mask = LegalMask::from_u64(0b000010101, 9); // positions 0, 2, 4
-        let result = policy.random_action(&legal_mask).unwrap();
-
-        // Each legal move should have 1/3 probability
-        let expected = 1.0 / 3.0;
-        assert!((result.policy[0] - expected).abs() < 1e-6);
-        assert!((result.policy[2] - expected).abs() < 1e-6);
-        assert!((result.policy[4] - expected).abs() < 1e-6);
-
-        // Illegal moves should have 0 probability
-        assert_eq!(result.policy[1], 0.0);
-        assert_eq!(result.policy[3], 0.0);
-        assert_eq!(result.policy[5], 0.0);
     }
 
     // ========================================
@@ -503,34 +382,6 @@ mod tests {
     }
 
     // ========================================
-    // MCTS stats tests (when model not loaded)
-    // ========================================
-
-    #[test]
-    fn test_random_action_returns_default_stats() {
-        let mut policy = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 42);
-        let legal_mask = LegalMask::from_u64(0b111111111, 9);
-
-        let result = policy.random_action(&legal_mask).unwrap();
-
-        // Without MCTS (no model), stats should be default
-        assert_eq!(result.stats.total_time_us, 0);
-        assert_eq!(result.stats.inference_time_us, 0);
-        assert_eq!(result.stats.num_batches, 0);
-    }
-
-    #[test]
-    fn test_random_action_returns_neutral_value() {
-        let mut policy = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 42);
-        let legal_mask = LegalMask::from_u64(0b111111111, 9);
-
-        let result = policy.random_action(&legal_mask).unwrap();
-
-        // Without a model, value should be neutral (0.0)
-        assert!((result.value - 0.0).abs() < 1e-6);
-    }
-
-    // ========================================
     // Connect4 tests (different game configuration)
     // ========================================
 
@@ -545,12 +396,16 @@ mod tests {
     }
 
     #[test]
-    fn test_random_action_connect4() {
-        let mut policy = MctsPolicy::with_seed("connect4".into(), 7, 127, 42);
+    fn test_uniform_mcts_connect4() {
+        setup();
 
-        // All 7 columns legal in Connect4
-        let legal_mask = LegalMask::from_u64(0b1111111, 7);
-        let result = policy.random_action(&legal_mask).unwrap();
+        let mut policy = MctsPolicy::with_seed("connect4".into(), 7, 127, 42);
+        let mut context = EngineContext::new("connect4").unwrap();
+        let reset = context.reset(42, &[]).unwrap();
+
+        let result = policy
+            .select_action(&reset.state, &reset.timestep, 0)
+            .unwrap();
 
         let action = u32::from_le_bytes(result.action.try_into().unwrap());
         assert!(action < 7, "Connect4 action should be 0-6, got {}", action);
@@ -566,42 +421,24 @@ mod tests {
 
     #[test]
     fn test_seeded_policy_is_deterministic() {
+        setup();
+
         // Create two policies with the same seed
         let mut policy1 = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 12345);
         let mut policy2 = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 12345);
+        let mut context = EngineContext::new("tictactoe").unwrap();
+        let reset = context.reset(7, &[]).unwrap();
 
-        let legal_mask = LegalMask::from_u64(0b111111111, 9);
-
-        // They should produce the same sequence of actions
-        for _ in 0..10 {
-            let r1 = policy1.random_action(&legal_mask).unwrap();
-            let r2 = policy2.random_action(&legal_mask).unwrap();
+        // They should produce the same actions and policy targets
+        for move_number in 0..5 {
+            let r1 = policy1
+                .select_action(&reset.state, &reset.timestep, move_number)
+                .unwrap();
+            let r2 = policy2
+                .select_action(&reset.state, &reset.timestep, move_number)
+                .unwrap();
             assert_eq!(r1.action, r2.action);
+            assert_eq!(r1.policy, r2.policy);
         }
-    }
-
-    #[test]
-    fn test_different_seeds_produce_different_sequences() {
-        let mut policy1 = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 11111);
-        let mut policy2 = MctsPolicy::with_seed("tictactoe".into(), 9, 29, 22222);
-
-        let legal_mask = LegalMask::from_u64(0b111111111, 9);
-
-        // Run enough iterations that it's extremely unlikely they match
-        let mut matches = 0;
-        for _ in 0..20 {
-            let r1 = policy1.random_action(&legal_mask).unwrap();
-            let r2 = policy2.random_action(&legal_mask).unwrap();
-            if r1.action == r2.action {
-                matches += 1;
-            }
-        }
-
-        // With 9 possible actions, expected matches ~= 20/9 ≈ 2.2
-        // Very unlikely to have all 20 match
-        assert!(
-            matches < 20,
-            "Different seeds should produce different sequences"
-        );
     }
 }

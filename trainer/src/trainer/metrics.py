@@ -77,11 +77,11 @@ STEPS_PER_SECOND = Gauge(
     "Current training throughput (steps/second)",
 )
 
-# ========== Replay Buffer Metrics ==========
+# ========== Replay Store Metrics ==========
 
-REPLAY_BUFFER_SIZE = Gauge(
-    "trainer_replay_buffer_size",
-    "Number of transitions in replay buffer",
+REPLAY_RECORD_COUNT = Gauge(
+    "trainer_replay_record_count",
+    "Number of opaque records in the exact replay selection",
 )
 
 # ========== Checkpoint Metrics ==========
@@ -252,13 +252,13 @@ def record_evaluation(
     EVALUATION_DURATION.observe(duration_seconds)
 
 
-def update_replay_buffer_size(size: int) -> None:
-    """Update replay buffer size metric.
+def update_replay_record_count(count: int) -> None:
+    """Update the exact replay selection's record-count metric.
 
     Args:
-        size: Number of transitions in buffer.
+        count: Number of opaque replay records.
     """
-    REPLAY_BUFFER_SIZE.set(size)
+    REPLAY_RECORD_COUNT.set(count)
 
 
 def update_gpu_memory() -> None:

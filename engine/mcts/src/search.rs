@@ -8,7 +8,12 @@
 
 use std::time::Instant;
 
-use engine_core::{ActionSpace, EngineContext, LegalMask};
+use algorithm_core::BuiltinAlgorithm;
+use engine_core::board_profile::LegalMask;
+use engine_core::{
+    ActionAvailability, ActionSpace, AgentId, EngineContext, EpisodeStatus, ErasedTimestep,
+    TransitionSource,
+};
 use rand_chacha::ChaCha20Rng;
 use tracing::debug;
 
@@ -29,13 +34,10 @@ pub struct MctsSearch<'a, E: Evaluator> {
     evaluator: &'a E,
     config: MctsConfig,
     num_actions: usize,
-    /// Float offset of the legal-move plane in the observation; child masks
-    /// are read from the child obs rather than the (width-limited) info bits.
-    legal_mask_offset: usize,
     root_state: Vec<u8>,
     root_obs: Vec<u8>,
     step_state_buf: Vec<u8>,
-    step_obs_buf: Vec<u8>,
+    step_timestep_buf: ErasedTimestep,
 }
 
 impl<'a, E: Evaluator> MctsSearch<'a, E> {
@@ -45,38 +47,62 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
         evaluator: &'a E,
         config: MctsConfig,
         state: Vec<u8>,
-        obs: Vec<u8>,
-        legal_moves_mask: LegalMask,
+        timestep: ErasedTimestep,
     ) -> Result<Self, SearchError> {
-        let num_actions = match ctx.action_space() {
-            ActionSpace::Discrete(n) => n as usize,
+        config.validate()?;
+        BuiltinAlgorithm::AlphaZeroBoardV1
+            .compatibility(ctx)
+            .require_compatible()
+            .map_err(|error| SearchError::IncompatibleEnvironment(error.to_string()))?;
+        let active = timestep.decision.sole_agent().ok_or_else(|| {
+            SearchError::InvalidTimestep(format!(
+                "AlphaZero requires one active agent, got {:?}",
+                timestep.decision
+            ))
+        })?;
+        let active_agent = active.agent_id;
+        let obs = timestep
+            .observation_for(active_agent)
+            .ok_or_else(|| {
+                SearchError::InvalidTimestep(format!(
+                    "missing observation for active agent {}",
+                    active_agent.0
+                ))
+            })?
+            .to_vec();
+        let num_actions = match ctx.action_space(active_agent) {
+            Some(ActionSpace::Discrete { size }) => size as usize,
             _ => return Err(SearchError::UnsupportedActionSpace),
         };
-        let legal_mask_offset = ctx.metadata().legal_mask_offset;
-        debug_assert_eq!(legal_moves_mask.num_actions(), num_actions);
+        let legal_moves_mask = decision_legal_mask(active, num_actions)?.clone();
+        if legal_moves_mask.num_actions() != num_actions {
+            return Err(SearchError::LegalMaskWidthMismatch {
+                expected: num_actions,
+                actual: legal_moves_mask.num_actions(),
+            });
+        }
 
         let tree = MctsTree::new(legal_moves_mask);
         let state_capacity = state.len().max(64);
-        let obs_capacity = obs.len().max(64);
-
         Ok(Self {
             tree,
             ctx,
             evaluator,
             config,
             num_actions,
-            legal_mask_offset,
             root_state: state,
             root_obs: obs,
             step_state_buf: Vec::with_capacity(state_capacity),
-            step_obs_buf: Vec::with_capacity(obs_capacity),
+            step_timestep_buf: ErasedTimestep::default(),
         })
     }
 
     /// Run the MCTS search for the configured number of simulations.
     ///
-    /// Uses batched neural network evaluation for efficiency. Leaves are collected
-    /// until `eval_batch_size` is reached, then evaluated together in a single NN call.
+    /// Uses batched neural network evaluation for efficiency. The effective
+    /// batch is capped at one quarter of the simulation budget so selection
+    /// interleaves with evaluated values instead of queuing the entire search
+    /// from priors and virtual loss alone.
     pub fn run(&mut self, rng: &mut ChaCha20Rng) -> Result<SearchResult, SearchError> {
         let search_start = Instant::now();
         let mut stats = SearchStats::default();
@@ -106,11 +132,7 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
         // returned, visit counts would be driven purely by priors and
         // virtual loss, and the search would never use its value estimates.
         let target_simulations = self.config.num_simulations;
-        let batch_size = self
-            .config
-            .eval_batch_size
-            .max(1)
-            .min(((target_simulations as usize) / 4).max(1));
+        let batch_size = effective_eval_batch_size(&self.config);
         let mut pending: Vec<PendingLeaf> = Vec::with_capacity(batch_size);
         let mut completed_simulations: u32 = 0;
 
@@ -303,12 +325,12 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
                     &state,
                     &action_bytes,
                     &mut self.step_state_buf,
-                    &mut self.step_obs_buf,
+                    &mut self.step_timestep_buf,
                 )
                 .map_err(|e| SearchError::EngineError(e.to_string()))?;
 
             std::mem::swap(&mut state, &mut self.step_state_buf);
-            std::mem::swap(&mut obs, &mut self.step_obs_buf);
+            obs = decision_observation(&self.step_timestep_buf)?.to_vec();
         }
 
         Ok((state, obs))
@@ -416,22 +438,41 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
 
             // Simulate the action using zero-copy buffers.
             let action_bytes = (action as u32).to_le_bytes();
-            let (reward, done, _info) = self
-                .ctx
+            self.ctx
                 .step_into(
                     parent_state,
                     &action_bytes,
                     &mut self.step_state_buf,
-                    &mut self.step_obs_buf,
+                    &mut self.step_timestep_buf,
                 )
                 .map_err(|e| SearchError::EngineError(e.to_string()))?;
             step_count += 1;
 
-            // Read the child's legal moves from its observation. The obs is
-            // the authoritative source: info bits collide with the player/
-            // winner fields past 16 actions and cannot hold >64 actions.
-            let child_legal_mask =
-                LegalMask::from_obs(&self.step_obs_buf, self.legal_mask_offset, self.num_actions);
+            let actor = transition_actor(&self.step_timestep_buf)?;
+            let reward = self.step_timestep_buf.reward_for(actor).ok_or_else(|| {
+                SearchError::InvalidTimestep(format!(
+                    "missing outcome for acting agent {}",
+                    actor.0
+                ))
+            })?;
+            let done = self.step_timestep_buf.episode != EpisodeStatus::Running;
+            // Terminal nodes have no next decision. Running nodes carry their
+            // exact availability in the decision envelope.
+            let child_legal_mask = if done {
+                LegalMask::new(self.num_actions)
+            } else {
+                let next = self
+                    .step_timestep_buf
+                    .decision
+                    .sole_agent()
+                    .ok_or_else(|| {
+                        SearchError::InvalidTimestep(format!(
+                            "expected one next actor, got {:?}",
+                            self.step_timestep_buf.decision
+                        ))
+                    })?;
+                decision_legal_mask(next, self.num_actions)?.clone()
+            };
 
             // Terminal value (negated for opponent's perspective)
             let terminal_value = if done { -reward } else { 0.0 };
@@ -478,17 +519,67 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
     }
 }
 
+fn effective_eval_batch_size(config: &MctsConfig) -> usize {
+    config
+        .eval_batch_size
+        .max(1)
+        .min(((config.num_simulations as usize) / 4).max(1))
+}
+
+fn decision_observation(timestep: &ErasedTimestep) -> Result<&[u8], SearchError> {
+    let agent_id = timestep
+        .decision
+        .sole_agent()
+        .ok_or_else(|| {
+            SearchError::InvalidTimestep(format!(
+                "expected one next actor, got {:?}",
+                timestep.decision
+            ))
+        })?
+        .agent_id;
+    timestep.observation_for(agent_id).ok_or_else(|| {
+        SearchError::InvalidTimestep(format!("missing observation for next agent {}", agent_id.0))
+    })
+}
+
+fn decision_legal_mask(
+    decision: &engine_core::AgentDecision,
+    num_actions: usize,
+) -> Result<&LegalMask, SearchError> {
+    let ActionAvailability::DiscreteMask { mask } = &decision.availability else {
+        return Err(SearchError::InvalidTimestep(format!(
+            "AlphaZero requires a discrete legal mask for agent {}",
+            decision.agent_id.0
+        )));
+    };
+    if mask.num_actions() != num_actions {
+        return Err(SearchError::LegalMaskWidthMismatch {
+            expected: num_actions,
+            actual: mask.num_actions(),
+        });
+    }
+    Ok(mask)
+}
+
+fn transition_actor(timestep: &ErasedTimestep) -> Result<AgentId, SearchError> {
+    match &timestep.source {
+        TransitionSource::Agents { agent_ids } if agent_ids.len() == 1 => Ok(agent_ids[0]),
+        source => Err(SearchError::InvalidTimestep(format!(
+            "expected one acting agent, got {source:?}"
+        ))),
+    }
+}
+
 /// Convenience function to run a single MCTS search.
 pub fn run_mcts<E: Evaluator>(
     ctx: &mut EngineContext,
     evaluator: &E,
     config: MctsConfig,
     state: Vec<u8>,
-    obs: Vec<u8>,
-    legal_moves_mask: LegalMask,
+    timestep: ErasedTimestep,
     rng: &mut ChaCha20Rng,
 ) -> Result<SearchResult, SearchError> {
-    let mut search = MctsSearch::new(ctx, evaluator, config, state, obs, legal_moves_mask)?;
+    let mut search = MctsSearch::new(ctx, evaluator, config, state, timestep)?;
     search.run(rng)
 }
 

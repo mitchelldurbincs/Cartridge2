@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -27,9 +27,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref }}
-          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -39,19 +36,12 @@ jobs:
             engine
             actor
             web
-      # Formats the code; on PRs the resulting fixes are committed back.
-      - name: Format code (engine)
-        run: cargo fmt --all --manifest-path engine/Cargo.toml
-      - name: Format code (actor)
-        run: cargo fmt --manifest-path actor/Cargo.toml
-      - name: Format code (web)
-        run: cargo fmt --manifest-path web/Cargo.toml
-      - name: Commit formatting fixes
-        if: github.event_name == 'pull_request'
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "style: auto-fix Rust formatting"
-          file_pattern: "*.rs"
+      - name: Check formatting (engine)
+        run: cargo fmt --all --manifest-path engine/Cargo.toml -- --check
+      - name: Check formatting (actor)
+        run: cargo fmt --manifest-path actor/Cargo.toml -- --check
+      - name: Check formatting (web)
+        run: cargo fmt --manifest-path web/Cargo.toml -- --check
 
   rust-clippy:
     name: Rust Clippy
@@ -72,10 +62,14 @@ jobs:
       # different graph than the one that was reviewed.
       - name: Clippy (engine)
         run: cargo clippy --locked --manifest-path engine/Cargo.toml --all-targets -- -D warnings
-      - name: Clippy (actor)
-        run: cargo clippy --locked --manifest-path actor/Cargo.toml --all-targets -- -D warnings
+      - name: Clippy (model watcher, all features)
+        run: cargo clippy --locked --manifest-path engine/Cargo.toml -p model-watcher --all-targets --all-features -- -D warnings
+      - name: Clippy (actor, Linux features)
+        run: cargo clippy --locked --manifest-path actor/Cargo.toml --all-targets --features s3 -- -D warnings
       - name: Clippy (web)
-        run: cargo clippy --locked --manifest-path web/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --locked --manifest-path web/Cargo.toml --all-targets --all-features -- -D warnings
+      - name: Clippy (web without ONNX)
+        run: cargo clippy --locked --manifest-path web/Cargo.toml --all-targets --no-default-features -- -D warnings
 
   rust-test:
     name: Rust Tests
@@ -91,10 +85,16 @@ jobs:
             web
       - name: Test engine
         run: cargo test --locked --manifest-path engine/Cargo.toml
-      - name: Test actor
-        run: cargo test --locked --manifest-path actor/Cargo.toml
+      - name: Test model watcher (all features)
+        run: cargo test --locked --manifest-path engine/Cargo.toml -p model-watcher --all-features
+      - name: Test actor (filesystem and S3)
+        # CoreML is an Apple-only execution provider. On Linux, `s3` is the
+        # complete supported feature set and still covers both storage paths.
+        run: cargo test --locked --manifest-path actor/Cargo.toml --features s3
       - name: Test web
         run: cargo test --locked --manifest-path web/Cargo.toml
+      - name: Test web without ONNX
+        run: cargo test --locked --manifest-path web/Cargo.toml --no-default-features
 
   rust-build:
     name: Rust Build (Release)
@@ -126,8 +126,7 @@ jobs:
     #   RUSTSEC-2024-0437  protobuf 2.28.0 <- prometheus 0.13.4 <- metrics-common.
     #                      Clearing it means prometheus 0.14+, which drops
     #                      protobuf but changes the API used by
-    #                      engine/metrics-common, actor/src/metrics.rs and
-    #                      web/src/metrics.rs.
+    #                      engine/metrics-common and web/src/metrics.rs.
     #   RUSTSEC-2026-0098  rustls-webpki 0.101.7 <- rustls 0.21.12, reached only
     #   RUSTSEC-2026-0099  through feature-gated deps (not in the default build
     #   RUSTSEC-2026-0104  tree). Needs the rustls 0.23 chain.
@@ -173,27 +172,17 @@ jobs:
         working-directory: trainer
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref }}
-          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: trainer/pyproject.toml
       - name: Install linters
-        run: pip install ruff black
-      # Auto-fix linting issues
-      - name: Ruff fix
-        run: ruff check --fix src/
-      - name: Black format
-        run: black src/
-      - name: Commit lint fixes
-        if: github.event_name == 'pull_request'
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "style: auto-fix Python formatting"
-          file_pattern: "trainer/**/*.py"
+        run: pip install ruff==0.16.1
+      - name: Ruff check
+        run: ruff check src/ tests/ smoke_test.py
+      - name: Ruff format check
+        run: ruff format --check src/ tests/ smoke_test.py
 
   python-test:
     name: Python Tests
@@ -283,6 +272,7 @@ jobs:
           file: ./Dockerfile.alphazero
           push: false
           tags: cartridge-alphazero:test
+          build-args: CARGO_FEATURES=s3
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Build Web image
@@ -292,6 +282,7 @@ jobs:
           file: ./web/Dockerfile
           push: false
           tags: cartridge-web:test
+          build-args: CARGO_FEATURES=s3
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Build Frontend image

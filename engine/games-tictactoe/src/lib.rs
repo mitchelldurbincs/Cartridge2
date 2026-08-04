@@ -1,7 +1,7 @@
 //! TicTacToe game implementation for the Cartridge engine
 //!
 //! This crate provides a complete reference implementation of TicTacToe
-//! demonstrating how to implement the Game trait for the engine framework.
+//! demonstrating the narrow BoardGame adapter contract.
 //!
 //! # Usage
 //!
@@ -17,24 +17,27 @@
 //! let reset = ctx.reset(42, &[]).unwrap();
 //! ```
 
-use engine_core::game_utils::{
-    calculate_reward, decode_action_u32, info_bits, opponent, validate_board_cells,
-    validate_player_and_winner,
+use engine_core::board_profile::{
+    calculate_reward, decode_action_u32, opponent, register_board_game, validate_board_cells,
+    validate_player_and_winner, BoardGame, BoardGameMetadata, BoardPlayerMetadata, BoardTransition,
+    BoardView, TwoPlayerObs, TwoPlayerObsError,
 };
 use engine_core::typed::{
-    ActionSpace, Capabilities, DecodeError, EncodeError, Encoding, EngineId, Game,
+    ActionSpace, AgentId, AgentModel, Capabilities, DecodeError, EncodeError, Encoding, EngineId,
+    EnvironmentSemantics, TensorSpec,
 };
-use engine_core::{register_game, GameAdapter, GameMetadata, TwoPlayerObs};
+use engine_core::{EnvironmentError, EnvironmentMetadata, LegalMask};
 use rand_chacha::ChaCha20Rng;
+
+/// Immutable environment contract revision for wire formats and semantics.
+pub const ENV_CONTRACT_VERSION: u32 = 2;
 
 /// Register TicTacToe with the global game registry
 ///
 /// Call this function once at startup to make TicTacToe available
 /// via `EngineContext::new("tictactoe")`.
 pub fn register_tictactoe() {
-    register_game("tictactoe".to_string(), || {
-        Box::new(GameAdapter::new(TicTacToe::new()))
-    });
+    register_board_game::<TicTacToe>().expect("tictactoe environment must only be registered once");
 }
 
 /// TicTacToe game state
@@ -157,16 +160,12 @@ impl Default for State {
 /// TicTacToe action - position to place a piece (0-8)
 pub type Action = u8;
 
-/// TicTacToe observation (18 board view + 9 legal moves + 2 current player = 29 floats)
-pub type Observation = TwoPlayerObs<18, 9>;
+/// Player-relative TicTacToe observation: two 3x3 occupancy planes.
+pub type Observation = TwoPlayerObs<18>;
 
 /// Create observation from game state
-pub fn observation_from_state(state: &State) -> Observation {
-    TwoPlayerObs::from_board(
-        &state.board,
-        state.legal_moves_mask() as u64,
-        state.current_player,
-    )
+pub fn observation_from_state(state: &State) -> Result<Observation, TwoPlayerObsError> {
+    TwoPlayerObs::from_board(&state.board, state.current_player)
 }
 
 /// TicTacToe game implementation
@@ -178,23 +177,6 @@ impl TicTacToe {
     pub fn new() -> Self {
         Self
     }
-
-    /// Pack auxiliary information about the state into a u64 bit-field.
-    ///
-    /// Uses the standard layout from `engine_core::game_utils::info_bits`:
-    /// * Bits 0-8  : Legal move mask
-    /// * Bits 16-19: Current player (1 = X, 2 = O)
-    /// * Bits 20-23: Winner (0 = none, 1 = X, 2 = O, 3 = draw)
-    /// * Bits 24-31: Moves played so far (0-9)
-    fn compute_info_bits(state: &State) -> u64 {
-        let moves_played = state.board.iter().filter(|&&cell| cell != 0).count() as u64;
-        info_bits::compute_info_bits(
-            state.legal_moves_mask() as u64,
-            state.current_player,
-            state.winner,
-            moves_played,
-        )
-    }
 }
 
 impl Default for TicTacToe {
@@ -203,10 +185,10 @@ impl Default for TicTacToe {
     }
 }
 
-impl Game for TicTacToe {
+impl BoardGame for TicTacToe {
     type State = State;
     type Action = Action;
-    type Obs = Observation;
+    type Observation = Observation;
 
     fn engine_id(&self) -> EngineId {
         EngineId {
@@ -218,35 +200,42 @@ impl Game for TicTacToe {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             id: self.engine_id(),
-            encoding: Encoding {
-                state: "tictactoe_state:v1".to_string(),
-                action: "discrete_position:v1".to_string(),
-                obs: "f32x29:v1".to_string(), // 18 + 9 + 2 = 29 floats
-                schema_version: 1,
-            },
-            max_horizon: 9,                         // Maximum 9 moves in TicTacToe
-            action_space: ActionSpace::Discrete(9), // 9 possible positions
+            contract_version: ENV_CONTRACT_VERSION,
+            encoding: Encoding::discrete_u32_le(
+                "tictactoe_state:v1",
+                TensorSpec::f32_fixed([("channel", 2), ("row", 3), ("column", 3)]),
+            ),
+            semantics:
+                EnvironmentSemantics::deterministic_alternating_perfect_information_terminal_zero_sum(),
+            max_horizon: Some(9),
+            agents: AgentModel::fixed_homogeneous_masked(
+                [AgentId(1), AgentId(2)],
+                ActionSpace::discrete(9),
+            ),
             preferred_batch: 64,
         }
     }
 
-    fn metadata(&self) -> GameMetadata {
-        GameMetadata::new("tictactoe", "Tic-Tac-Toe")
-            .with_board(3, 3)
-            .with_actions(9)
-            .with_observation(29, 18) // 29 floats, legal mask starts at index 18
-            .with_obs_encoding(2, false) // one absolute plane per player
-            .with_alternating_turns(true) // X and O strictly alternate
-            .with_players(2, vec!["X".to_string(), "O".to_string()], vec!['X', 'O'])
+    fn metadata(&self) -> EnvironmentMetadata {
+        EnvironmentMetadata::new("tictactoe", "Tic-Tac-Toe")
             .with_description("Get three in a row to win!")
+            .with_board(BoardGameMetadata::new(3, 3).with_players(vec![
+                BoardPlayerMetadata::new("X", "X"),
+                BoardPlayerMetadata::new("O", "O"),
+            ]))
     }
 
-    // reset/step mirror games-connect4 and games-othello; the shared pieces
-    // (reward, info bits, validation) live in engine_core::game_utils.
-    fn reset(&mut self, _rng: &mut ChaCha20Rng, _hint: &[u8]) -> (Self::State, Self::Obs) {
+    // reset/step mirror games-connect4 and games-othello; shared reward and
+    // Validation helpers live in the explicit engine_core::board_profile API.
+    fn reset(
+        &mut self,
+        _rng: &mut ChaCha20Rng,
+        _hint: &[u8],
+    ) -> Result<(Self::State, Self::Observation), EnvironmentError> {
         let state = State::new();
-        let obs = observation_from_state(&state);
-        (state, obs)
+        let obs = observation_from_state(&state)
+            .map_err(|error| EnvironmentError::InvalidState(error.to_string()))?;
+        Ok((state, obs))
     }
 
     fn step(
@@ -254,16 +243,24 @@ impl Game for TicTacToe {
         state: &mut Self::State,
         action: Self::Action,
         _rng: &mut ChaCha20Rng,
-    ) -> (Self::Obs, f32, bool, u64) {
+    ) -> Result<BoardTransition<Self::Observation>, EnvironmentError> {
+        if state.is_done() || action >= 9 || state.board[action as usize] != 0 {
+            return Err(EnvironmentError::InvalidAction(format!(
+                "position {action} is not legal in the current Tic-Tac-Toe state"
+            )));
+        }
         let previous_player = state.current_player;
         *state = state.make_move(action);
 
-        let obs = observation_from_state(state);
+        let obs = observation_from_state(state)
+            .map_err(|error| EnvironmentError::InvalidState(error.to_string()))?;
         let reward = calculate_reward(state.winner, previous_player);
         let done = state.is_done();
-        let info = Self::compute_info_bits(state);
-
-        (obs, reward, done, info)
+        Ok(BoardTransition {
+            observation: obs,
+            actor_reward: reward,
+            terminated: done,
+        })
     }
 
     fn encode_state(state: &Self::State, out: &mut Vec<u8>) -> Result<(), EncodeError> {
@@ -323,9 +320,17 @@ impl Game for TicTacToe {
         Ok(position as u8)
     }
 
-    fn encode_obs(obs: &Self::Obs, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn encode_observation(obs: &Self::Observation, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         obs.encode(out);
         Ok(())
+    }
+
+    fn legal_actions(state: &Self::State) -> Result<LegalMask, EnvironmentError> {
+        Ok(LegalMask::from_u64(state.legal_moves_mask() as u64, 9))
+    }
+
+    fn view(state: &Self::State) -> BoardView {
+        BoardView::from_owners(&state.board, state.current_player, state.winner)
     }
 }
 
