@@ -598,6 +598,10 @@ class FakeS3:
         self.objects[key] = bytes(data)
         self.puts.append(kwargs)
 
+    def delete_object(self, *, Bucket, Key):
+        del Bucket
+        self.objects.pop(Key, None)
+
     def list_objects_v2(self, *, Bucket, Prefix, ContinuationToken=None):
         del Bucket
         if ContinuationToken is not None:
@@ -635,7 +639,7 @@ def test_s3_publishes_verified_immutables_before_authoritative_head(tmp_path, st
     )
     checkpoint = _publish(publisher, staged_blobs)
 
-    put_keys = [item["Key"] for item in client.puts]
+    put_keys = [item["Key"] for item in client.puts if "/cas-probe/" not in item["Key"]]
     prefix = "profiles/alphazero_board_v1/tictactoe/v1/models"
     assert put_keys[-1:] == [f"{prefix}/channels/current.json"]
     assert put_keys[:3] == [
@@ -872,3 +876,62 @@ def test_canonical_json_is_raw_utf8_cross_language_golden():
 
     # ASCII identity fields are unaffected by the raw-UTF-8 rule.
     assert canonical_json_bytes({"b": 2, "a": 1}) == b'{"a":1,"b":2}'
+
+
+class ConditionIgnoringS3(FakeS3):
+    """A fail-open backend: conditional headers are silently ignored."""
+
+    def put_object(self, **kwargs):
+        kwargs.pop("IfNoneMatch", None)
+        kwargs.pop("IfMatch", None)
+        super().put_object(**kwargs)
+
+
+def test_s3_publisher_refuses_to_publish_on_a_fail_open_backend(tmp_path, staged_blobs):
+    publisher = S3CheckpointPublisher(
+        model_root=tmp_path,
+        bucket="models-bucket",
+        contract=CONTRACT,
+        client=ConditionIgnoringS3(),
+    )
+    with pytest.raises(ArtifactValidationError, match="does not enforce conditional writes"):
+        _publish(publisher, staged_blobs)
+
+
+def test_s3_cas_probe_runs_once_per_publisher_and_cleans_up(tmp_path, staged_blobs):
+    client = FakeS3()
+    publisher = S3CheckpointPublisher(
+        model_root=tmp_path,
+        bucket="models-bucket",
+        contract=CONTRACT,
+        client=client,
+    )
+    _publish(publisher, staged_blobs)
+
+    probe_puts = [item for item in client.puts if "/cas-probe/" in item["Key"]]
+    assert len(probe_puts) == 1  # the create; both must-fail writes were rejected
+    assert not any("/cas-probe/" in key for key in client.objects)
+
+
+def test_s3_read_paths_never_probe(tmp_path, staged_blobs):
+    client = FakeS3()
+    source = S3CheckpointPublisher(
+        model_root=tmp_path / "source",
+        bucket="models-bucket",
+        contract=CONTRACT,
+        client=client,
+    )
+    first = _publish(source, staged_blobs)
+
+    # A reader over a fail-open backend still resolves; only writes probe.
+    fail_open = ConditionIgnoringS3()
+    fail_open.objects = dict(client.objects)
+    reader = S3CheckpointPublisher(
+        model_root=tmp_path / "reader",
+        bucket="models-bucket",
+        contract=CONTRACT,
+        client=fail_open,
+    )
+    resolved = reader.resolve_head(expected_config_sha256=CONFIG_SHA256)
+    assert resolved is not None and resolved.checkpoint_id == first.checkpoint_id
+    assert not any("/cas-probe/" in item["Key"] for item in fail_open.puts)

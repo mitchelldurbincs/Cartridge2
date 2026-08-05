@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import secrets
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -22,6 +24,8 @@ from .checkpoint_validation import (
     validate_onnx_checkpoint,
     verified_blob,
 )
+
+logger = logging.getLogger(__name__)
 
 _CONDITIONAL_WRITE_ATTEMPTS = 5
 
@@ -79,6 +83,7 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
                 ) from exc
             client = boto3.client("s3", endpoint_url=endpoint)
         self._client = client
+        self._conditional_writes_verified = False
 
     @property
     def prefix(self) -> str:
@@ -178,7 +183,82 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
         """S3 RunHead serialization is its exact ETag conditional write."""
         return nullcontext()
 
+    def _ensure_conditional_writes_enforced(self) -> None:
+        """Prove the backend enforces conditional writes before any publish.
+
+        Some S3-compatible backends (older MinIO releases, various gateways)
+        silently ignore ``IfMatch``/``IfNoneMatch``. On such a backend the
+        RunHead compare-and-set would "succeed" unconditionally, and a
+        concurrent writer's head would be lost with no error anywhere — a
+        fail-open outcome. So before the first conditional write of this
+        process, deliberately attempt writes that MUST be rejected and refuse
+        to publish unless they are.
+
+        The probe runs on write paths only (readers never probe), needs
+        ``s3:DeleteObject`` on the ``cas-probe/`` prefix for cleanup (a leaked
+        probe object is harmless), and the read-only Rust S3 watcher
+        deliberately has no equivalent.
+        """
+        if self._conditional_writes_verified:
+            return
+        key = None
+        for attempt in range(2):
+            candidate = self._key(f"cas-probe/{secrets.token_hex(16)}")
+            try:
+                self._client.put_object(
+                    Bucket=self.bucket,
+                    Key=candidate,
+                    Body=b"cas-probe-create",
+                    ContentType="application/octet-stream",
+                    IfNoneMatch="*",
+                )
+            except Exception as exc:
+                if _is_precondition_failed(exc) and attempt == 0:
+                    continue
+                raise ArtifactValidationError(
+                    f"S3 conditional-write probe could not create its object: {exc}"
+                ) from exc
+            key = candidate
+            break
+        if key is None:
+            raise ArtifactValidationError(
+                "S3 conditional-write probe could not allocate a probe key"
+            )
+        try:
+            for body, condition in (
+                (b"cas-probe-if-none-match", {"IfNoneMatch": "*"}),
+                (b"cas-probe-if-match", {"IfMatch": '"cas-probe-wrong-etag"'}),
+            ):
+                condition_name = next(iter(condition))
+                try:
+                    self._client.put_object(
+                        Bucket=self.bucket,
+                        Key=key,
+                        Body=body,
+                        ContentType="application/octet-stream",
+                        **condition,
+                    )
+                except Exception as exc:
+                    if not _is_precondition_failed(exc):
+                        raise ArtifactValidationError(
+                            f"S3 conditional-write probe failed unexpectedly: {exc}"
+                        ) from exc
+                else:
+                    raise ArtifactValidationError(
+                        f"S3 backend accepted a must-fail {condition_name} write; it "
+                        "does not enforce conditional writes, so RunHead compare-and-"
+                        "set would fail open and silently lose concurrent updates. "
+                        "Refusing to publish."
+                    )
+        finally:
+            try:
+                self._client.delete_object(Bucket=self.bucket, Key=key)
+            except Exception as exc:
+                logger.warning("Failed to delete S3 CAS probe object %s: %s", key, exc)
+        self._conditional_writes_verified = True
+
     def _put_immutable(self, key: str, data: bytes, content_type: str) -> None:
+        self._ensure_conditional_writes_enforced()
         existing = self._get(key)
         if existing is not None:
             if existing != data:
@@ -219,6 +299,7 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
         expected: tuple[bytes, str | None] | None,
         target: bytes,
     ) -> RunHeadV2:
+        self._ensure_conditional_writes_enforced()
         if expected is not None and expected[1] is None:
             raise ArtifactValidationError("S3 run-head CAS requires an ETag")
         condition = {"IfNoneMatch": "*"} if expected is None else {"IfMatch": expected[1]}
