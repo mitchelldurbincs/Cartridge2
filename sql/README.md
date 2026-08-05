@@ -9,23 +9,23 @@ algorithm does not add algorithm-specific columns or tables.
 
 | File | Purpose | Used by |
 |------|---------|---------|
-| `schema.sql` | Canonical replay-v3 DDL | Rust actor and local setup |
+| `schema.sql` | Canonical replay-v4 DDL | Rust actor and local setup |
 | `../trainer/src/trainer/storage/schema.sql` | Byte-identical packaged mirror | Python trainer |
-| `../scripts/init-postgres.sql` | Canonical DDL plus deployment grants | Docker Compose |
+| `../scripts/init-postgres.sql` | Byte-identical container mirror | Docker Compose |
 | `../k8s/base/postgres/init-configmap.yaml` | Canonical DDL embedded for Kubernetes | In-cluster PostgreSQL |
 
-Every form creates exactly `cartridge_schema_versions` and `replay_records`.
-The deployment forms add only their role grants. Actor and trainer create the
+Every form creates exactly `cartridge_schema_versions`, `collection_scopes`,
+and `replay_records`. Actor and trainer create the
 schema only when the database has no tables; otherwise startup requires the
 exact table set, columns, PostgreSQL types, nullability, primary-key order, and
 schema marker. Partial, extra, unversioned, or wrong-version schemas fail fast.
 
-## Replay protocol v3
+## Replay protocol v4
 
 `cartridge_schema_versions` must contain exactly:
 
 ```text
-('replay', 3)
+('replay', 4)
 ```
 
 `replay_records` has this storage-owned envelope:
@@ -51,8 +51,8 @@ The primary key is:
  collection_scope_id, id)
 ```
 
-Indexes support newest-first selection retention and selection-scoped episode
-ordering. Every count, distinct-episode count, sample, clear, cleanup, and write
+The selection/created index supports newest-first retention; sampling fetches
+rows by ID from an in-memory snapshot of the selection. Every count, distinct-episode count, sample, clear, cleanup, and write
 operation is bound to the full `ReplaySelection`: the four-field profile,
 `collection_scope_id`, and exact nullable `source_checkpoint_id`. SQL compares
 the nullable source with `IS NOT DISTINCT FROM`, so null means root and never
@@ -78,9 +78,9 @@ does not know or validate those fields; the installed AlphaZero cartridge does.
 
 ## Clean cutover
 
-Replay v3 has no migration, compatibility view, legacy table reader, default
-profile inference, or implicit collection scope. Replay-v1 and replay-v2
-databases are deliberately rejected. Preserve any data you need, then recreate
+Replay v4 has no migration, compatibility view, legacy table reader, default
+profile inference, or implicit collection scope. Older replay versions are
+deliberately rejected. Preserve any data you need, then recreate
 the replay database from the current schema.
 
 ## Setup

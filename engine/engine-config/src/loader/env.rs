@@ -71,6 +71,7 @@ const KNOWN_CONFIG_ENV_KEYS: &[&str] = &[
     "CARTRIDGE_STORAGE_POOL_MAX_SIZE",
     "CARTRIDGE_STORAGE_POOL_CONNECT_TIMEOUT",
     "CARTRIDGE_STORAGE_POOL_IDLE_TIMEOUT",
+    "CARTRIDGE_STORAGE_REPLAY_RETAINED_SCOPES",
     "CARTRIDGE_WANDB_ENABLED",
     "CARTRIDGE_WANDB_REQUIRED",
     "CARTRIDGE_WANDB_PROJECT",
@@ -450,6 +451,12 @@ fn apply_service_overrides(config: &mut CentralConfig) -> Result<(), ConfigError
         storage.pool_idle_timeout,
         "CARTRIDGE_STORAGE_POOL_IDLE_TIMEOUT",
         optional_parse
+    );
+    env_override!(
+        config,
+        storage.replay_retained_scopes,
+        "CARTRIDGE_STORAGE_REPLAY_RETAINED_SCOPES",
+        parse
     );
     env_override!(config, wandb.enabled, "CARTRIDGE_WANDB_ENABLED", parse);
     env_override!(config, wandb.required, "CARTRIDGE_WANDB_REQUIRED", parse);

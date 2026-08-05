@@ -69,6 +69,11 @@ fn validate_storage_and_logging(config: &CentralConfig) -> Result<(), ConfigErro
             "storage pool size and connect timeout must be greater than zero".to_string(),
         ));
     }
+    if config.storage.replay_retained_scopes == 0 {
+        return Err(ConfigError::InvalidConfig(
+            "storage.replay_retained_scopes must be greater than zero".to_string(),
+        ));
+    }
     if !matches!(config.logging.format.as_str(), "text" | "json") {
         return Err(ConfigError::InvalidConfig(format!(
             "logging.format must be 'text' or 'json', got {:?}",

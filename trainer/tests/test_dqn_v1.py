@@ -400,6 +400,11 @@ def test_dqn_loop_calls_typed_application_methods_and_honors_runtime_options(
         "trainer.algorithms.dqn_loop.create_checkpoint_publisher",
         lambda contract, model_dir: Checkpoints(),
     )
+    reaped: list[tuple] = []
+    monkeypatch.setattr(
+        "trainer.algorithms.dqn_loop.reap_profile_scopes",
+        lambda *, profile, retained_scopes: reaped.append((profile, retained_scopes)) or 0,
+    )
     monkeypatch.setattr(
         cartridge,
         "collect",

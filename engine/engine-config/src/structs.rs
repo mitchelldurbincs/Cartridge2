@@ -157,6 +157,9 @@ fn d_pool_connect_timeout() -> u64 {
 fn d_pool_idle_timeout() -> Option<u64> {
     Some(defaults::pool_idle_timeout())
 }
+fn d_replay_retained_scopes() -> u32 {
+    defaults::replay_retained_scopes()
+}
 fn d_wandb_enabled() -> bool {
     defaults::wandb_enabled()
 }
@@ -478,6 +481,9 @@ pub struct StorageConfig {
     /// Idle timeout for connections in seconds (None = no timeout)
     #[serde(default = "d_pool_idle_timeout")]
     pub pool_idle_timeout: Option<u64>,
+    /// Newest collection scopes kept per profile by the Python scope reaper
+    #[serde(default = "d_replay_retained_scopes")]
+    pub replay_retained_scopes: u32,
 }
 
 impl Default for StorageConfig {
@@ -490,6 +496,7 @@ impl Default for StorageConfig {
             pool_max_size: defaults::pool_max_size(),
             pool_connect_timeout: defaults::pool_connect_timeout(),
             pool_idle_timeout: Some(defaults::pool_idle_timeout()),
+            replay_retained_scopes: defaults::replay_retained_scopes(),
         }
     }
 }

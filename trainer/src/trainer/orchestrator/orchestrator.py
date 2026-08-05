@@ -18,6 +18,7 @@ from crucible.orchestrator.orchestrator import (
 )
 
 from ..algorithms import get_algorithm
+from ..central_config import get_config
 from ..environment_catalog import get_environment
 from ..stats import (
     EvaluationStats,
@@ -43,6 +44,7 @@ from ..storage.run_commit import (
     RunCommitV1,
     RunRecipeV1,
 )
+from ..storage.scope_reaper import reap_profile_scopes
 from ..structured_logging import (
     generate_span_id,
     generate_trace_id,
@@ -622,6 +624,14 @@ class Orchestrator(_CoreOrchestrator):
         prepared = PreparedRunV1(run_commit=commit, evaluation=evaluation)
         self.run_journal.publish(prepared)
         self._finish_prepared(prepared)
+        # The commit is authoritative, so scopes older than the retained
+        # window are now unreachable by any future selection: reap them so
+        # the replay table stays bounded. Fail closed — a reaper error is a
+        # storage problem the operator must see, not a warning to scroll past.
+        reap_profile_scopes(
+            profile=replay_selection.profile,
+            retained_scopes=get_config().storage.replay_retained_scopes,
+        )
         committed_chain = self._head_chain()
         self._rebuild_projections(committed_chain)
         self._report_committed(commit)

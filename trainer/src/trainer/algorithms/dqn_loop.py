@@ -9,10 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..central_config import get_config
 from ..environment_catalog import get_environment
 from ..runtime_profile import resolve_runtime_profile
 from ..storage import ReplayProfile, ReplaySelection
 from ..storage.publisher import create_checkpoint_publisher
+from ..storage.scope_reaper import reap_profile_scopes
 from .dqn_application import format_evaluation_result
 from .dqn_requests import DqnCollectRequest, DqnEvaluateRequest, DqnTrainRequest
 
@@ -128,6 +130,12 @@ class DqnLoop:
         advanced = checkpoints.resolve_run_head()
         if advanced is None or advanced.checkpoint_id == source_checkpoint_id:
             raise RuntimeError("DQN learner did not advance the authoritative RunHead")
+        # The head advanced, so scopes older than the retained window are dead
+        # for every future selection: reap them to keep the table bounded.
+        reap_profile_scopes(
+            profile=selection.profile,
+            retained_scopes=get_config().storage.replay_retained_scopes,
+        )
         if self.config.evaluation_episodes > 0:
             result = self.cartridge.evaluate(
                 self._evaluate_request(environment, profile_dir, advanced.checkpoint_id, iteration)

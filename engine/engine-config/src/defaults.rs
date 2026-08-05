@@ -115,6 +115,7 @@ struct StorageDefaults {
     pool_max_size: usize,
     pool_connect_timeout: u64,
     pool_idle_timeout: u64,
+    replay_retained_scopes: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -295,6 +296,9 @@ pub fn pool_connect_timeout() -> u64 {
 }
 pub fn pool_idle_timeout() -> u64 {
     DEFAULTS.storage.pool_idle_timeout
+}
+pub fn replay_retained_scopes() -> u32 {
+    DEFAULTS.storage.replay_retained_scopes
 }
 
 // W&B (parsed by Rust so the canonical config has one strict schema even

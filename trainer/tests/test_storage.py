@@ -1,4 +1,4 @@
-"""Tests for the opaque, exact-selection replay v3 storage contract."""
+"""Tests for the opaque, exact-selection replay v4 storage contract."""
 
 import os
 from contextlib import contextmanager
@@ -165,7 +165,7 @@ def store_with_recording_cursor(
     return store, cursor, connection
 
 
-class TestReplayV3Contract:
+class TestReplayV4Contract:
     @pytest.mark.parametrize(
         "legacy_name",
         [
@@ -206,11 +206,13 @@ class TestReplayV3Contract:
         )
         assert f"{embedded}\n" == expected
 
-    def test_schema_validation_requires_only_v3_tables(self):
-        exact = {"cartridge_schema_versions", "replay_records"}
+    def test_schema_validation_requires_only_v4_tables(self):
+        exact = {"cartridge_schema_versions", "collection_scopes", "replay_records"}
         _validate_schema_tables(exact)
         with pytest.raises(RuntimeError, match="missing tables: replay_records"):
-            _validate_schema_tables({"cartridge_schema_versions"})
+            _validate_schema_tables({"cartridge_schema_versions", "collection_scopes"})
+        with pytest.raises(RuntimeError, match="missing tables: collection_scopes"):
+            _validate_schema_tables({"cartridge_schema_versions", "replay_records"})
         with pytest.raises(RuntimeError, match="unexpected tables: game_metadata, transitions"):
             _validate_schema_tables(exact | {"transitions", "game_metadata"})
 
@@ -240,7 +242,7 @@ class TestReplayV3Contract:
             with pytest.raises(RuntimeError, match="replay_records.*columns"):
                 _validate_record_schema(columns, _EXPECTED_RECORD_PRIMARY_KEY)
 
-    def test_schema_marker_requires_exact_v3_shape_and_single_row(self):
+    def test_schema_marker_requires_exact_v4_shape_and_single_row(self):
         with pytest.raises(RuntimeError, match="missing.*version marker"):
             _validate_schema_marker(
                 _EXPECTED_SCHEMA_MARKER_COLUMNS,
@@ -715,3 +717,131 @@ class TestPostgresReplayStore:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestScopeRegistry:
+    def test_register_or_verify_accepts_the_exact_registered_binding(self):
+        expected_row = (
+            TEST_PROFILE.env_id,
+            TEST_PROFILE.env_contract_version,
+            TEST_PROFILE.algorithm_id,
+            TEST_PROFILE.experience_schema,
+            TEST_SELECTION.source_checkpoint_id,
+        )
+        store, cursor, _ = store_with_recording_cursor(fetchone=expected_row)
+        with store._connection() as conn:
+            store._register_or_verify_scope(conn.cursor())
+        insert_sql, insert_params = cursor.calls[0]
+        assert "INSERT INTO collection_scopes" in insert_sql
+        assert "ON CONFLICT (scope_id) DO NOTHING" in insert_sql
+        assert insert_params[0] == TEST_SELECTION.collection_scope_id
+
+    def test_register_or_verify_rejects_a_conflicting_source_checkpoint(self):
+        conflicting = (
+            TEST_PROFILE.env_id,
+            TEST_PROFILE.env_contract_version,
+            TEST_PROFILE.algorithm_id,
+            TEST_PROFILE.experience_schema,
+            "f" * 64,  # scope was registered against a different checkpoint
+        )
+        store, _, _ = store_with_recording_cursor(fetchone=conflicting)
+        with store._connection() as conn:
+            with pytest.raises(RuntimeError, match="one scope binds exactly one source"):
+                store._register_or_verify_scope(conn.cursor())
+
+
+class _FakeReaperCursor(_RecordingCursor):
+    def __init__(self, *, victims):
+        super().__init__(rowcount=7)
+        self._victims = victims
+
+    def fetchall(self):
+        return [(victim,) for victim in self._victims]
+
+
+class _FakeReaperConnection:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.autocommit = False
+        self.closed = False
+        self.commits = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None:
+            self.commits += 1
+        return False
+
+    def cursor(self):
+        return self._cursor
+
+    def close(self):
+        self.closed = True
+
+
+class TestScopeReaper:
+    @pytest.mark.parametrize("retained", [0, -1, True, "2", 1.5])
+    def test_reaper_rejects_invalid_retained_scopes(self, retained):
+        from trainer.storage.scope_reaper import reap_profile_scopes
+
+        with pytest.raises(ValueError, match="positive integer"):
+            reap_profile_scopes(
+                profile=TEST_PROFILE,
+                retained_scopes=retained,
+                connection_string="postgresql://unused",
+            )
+
+    def test_reaper_deletes_profile_scopes_beyond_the_window(self, monkeypatch):
+        import trainer.storage.scope_reaper as scope_reaper
+
+        victims = ["b" * 64, "c" * 64]
+        cursor = _FakeReaperCursor(victims=victims)
+        connection = _FakeReaperConnection(cursor)
+        import psycopg2
+
+        monkeypatch.setattr(psycopg2, "connect", lambda dsn, connect_timeout: connection)
+
+        deleted = scope_reaper.reap_profile_scopes(
+            profile=TEST_PROFILE,
+            retained_scopes=2,
+            connection_string="postgresql://unused",
+        )
+
+        assert deleted == 7
+        select_sql, select_params = cursor.calls[0]
+        assert "FROM collection_scopes" in select_sql
+        assert "OFFSET %s" in select_sql
+        assert select_params[-1] == 2
+        delete_records_sql, delete_records_params = cursor.calls[1]
+        assert "DELETE FROM replay_records" in delete_records_sql
+        assert "collection_scope_id = ANY(%s)" in delete_records_sql
+        assert delete_records_params[-1] == victims
+        delete_scopes_sql, delete_scopes_params = cursor.calls[2]
+        assert "DELETE FROM collection_scopes" in delete_scopes_sql
+        assert delete_scopes_params == (victims,)
+        vacuum_sql, _ = cursor.calls[3]
+        assert vacuum_sql.startswith("VACUUM")
+        assert connection.autocommit is True
+        assert connection.closed is True
+
+    def test_reaper_is_a_noop_when_the_window_covers_every_scope(self, monkeypatch):
+        import trainer.storage.scope_reaper as scope_reaper
+
+        cursor = _FakeReaperCursor(victims=[])
+        connection = _FakeReaperConnection(cursor)
+        import psycopg2
+
+        monkeypatch.setattr(psycopg2, "connect", lambda dsn, connect_timeout: connection)
+
+        assert (
+            scope_reaper.reap_profile_scopes(
+                profile=TEST_PROFILE,
+                retained_scopes=5,
+                connection_string="postgresql://unused",
+            )
+            == 0
+        )
+        assert len(cursor.calls) == 1
+        assert connection.closed is True

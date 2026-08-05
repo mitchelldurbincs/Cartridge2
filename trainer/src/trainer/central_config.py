@@ -307,6 +307,7 @@ def _validate_storage(config: Config) -> None:
         (config.storage.pool_max_size, "storage.pool_max_size"),
         (config.storage.pool_connect_timeout, "storage.pool_connect_timeout"),
         (config.storage.pool_idle_timeout, "storage.pool_idle_timeout"),
+        (config.storage.replay_retained_scopes, "storage.replay_retained_scopes"),
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"{path} must be a positive integer")

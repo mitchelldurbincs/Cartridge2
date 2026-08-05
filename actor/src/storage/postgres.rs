@@ -23,13 +23,27 @@ const SELECTION_PREDICATE: &str = "env_id = $1 AND env_contract_version = $2
      AND collection_scope_id = $5
      AND source_checkpoint_id IS NOT DISTINCT FROM $6";
 
-const REPLAY_SCHEMA_VERSION: i32 = 3;
-const REPLAY_SCHEMA_TABLES: &[&str] = &["cartridge_schema_versions", "replay_records"];
+const REPLAY_SCHEMA_VERSION: i32 = 4;
+const REPLAY_SCHEMA_TABLES: &[&str] = &[
+    "cartridge_schema_versions",
+    "collection_scopes",
+    "replay_records",
+];
 const EXPECTED_SCHEMA_MARKER_COLUMNS: &[(&str, &str, &str)] = &[
     ("component", "text", "NO"),
     ("schema_version", "integer", "NO"),
 ];
 const EXPECTED_SCHEMA_MARKER_PRIMARY_KEY: &[&str] = &["component"];
+const EXPECTED_SCOPE_COLUMNS: &[(&str, &str, &str)] = &[
+    ("scope_id", "text", "NO"),
+    ("env_id", "text", "NO"),
+    ("env_contract_version", "bigint", "NO"),
+    ("algorithm_id", "text", "NO"),
+    ("experience_schema", "text", "NO"),
+    ("source_checkpoint_id", "text", "YES"),
+    ("created_at", "timestamp without time zone", "NO"),
+];
+const EXPECTED_SCOPE_PRIMARY_KEY: &[&str] = &["scope_id"];
 const EXPECTED_RECORD_COLUMNS: &[(&str, &str, &str)] = &[
     ("id", "text", "NO"),
     ("env_id", "text", "NO"),
@@ -193,6 +207,16 @@ fn validate_record_schema(columns: &[ColumnSpec], primary_key: &[String]) -> Res
         primary_key,
         EXPECTED_RECORD_COLUMNS,
         EXPECTED_RECORD_PRIMARY_KEY,
+    )
+}
+
+fn validate_scope_schema(columns: &[ColumnSpec], primary_key: &[String]) -> Result<()> {
+    validate_table_schema(
+        "collection_scopes",
+        columns,
+        primary_key,
+        EXPECTED_SCOPE_COLUMNS,
+        EXPECTED_SCOPE_PRIMARY_KEY,
     )
 }
 
@@ -478,6 +502,11 @@ impl PostgresReplayStore {
         let record_primary_key = table_primary_key(&transaction, "replay_records").await?;
         validate_record_schema(&record_columns, &record_primary_key)?;
 
+        let scope_columns = table_columns(&transaction, "collection_scopes").await?;
+        let scope_primary_key = table_primary_key(&transaction, "collection_scopes").await?;
+        validate_scope_schema(&scope_columns, &scope_primary_key)?;
+        self.register_or_verify_scope(&transaction).await?;
+
         transaction
             .commit()
             .await
@@ -486,6 +515,68 @@ impl PostgresReplayStore {
             schema_version = REPLAY_SCHEMA_VERSION,
             "PostgreSQL replay schema validated"
         );
+        Ok(())
+    }
+
+    /// Register this store's scope, or verify an existing registration.
+    ///
+    /// One collection scope binds exactly one profile and source checkpoint.
+    /// The first store to use a scope registers that binding; any later store
+    /// arriving with a different source checkpoint fails here, loudly, at
+    /// startup — instead of silently writing rows no read or delete could
+    /// ever reach through the exact selection fence.
+    async fn register_or_verify_scope(&self, transaction: &Transaction<'_>) -> Result<()> {
+        let profile = &self.selection.profile;
+        let contract_version = i64::from(profile.env_contract_version);
+        transaction
+            .execute(
+                "INSERT INTO collection_scopes
+                 (scope_id, env_id, env_contract_version, algorithm_id,
+                  experience_schema, source_checkpoint_id)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (scope_id) DO NOTHING",
+                &[
+                    &self.selection.collection_scope_id,
+                    &profile.env_id,
+                    &contract_version,
+                    &profile.algorithm_id,
+                    &profile.experience_schema,
+                    &self.selection.source_checkpoint_id,
+                ],
+            )
+            .await
+            .context("failed to register replay collection scope")?;
+        let row = transaction
+            .query_one(
+                "SELECT env_id, env_contract_version, algorithm_id, experience_schema,
+                        source_checkpoint_id
+                 FROM collection_scopes WHERE scope_id = $1",
+                &[&self.selection.collection_scope_id],
+            )
+            .await
+            .context("failed to read registered replay collection scope")?;
+        let registered = (
+            row.get::<_, String>(0),
+            row.get::<_, i64>(1),
+            row.get::<_, String>(2),
+            row.get::<_, String>(3),
+            row.get::<_, Option<String>>(4),
+        );
+        let expected = (
+            profile.env_id.clone(),
+            contract_version,
+            profile.algorithm_id.clone(),
+            profile.experience_schema.clone(),
+            self.selection.source_checkpoint_id.clone(),
+        );
+        if registered != expected {
+            bail!(
+                "collection scope '{}' is already registered with a different \
+                 profile or source checkpoint (registered {registered:?}, this \
+                 store requires {expected:?}); one scope binds exactly one source",
+                self.selection.collection_scope_id
+            );
+        }
         Ok(())
     }
 
@@ -717,8 +808,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_is_v3_selection_fenced_opaque_record_contract() {
-        assert!(SCHEMA_SQL.contains("VALUES ('replay', 3)"));
+    fn schema_is_v4_selection_fenced_opaque_record_contract() {
+        assert!(SCHEMA_SQL.contains("VALUES ('replay', 4)"));
         assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS replay_records"));
         assert!(SCHEMA_SQL.contains("env_contract_version BETWEEN 1 AND 4294967295"));
         assert!(SCHEMA_SQL.contains("step_number BIGINT NOT NULL"));
@@ -726,6 +817,12 @@ mod tests {
         assert!(SCHEMA_SQL.contains("collection_scope_id TEXT NOT NULL"));
         assert!(SCHEMA_SQL.contains("source_checkpoint_id TEXT"));
         assert!(SCHEMA_SQL.contains("payload BYTEA NOT NULL"));
+        // v4: first-class scope registry, records FK to it, reaper-friendly
+        // autovacuum, and no unused episode index.
+        assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS collection_scopes"));
+        assert!(SCHEMA_SQL.contains("REFERENCES collection_scopes(scope_id)"));
+        assert!(SCHEMA_SQL.contains("autovacuum_vacuum_scale_factor"));
+        assert!(!SCHEMA_SQL.contains("idx_replay_records_selection_episode"));
         for leaked in [
             "game_metadata",
             "policy_probs",
@@ -740,12 +837,17 @@ mod tests {
 
     #[test]
     fn exact_schema_validation_rejects_extra_tables_or_columns() {
-        let tables = vec![
+        let exact = vec![
             "cartridge_schema_versions".into(),
+            "collection_scopes".into(),
             "replay_records".into(),
-            "legacy".into(),
         ];
+        assert!(validate_schema_tables(&exact).is_ok());
+        let mut tables = exact.clone();
+        tables.push("legacy".into());
         assert!(validate_schema_tables(&tables).is_err());
+        let missing_scopes = vec!["cartridge_schema_versions".into(), "replay_records".into()];
+        assert!(validate_schema_tables(&missing_scopes).is_err());
 
         let mut columns = column_specs(EXPECTED_RECORD_COLUMNS);
         columns.push(ColumnSpec::new("reward", "real", "NO"));
@@ -757,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_marker_requires_exact_v3_row() {
+    fn schema_marker_requires_exact_v4_row() {
         let columns = column_specs(EXPECTED_SCHEMA_MARKER_COLUMNS);
         let primary_key = vec!["component".to_string()];
         assert!(validate_schema_marker(

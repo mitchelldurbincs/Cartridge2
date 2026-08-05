@@ -129,6 +129,7 @@ Storage backend configuration.
 | `pool_max_size` | usize | `16` | Max PostgreSQL pool connections |
 | `pool_connect_timeout` | u64 | `30` | Pool connection timeout (seconds) |
 | `pool_idle_timeout` | u64? | `300` | Pool idle timeout (seconds) |
+| `replay_retained_scopes` | u32 | `2` | Newest collection scopes kept per profile; older scopes are reaped after each commit |
 
 ### [wandb]
 

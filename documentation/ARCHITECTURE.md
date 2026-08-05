@@ -1251,72 +1251,38 @@ Storage interprets none of the payload bytes; the algorithm cartridge named by
 
 Schema — the authoritative copy is [`sql/schema.sql`](../sql/schema.sql), which
 the Rust actor embeds at compile time (`include_str!`) and the Python trainer
-reads at runtime:
+reads at runtime. The DDL is deliberately not restated here — earlier copies of
+this section drifted from the shipped file; read the source.
 
-```sql
-CREATE TABLE IF NOT EXISTS cartridge_schema_versions (
-    component TEXT PRIMARY KEY,
-    schema_version INTEGER NOT NULL CHECK (schema_version > 0)
-);
+The v4 contract in brief:
 
-INSERT INTO cartridge_schema_versions (component, schema_version)
-VALUES ('replay', 3)
-ON CONFLICT (component) DO NOTHING;
-
-CREATE TABLE IF NOT EXISTS replay_records (
-    id TEXT NOT NULL,
-    env_id TEXT NOT NULL,
-    env_contract_version BIGINT NOT NULL
-        CHECK (env_contract_version BETWEEN 1 AND 4294967295),
-    algorithm_id TEXT NOT NULL,
-    experience_schema TEXT NOT NULL,
-    collection_scope_id TEXT NOT NULL
-        CHECK (collection_scope_id ~ '^[0-9a-f]{64}$'),
-    source_checkpoint_id TEXT
-        CHECK (
-            source_checkpoint_id IS NULL
-            OR source_checkpoint_id ~ '^[0-9a-f]{64}$'
-        ),
-    episode_id TEXT NOT NULL,
-    step_number BIGINT NOT NULL
-        CHECK (step_number BETWEEN 0 AND 4294967295),
-    payload BYTEA NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (
-        env_id, env_contract_version, algorithm_id, experience_schema,
-        collection_scope_id, id
-    )
-);
-
-CREATE INDEX IF NOT EXISTS idx_replay_records_selection_created
-    ON replay_records(
-        env_id, env_contract_version, algorithm_id, experience_schema,
-        collection_scope_id, source_checkpoint_id, created_at DESC
-    );
-
-CREATE INDEX IF NOT EXISTS idx_replay_records_selection_episode
-    ON replay_records(
-        env_id, env_contract_version, algorithm_id, experience_schema,
-        collection_scope_id, source_checkpoint_id, episode_id, step_number
-    );
-```
-
-Selection/creation-time and selection/episode indexes support concurrent
-writers, sampling, retention cleanup, and episode inspection without adding
-algorithm-specific columns.
+- `cartridge_schema_versions` must contain exactly `('replay', 4)`.
+- `collection_scopes` is a first-class scope registry: the first store to use
+  a scope registers its profile and `source_checkpoint_id`, every later store
+  must match that binding exactly (a mismatched source checkpoint fails at
+  startup), and `replay_records.collection_scope_id` references it, so a
+  record can never be written into an unregistered scope.
+- `replay_records` keeps the opaque envelope and the profile-scoped primary
+  key `(env_id, env_contract_version, algorithm_id, experience_schema,
+  collection_scope_id, id)`.
+- One selection/created index supports newest-first retention. Sampling does
+  not scan the table: the trainer snapshots the selection's row IDs in memory
+  and fetches minibatches by `id = ANY(...)`, so the per-step cost is
+  O(batch) regardless of table size.
+- After every committed iteration the orchestrator reaps scopes beyond
+  `storage.replay_retained_scopes` (default 2): dead scopes' rows and
+  registry entries are deleted and the table vacuumed, so the replay database
+  stays bounded across arbitrarily long runs.
 
 > **Clean schema cutover:** existing replay databases must be recreated from
-> `sql/schema.sql`. Cartridge2 deliberately provides no migration from the old
-> concrete transition columns to an opaque payload because there is no honest,
-> generic codec that can be inferred for those rows.
+> `sql/schema.sql`. Cartridge2 deliberately provides no migration; preserve
+> anything you need first.
 
-The runtime requires the exact replay protocol marker
-`cartridge_schema_versions(component='replay', schema_version=3)`. The actor
-embeds `sql/schema.sql`, and the trainer's packaged copy is byte-identical.
-Compose and K8s bootstrap scripts implement the same tables, constraints, keys,
-and indexes, then add deployment-specific grants. The only tables in the replay
-contract are `cartridge_schema_versions` and `replay_records`; there are no
-board, environment-metadata, model, or training-stat tables.
+The actor embeds `sql/schema.sql`, and the trainer's packaged copy is
+byte-identical, as are the Compose and K8s bootstrap copies (enforced by
+tests). The only tables in the replay contract are `cartridge_schema_versions`,
+`collection_scopes`, and `replay_records`; there are no board,
+environment-metadata, model, or training-stat tables.
 
 `alphazero_board_v1` owns `alphazero_transition_v1`. Its exact language-neutral
 payload is a concatenation of little-endian `f32` values:

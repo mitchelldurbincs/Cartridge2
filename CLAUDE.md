@@ -194,7 +194,7 @@ Algorithm-dispatched experience collector using engine-core directly:
   the requested source checkpoint, then drops the watcher before collection
 - Stores MCTS visit distributions as policy targets (raw tau=1, never sharpened
   by the play temperature)
-- Stores an opaque AlphaZero payload inside a replay-v3 envelope tagged with
+- Stores an opaque AlphaZero payload inside a replay-v4 envelope tagged with
   `env_id`, `env_contract_version`, `algorithm_id`, `experience_schema`,
   `collection_scope_id`, and nullable `source_checkpoint_id`
 - Terminal outcome encoding for value targets
@@ -456,7 +456,7 @@ Highest to lowest:
 - **The trainer reads the replay DSN only from `CARTRIDGE_STORAGE_POSTGRES_URL`.**
   `storage.postgres_url` in `config.toml` is used by the Rust actor and web
   server, but *not* by the Python trainer.
-- **Replay schema v3 is a clean cutover.** Existing databases do not have the
+- **Replay schema v4 is a clean cutover.** Existing databases do not have the
   required `env_contract_version`, `algorithm_id`, `experience_schema`,
   `collection_scope_id`, and nullable `source_checkpoint_id` fence or composite
   primary key. Recreate the database from `sql/schema.sql`; there is no data

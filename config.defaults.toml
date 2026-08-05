@@ -79,6 +79,7 @@ postgres_url = "postgresql://cartridge:cartridge@localhost:5432/cartridge"
 pool_max_size = 16
 pool_connect_timeout = 30
 pool_idle_timeout = 300
+replay_retained_scopes = 2  # Newest collection scopes kept per profile; older scopes are reaped after each commit
 
 [wandb]
 enabled = false           # Log cartridge loop runs to Weights & Biases

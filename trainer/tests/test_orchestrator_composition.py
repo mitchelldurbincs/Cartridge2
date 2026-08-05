@@ -377,6 +377,12 @@ class TestOrchestratorComposition:
             return buffer
 
         monkeypatch.setattr(orchestrator_module, "create_replay_store", fake_replay_factory)
+        reaped: list[tuple] = []
+        monkeypatch.setattr(
+            orchestrator_module,
+            "reap_profile_scopes",
+            lambda *, profile, retained_scopes: reaped.append((profile, retained_scopes)) or 0,
+        )
         built = make_stub_learner(monkeypatch)
 
         fake_binary = tmp_path / "actor-stub.exe"
@@ -444,6 +450,8 @@ class TestOrchestratorComposition:
             buffers[-1].selection.collection_scope_id
         )
         assert committed.orchestration.source_checkpoint_id is None
+        # The reaper ran exactly once, after the commit, over this profile.
+        assert reaped == [(replay_profile("tictactoe"), 2)]
 
     def test_exact_episode_seal_aborts_before_learning_or_commit(self, tmp_path, monkeypatch):
         buffers: list[FakeReplayStore] = []

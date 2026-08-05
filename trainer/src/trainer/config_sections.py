@@ -300,6 +300,7 @@ class StorageConfig:
     pool_max_size: int = _default("storage", "pool_max_size")
     pool_connect_timeout: int = _default("storage", "pool_connect_timeout")
     pool_idle_timeout: int = _default("storage", "pool_idle_timeout")
+    replay_retained_scopes: int = _default("storage", "replay_retained_scopes")
 
 
 @dataclass

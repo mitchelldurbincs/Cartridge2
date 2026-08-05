@@ -21,14 +21,24 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-REPLAY_SCHEMA_VERSION = 3
-_REPLAY_SCHEMA_TABLES = {"cartridge_schema_versions", "replay_records"}
+REPLAY_SCHEMA_VERSION = 4
+_REPLAY_SCHEMA_TABLES = {"cartridge_schema_versions", "collection_scopes", "replay_records"}
 _EXPECTED_SCHEMA_MARKER_COLUMNS = (
     ("component", "text", "NO"),
     ("schema_version", "integer", "NO"),
 )
 _EXPECTED_SCHEMA_MARKER_PRIMARY_KEY = ("component",)
 _EXPECTED_SCHEMA_MARKER_ROWS = (("replay", REPLAY_SCHEMA_VERSION),)
+_EXPECTED_SCOPE_COLUMNS = (
+    ("scope_id", "text", "NO"),
+    ("env_id", "text", "NO"),
+    ("env_contract_version", "bigint", "NO"),
+    ("algorithm_id", "text", "NO"),
+    ("experience_schema", "text", "NO"),
+    ("source_checkpoint_id", "text", "YES"),
+    ("created_at", "timestamp without time zone", "NO"),
+)
+_EXPECTED_SCOPE_PRIMARY_KEY = ("scope_id",)
 _EXPECTED_RECORD_COLUMNS = (
     ("id", "text", "NO"),
     ("env_id", "text", "NO"),
@@ -121,6 +131,18 @@ def _validate_record_schema(
         primary_key,
         _EXPECTED_RECORD_COLUMNS,
         _EXPECTED_RECORD_PRIMARY_KEY,
+    )
+
+
+def _validate_scope_schema(
+    columns: tuple[tuple[str, str, str], ...], primary_key: tuple[str, ...]
+) -> None:
+    _validate_table_schema(
+        "collection_scopes",
+        columns,
+        primary_key,
+        _EXPECTED_SCOPE_COLUMNS,
+        _EXPECTED_SCOPE_PRIMARY_KEY,
     )
 
 
@@ -297,7 +319,7 @@ class PostgresReplayStore(ReplayStore):
         return columns, tuple(row[0] for row in cur.fetchall())
 
     def _ensure_schema(self) -> None:
-        """Create only an empty schema, then require the exact v3 protocol."""
+        """Create only an empty schema, then require the exact v4 protocol."""
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT pg_advisory_xact_lock(745472510202)")
@@ -333,8 +355,63 @@ class PostgresReplayStore(ReplayStore):
 
                 record_columns, record_primary_key = self._table_contract(cur, "replay_records")
                 _validate_record_schema(record_columns, record_primary_key)
+
+                scope_columns, scope_primary_key = self._table_contract(cur, "collection_scopes")
+                _validate_scope_schema(scope_columns, scope_primary_key)
+                self._register_or_verify_scope(cur)
                 conn.commit()
-                logger.info("PostgreSQL replay schema v3 validated/created")
+                logger.info("PostgreSQL replay schema v4 validated/created")
+
+    def _register_or_verify_scope(self, cur) -> None:
+        """Register this store's scope, or verify an existing registration.
+
+        One collection scope binds exactly one profile and source checkpoint.
+        The first store to use a scope registers that binding; any later store
+        arriving with a different source checkpoint fails here, loudly, at
+        startup — instead of silently writing rows no read or delete could
+        ever reach through the exact selection fence.
+        """
+        profile = self.selection.profile
+        cur.execute(
+            """
+            INSERT INTO collection_scopes
+                (scope_id, env_id, env_contract_version, algorithm_id,
+                 experience_schema, source_checkpoint_id)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (scope_id) DO NOTHING
+            """,
+            (
+                self.selection.collection_scope_id,
+                profile.env_id,
+                profile.env_contract_version,
+                profile.algorithm_id,
+                profile.experience_schema,
+                self.selection.source_checkpoint_id,
+            ),
+        )
+        cur.execute(
+            """
+            SELECT env_id, env_contract_version, algorithm_id, experience_schema,
+                   source_checkpoint_id
+            FROM collection_scopes WHERE scope_id = %s
+            """,
+            (self.selection.collection_scope_id,),
+        )
+        registered = cur.fetchone()
+        expected = (
+            profile.env_id,
+            profile.env_contract_version,
+            profile.algorithm_id,
+            profile.experience_schema,
+            self.selection.source_checkpoint_id,
+        )
+        if tuple(registered or ()) != expected:
+            raise RuntimeError(
+                f"Collection scope '{self.selection.collection_scope_id}' is "
+                f"already registered with a different profile or source "
+                f"checkpoint (registered {registered!r}, this store requires "
+                f"{expected!r}); one scope binds exactly one source."
+            )
 
     def _count_selection(self, cur) -> int:
         cur.execute(
