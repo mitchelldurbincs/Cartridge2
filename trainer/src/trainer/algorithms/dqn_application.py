@@ -106,7 +106,9 @@ class DqnApplication:
             repository = create_checkpoint_publisher(
                 self.cartridge.artifact_contract(environment), request.model_dir
             )
-            checkpoint = repository.resolve_checkpoint(request.checkpoint_id)
+            checkpoint = repository.resolve_checkpoint(
+                request.checkpoint_id, require_learner_state=False
+            )
             player = str(checkpoint.onnx_path)
         binary = _find_binary(
             request.eval_binary,

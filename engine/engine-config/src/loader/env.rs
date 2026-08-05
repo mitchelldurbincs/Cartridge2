@@ -72,6 +72,7 @@ const KNOWN_CONFIG_ENV_KEYS: &[&str] = &[
     "CARTRIDGE_STORAGE_POOL_CONNECT_TIMEOUT",
     "CARTRIDGE_STORAGE_POOL_IDLE_TIMEOUT",
     "CARTRIDGE_STORAGE_REPLAY_RETAINED_SCOPES",
+    "CARTRIDGE_STORAGE_LEARNER_STATE_RETAINED_CHECKPOINTS",
     "CARTRIDGE_WANDB_ENABLED",
     "CARTRIDGE_WANDB_REQUIRED",
     "CARTRIDGE_WANDB_PROJECT",
@@ -456,6 +457,12 @@ fn apply_service_overrides(config: &mut CentralConfig) -> Result<(), ConfigError
         config,
         storage.replay_retained_scopes,
         "CARTRIDGE_STORAGE_REPLAY_RETAINED_SCOPES",
+        parse
+    );
+    env_override!(
+        config,
+        storage.learner_state_retained_checkpoints,
+        "CARTRIDGE_STORAGE_LEARNER_STATE_RETAINED_CHECKPOINTS",
         parse
     );
     env_override!(config, wandb.enabled, "CARTRIDGE_WANDB_ENABLED", parse);

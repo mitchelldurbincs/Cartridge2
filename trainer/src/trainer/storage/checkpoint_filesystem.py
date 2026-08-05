@@ -189,13 +189,14 @@ class FilesystemCheckpointPublisher:
         self,
         manifest: CheckpointManifestV1,
         onnx_data: bytes,
-        learner_data: bytes,
+        learner_data: bytes | None,
     ) -> CheckpointRef:
         checkpoint_id = manifest.checkpoint_id
         onnx_path = self._blob_path(manifest.onnx, "onnx")
         learner_path = self._blob_path(manifest.learner_state, "pt")
         create_or_verify(onnx_path, onnx_data)
-        create_or_verify(learner_path, learner_data)
+        if learner_data is not None:
+            create_or_verify(learner_path, learner_data)
         create_or_verify(self._manifest_path(checkpoint_id), manifest.to_bytes())
         return CheckpointRef(checkpoint_id, manifest, onnx_path, learner_path)
 
@@ -345,7 +346,17 @@ class FilesystemCheckpointPublisher:
         checkpoint_id: str,
         *,
         expected_config_sha256: str | None = None,
+        require_learner_state: bool = True,
     ) -> CheckpointRef:
+        """Resolve and verify one immutable checkpoint.
+
+        ``require_learner_state=False`` is for inference-only consumers
+        (player registry, solver-eval discovery, champion evaluation): an
+        *absent* learner-state blob is then permitted, because the blob
+        reaper prunes ``.pt`` blobs beyond the resume window. A *present*
+        invalid blob still fails either way — absent is permitted, corrupt
+        never is.
+        """
         manifest = self._load_manifest(
             checkpoint_id,
             expected_config_sha256=expected_config_sha256,
@@ -354,14 +365,22 @@ class FilesystemCheckpointPublisher:
         onnx_path = self._blob_path(manifest.onnx, "onnx")
         learner_path = self._blob_path(manifest.learner_state, "pt")
         self._verify_local_blob(onnx_path, manifest.onnx, name="ONNX blob")
-        self._verify_local_blob(learner_path, manifest.learner_state, name="learner-state blob")
         validate_onnx_checkpoint(onnx_path, self.contract)
-        validate_learner_state(
-            learner_path,
-            contract=self.contract,
-            step=manifest.step,
-            config_sha256=manifest.config_sha256,
-        )
+        if require_learner_state and not learner_path.is_file():
+            raise ArtifactValidationError(
+                f"learner-state blob does not exist: {learner_path}. It may "
+                "have been pruned by the blob reaper "
+                "(storage.learner_state_retained_checkpoints); resume from a "
+                "newer checkpoint."
+            )
+        if require_learner_state or learner_path.is_file():
+            self._verify_local_blob(learner_path, manifest.learner_state, name="learner-state blob")
+            validate_learner_state(
+                learner_path,
+                contract=self.contract,
+                step=manifest.step,
+                config_sha256=manifest.config_sha256,
+            )
         return CheckpointRef(checkpoint_id, manifest, onnx_path, learner_path)
 
     def resolve_checkpoint_manifest(
@@ -388,7 +407,7 @@ class FilesystemCheckpointPublisher:
             expected_config_sha256=expected_config_sha256,
         )
 
-    def list_checkpoints(self) -> list[CheckpointRef]:
+    def list_checkpoint_manifest_ids(self) -> list[str]:
         directory = self.model_root / "manifests" / "sha256"
         if not directory.exists():
             return []
@@ -405,9 +424,29 @@ class FilesystemCheckpointPublisher:
             checkpoint_id = path.stem
             require_digest(checkpoint_id, field="manifest filename checkpoint_id")
             checkpoint_ids.append(checkpoint_id)
-        checkpoints = [self.resolve_checkpoint(item) for item in checkpoint_ids]
+        return checkpoint_ids
+
+    def list_checkpoints(self) -> list[CheckpointRef]:
+        # Discovery serves inference consumers (registry, solver-eval), so a
+        # reaped learner-state blob must not hide a checkpoint from them.
+        checkpoints = [
+            self.resolve_checkpoint(item, require_learner_state=False)
+            for item in self.list_checkpoint_manifest_ids()
+        ]
         checkpoints.sort(key=lambda item: (item.manifest.step, item.checkpoint_id))
         return checkpoints
+
+    def delete_learner_state_blob(self, digest: str) -> bool:
+        """Remove one immutable learner-state blob (blob reaper only).
+
+        Returns True only when a blob was actually present and removed.
+        """
+        require_digest(digest, field="learner-state blob digest")
+        path = self.model_root / "blobs" / "sha256" / f"{digest}.pt"
+        if not path.is_file():
+            return False
+        path.unlink()
+        return True
 
     def _validate_manifest_profile(
         self,

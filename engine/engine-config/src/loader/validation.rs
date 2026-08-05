@@ -74,6 +74,11 @@ fn validate_storage_and_logging(config: &CentralConfig) -> Result<(), ConfigErro
             "storage.replay_retained_scopes must be greater than zero".to_string(),
         ));
     }
+    if config.storage.learner_state_retained_checkpoints == 0 {
+        return Err(ConfigError::InvalidConfig(
+            "storage.learner_state_retained_checkpoints must be greater than zero".to_string(),
+        ));
+    }
     if !matches!(config.logging.format.as_str(), "text" | "json") {
         return Err(ConfigError::InvalidConfig(format!(
             "logging.format must be 'text' or 'json', got {:?}",

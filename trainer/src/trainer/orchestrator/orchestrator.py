@@ -27,6 +27,7 @@ from ..stats import (
     prepare_stats_snapshot,
 )
 from ..storage import ReplayProfile, ReplaySelection, create_replay_store
+from ..storage.blob_reaper import prune_learner_state_blobs
 from ..storage.evaluation import (
     ChampionReferenceV1,
     create_evaluation_repository,
@@ -624,15 +625,21 @@ class Orchestrator(_CoreOrchestrator):
         prepared = PreparedRunV1(run_commit=commit, evaluation=evaluation)
         self.run_journal.publish(prepared)
         self._finish_prepared(prepared)
-        # The commit is authoritative, so scopes older than the retained
-        # window are now unreachable by any future selection: reap them so
-        # the replay table stays bounded. Fail closed — a reaper error is a
-        # storage problem the operator must see, not a warning to scroll past.
+        # The commit is authoritative, so storage older than the retained
+        # windows is now unreachable by any future selection or resume: reap
+        # dead replay scopes and prune learner-state blobs so both stores stay
+        # bounded. Fail closed — a reaper error is a storage problem the
+        # operator must see, not a warning to scroll past.
         reap_profile_scopes(
             profile=replay_selection.profile,
             retained_scopes=get_config().storage.replay_retained_scopes,
         )
         committed_chain = self._head_chain()
+        prune_learner_state_blobs(
+            self.run_commits.checkpoints,
+            committed_chain,
+            retained_checkpoints=get_config().storage.learner_state_retained_checkpoints,
+        )
         self._rebuild_projections(committed_chain)
         self._report_committed(commit)
         return self._iteration_stats(commit)

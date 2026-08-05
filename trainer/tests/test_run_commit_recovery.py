@@ -767,3 +767,80 @@ def test_resolve_chain_memoizes_validated_prefixes_on_the_publisher(tmp_path, st
     cold = RunCommitRepository(cold_publisher, FilesystemEvaluationRepository(cold_publisher))
     with pytest.raises(ArtifactValidationError, match="does not exist"):
         cold.resolve_chain(head.run_commit_id)
+
+
+def test_blob_reaper_prunes_only_in_chain_learner_state_beyond_the_window(tmp_path, staged_blobs):
+    from trainer.storage.blob_reaper import prune_learner_state_blobs
+
+    config = loop_config(tmp_path / "blob-reaper")
+    checkpoints, evaluations, commits, root_candidate, prepared = build_root(config, staged_blobs)
+    evaluations.publish_evidence(prepared.evaluation.artifact)
+    root = commits.publish(prepared.run_commit)
+    child_candidate = stage_checkpoint(
+        checkpoints,
+        staged_blobs,
+        step=2,
+        config_sha256=recipe_for(config).learner_config_sha256,
+        parent=root_candidate.checkpoint_id,
+    )
+    child_evaluation = evaluation_for(
+        config, child_candidate, root.commit, iteration=2, promoted=False
+    )
+    evaluations.publish_evidence(child_evaluation.artifact)
+    middle = commits.publish(
+        commit_for(config, child_candidate, root.commit, iteration=2, evaluation=child_evaluation)
+    )
+    third_candidate = stage_checkpoint(
+        checkpoints,
+        staged_blobs,
+        step=3,
+        config_sha256=recipe_for(config).learner_config_sha256,
+        parent=child_candidate.checkpoint_id,
+    )
+    third_evaluation = evaluation_for(
+        config, third_candidate, middle.commit, iteration=3, promoted=False
+    )
+    evaluations.publish_evidence(third_evaluation.artifact)
+    head = commits.publish(
+        commit_for(config, third_candidate, middle.commit, iteration=3, evaluation=third_evaluation)
+    )
+    chain = commits.resolve_chain(head.run_commit_id)
+
+    # Distinct learner states per checkpoint; the root is the champion.
+    assert (
+        len(
+            {
+                root_candidate.learner_state_path,
+                child_candidate.learner_state_path,
+                third_candidate.learner_state_path,
+            }
+        )
+        == 3
+    )
+    assert chain[-1].commit.champion.checkpoint_id == root_candidate.checkpoint_id
+
+    pruned = prune_learner_state_blobs(checkpoints, chain, retained_checkpoints=1)
+
+    # Only the middle checkpoint is prunable: the newest is retained for
+    # resume and the champion (the root) is protected.
+    assert pruned == 1
+    assert not child_candidate.learner_state_path.is_file()
+    assert root_candidate.learner_state_path.is_file()
+    assert third_candidate.learner_state_path.is_file()
+    # Every ONNX blob is preserved for tournaments/solver-eval.
+    assert child_candidate.onnx_path.is_file()
+
+    # The pruned checkpoint still resolves for inference-only consumers, and
+    # still fails closed for resume.
+    resolved = checkpoints.resolve_checkpoint(
+        child_candidate.checkpoint_id, require_learner_state=False
+    )
+    assert resolved.checkpoint_id == child_candidate.checkpoint_id
+    with pytest.raises(ArtifactValidationError, match="pruned by the blob reaper"):
+        checkpoints.resolve_checkpoint(child_candidate.checkpoint_id)
+
+    # Idempotent: a second pass finds nothing new.
+    assert prune_learner_state_blobs(checkpoints, chain, retained_checkpoints=1) == 0
+
+    with pytest.raises(ValueError, match="positive integer"):
+        prune_learner_state_blobs(checkpoints, chain, retained_checkpoints=0)

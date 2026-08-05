@@ -131,7 +131,9 @@ def _resolve_registered_checkpoint(
     path = Path(onnx_path)
     model_root = _model_root_from_blob(path)
     repository = create_checkpoint_publisher(contract, model_root)
-    checkpoint = repository.resolve_checkpoint(checkpoint_id)
+    # Inference-only: tournaments need the ONNX blob; the learner-state blob
+    # may have been pruned for historical checkpoints and is not required.
+    checkpoint = repository.resolve_checkpoint(checkpoint_id, require_learner_state=False)
     if checkpoint.onnx_path != path:
         raise ArtifactValidationError(
             f"Registered ONNX path {path} does not match checkpoint "

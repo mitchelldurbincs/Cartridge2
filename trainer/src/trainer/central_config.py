@@ -308,6 +308,10 @@ def _validate_storage(config: Config) -> None:
         (config.storage.pool_connect_timeout, "storage.pool_connect_timeout"),
         (config.storage.pool_idle_timeout, "storage.pool_idle_timeout"),
         (config.storage.replay_retained_scopes, "storage.replay_retained_scopes"),
+        (
+            config.storage.learner_state_retained_checkpoints,
+            "storage.learner_state_retained_checkpoints",
+        ),
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"{path} must be a positive integer")

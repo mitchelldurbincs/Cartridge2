@@ -380,13 +380,15 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
         )
         return checkpoint
 
-    def _local_blob_or_download(self, descriptor, extension: str, *, name: str) -> bytes:
+    def _optional_blob(self, descriptor, extension: str, *, name: str) -> bytes | None:
         """Return verified blob bytes, preferring the local content-addressed cache.
 
         The cached file is re-hashed against the manifest descriptor on every
         use (fail-closed against local corruption); only on absence or
         mismatch is the object actually downloaded. This is what keeps
         commit_run_head from re-downloading both full blobs per iteration.
+        Returns None only when the object does not exist anywhere; present
+        invalid bytes always raise.
         """
         path = self._blob_path(descriptor, extension)
         if path.is_file():
@@ -395,8 +397,14 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
                 return cached
         data = self._get(self._key(f"blobs/sha256/{descriptor.sha256}.{extension}"))
         if data is None:
-            raise ArtifactValidationError("S3 checkpoint is missing a blob")
+            return None
         verified_blob(data, descriptor, name=name)
+        return data
+
+    def _local_blob_or_download(self, descriptor, extension: str, *, name: str) -> bytes:
+        data = self._optional_blob(descriptor, extension, name=name)
+        if data is None:
+            raise ArtifactValidationError("S3 checkpoint is missing a blob")
         return data
 
     def resolve_checkpoint(
@@ -404,6 +412,7 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
         checkpoint_id: str,
         *,
         expected_config_sha256: str | None = None,
+        require_learner_state: bool = True,
     ) -> CheckpointRef:
         manifest = self._load_manifest(
             checkpoint_id,
@@ -411,17 +420,27 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
         )
         self._validate_manifest_lineage(manifest)
         onnx_data = self._local_blob_or_download(manifest.onnx, "onnx", name="S3 ONNX blob")
-        learner_data = self._local_blob_or_download(
+        # Absent is permitted only for inference-only resolution; a present
+        # invalid blob raises either way.
+        learner_data = self._optional_blob(
             manifest.learner_state, "pt", name="S3 learner-state blob"
         )
+        if require_learner_state and learner_data is None:
+            raise ArtifactValidationError(
+                "S3 learner-state blob does not exist. It may have been pruned "
+                "by the blob reaper "
+                "(storage.learner_state_retained_checkpoints); resume from a "
+                "newer checkpoint."
+            )
         checkpoint = self._materialize_immutables(manifest, onnx_data, learner_data)
         validate_onnx_checkpoint(checkpoint.onnx_path, self.contract)
-        validate_learner_state(
-            checkpoint.learner_state_path,
-            contract=self.contract,
-            step=manifest.step,
-            config_sha256=manifest.config_sha256,
-        )
+        if learner_data is not None:
+            validate_learner_state(
+                checkpoint.learner_state_path,
+                contract=self.contract,
+                step=manifest.step,
+                config_sha256=manifest.config_sha256,
+            )
         return checkpoint
 
     def resolve_checkpoint_manifest(
@@ -448,7 +467,7 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
             expected_config_sha256=expected_config_sha256,
         )
 
-    def list_checkpoints(self) -> list[CheckpointRef]:
+    def list_checkpoint_manifest_ids(self) -> list[str]:
         prefix = self._key("manifests/sha256/")
         checkpoint_ids: list[str] = []
         continuation_token: str | None = None
@@ -473,9 +492,30 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
                 )
         if len(checkpoint_ids) != len(set(checkpoint_ids)):
             raise ArtifactValidationError("S3 checkpoint listing contains duplicate objects")
-        checkpoints = [self.resolve_checkpoint(item) for item in checkpoint_ids]
+        return checkpoint_ids
+
+    def list_checkpoints(self) -> list[CheckpointRef]:
+        # Discovery serves inference consumers (registry, solver-eval), so a
+        # reaped learner-state blob must not hide a checkpoint from them.
+        checkpoints = [
+            self.resolve_checkpoint(item, require_learner_state=False)
+            for item in self.list_checkpoint_manifest_ids()
+        ]
         checkpoints.sort(key=lambda item: (item.manifest.step, item.checkpoint_id))
         return checkpoints
+
+    def delete_learner_state_blob(self, digest: str) -> bool:
+        """Remove one immutable learner-state blob remotely and locally.
+
+        Returns True only when the remote blob was actually present.
+        """
+        require_digest(digest, field="learner-state blob digest")
+        key = self._key(f"blobs/sha256/{digest}.pt")
+        existed = self._get(key) is not None
+        if existed:
+            self._client.delete_object(Bucket=self.bucket, Key=key)
+        (self.model_root / "blobs" / "sha256" / f"{digest}.pt").unlink(missing_ok=True)
+        return existed
 
     @staticmethod
     def _checkpoint_ids_from_listing(contents: list[object], prefix: str) -> list[str]:

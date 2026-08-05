@@ -130,6 +130,7 @@ Storage backend configuration.
 | `pool_connect_timeout` | u64 | `30` | Pool connection timeout (seconds) |
 | `pool_idle_timeout` | u64? | `300` | Pool idle timeout (seconds) |
 | `replay_retained_scopes` | u32 | `2` | Newest collection scopes kept per profile; older scopes are reaped after each commit |
+| `learner_state_retained_checkpoints` | u32 | `3` | Newest checkpoints keeping their learner-state (.pt) blob; every ONNX is kept forever |
 
 ### [wandb]
 

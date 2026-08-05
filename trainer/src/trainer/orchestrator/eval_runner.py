@@ -263,7 +263,11 @@ class EvalRunner(EvalReportingMixin):
             raise ArtifactValidationError(
                 "RunCommit champion is not supported by promoted evaluation evidence"
             )
-        checkpoint = self.checkpoints.resolve_checkpoint(reference.checkpoint_id)
+        # The champion plays inference-only; its learner-state blob may have
+        # been pruned once it left the resume window.
+        checkpoint = self.checkpoints.resolve_checkpoint(
+            reference.checkpoint_id, require_learner_state=False
+        )
         self.champion_iteration = evaluation.artifact.iteration
         return reference, checkpoint
 

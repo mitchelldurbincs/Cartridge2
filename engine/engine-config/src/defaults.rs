@@ -116,6 +116,7 @@ struct StorageDefaults {
     pool_connect_timeout: u64,
     pool_idle_timeout: u64,
     replay_retained_scopes: u32,
+    learner_state_retained_checkpoints: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,6 +300,9 @@ pub fn pool_idle_timeout() -> u64 {
 }
 pub fn replay_retained_scopes() -> u32 {
     DEFAULTS.storage.replay_retained_scopes
+}
+pub fn learner_state_retained_checkpoints() -> u32 {
+    DEFAULTS.storage.learner_state_retained_checkpoints
 }
 
 // W&B (parsed by Rust so the canonical config has one strict schema even

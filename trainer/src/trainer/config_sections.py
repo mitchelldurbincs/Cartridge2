@@ -301,6 +301,9 @@ class StorageConfig:
     pool_connect_timeout: int = _default("storage", "pool_connect_timeout")
     pool_idle_timeout: int = _default("storage", "pool_idle_timeout")
     replay_retained_scopes: int = _default("storage", "replay_retained_scopes")
+    learner_state_retained_checkpoints: int = _default(
+        "storage", "learner_state_retained_checkpoints"
+    )
 
 
 @dataclass
