@@ -1,33 +1,92 @@
 use anyhow::{anyhow, bail, Result};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use super::recipe::expected_collector_simulations;
 use super::types::{OrchestrationCommitV1, ResolvedRunCommit, RunCommitV1, RunHeadV2};
 
-pub(crate) fn validate_run_commit_chain(
+/// The last fully validated `(head id, chain)` for one watcher.
+///
+/// Every id is the SHA-256 of the artifact's bytes and resolution re-verifies
+/// it, so a chain validated once cannot change under its ids: a new head only
+/// needs the suffix beyond this prefix read and validated. The cache never
+/// needs invalidation for the process lifetime.
+#[derive(Debug, Default)]
+pub(crate) struct ChainCache {
+    validated: Option<(String, Arc<Vec<ResolvedRunCommit>>)>,
+}
+
+impl ChainCache {
+    pub(crate) fn snapshot(&self) -> Option<(String, Arc<Vec<ResolvedRunCommit>>)> {
+        self.validated
+            .as_ref()
+            .map(|(head_id, chain)| (head_id.clone(), Arc::clone(chain)))
+    }
+
+    pub(crate) fn store(&mut self, head_id: String, chain: Arc<Vec<ResolvedRunCommit>>) {
+        self.validated = Some((head_id, chain));
+    }
+}
+
+/// Incremental fold over one RunCommit chain, oldest first.
+///
+/// `feed` validates one new edge; `replay_validated` reconstructs the fold
+/// state from an already-validated prefix without re-checking it. Feeding an
+/// entire chain through `feed` is exactly the original full validation.
+#[derive(Default)]
+pub(crate) struct ChainValidator<'a> {
+    parent: Option<&'a ResolvedRunCommit>,
+    latest_orchestration: Option<&'a OrchestrationCommitV1>,
+    lineage_checkpoints: HashSet<&'a str>,
+    collection_scopes: HashSet<&'a str>,
+}
+
+impl<'a> ChainValidator<'a> {
+    pub(crate) fn feed(&mut self, entry: &'a ResolvedRunCommit) -> Result<()> {
+        validate_checkpoint_edge(entry, self.parent, &mut self.lineage_checkpoints)?;
+        validate_run_mode(&entry.commit, self.parent)?;
+        validate_orchestration_edge(
+            entry,
+            self.parent,
+            &mut self.latest_orchestration,
+            &mut self.collection_scopes,
+        )?;
+        self.parent = Some(entry);
+        Ok(())
+    }
+
+    pub(crate) fn replay_validated(&mut self, entry: &'a ResolvedRunCommit) {
+        self.lineage_checkpoints
+            .insert(entry.commit.checkpoint_id.as_str());
+        if let Some(orchestration) = &entry.commit.orchestration {
+            self.collection_scopes
+                .insert(orchestration.collection_scope_id.as_str());
+            self.latest_orchestration = Some(orchestration);
+        }
+        self.parent = Some(entry);
+    }
+}
+
+/// Validate a chain whose first `prefix_len` entries were already validated
+/// as a chain in this process: the prefix is replayed in memory and only the
+/// suffix edges are checked.
+pub(crate) fn validate_spliced_chain(
+    prefix_len: usize,
     chain: &[ResolvedRunCommit],
     head: &RunHeadV2,
 ) -> Result<()> {
     validate_selected_head(chain, head)?;
-    let mut parent: Option<&ResolvedRunCommit> = None;
-    let mut latest_orchestration: Option<&OrchestrationCommitV1> = None;
-    let mut lineage_checkpoints = HashSet::new();
-    let mut collection_scopes = HashSet::new();
-    for entry in chain {
-        validate_checkpoint_edge(entry, parent, &mut lineage_checkpoints)?;
-        validate_run_mode(&entry.commit, parent)?;
-        validate_orchestration_edge(
-            entry,
-            parent,
-            &mut latest_orchestration,
-            &mut collection_scopes,
-        )?;
-        parent = Some(entry);
+    let mut validator = ChainValidator::default();
+    for entry in &chain[..prefix_len] {
+        validator.replay_validated(entry);
+    }
+    for entry in &chain[prefix_len..] {
+        validator.feed(entry)?;
     }
     Ok(())
 }
 
-fn validate_selected_head(chain: &[ResolvedRunCommit], head: &RunHeadV2) -> Result<()> {
+pub(crate) fn validate_selected_head(chain: &[ResolvedRunCommit], head: &RunHeadV2) -> Result<()> {
     let selected = chain
         .last()
         .ok_or_else(|| anyhow!("RunCommit lineage is empty"))?;

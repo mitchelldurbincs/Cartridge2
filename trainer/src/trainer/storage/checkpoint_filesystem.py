@@ -28,6 +28,7 @@ from .evaluation_repository import create_evaluation_repository
 from .filesystem_backend import atomic_replace, create_or_verify, directory_lock
 from .run_commit_repository import RunCommitRepository
 from .run_commit_types import RunCommitV1
+from .run_lineage_cache import RunLineageCache
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,9 @@ class FilesystemCheckpointPublisher:
     def __init__(self, *, model_root: str | Path, contract: OnnxArtifactContract):
         self.model_root = Path(model_root)
         self.contract = contract
+        # Shared by every repository built over this publisher; see
+        # run_lineage_cache for why cached chains never need invalidation.
+        self._lineage_cache = RunLineageCache()
 
     def _blob_path(self, descriptor: BlobDescriptorV1, extension: str) -> Path:
         return self.model_root / "blobs" / "sha256" / f"{descriptor.sha256}.{extension}"

@@ -10,6 +10,7 @@ from .evaluation_artifact import EvaluationArtifactV2
 from .evaluation_repository import EvaluationRepository
 from .run_commit_transition import validate_transition
 from .run_commit_types import OrchestrationCommitV1, RunCommitRef, RunCommitV1
+from .run_lineage_cache import lineage_cache_for
 
 
 class _RunCommitStorage(Protocol):
@@ -28,6 +29,7 @@ class RunCommitRepository:
     ) -> None:
         self.checkpoints = checkpoints
         self.evaluations = evaluations
+        self._cache = lineage_cache_for(checkpoints)
 
     def resolve(self, run_commit_id: str) -> RunCommitRef:
         validate_sha256_digest(run_commit_id, field="run_commit_id")
@@ -101,21 +103,41 @@ class RunCommitRepository:
     def resolve_chain(self, run_commit_id: str | None) -> list[RunCommitRef]:
         if run_commit_id is None:
             return []
-        reversed_chain: list[RunCommitRef] = []
+        cached = self._cache.chains.get(run_commit_id)
+        if cached is not None:
+            return list(cached)
+        # Walk toward the root, stopping at the deepest already-validated
+        # ancestor: only the suffix beyond it needs reads and validation.
+        reversed_suffix: list[RunCommitRef] = []
         seen: set[str] = set()
+        prefix: tuple[RunCommitRef, ...] = ()
         current_id: str | None = run_commit_id
         while current_id is not None:
             if current_id in seen:
                 raise ArtifactValidationError("RunCommit lineage contains a cycle")
+            cached_prefix = self._cache.chains.get(current_id)
+            if cached_prefix is not None:
+                prefix = cached_prefix
+                break
             seen.add(current_id)
             reference = self.resolve(current_id)
-            reversed_chain.append(reference)
+            reversed_suffix.append(reference)
             current_id = reference.commit.parent_run_commit_id
-        chain = list(reversed(reversed_chain))
-        parent: RunCommitV1 | None = None
+        if seen & {reference.run_commit_id for reference in prefix}:
+            raise ArtifactValidationError("RunCommit lineage contains a cycle")
+        chain = [*prefix, *reversed(reversed_suffix)]
+        # Seed the fold state from the validated prefix entirely in memory —
+        # no reads, no hashing, no re-validation of settled history.
+        parent: RunCommitV1 | None = prefix[-1].commit if prefix else None
         latest_orchestration: OrchestrationCommitV1 | None = None
         collection_scopes: set[str] = set()
-        for reference in chain:
+        for reference in prefix:
+            orchestration = reference.commit.orchestration
+            if orchestration is not None:
+                collection_scopes.add(orchestration.collection_scope_id)
+                latest_orchestration = orchestration
+        for index in range(len(prefix), len(chain)):
+            reference = chain[index]
             validate_transition(
                 reference.commit,
                 parent,
@@ -145,4 +167,6 @@ class RunCommitRepository:
                     )
                 latest_orchestration = orchestration
             parent = reference.commit
+            # Every prefix of a validated chain is itself a validated chain.
+            self._cache.chains[reference.run_commit_id] = tuple(chain[: index + 1])
         return chain

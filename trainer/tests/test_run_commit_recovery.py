@@ -716,3 +716,54 @@ def test_changed_recipe_fails_before_replay_is_opened(tmp_path, staged_blobs, mo
     with pytest.raises(ArtifactValidationError, match="learner config"):
         Orchestrator(changed)
     assert opened is False
+
+
+def test_resolve_chain_memoizes_validated_prefixes_on_the_publisher(tmp_path, staged_blobs):
+    config = loop_config(tmp_path / "lineage-cache")
+    checkpoints, evaluations, commits, root_candidate, prepared = build_root(config, staged_blobs)
+    evaluations.publish_evidence(prepared.evaluation.artifact)
+    root = commits.publish(prepared.run_commit)
+
+    child_candidate = stage_checkpoint(
+        checkpoints,
+        staged_blobs,
+        step=2,
+        config_sha256=recipe_for(config).learner_config_sha256,
+        parent=root_candidate.checkpoint_id,
+    )
+    child_evaluation = evaluation_for(
+        config, child_candidate, root.commit, iteration=2, promoted=False
+    )
+    evaluations.publish_evidence(child_evaluation.artifact)
+    head = commits.publish(
+        commit_for(config, child_candidate, root.commit, iteration=2, evaluation=child_evaluation)
+    )
+
+    reads: list[str] = []
+    original_read = checkpoints.read_run_commit_bytes
+    checkpoints.read_run_commit_bytes = lambda run_commit_id: (
+        reads.append(run_commit_id) or original_read(run_commit_id)
+    )
+
+    # publish() already validated and cached the root chain, so resolving the
+    # new head reads exactly one commit: the head itself.
+    chain = commits.resolve_chain(head.run_commit_id)
+    assert [ref.run_commit_id for ref in chain] == [root.run_commit_id, head.run_commit_id]
+    assert reads == [head.run_commit_id]
+
+    # A repeated resolution is a pure memo hit with zero storage reads, and a
+    # fresh repository over the same publisher shares the cache.
+    commits.resolve_chain(head.run_commit_id)
+    FilesystemEvaluationRepository(checkpoints)
+    fresh = RunCommitRepository(checkpoints, FilesystemEvaluationRepository(checkpoints))
+    fresh.resolve_chain(head.run_commit_id)
+    assert reads == [head.run_commit_id]
+
+    # Settled history is not re-read: deleting the root's bytes does not
+    # disturb this process, while a publisher with a cold cache fails closed.
+    checkpoints._run_commit_path(root.run_commit_id).unlink()
+    fresh.resolve_chain(head.run_commit_id)
+    cold_publisher = FilesystemCheckpointPublisher(model_root=config.models_dir, contract=CONTRACT)
+    cold = RunCommitRepository(cold_publisher, FilesystemEvaluationRepository(cold_publisher))
+    with pytest.raises(ArtifactValidationError, match="does not exist"):
+        cold.resolve_chain(head.run_commit_id)

@@ -17,7 +17,9 @@ use tracing::{debug, error, info, warn};
 mod artifact;
 mod load;
 
-use artifact::{read_filesystem_head, resolve_filesystem_head, run_head_path, ResolvedCheckpoint};
+use artifact::{
+    read_filesystem_head, resolve_filesystem_head, run_head_path, ChainCache, ResolvedCheckpoint,
+};
 
 #[cfg(feature = "s3")]
 pub mod s3;
@@ -51,12 +53,14 @@ pub fn resolve_current_filesystem_model(
     let Some(head) = read_filesystem_head(model_root)? else {
         return Ok(None);
     };
+    // One-shot resolution (bounded actors): no cache to carry across calls.
     let resolved = resolve_filesystem_head(
         model_root,
         head,
         identity,
         environment_max_horizon,
         selection,
+        None,
     )?;
     Ok(Some(ResolvedModel {
         checkpoint_id: resolved.checkpoint_id,
@@ -100,6 +104,7 @@ pub struct ModelWatcher {
     accepted_head: Arc<RwLock<Option<AcceptedHead>>>,
     poll_interval: Duration,
     model_info: Arc<RwLock<ModelInfo>>,
+    chain_cache: Arc<RwLock<ChainCache>>,
 }
 
 impl ModelWatcher {
@@ -117,6 +122,7 @@ impl ModelWatcher {
             accepted_head: Arc::new(RwLock::new(None)),
             poll_interval: DEFAULT_POLL_INTERVAL,
             model_info: Arc::new(RwLock::new(ModelInfo::default())),
+            chain_cache: Arc::new(RwLock::new(ChainCache::default())),
         }
     }
 
@@ -145,6 +151,7 @@ impl ModelWatcher {
             &self.evaluator,
             &self.accepted_head,
             &self.model_info,
+            &self.chain_cache,
         )
     }
 
@@ -238,6 +245,7 @@ impl ModelWatcher {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn load_current_static(
         model_root: &Path,
         model_spec: &ModelLoadSpec,
@@ -245,6 +253,7 @@ impl ModelWatcher {
         evaluator: &Arc<RwLock<Option<SharedOnnxEvaluator>>>,
         accepted_head: &Arc<RwLock<Option<AcceptedHead>>>,
         model_info: &Arc<RwLock<ModelInfo>>,
+        chain_cache: &Arc<RwLock<ChainCache>>,
     ) -> Result<LoadOutcome> {
         let Some(head) = read_filesystem_head(model_root)? else {
             return Ok(LoadOutcome::Absent);
@@ -263,6 +272,7 @@ impl ModelWatcher {
             &model_spec.identity,
             model_spec.environment_max_horizon,
             selection,
+            Some(chain_cache),
         )?;
         let new_evaluator = if accepted
             .as_ref()
@@ -325,6 +335,7 @@ impl ModelWatcher {
         let event_evaluator = Arc::clone(&self.evaluator);
         let event_accepted = Arc::clone(&self.accepted_head);
         let event_info = Arc::clone(&self.model_info);
+        let event_cache = Arc::clone(&self.chain_cache);
         let event_updates = updates_tx.clone();
         tokio::spawn(async move {
             let _watcher = watcher;
@@ -343,6 +354,7 @@ impl ModelWatcher {
                     &event_evaluator,
                     &event_accepted,
                     &event_info,
+                    &event_cache,
                 ) {
                     Ok(LoadOutcome::Loaded) => {
                         let _ = event_updates.send(()).await;
@@ -359,6 +371,7 @@ impl ModelWatcher {
         let poll_evaluator = Arc::clone(&self.evaluator);
         let poll_accepted = Arc::clone(&self.accepted_head);
         let poll_info = Arc::clone(&self.model_info);
+        let poll_cache = Arc::clone(&self.chain_cache);
         let poll_interval = self.poll_interval;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(poll_interval);
@@ -372,6 +385,7 @@ impl ModelWatcher {
                     &poll_evaluator,
                     &poll_accepted,
                     &poll_info,
+                    &poll_cache,
                 ) {
                     Ok(LoadOutcome::Loaded) => {
                         let _ = updates_tx.send(()).await;

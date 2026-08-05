@@ -11,6 +11,7 @@ from .checkpoint_types import CheckpointPublisher, OnnxArtifactContract
 from .evaluation_artifact import EvaluationArtifactV2
 from .evaluation_recipe import ChampionReferenceV1
 from .filesystem_backend import create_or_verify
+from .run_lineage_cache import lineage_cache_for
 
 
 @runtime_checkable
@@ -119,25 +120,49 @@ class FilesystemEvaluationRepository:
         return EvaluationRef(evaluation_id, artifact, path)
 
     def list_evaluations(self, evaluation_head_id: str | None) -> list[EvaluationRef]:
-        """Resolve and fully validate an immutable evaluation chain."""
+        """Resolve and fully validate an immutable evaluation chain.
+
+        Validated lineages are memoized on the publisher's lineage cache
+        (sound because every evaluation_id is the SHA-256 of its bytes and
+        resolution re-verifies it), so a chain settled earlier in the process
+        is spliced in instead of re-read and re-validated on every call.
+        """
         if evaluation_head_id is None:
             return []
         validate_sha256_digest(evaluation_head_id, field="evaluation_head_id")
-        reversed_lineage: list[EvaluationRef] = []
+        cache = lineage_cache_for(self.checkpoints)
+        cached = cache.eval_lineages.get(evaluation_head_id)
+        if cached is not None:
+            return list(cached)
+        reversed_suffix: list[EvaluationRef] = []
         seen: set[str] = set()
+        prefix: tuple[EvaluationRef, ...] = ()
         current_id: str | None = evaluation_head_id
         while current_id is not None:
             if current_id in seen:
                 raise ArtifactValidationError("Evaluation lineage contains a cycle")
+            cached_prefix = cache.eval_lineages.get(current_id)
+            if cached_prefix is not None:
+                prefix = cached_prefix
+                break
             seen.add(current_id)
             reference = self.resolve_evaluation(current_id)
-            reversed_lineage.append(reference)
+            reversed_suffix.append(reference)
             current_id = reference.artifact.previous_evaluation_id
-        lineage = list(reversed(reversed_lineage))
+        if seen & {reference.evaluation_id for reference in prefix}:
+            raise ArtifactValidationError("Evaluation lineage contains a cycle")
+        lineage = [*prefix, *reversed(reversed_suffix)]
 
-        previous: EvaluationRef | None = None
+        previous: EvaluationRef | None = prefix[-1] if prefix else None
         champion: ChampionReferenceV1 | None = None
-        for reference in lineage:
+        for reference in prefix:
+            if reference.artifact.decision.promoted:
+                champion = ChampionReferenceV1(
+                    checkpoint_id=reference.artifact.candidate_checkpoint_id,
+                    evaluation_id=reference.evaluation_id,
+                )
+        for index in range(len(prefix), len(lineage)):
+            reference = lineage[index]
             artifact = reference.artifact
             expected_previous = previous.evaluation_id if previous is not None else None
             if artifact.previous_evaluation_id != expected_previous:
@@ -160,6 +185,7 @@ class FilesystemEvaluationRepository:
                     evaluation_id=reference.evaluation_id,
                 )
             previous = reference
+            cache.eval_lineages[reference.evaluation_id] = tuple(lineage[: index + 1])
         return lineage
 
 

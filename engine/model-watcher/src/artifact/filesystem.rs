@@ -3,10 +3,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use super::checkpoint::validate_manifest;
 use super::codec::{parse_canonical_json, sha256_hex, validate_digest, validate_run_head};
-use super::lineage::validate_run_commit_chain;
+use super::lineage::{validate_selected_head, validate_spliced_chain, ChainCache};
 use super::run_commit::parse_run_commit;
 use super::types::*;
 
@@ -94,11 +95,37 @@ pub(crate) fn resolve_filesystem_run_commit_chain(
     head: &RunHeadV2,
     expected_contract: &ModelArtifactContract,
     environment_max_horizon: u32,
-) -> Result<Vec<ResolvedRunCommit>> {
-    let mut reversed = Vec::new();
+    cache: Option<&RwLock<ChainCache>>,
+) -> Result<Arc<Vec<ResolvedRunCommit>>> {
+    let snapshot = match cache {
+        Some(lock) => lock
+            .read()
+            .map_err(|error| anyhow!("failed to read chain cache: {error}"))?
+            .snapshot(),
+        None => None,
+    };
+    if let Some((cached_head, chain)) = &snapshot {
+        if *cached_head == head.run_commit_id {
+            // Same head as the last validated chain: only re-check the head
+            // binding, which costs no reads.
+            validate_selected_head(chain, head)?;
+            return Ok(Arc::clone(chain));
+        }
+    }
+
+    // Walk toward the root, stopping at the last validated head: only the
+    // suffix beyond that prefix is read, parsed, hashed, and validated.
+    let mut reversed_suffix = Vec::new();
     let mut seen = HashSet::new();
+    let mut prefix: Option<Arc<Vec<ResolvedRunCommit>>> = None;
     let mut current_id = Some(head.run_commit_id.clone());
     while let Some(run_commit_id) = current_id {
+        if let Some((cached_head, chain)) = &snapshot {
+            if *cached_head == run_commit_id {
+                prefix = Some(Arc::clone(chain));
+                break;
+            }
+        }
         if !seen.insert(run_commit_id.clone()) {
             bail!("RunCommit lineage contains a cycle");
         }
@@ -115,13 +142,28 @@ pub(crate) fn resolve_filesystem_run_commit_chain(
         let manifest =
             read_filesystem_manifest(model_root, &commit.checkpoint_id, expected_contract)?;
         current_id = commit.parent_run_commit_id.clone();
-        reversed.push(ResolvedRunCommit {
+        reversed_suffix.push(ResolvedRunCommit {
             run_commit_id,
             commit,
             manifest,
         });
     }
-    reversed.reverse();
-    validate_run_commit_chain(&reversed, head)?;
-    Ok(reversed)
+    let prefix_entries: &[ResolvedRunCommit] = prefix.as_deref().map_or(&[], Vec::as_slice);
+    if prefix_entries
+        .iter()
+        .any(|entry| seen.contains(&entry.run_commit_id))
+    {
+        bail!("RunCommit lineage contains a cycle");
+    }
+    let mut chain = Vec::with_capacity(prefix_entries.len() + reversed_suffix.len());
+    chain.extend_from_slice(prefix_entries);
+    chain.extend(reversed_suffix.into_iter().rev());
+    validate_spliced_chain(prefix_entries.len(), &chain, head)?;
+    let chain = Arc::new(chain);
+    if let Some(lock) = cache {
+        lock.write()
+            .map_err(|error| anyhow!("failed to update chain cache: {error}"))?
+            .store(head.run_commit_id.clone(), Arc::clone(&chain));
+    }
+    Ok(chain)
 }

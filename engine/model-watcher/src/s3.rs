@@ -15,8 +15,9 @@ use tracing::{debug, error, info};
 
 use crate::artifact::{
     parse_canonical_json, parse_run_commit, select_inference_checkpoint, sha256_hex,
-    validate_manifest, validate_run_commit_chain, validate_run_head, verify_blob_bytes,
-    CheckpointManifestV1, ResolvedRunCommit, RunHeadV2, RUN_HEAD_CHANNEL,
+    validate_manifest, validate_run_head, validate_selected_head, validate_spliced_chain,
+    verify_blob_bytes, ChainCache, CheckpointManifestV1, ResolvedRunCommit, RunHeadV2,
+    RUN_HEAD_CHANNEL,
 };
 use crate::{AcceptedHead, ModelInfo, ModelLoadSpec, ModelSelection};
 
@@ -53,6 +54,7 @@ struct S3LoadContext<'a> {
     evaluator: &'a Arc<RwLock<Option<SharedOnnxEvaluator>>>,
     accepted_head: &'a Arc<RwLock<Option<AcceptedHead>>>,
     model_info: &'a Arc<RwLock<ModelInfo>>,
+    chain_cache: &'a Arc<RwLock<ChainCache>>,
 }
 
 pub struct S3ModelWatcher {
@@ -66,6 +68,7 @@ pub struct S3ModelWatcher {
     poll_interval: Duration,
     cache_dir: PathBuf,
     model_info: Arc<RwLock<ModelInfo>>,
+    chain_cache: Arc<RwLock<ChainCache>>,
 }
 
 impl S3ModelWatcher {
@@ -113,6 +116,7 @@ impl S3ModelWatcher {
             poll_interval: DEFAULT_S3_POLL_INTERVAL,
             cache_dir: config.cache_dir,
             model_info: Arc::new(RwLock::new(ModelInfo::default())),
+            chain_cache: Arc::new(RwLock::new(ChainCache::default())),
         })
     }
 
@@ -213,11 +217,33 @@ impl S3ModelWatcher {
         prefix: &str,
         head: &RunHeadV2,
         model_spec: &ModelLoadSpec,
-    ) -> Result<Vec<ResolvedRunCommit>> {
-        let mut reversed = Vec::new();
+        chain_cache: &Arc<RwLock<ChainCache>>,
+    ) -> Result<Arc<Vec<ResolvedRunCommit>>> {
+        let snapshot = chain_cache
+            .read()
+            .map_err(|error| anyhow!("failed to read S3 chain cache: {error}"))?
+            .snapshot();
+        if let Some((cached_head, chain)) = &snapshot {
+            if *cached_head == head.run_commit_id {
+                validate_selected_head(chain, head)?;
+                return Ok(Arc::clone(chain));
+            }
+        }
+
+        // Walk toward the root, stopping at the last validated head. Each
+        // commit beyond the cached prefix costs two GETs (commit + manifest);
+        // the prefix itself costs none.
+        let mut reversed_suffix = Vec::new();
         let mut seen = HashSet::new();
+        let mut cached_prefix: Option<Arc<Vec<ResolvedRunCommit>>> = None;
         let mut current_id = Some(head.run_commit_id.clone());
         while let Some(run_commit_id) = current_id {
+            if let Some((cached_head, chain)) = &snapshot {
+                if *cached_head == run_commit_id {
+                    cached_prefix = Some(Arc::clone(chain));
+                    break;
+                }
+            }
             if !seen.insert(run_commit_id.clone()) {
                 bail!("S3 RunCommit lineage contains a cycle");
             }
@@ -243,15 +269,30 @@ impl S3ModelWatcher {
                 parse_canonical_json("S3 checkpoint manifest", &manifest_bytes)?;
             validate_manifest(&manifest, &model_spec.identity)?;
             current_id = commit.parent_run_commit_id.clone();
-            reversed.push(ResolvedRunCommit {
+            reversed_suffix.push(ResolvedRunCommit {
                 run_commit_id,
                 commit,
                 manifest,
             });
         }
-        reversed.reverse();
-        validate_run_commit_chain(&reversed, head)?;
-        Ok(reversed)
+        let prefix_entries: &[ResolvedRunCommit] =
+            cached_prefix.as_deref().map_or(&[], Vec::as_slice);
+        if prefix_entries
+            .iter()
+            .any(|entry| seen.contains(&entry.run_commit_id))
+        {
+            bail!("S3 RunCommit lineage contains a cycle");
+        }
+        let mut chain = Vec::with_capacity(prefix_entries.len() + reversed_suffix.len());
+        chain.extend_from_slice(prefix_entries);
+        chain.extend(reversed_suffix.into_iter().rev());
+        validate_spliced_chain(prefix_entries.len(), &chain, head)?;
+        let chain = Arc::new(chain);
+        chain_cache
+            .write()
+            .map_err(|error| anyhow!("failed to update S3 chain cache: {error}"))?
+            .store(head.run_commit_id.clone(), Arc::clone(&chain));
+        Ok(chain)
     }
 
     async fn load_current(context: S3LoadContext<'_>) -> Result<RemoteUpdate> {
@@ -265,6 +306,7 @@ impl S3ModelWatcher {
             evaluator,
             accepted_head,
             model_info,
+            chain_cache,
         } = context;
         let run_head_key = Self::run_head_key(prefix);
         let Some(run_head_bytes) = Self::get_optional(client, bucket, &run_head_key).await? else {
@@ -283,8 +325,15 @@ impl S3ModelWatcher {
             return Ok(RemoteUpdate::Unchanged);
         }
 
-        let chain =
-            Self::resolve_run_commit_chain(client, bucket, prefix, &run_head, model_spec).await?;
+        let chain = Self::resolve_run_commit_chain(
+            client,
+            bucket,
+            prefix,
+            &run_head,
+            model_spec,
+            chain_cache,
+        )
+        .await?;
         let selected = select_inference_checkpoint(&chain, selection)?;
         let checkpoint_id = selected.commit.checkpoint_id.clone();
         let manifest = selected.manifest.clone();
@@ -398,6 +447,7 @@ impl S3ModelWatcher {
                 evaluator: &self.evaluator,
                 accepted_head: &self.accepted_head,
                 model_info: &self.model_info,
+                chain_cache: &self.chain_cache,
             })
             .await?,
             RemoteUpdate::Absent
@@ -415,6 +465,7 @@ impl S3ModelWatcher {
         let evaluator = Arc::clone(&self.evaluator);
         let accepted = Arc::clone(&self.accepted_head);
         let model_info = Arc::clone(&self.model_info);
+        let chain_cache = Arc::clone(&self.chain_cache);
         let poll_interval = self.poll_interval;
 
         tokio::spawn(async move {
@@ -431,6 +482,7 @@ impl S3ModelWatcher {
                     evaluator: &evaluator,
                     accepted_head: &accepted,
                     model_info: &model_info,
+                    chain_cache: &chain_cache,
                 })
                 .await
                 {

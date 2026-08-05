@@ -299,6 +299,25 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
         )
         return checkpoint
 
+    def _local_blob_or_download(self, descriptor, extension: str, *, name: str) -> bytes:
+        """Return verified blob bytes, preferring the local content-addressed cache.
+
+        The cached file is re-hashed against the manifest descriptor on every
+        use (fail-closed against local corruption); only on absence or
+        mismatch is the object actually downloaded. This is what keeps
+        commit_run_head from re-downloading both full blobs per iteration.
+        """
+        path = self._blob_path(descriptor, extension)
+        if path.is_file():
+            cached = path.read_bytes()
+            if len(cached) == descriptor.size_bytes and sha256_bytes(cached) == descriptor.sha256:
+                return cached
+        data = self._get(self._key(f"blobs/sha256/{descriptor.sha256}.{extension}"))
+        if data is None:
+            raise ArtifactValidationError("S3 checkpoint is missing a blob")
+        verified_blob(data, descriptor, name=name)
+        return data
+
     def resolve_checkpoint(
         self,
         checkpoint_id: str,
@@ -310,12 +329,10 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
             expected_config_sha256=expected_config_sha256,
         )
         self._validate_manifest_lineage(manifest)
-        onnx_data = self._get(self._key(f"blobs/sha256/{manifest.onnx.sha256}.onnx"))
-        learner_data = self._get(self._key(f"blobs/sha256/{manifest.learner_state.sha256}.pt"))
-        if onnx_data is None or learner_data is None:
-            raise ArtifactValidationError("S3 checkpoint is missing a blob")
-        verified_blob(onnx_data, manifest.onnx, name="S3 ONNX blob")
-        verified_blob(learner_data, manifest.learner_state, name="S3 learner-state blob")
+        onnx_data = self._local_blob_or_download(manifest.onnx, "onnx", name="S3 ONNX blob")
+        learner_data = self._local_blob_or_download(
+            manifest.learner_state, "pt", name="S3 learner-state blob"
+        )
         checkpoint = self._materialize_immutables(manifest, onnx_data, learner_data)
         validate_onnx_checkpoint(checkpoint.onnx_path, self.contract)
         validate_learner_state(

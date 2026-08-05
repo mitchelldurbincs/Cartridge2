@@ -904,6 +904,7 @@ fn accepted_head_compare_and_set_prevents_overlapping_load_regression() {
         &expected,
         9,
         ModelSelection::Latest,
+        None,
     )
     .unwrap();
     let new_evaluator = watcher
@@ -1049,4 +1050,50 @@ fn path_errors_are_not_treated_as_absence() {
         Arc::new(RwLock::new(None)),
     );
     assert!(watcher.try_load_existing().is_err());
+}
+
+#[test]
+fn chain_cache_splices_validated_prefixes_without_rereading_history() {
+    let root = tempdir().unwrap();
+    let expected = identity("contract_test");
+    let checkpoint_one = publish_test_checkpoint(root.path(), CONTRACT_TEST_MODEL, &expected, 7);
+    let watcher = ModelWatcher::new(
+        root.path(),
+        model_spec(expected.clone()),
+        ModelSelection::Latest,
+        Arc::new(RwLock::new(None)),
+    );
+    assert!(watcher.try_load_existing().unwrap());
+    let head_one = read_filesystem_head(root.path()).unwrap().unwrap();
+
+    // Settled history is spliced from the cache, never re-read: deleting the
+    // validated root's bytes does not disturb this watcher when the head
+    // advances, while a fresh watcher (cold cache) fails closed.
+    std::fs::remove_file(run_commit_path(root.path(), &head_one.run_commit_id)).unwrap();
+    let (_, run_commit_two) = publish_test_checkpoint_with_parent(
+        root.path(),
+        CONTRACT_TEST_MODEL,
+        &expected,
+        8,
+        Some(checkpoint_one),
+        Some(head_one.run_commit_id),
+    );
+    assert!(watcher.try_load_existing().unwrap());
+    assert_eq!(
+        watcher
+            .accepted_head
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|head| head.run_commit_id.clone()),
+        Some(run_commit_two)
+    );
+
+    let cold_watcher = ModelWatcher::new(
+        root.path(),
+        model_spec(expected),
+        ModelSelection::Latest,
+        Arc::new(RwLock::new(None)),
+    );
+    assert!(cold_watcher.try_load_existing().is_err());
 }

@@ -11,6 +11,7 @@ mod types;
 mod validation;
 
 pub(crate) use filesystem::{read_filesystem_head, run_head_path};
+pub(crate) use lineage::ChainCache;
 pub(crate) use selection::resolve_filesystem_head;
 pub(crate) use types::ResolvedCheckpoint;
 
@@ -21,7 +22,7 @@ pub(crate) use codec::{parse_canonical_json, sha256_hex, validate_run_head};
 #[cfg(any(test, feature = "s3"))]
 pub(crate) use filesystem::verify_blob_bytes;
 #[cfg(feature = "s3")]
-pub(crate) use lineage::validate_run_commit_chain;
+pub(crate) use lineage::{validate_selected_head, validate_spliced_chain};
 #[cfg(feature = "s3")]
 pub(crate) use run_commit::parse_run_commit;
 #[cfg(feature = "s3")]

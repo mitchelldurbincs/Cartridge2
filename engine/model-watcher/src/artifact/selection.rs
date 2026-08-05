@@ -1,8 +1,10 @@
 use algorithm_core::ModelArtifactContract;
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
+use std::sync::RwLock;
 
 use super::filesystem::{onnx_blob_path, resolve_filesystem_run_commit_chain, verify_blob_bytes};
+use super::lineage::ChainCache;
 use super::types::{ResolvedCheckpoint, ResolvedRunCommit, RunHeadV2};
 use crate::ModelSelection;
 
@@ -35,12 +37,14 @@ pub(crate) fn resolve_filesystem_head(
     expected_contract: &ModelArtifactContract,
     environment_max_horizon: u32,
     selection: ModelSelection,
+    chain_cache: Option<&RwLock<ChainCache>>,
 ) -> Result<ResolvedCheckpoint> {
     let chain = resolve_filesystem_run_commit_chain(
         model_root,
         &head,
         expected_contract,
         environment_max_horizon,
+        chain_cache,
     )?;
     let selected = select_inference_checkpoint(&chain, selection)?;
     let checkpoint_id = selected.commit.checkpoint_id.clone();
