@@ -20,6 +20,7 @@ from trainer.storage.postgres import (
     _EXPECTED_RECORD_PRIMARY_KEY,
     _EXPECTED_SCHEMA_MARKER_COLUMNS,
     _EXPECTED_SCHEMA_MARKER_PRIMARY_KEY,
+    _ID_CACHE_REFRESH_INTERVAL,
     REPLAY_SCHEMA_VERSION,
     PostgresReplayStore,
     _load_schema,
@@ -58,6 +59,22 @@ def make_record(
     )
 
 
+def _record_row(record: ReplayRecord) -> tuple:
+    """One database row for `record`, as the sampler's fetch query returns it."""
+    return (
+        record.id,
+        record.env_id,
+        record.env_contract_version,
+        record.algorithm_id,
+        record.experience_schema,
+        record.collection_scope_id,
+        record.source_checkpoint_id,
+        record.episode_id,
+        record.step_number,
+        memoryview(record.payload),
+    )
+
+
 @pytest.fixture
 def replay_store():
     url = os.environ["CARTRIDGE_STORAGE_POSTGRES_URL"]
@@ -71,10 +88,13 @@ def replay_store():
 
 
 class _RecordingCursor:
-    def __init__(self, *, fetchone=(0,), fetchall=None, rowcount=0):
+    def __init__(self, *, fetchone=(0,), fetchall=None, rowcount=0, fetchall_script=None):
         self.calls: list[tuple[str, tuple | list | None]] = []
         self._fetchone = fetchone
         self._fetchall = [] if fetchall is None else fetchall
+        # When provided, each fetchall() consumes the next scripted result,
+        # letting one test drive multi-query flows (id snapshot, then rows).
+        self._fetchall_script = fetchall_script
         self.rowcount = rowcount
 
     def __enter__(self):
@@ -93,6 +113,8 @@ class _RecordingCursor:
         return self._fetchone
 
     def fetchall(self):
+        if self._fetchall_script is not None:
+            return self._fetchall_script.pop(0) if self._fetchall_script else []
         return self._fetchall
 
 
@@ -111,12 +133,13 @@ class _RecordingConnection:
 
 
 def store_with_recording_cursor(
-    *, fetchone=(0,), fetchall=None, rowcount=0
+    *, fetchone=(0,), fetchall=None, rowcount=0, fetchall_script=None
 ) -> tuple[PostgresReplayStore, _RecordingCursor, _RecordingConnection]:
     cursor = _RecordingCursor(
         fetchone=fetchone,
         fetchall=fetchall,
         rowcount=rowcount,
+        fetchall_script=fetchall_script,
     )
     connection = _RecordingConnection(cursor)
     store = PostgresReplayStore.__new__(PostgresReplayStore)
@@ -124,6 +147,8 @@ def store_with_recording_cursor(
     # No transient classes registered: retry becomes a pass-through, so these
     # unit tests observe exactly one attempt per operation.
     store._transient_errors = ()
+    store._id_cache = None
+    store._samples_since_refresh = 0
 
     @contextmanager
     def connection_scope():
@@ -395,25 +420,16 @@ class TestSelectionScopedSql:
         )
         assert connection.commits == 1
 
-    def test_large_selection_sampling_is_bounded_and_exactly_fenced(self):
+    def test_sampling_snapshots_ids_and_fetches_by_id_exactly_fenced(self):
         record = make_record()
-        row = (
-            record.id,
-            record.env_id,
-            record.env_contract_version,
-            record.algorithm_id,
-            record.experience_schema,
-            record.collection_scope_id,
-            record.source_checkpoint_id,
-            record.episode_id,
-            record.step_number,
-            memoryview(record.payload),
+        row = _record_row(record)
+        store, cursor, connection = store_with_recording_cursor(
+            fetchall_script=[[(record.id,)], [row]]
         )
-        store, cursor, connection = store_with_recording_cursor(fetchone=(1000,), fetchall=[row])
 
         assert store.sample(3) == [record, record, record]
 
-        count_call, sampled_call, fallback_call = cursor.calls
+        ids_call, fetch_call = cursor.calls
         selection_key = (
             TEST_PROFILE.env_id,
             TEST_PROFILE.env_contract_version,
@@ -422,14 +438,69 @@ class TestSelectionScopedSql:
             TEST_SELECTION.collection_scope_id,
             TEST_SELECTION.source_checkpoint_id,
         )
-        assert "replay_records" in count_call[0]
-        assert count_call[1] == selection_key
-        assert "FROM replay_records TABLESAMPLE" in sampled_call[0]
-        assert sampled_call[1] == (3.0, *selection_key, 3)
-        assert "FROM replay_records" in fallback_call[0]
-        assert fallback_call[1] == (*selection_key, 3)
-        assert all("ARRAY_AGG" not in sql and "MATERIALIZED" not in sql for sql, _ in cursor.calls)
+        assert ids_call[0].lstrip().startswith("SELECT id FROM replay_records")
+        assert ids_call[1] == selection_key
+        assert "id = ANY(%s)" in fetch_call[0]
+        assert fetch_call[1] == (*selection_key, [record.id])
+        for sql, _ in cursor.calls:
+            assert "TABLESAMPLE" not in sql
+            assert "RANDOM()" not in sql
+            assert "COUNT(" not in sql
         assert connection.checkouts == 1
+
+    def test_sampling_reuses_the_id_snapshot_until_mutation(self):
+        record = make_record()
+        row = _record_row(record)
+        store, cursor, _ = store_with_recording_cursor(
+            fetchall_script=[[(record.id,)], [row], [row], [(record.id,)], [row]]
+        )
+
+        store.sample(2)
+        store.sample(2)
+        # Two samples share one id snapshot: 1 id query + 2 fetches.
+        assert len(cursor.calls) == 3
+
+        store.clear()
+        store.sample(2)
+        # The mutation invalidated the snapshot, forcing a fresh id query.
+        id_queries = [sql for sql, _ in cursor.calls if sql.lstrip().startswith("SELECT id FROM")]
+        assert len(id_queries) == 2
+
+    def test_sampling_refreshes_the_id_snapshot_periodically(self):
+        record = make_record()
+        row = _record_row(record)
+        store, cursor, _ = store_with_recording_cursor(
+            fetchall_script=[[(record.id,)], [row], [(record.id,)], [row]]
+        )
+
+        store.sample(1)
+        store._samples_since_refresh = _ID_CACHE_REFRESH_INTERVAL
+        store.sample(1)
+
+        id_queries = [sql for sql, _ in cursor.calls if sql.lstrip().startswith("SELECT id FROM")]
+        assert len(id_queries) == 2
+        assert store._samples_since_refresh == 1
+
+    def test_stale_snapshot_ids_trigger_one_refresh_and_redraw(self):
+        stale = make_record(record_id="stale-001")
+        fresh = make_record(record_id="fresh-001", step_number=1)
+        store, cursor, _ = store_with_recording_cursor(
+            fetchall_script=[
+                [(stale.id,)],  # initial snapshot
+                [],  # stale.id vanished (concurrent delete)
+                [(fresh.id,)],  # refreshed snapshot
+                [_record_row(fresh)],  # redraw fetch succeeds
+            ]
+        )
+
+        assert store.sample(2) == [fresh, fresh]
+
+        # A second disappearance in the same sample is a hard error.
+        store_two, _, _ = store_with_recording_cursor(
+            fetchall_script=[[(stale.id,)], [], [(stale.id,)], []]
+        )
+        with pytest.raises(RuntimeError, match="disappeared twice"):
+            store_two.sample(1)
 
     def test_empty_selection_sample_fails_loudly(self):
         store, _, connection = store_with_recording_cursor(fetchall=[])

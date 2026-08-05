@@ -199,9 +199,14 @@ class ReplayStore(ABC):
     def sample(self, batch_size: int) -> list[ReplayRecord]:
         """Sample exactly ``batch_size`` records, using replacement as needed.
 
-        A positive request against a non-empty exact selection returns exactly
-        the requested number of records even when the selection is smaller
-        than the minibatch. Implementations raise
+        The draw is a uniform i.i.d. sample with replacement over a snapshot
+        of the selection's row ids, refreshed at least every 100 samples and
+        after any mutation through this store — so a scope sealed before
+        training (the orchestrated loops) samples an exact snapshot, while an
+        externally growing scope (standalone ``train``) is picked up on the
+        next refresh. A positive request against a non-empty exact selection
+        returns exactly the requested number of records even when the
+        selection is smaller than the minibatch. Implementations raise
         :class:`EmptyReplaySelectionError` when that selection is empty and
         must never widen the selection fence to fill a batch.
         """

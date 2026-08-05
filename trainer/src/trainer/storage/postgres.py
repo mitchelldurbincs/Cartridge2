@@ -57,6 +57,13 @@ _SELECTION_WHERE = """
     AND source_checkpoint_id IS NOT DISTINCT FROM %s
 """
 
+# How many sample() calls may reuse one cached snapshot of the selection's row
+# ids. The orchestrated loops seal a scope before training starts, so the
+# snapshot is exact there; the standalone `train` command can overlap an
+# external collector still writing into the scope, so the snapshot is
+# refreshed periodically to pick up new rows.
+_ID_CACHE_REFRESH_INTERVAL = 100
+
 
 def _format_columns(columns: tuple[tuple[str, str, str], ...]) -> str:
     return ", ".join(
@@ -171,6 +178,10 @@ class PostgresReplayStore(ReplayStore):
         self._selection = selection
         self._pool_size = pool_size
         self._transient_errors = (psycopg2.OperationalError, psycopg2.InterfaceError)
+        # Snapshot of the selection's row ids for O(batch) sampling. Worst
+        # case a few hundred thousand short strings — tens of MB.
+        self._id_cache: list[str] | None = None
+        self._samples_since_refresh = 0
         try:
             self._pool = pool.ThreadedConnectionPool(
                 # psycopg2 retains only `minconn` idle connections and *closes*
@@ -355,51 +366,75 @@ class PostgresReplayStore(ReplayStore):
     def _sample_once(self, batch_size: int) -> list[ReplayRecord]:
         with self._connection() as conn:
             with conn.cursor() as cur:
-                selection_count = self._count_selection(cur)
-                if selection_count == 0:
+                if (
+                    self._id_cache is None
+                    or self._samples_since_refresh >= _ID_CACHE_REFRESH_INTERVAL
+                ):
+                    self._refresh_id_cache(cur)
+                if not self._id_cache:
                     raise EmptyReplaySelectionError(
                         "cannot sample from an empty exact replay selection"
                     )
-                # Keep database work bounded by the minibatch. If the exact
-                # selection is smaller, fill the remainder with replacement
-                # after decoding the selected immutable rows.
-                sample_size = min(batch_size, selection_count)
-                sample_pct = min(
-                    100.0,
-                    (sample_size * 10.0 * 100.0) / selection_count,
-                )
-                cur.execute(
-                    f"""
-                    SELECT id, env_id, env_contract_version, algorithm_id,
-                           experience_schema, collection_scope_id,
-                           source_checkpoint_id, episode_id, step_number, payload
-                    FROM replay_records TABLESAMPLE SYSTEM(%s)
-                    WHERE {_SELECTION_WHERE}
-                    LIMIT %s
-                    """,
-                    (sample_pct, *self._selection_params, sample_size),
-                )
-                rows = cur.fetchall()
-                if len(rows) < sample_size:
-                    cur.execute(
-                        f"""
-                        SELECT id, env_id, env_contract_version, algorithm_id,
-                               experience_schema, collection_scope_id,
-                               source_checkpoint_id, episode_id, step_number, payload
-                        FROM replay_records
-                        WHERE {_SELECTION_WHERE}
-                        ORDER BY RANDOM()
-                        LIMIT %s
-                        """,
-                        (*self._selection_params, sample_size),
-                    )
-                    rows = cur.fetchall()
-                records = self._rows_to_records(rows)
-        if not records:
-            raise EmptyReplaySelectionError("cannot sample from an empty exact replay selection")
-        if len(records) < batch_size:
-            records.extend(random.choices(records, k=batch_size - len(records)))
-        return records
+                self._samples_since_refresh += 1
+                # A uniform i.i.d. draw with replacement over the snapshot:
+                # every record has equal probability on every draw, cost is
+                # O(batch) regardless of selection or table size, and a
+                # selection smaller than the batch fills it by repetition.
+                chosen = random.choices(self._id_cache, k=batch_size)
+                records = self._fetch_records_by_id(cur, chosen)
+                if records is None:
+                    # Chosen ids vanished (concurrent clear/cleanup): refresh
+                    # the snapshot once and redraw from it.
+                    self._refresh_id_cache(cur)
+                    if not self._id_cache:
+                        raise EmptyReplaySelectionError(
+                            "cannot sample from an empty exact replay selection"
+                        )
+                    chosen = random.choices(self._id_cache, k=batch_size)
+                    records = self._fetch_records_by_id(cur, chosen)
+                    if records is None:
+                        raise RuntimeError(
+                            "replay selection rows disappeared twice during one "
+                            "sample; a concurrent writer is deleting from the "
+                            "exact selection"
+                        )
+                return records
+
+    def _refresh_id_cache(self, cur) -> None:
+        cur.execute(
+            f"SELECT id FROM replay_records WHERE {_SELECTION_WHERE}",
+            self._selection_params,
+        )
+        self._id_cache = [row[0] for row in cur.fetchall()]
+        self._samples_since_refresh = 0
+
+    def _invalidate_id_cache(self) -> None:
+        self._id_cache = None
+        self._samples_since_refresh = 0
+
+    def _fetch_records_by_id(self, cur, chosen: list[str]) -> list[ReplayRecord] | None:
+        """Fetch the chosen ids, expanding duplicate draws from one row each.
+
+        Returns None when any chosen id no longer exists so the caller can
+        refresh its snapshot. The full selection fence stays on the query, so
+        a stale id can never fetch a row from outside the exact selection.
+        """
+        unique_ids = list(dict.fromkeys(chosen))
+        cur.execute(
+            f"""
+            SELECT id, env_id, env_contract_version, algorithm_id,
+                   experience_schema, collection_scope_id,
+                   source_checkpoint_id, episode_id, step_number, payload
+            FROM replay_records
+            WHERE {_SELECTION_WHERE}
+              AND id = ANY(%s)
+            """,
+            (*self._selection_params, unique_ids),
+        )
+        records_by_id = {record.id: record for record in self._rows_to_records(cur.fetchall())}
+        if len(records_by_id) < len(unique_ids):
+            return None
+        return [records_by_id[record_id] for record_id in chosen]
 
     @staticmethod
     def _rows_to_records(rows: list) -> list[ReplayRecord]:
@@ -420,6 +455,7 @@ class PostgresReplayStore(ReplayStore):
         ]
 
     def clear(self) -> int:
+        self._invalidate_id_cache()
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -433,6 +469,7 @@ class PostgresReplayStore(ReplayStore):
     def cleanup(self, window_size: int) -> int:
         if window_size < 0:
             raise ValueError("window_size cannot be negative")
+        self._invalidate_id_cache()
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -485,6 +522,7 @@ class PostgresReplayStore(ReplayStore):
         self._require_selection(records)
         if not records:
             return
+        self._invalidate_id_cache()
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.executemany(
