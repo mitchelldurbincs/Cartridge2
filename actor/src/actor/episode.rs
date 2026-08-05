@@ -158,7 +158,10 @@ struct EpisodeState {
     stats: EpisodeStats,
 }
 
-pub(super) fn episode_id_prefix(
+/// Shared by every collector (AlphaZero and DQN alike): the random
+/// `process_token` makes episode IDs collide-free across process restarts
+/// within the same collection scope.
+pub(crate) fn episode_id_prefix(
     actor_id: &str,
     collection_scope_id: &str,
     process_token: u64,

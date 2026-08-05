@@ -2,9 +2,10 @@
 
 import logging
 import random
+import time
 from contextlib import contextmanager
 from importlib.resources import files
-from typing import TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING, Callable, Generator, TypeVar
 
 from trainer.storage.base import (
     EmptyReplaySelectionError,
@@ -17,6 +18,8 @@ if TYPE_CHECKING:
     from psycopg2.extensions import connection as PgConnection
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 REPLAY_SCHEMA_VERSION = 3
 _REPLAY_SCHEMA_TABLES = {"cartridge_schema_versions", "replay_records"}
@@ -167,11 +170,20 @@ class PostgresReplayStore(ReplayStore):
             raise TypeError("selection must be ReplaySelection")
         self._selection = selection
         self._pool_size = pool_size
+        self._transient_errors = (psycopg2.OperationalError, psycopg2.InterfaceError)
         try:
             self._pool = pool.ThreadedConnectionPool(
-                minconn=1,
+                # psycopg2 retains only `minconn` idle connections and *closes*
+                # every returned connection above it, so minconn must equal
+                # maxconn for the pool to actually keep its connections.
+                minconn=pool_size,
                 maxconn=pool_size,
                 dsn=connection_string,
+                connect_timeout=10,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=3,
             )
         except psycopg2.Error as exc:
             raise ConnectionError(f"Failed to connect to PostgreSQL: {exc}") from exc
@@ -203,13 +215,44 @@ class PostgresReplayStore(ReplayStore):
     @contextmanager
     def _connection(self) -> Generator["PgConnection", None, None]:
         conn = self._get_conn()
+        broken = False
         try:
             yield conn
         except BaseException:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception:
+                # The socket itself is dead; it must not re-enter the pool.
+                broken = True
             raise
         finally:
-            self._put_conn(conn)
+            if broken or conn.closed:
+                self._pool.putconn(conn, close=True)
+            else:
+                self._put_conn(conn)
+
+    def _with_retry(self, operation: Callable[[], T]) -> T:
+        """Retry read-side operations across transient connection failures.
+
+        Bounded and read-only: writes get their idempotent retry in the Rust
+        actor; here only sampling-path reads are retried, so a retry can never
+        duplicate state.
+        """
+        delays = (0.1, 0.2, 0.4)
+        for attempt, delay in enumerate((*delays, None)):
+            try:
+                return operation()
+            except self._transient_errors as exc:
+                if delay is None:
+                    raise
+                logger.warning(
+                    "Transient replay database failure (attempt %d): %s; retrying in %.1fs",
+                    attempt + 1,
+                    exc,
+                    delay,
+                )
+                time.sleep(delay)
+        raise AssertionError("unreachable retry state")
 
     def close(self) -> None:
         self._pool.closeall()
@@ -307,6 +350,9 @@ class PostgresReplayStore(ReplayStore):
     def sample(self, batch_size: int) -> list[ReplayRecord]:
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
+        return self._with_retry(lambda: self._sample_once(batch_size))
+
+    def _sample_once(self, batch_size: int) -> list[ReplayRecord]:
         with self._connection() as conn:
             with conn.cursor() as cur:
                 selection_count = self._count_selection(cur)

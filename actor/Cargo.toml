@@ -52,6 +52,10 @@ indicatif = "0.17"
 # PostgreSQL for replay buffer (required)
 tokio-postgres = "0.7"
 deadpool-postgres = "0.14"
+# TLS for PostgreSQL connections (sslmode in the DSN is honored, never dropped)
+tokio-postgres-rustls = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-native-certs = "0.8"
 
 # Time utilities
 uuid = { version = "1.6", features = ["v4"] }

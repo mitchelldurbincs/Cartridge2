@@ -2,8 +2,9 @@
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use deadpool_postgres::{Config, Object, Pool, Runtime};
+use deadpool_postgres::{Manager, ManagerConfig, Object, Pool, RecyclingMethod, Runtime};
 use std::time::Duration;
+use tokio_postgres::config::SslMode;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{NoTls, Transaction};
 
@@ -255,6 +256,14 @@ fn build_batch_insert_sql(batch_size: usize) -> String {
         }
         sql.push(')');
     }
+    // Records are immutable and keyed by content, so re-inserting the same
+    // rows must be a no-op: store_batch retries after ambiguous outcomes
+    // (e.g. a connection lost mid-commit), and a restarted worker may replay
+    // an already-persisted episode. DO NOTHING can never overwrite a record.
+    sql.push_str(
+        " ON CONFLICT (env_id, env_contract_version, algorithm_id, experience_schema, \
+         collection_scope_id, id) DO NOTHING",
+    );
     sql
 }
 
@@ -279,9 +288,73 @@ impl Default for PoolConfig {
     }
 }
 
+/// Transient failures worth retrying: the connection died, the server is
+/// restarting/failing over, or the transaction lost a concurrency race.
+/// Validation and constraint errors are never transient and fail immediately.
+fn is_transient_storage_error(error: &anyhow::Error) -> bool {
+    for cause in error.chain() {
+        if cause.downcast_ref::<std::io::Error>().is_some() {
+            return true;
+        }
+        if let Some(pool_error) = cause.downcast_ref::<deadpool_postgres::PoolError>() {
+            if matches!(pool_error, deadpool_postgres::PoolError::Timeout(_)) {
+                return true;
+            }
+        }
+        if let Some(pg_error) = cause.downcast_ref::<tokio_postgres::Error>() {
+            if pg_error.is_closed() {
+                return true;
+            }
+            if let Some(state) = pg_error.code() {
+                let code = state.code();
+                // 08xxx connection exceptions; 57P01-57P03 shutdown/failover;
+                // 40001/40P01 serialization failure and deadlock.
+                if code.starts_with("08")
+                    || matches!(code, "57P01" | "57P02" | "57P03" | "40001" | "40P01")
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+const STORE_RETRY_ATTEMPTS: u32 = 4;
+
+fn store_retry_delay(attempt: u32) -> Duration {
+    let base_ms = 100u64.saturating_mul(1 << attempt);
+    let jitter_ms = rand::random::<u64>() % (base_ms / 2 + 1);
+    Duration::from_millis(base_ms + jitter_ms)
+}
+
+/// Build a TLS connector that trusts the host's native root certificates.
+/// Hostname verification stays on for every TLS mode (stricter than libpq's
+/// `require`), so a connection that negotiates TLS is always authenticated.
+fn rustls_connector() -> Result<tokio_postgres_rustls::MakeRustlsConnect> {
+    let loaded = rustls_native_certs::load_native_certs();
+    for error in &loaded.errors {
+        tracing::warn!(%error, "failed to load a native root certificate");
+    }
+    if loaded.certs.is_empty() {
+        bail!("no native root certificates available for PostgreSQL TLS");
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in loaded.certs {
+        roots
+            .add(cert)
+            .context("failed to add a native root certificate")?;
+    }
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(config))
+}
+
 pub struct PostgresReplayStore {
     pool: Pool,
     selection: ReplaySelection,
+    idle_timeout: Option<Duration>,
 }
 
 impl PostgresReplayStore {
@@ -296,34 +369,33 @@ impl PostgresReplayStore {
         selection: ReplaySelection,
     ) -> Result<Self> {
         selection.validate()?;
-        let pg_config: tokio_postgres::Config = connection_string.parse()?;
-        let mut config = Config::new();
-
-        if let Some(host) = pg_config.get_hosts().first() {
-            config.host = Some(match host {
-                tokio_postgres::config::Host::Tcp(value) => value.clone(),
-                #[cfg(unix)]
-                tokio_postgres::config::Host::Unix(path) => path.to_string_lossy().into_owned(),
-            });
+        // The fully parsed configuration flows into the pool manager, so every
+        // DSN parameter — sslmode, application_name, options, additional
+        // hosts — takes effect instead of being silently dropped.
+        let mut pg_config: tokio_postgres::Config = connection_string.parse()?;
+        if pg_config.get_connect_timeout().is_none() {
+            pg_config.connect_timeout(Duration::from_secs(pool_config.connect_timeout_secs));
         }
-        config.port = pg_config.get_ports().first().copied();
-        config.user = pg_config.get_user().map(str::to_string);
-        config.password = pg_config
-            .get_password()
-            .map(|password| String::from_utf8_lossy(password).into_owned());
-        config.dbname = pg_config.get_dbname().map(str::to_string);
-        config.pool = Some(deadpool_postgres::PoolConfig {
-            max_size: pool_config.max_size,
-            timeouts: deadpool_postgres::Timeouts {
-                wait: Some(Duration::from_secs(pool_config.connect_timeout_secs)),
-                create: Some(Duration::from_secs(pool_config.connect_timeout_secs)),
-                recycle: pool_config.idle_timeout_secs.map(Duration::from_secs),
-            },
-            ..Default::default()
-        });
-
-        let pool = config.create_pool(Some(Runtime::Tokio1), NoTls)?;
-        let store = Self { pool, selection };
+        let manager_config = ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        };
+        let manager = match pg_config.get_ssl_mode() {
+            SslMode::Disable => Manager::from_config(pg_config, NoTls, manager_config),
+            _ => Manager::from_config(pg_config, rustls_connector()?, manager_config),
+        };
+        let connect_timeout = Duration::from_secs(pool_config.connect_timeout_secs);
+        let pool = Pool::builder(manager)
+            .max_size(pool_config.max_size)
+            .wait_timeout(Some(connect_timeout))
+            .create_timeout(Some(connect_timeout))
+            .runtime(Runtime::Tokio1)
+            .build()
+            .context("failed to build PostgreSQL replay pool")?;
+        let store = Self {
+            pool,
+            selection,
+            idle_timeout: pool_config.idle_timeout_secs.map(Duration::from_secs),
+        };
         store.ensure_schema().await?;
         tracing::info!(
             max_size = pool_config.max_size,
@@ -333,6 +405,13 @@ impl PostgresReplayStore {
     }
 
     async fn client(&self) -> Result<Object> {
+        if let Some(idle) = self.idle_timeout {
+            // deadpool never retires idle connections on its own (its
+            // `recycle` timeout bounds the recycle *operation*, not idle
+            // lifetime), so approximate the configured idle timeout by
+            // dropping stale connections whenever the pool is next used.
+            self.pool.retain(|_, metrics| metrics.last_used() < idle);
+        }
         self.pool
             .get()
             .await
@@ -409,6 +488,56 @@ impl PostgresReplayStore {
         );
         Ok(())
     }
+
+    /// One attempt at storing a batch. All chunks commit atomically: either
+    /// the whole batch is stored or none of it is, so a failure can never
+    /// leave a partial episode.
+    async fn try_store_batch(
+        &self,
+        records: &[ReplayRecord],
+        contract_versions: &[i64],
+        step_numbers: &[i64],
+    ) -> Result<()> {
+        let mut client = self.client().await?;
+        let transaction = client
+            .transaction()
+            .await
+            .context("failed to start replay insert transaction")?;
+        for (chunk_index, chunk) in records.chunks(MAX_RECORDS_PER_INSERT).enumerate() {
+            let offset = chunk_index * MAX_RECORDS_PER_INSERT;
+            let sql = build_batch_insert_sql(chunk.len());
+            let mut parameters: Vec<&(dyn ToSql + Sync)> =
+                Vec::with_capacity(chunk.len() * COLS_PER_RECORD);
+            for (index, record) in chunk.iter().enumerate() {
+                parameters.push(&record.id);
+                parameters.push(&record.env_id);
+                parameters.push(&contract_versions[offset + index]);
+                parameters.push(&record.algorithm_id);
+                parameters.push(&record.experience_schema);
+                parameters.push(&record.collection_scope_id);
+                parameters.push(&record.source_checkpoint_id);
+                parameters.push(&record.episode_id);
+                parameters.push(&step_numbers[offset + index]);
+                parameters.push(&record.payload);
+            }
+            transaction
+                .execute(&sql, &parameters)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to insert replay records {}..{} of {}",
+                        offset,
+                        offset + chunk.len(),
+                        records.len()
+                    )
+                })?;
+        }
+        transaction
+            .commit()
+            .await
+            .with_context(|| format!("failed to commit {} replay records", records.len()))?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -450,47 +579,33 @@ impl ReplayStore for PostgresReplayStore {
             .map(|record| i64::from(record.env_contract_version))
             .collect::<Vec<_>>();
 
-        // All chunks commit atomically: either the whole batch is stored or
-        // none of it is, so a failure can never leave a partial episode.
-        let mut client = self.client().await?;
-        let transaction = client
-            .transaction()
-            .await
-            .context("failed to start replay insert transaction")?;
-        for (chunk_index, chunk) in records.chunks(MAX_RECORDS_PER_INSERT).enumerate() {
-            let offset = chunk_index * MAX_RECORDS_PER_INSERT;
-            let sql = build_batch_insert_sql(chunk.len());
-            let mut parameters: Vec<&(dyn ToSql + Sync)> =
-                Vec::with_capacity(chunk.len() * COLS_PER_RECORD);
-            for (index, record) in chunk.iter().enumerate() {
-                parameters.push(&record.id);
-                parameters.push(&record.env_id);
-                parameters.push(&contract_versions[offset + index]);
-                parameters.push(&record.algorithm_id);
-                parameters.push(&record.experience_schema);
-                parameters.push(&record.collection_scope_id);
-                parameters.push(&record.source_checkpoint_id);
-                parameters.push(&record.episode_id);
-                parameters.push(&step_numbers[offset + index]);
-                parameters.push(&record.payload);
-            }
-            transaction
-                .execute(&sql, &parameters)
+        // Transient failures are retried with bounded backoff. That is safe
+        // because the insert is idempotent (`ON CONFLICT ... DO NOTHING` over
+        // immutable content-keyed rows), so retrying after an ambiguous
+        // outcome can never duplicate or overwrite a record.
+        let mut attempt = 0;
+        loop {
+            match self
+                .try_store_batch(records, &contract_versions, &step_numbers)
                 .await
-                .with_context(|| {
-                    format!(
-                        "failed to insert replay records {}..{} of {}",
-                        offset,
-                        offset + chunk.len(),
-                        records.len()
-                    )
-                })?;
+            {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if attempt + 1 < STORE_RETRY_ATTEMPTS && is_transient_storage_error(&error) =>
+                {
+                    let delay = store_retry_delay(attempt);
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        delay_ms = delay.as_millis() as u64,
+                        error = %error,
+                        "transient replay store failure; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        transaction
-            .commit()
-            .await
-            .with_context(|| format!("failed to commit {} replay records", records.len()))?;
-        Ok(())
     }
 
     async fn count(&self) -> Result<usize> {
@@ -655,7 +770,11 @@ mod tests {
     }
 
     #[test]
-    fn batch_insert_is_immutable_and_uses_ten_columns_per_record() {
+    fn batch_insert_is_idempotent_and_never_overwrites() {
+        // `ON CONFLICT ... DO NOTHING` is required, not forbidden: store_batch
+        // retries after ambiguous commit outcomes, and re-inserting immutable
+        // content-keyed rows must be a no-op. What stays forbidden is any
+        // update path — a conflict may never overwrite an existing record.
         let sql = build_batch_insert_sql(2);
         assert!(sql.contains("INSERT INTO replay_records"));
         assert!(sql.contains("payload"));
@@ -663,8 +782,12 @@ mod tests {
         assert!(sql.contains("collection_scope_id"));
         assert!(sql.contains("source_checkpoint_id"));
         assert!(sql.contains("$20"));
-        assert!(!sql.contains("ON CONFLICT"));
-        assert!(!sql.contains("UPDATE"));
+        assert!(sql.contains(
+            "ON CONFLICT (env_id, env_contract_version, algorithm_id, experience_schema, \
+             collection_scope_id, id) DO NOTHING"
+        ));
+        assert!(!sql.contains("DO UPDATE"));
+        assert!(!sql.contains("SET "));
     }
 
     #[test]
@@ -672,11 +795,37 @@ mod tests {
         assert_eq!(MAX_RECORDS_PER_INSERT, 6553);
         assert_eq!(MAX_RECORDS_PER_INSERT * COLS_PER_RECORD, 65530);
 
-        // The largest permitted chunk must end on its exact final placeholder
-        // and never reach the u16 bind-parameter limit.
+        // The largest permitted chunk must reach its exact final placeholder
+        // and never the u16 bind-parameter limit.
         let sql = build_batch_insert_sql(MAX_RECORDS_PER_INSERT);
-        assert!(sql.ends_with(&format!("${})", MAX_RECORDS_PER_INSERT * COLS_PER_RECORD)));
+        assert!(sql.contains(&format!("${})", MAX_RECORDS_PER_INSERT * COLS_PER_RECORD)));
         assert!(!sql.contains("$65536"));
+    }
+
+    #[test]
+    fn transient_classification_retries_io_but_not_validation_errors() {
+        let io_error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        ))
+        .context("failed to commit 3 replay records");
+        assert!(is_transient_storage_error(&io_error));
+
+        let validation_error = anyhow::anyhow!("replay record 'x' does not match selection");
+        assert!(!is_transient_storage_error(&validation_error));
+    }
+
+    #[test]
+    fn store_retry_delays_are_bounded_exponential() {
+        for attempt in 0..STORE_RETRY_ATTEMPTS {
+            let base = 100u64 << attempt;
+            let delay = store_retry_delay(attempt).as_millis() as u64;
+            assert!(delay >= base, "attempt {attempt}: {delay} < {base}");
+            assert!(
+                delay <= base + base / 2,
+                "attempt {attempt}: {delay} too large"
+            );
+        }
     }
 
     #[test]

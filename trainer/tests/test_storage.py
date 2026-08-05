@@ -121,6 +121,9 @@ def store_with_recording_cursor(
     connection = _RecordingConnection(cursor)
     store = PostgresReplayStore.__new__(PostgresReplayStore)
     store._selection = TEST_SELECTION
+    # No transient classes registered: retry becomes a pass-through, so these
+    # unit tests observe exactly one attempt per operation.
+    store._transient_errors = ()
 
     @contextmanager
     def connection_scope():

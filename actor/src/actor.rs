@@ -4,6 +4,8 @@ mod episode;
 mod runner;
 mod setup;
 
+pub(crate) use episode::episode_id_prefix;
+
 use anyhow::{anyhow, Result};
 use engine_core::EngineContext;
 use std::sync::{
@@ -20,8 +22,8 @@ use crate::storage::{ReplaySelection, ReplayStore};
 
 #[cfg(test)]
 use episode::{
-    episode_id_prefix, require_active_position, require_reset_timestep, require_step_timestep,
-    AbandonReason, EpisodeContext, EpisodeOutcome,
+    require_active_position, require_reset_timestep, require_step_timestep, AbandonReason,
+    EpisodeContext, EpisodeOutcome,
 };
 #[cfg(test)]
 use setup::{require_reachable_temperature_threshold, require_source_checkpoint};

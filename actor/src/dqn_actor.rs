@@ -37,6 +37,7 @@ pub struct DqnCollector {
     replay: Arc<dyn ReplayStore>,
     shutdown_signal: AtomicBool,
     stats: ActorStats,
+    episode_prefix: String,
 }
 
 impl DqnCollector {
@@ -140,6 +141,11 @@ impl DqnCollector {
         );
         Ok(Self {
             stats: ActorStats::new(&config.env_id),
+            episode_prefix: crate::actor::episode_id_prefix(
+                &config.actor_id,
+                &config.collection_scope_id,
+                rand::random::<u64>(),
+            ),
             config,
             cartridge_config,
             replay_selection,
@@ -185,11 +191,10 @@ impl DqnCollector {
         if reset.timestep.source != TransitionSource::Reset {
             bail!("DQN environment reset returned a non-reset transition");
         }
-        let episode_id = format!(
-            "{}-{}-ep-{episode}",
-            self.config.actor_id,
-            &self.config.collection_scope_id[..8]
-        );
+        // The prefix carries a random per-process token (see
+        // `actor::episode_id_prefix`), so a restarted collector reusing this
+        // scope can never collide with episode IDs it wrote before dying.
+        let episode_id = format!("{}-ep-{episode}", self.episode_prefix);
         let mut state = reset.state;
         let mut timestep = reset.timestep;
         let mut rng = ChaCha20Rng::seed_from_u64(seed ^ 0xd151_5eed);
@@ -327,6 +332,11 @@ mod tests {
             replay: replay.clone(),
             shutdown_signal: AtomicBool::new(false),
             stats: ActorStats::new("counter"),
+            episode_prefix: crate::actor::episode_id_prefix(
+                "dqn-test",
+                &"a".repeat(64),
+                0x0123456789abcdef,
+            ),
         };
 
         let (steps, episode_return) = collector.run_episode(0).await.unwrap();
