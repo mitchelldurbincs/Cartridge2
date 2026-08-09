@@ -447,12 +447,17 @@ impl OnnxEvaluator {
     }
 
     fn validate_value(value: f32, batch_index: usize) -> Result<f32, EvaluatorError> {
-        if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
+        // A tanh value head cannot exceed [-1, 1] mathematically, but ONNX
+        // runtime graph rewrites (e.g. CoreML fused ops) can land a float ulp
+        // outside it. Clamp that noise; still reject anything materially out
+        // of contract.
+        const VALUE_TOLERANCE: f32 = 1e-4;
+        if !value.is_finite() || value.abs() > 1.0 + VALUE_TOLERANCE {
             return Err(EvaluatorError::EvaluationFailed(format!(
                 "value output at batch index {batch_index} must be finite and in [-1, 1], got {value}"
             )));
         }
-        Ok(value)
+        Ok(value.clamp(-1.0, 1.0))
     }
 }
 

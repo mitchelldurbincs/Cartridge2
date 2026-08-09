@@ -331,4 +331,12 @@ fn non_finite_policy_and_out_of_contract_values_are_rejected() {
     }
     assert_eq!(OnnxEvaluator::validate_value(-1.0, 0).unwrap(), -1.0);
     assert_eq!(OnnxEvaluator::validate_value(1.0, 0).unwrap(), 1.0);
+
+    // Float noise from runtime graph rewrites (observed: CoreML emitting
+    // ±1.0000001 from a tanh head) is clamped back into contract.
+    assert_eq!(OnnxEvaluator::validate_value(1.000_000_1, 0).unwrap(), 1.0);
+    assert_eq!(
+        OnnxEvaluator::validate_value(-1.000_000_1, 0).unwrap(),
+        -1.0
+    );
 }
