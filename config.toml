@@ -13,10 +13,12 @@
 #   2. Create DB: createdb cartridge
 #      psql cartridge -c "CREATE USER cartridge WITH PASSWORD 'cartridge'; GRANT ALL ON DATABASE cartridge TO cartridge;"
 #   3. Install trainer: pip install -e "trainer/.[dev]"
-#   4. Build actor with CoreML: cd actor && cargo build --release --features coreml
+#   4. Build actor: cd actor && cargo build --release
+#      (Do NOT use --features coreml: benchmarked ~3x slower than plain CPU
+#      onnxruntime for small-batch MCTS inference — dispatch overhead dominates
+#      and parallel actors contend for one Neural Engine.)
 #   5. Run training: python -m trainer --algorithm alphazero_board_v1 loop
 #   Device auto-detection uses MPS (Metal) for PyTorch training.
-#   Actors use CoreML for ONNX inference when built with --features coreml.
 #   Recommended: num_actors = 6 for 8-core, 8-10 for M2/M3/M4 Pro/Max.
 
 # =============================================================================
