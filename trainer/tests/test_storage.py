@@ -410,7 +410,7 @@ class TestSelectionScopedSql:
 
         assert store.sample(3) == [record, record, record]
 
-        count_call, sampled_call, fallback_call = cursor.calls
+        count_call, sampled_call = cursor.calls
         selection_key = (
             TEST_PROFILE.env_id,
             TEST_PROFILE.env_contract_version,
@@ -421,10 +421,10 @@ class TestSelectionScopedSql:
         )
         assert "replay_records" in count_call[0]
         assert count_call[1] == selection_key
-        assert "FROM replay_records TABLESAMPLE" in sampled_call[0]
-        assert sampled_call[1] == (3.0, *selection_key, 3)
-        assert "FROM replay_records" in fallback_call[0]
-        assert fallback_call[1] == (*selection_key, 3)
+        assert "FROM replay_records" in sampled_call[0]
+        assert "ORDER BY RANDOM()" in sampled_call[0]
+        assert "TABLESAMPLE" not in sampled_call[0]
+        assert sampled_call[1] == (*selection_key, 3)
         assert all("ARRAY_AGG" not in sql and "MATERIALIZED" not in sql for sql, _ in cursor.calls)
         assert connection.checkouts == 1
 

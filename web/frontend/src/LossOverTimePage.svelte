@@ -388,15 +388,15 @@
           </div>
           <div class="stat">
             <span class="stat-label">Total Loss</span>
-            <span class="stat-value" style="color: {CHART_COLORS.total}">{formatLoss(latest.total_loss)}</span>
+            <span class="stat-value" style="color: {CHART_COLORS.total}">{formatLoss(latest.metrics['loss/total'])}</span>
           </div>
           <div class="stat">
             <span class="stat-label">Policy Loss</span>
-            <span class="stat-value" style="color: {CHART_COLORS.policy}">{formatLoss(latest.policy_loss)}</span>
+            <span class="stat-value" style="color: {CHART_COLORS.policy}">{formatLoss(latest.metrics['loss/policy'])}</span>
           </div>
           <div class="stat">
             <span class="stat-label">Value Loss</span>
-            <span class="stat-value" style="color: {CHART_COLORS.value}">{formatLoss(latest.value_loss)}</span>
+            <span class="stat-value" style="color: {CHART_COLORS.value}">{formatLoss(latest.metrics['loss/value'])}</span>
           </div>
           <div class="stat">
             <span class="stat-label">Data Points</span>

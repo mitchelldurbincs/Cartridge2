@@ -45,19 +45,15 @@ export interface MoveResponse extends GameState {
 
 export interface EvalStats {
   step: number;
-  win_rate: number;
-  draw_rate: number;
-  loss_rate: number;
-  games_played: number;
-  avg_game_length: number;
+  metrics: Record<string, number>;
+  episodes: number;
+  mean_episode_length: number;
   timestamp: number;
 }
 
 export interface HistoryEntry {
   step: number;
-  total_loss: number;
-  value_loss: number;
-  policy_loss: number;
+  metrics: Record<string, number>;
   learning_rate: number;
   grad_norm: number | null;
 }
@@ -65,17 +61,15 @@ export interface HistoryEntry {
 export interface TrainingStats {
   step: number;
   total_steps: number;
-  total_loss: number;
-  policy_loss: number;
-  value_loss: number;
+  metrics: Record<string, number>;
   samples_seen: number;
   replay_record_count: number;
   last_checkpoint: string;
   learning_rate: number;
   timestamp: number;
   env_id: string;
-  last_eval: EvalStats | null;
-  eval_history: EvalStats[];
+  last_evaluation: EvalStats | null;
+  evaluation_history: EvalStats[];
   history: HistoryEntry[];
 }
 

@@ -110,7 +110,7 @@ export function createScales(
   const minStep = Math.min(...steps);
   const maxStep = Math.max(...steps);
 
-  const allLosses = data.flatMap((d) => [d.total_loss, d.policy_loss, d.value_loss]);
+  const allLosses = data.flatMap((d) => [d.metrics['loss/total'], d.metrics['loss/policy'], d.metrics['loss/value']]);
   if (includeAvg100Data && includeAvg100Data.length > 0) {
     allLosses.push(...includeAvg100Data.map((d) => d.avg));
   }
@@ -139,7 +139,7 @@ export function createScales(
 
 export function makePath(
   data: HistoryEntry[],
-  key: 'total_loss' | 'policy_loss' | 'value_loss',
+  key: 'loss/total' | 'loss/policy' | 'loss/value',
   xScale: (step: number) => number,
   yScale: (loss: number) => number
 ): string {
@@ -147,7 +147,7 @@ export function makePath(
   return sorted
     .map((d, i) => {
       const x = xScale(d.step);
-      const y = yScale(d[key]);
+      const y = yScale(d.metrics[key]);
       return `${i === 0 ? 'M' : 'L'} ${x} ${y}`;
     })
     .join(' ');
@@ -183,7 +183,7 @@ export function computeRollingAverage(
   for (let i = 0; i < sorted.length; i++) {
     const start = Math.max(0, i - window + 1);
     const windowData = sorted.slice(start, i + 1);
-    const avg = windowData.reduce((sum, d) => sum + d.total_loss, 0) / windowData.length;
+    const avg = windowData.reduce((sum, d) => sum + d.metrics['loss/total'], 0) / windowData.length;
     result.push({ step: sorted[i].step, avg });
   }
   return result;
@@ -234,9 +234,9 @@ export function buildChartData(options: BuildChartDataOptions): ChartData {
   );
 
   const paths: ChartPaths = {
-    total: makePath(sorted, 'total_loss', xScale, yScale),
-    policy: makePath(sorted, 'policy_loss', xScale, yScale),
-    value: makePath(sorted, 'value_loss', xScale, yScale),
+    total: makePath(sorted, 'loss/total', xScale, yScale),
+    policy: makePath(sorted, 'loss/policy', xScale, yScale),
+    value: makePath(sorted, 'loss/value', xScale, yScale),
   };
 
   if (includeAvg100) {
@@ -255,18 +255,18 @@ export function buildChartData(options: BuildChartDataOptions): ChartData {
 
   let points: ChartData['points'];
   if (includePoints) {
-    const makePoints = (key: 'total_loss' | 'policy_loss' | 'value_loss') =>
+    const makePoints = (key: 'loss/total' | 'loss/policy' | 'loss/value') =>
       sorted.map((d) => ({
         x: xScale(d.step),
-        y: yScale(d[key]),
+        y: yScale(d.metrics[key]),
         step: d.step,
-        value: d[key],
+        value: d.metrics[key],
       }));
 
     points = {
-      total: makePoints('total_loss'),
-      policy: makePoints('policy_loss'),
-      value: makePoints('value_loss'),
+      total: makePoints('loss/total'),
+      policy: makePoints('loss/policy'),
+      value: makePoints('loss/value'),
     };
   }
 

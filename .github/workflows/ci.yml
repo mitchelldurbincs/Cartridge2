@@ -187,6 +187,22 @@ jobs:
   python-test:
     name: Python Tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: cartridge
+          POSTGRES_PASSWORD: cartridge
+          POSTGRES_DB: cartridge_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cartridge -d cartridge_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      CARTRIDGE_STORAGE_POSTGRES_URL: postgresql://cartridge:cartridge@localhost:5432/cartridge_test
     defaults:
       run:
         working-directory: trainer

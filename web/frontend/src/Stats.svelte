@@ -127,7 +127,7 @@
   }
 
   let evaluationHistory = $derived.by(() =>
-    [...(stats?.eval_history ?? [])].sort((left, right) => left.step - right.step)
+    [...(stats?.evaluation_history ?? [])].sort((left, right) => left.step - right.step)
   );
 
   function chartX(history: EvalStats[], index: number): number {
@@ -144,7 +144,7 @@
 
   function chartPoints(history: EvalStats[]): string {
     return history
-      .map((point, index) => `${chartX(history, index)},${chartY(point.win_rate)}`)
+      .map((point, index) => `${chartX(history, index)},${chartY(point.metrics['outcome/win_rate'])}`)
       .join(' ');
   }
 </script>
@@ -220,15 +220,15 @@
       </div>
       <div class="stat">
         <span class="label">Total Loss</span>
-        <span class="value">{formatNumber(stats.total_loss)}</span>
+        <span class="value">{formatNumber(stats.metrics['loss/total'])}</span>
       </div>
       <div class="stat">
         <span class="label">Policy Loss</span>
-        <span class="value">{formatNumber(stats.policy_loss)}</span>
+        <span class="value">{formatNumber(stats.metrics['loss/policy'])}</span>
       </div>
       <div class="stat">
         <span class="label">Value Loss</span>
-        <span class="value">{formatNumber(stats.value_loss)}</span>
+        <span class="value">{formatNumber(stats.metrics['loss/value'])}</span>
       </div>
       <div class="stat">
         <span class="label">Learning Rate</span>
@@ -250,7 +250,7 @@
     {/if}
 
     <!-- Evaluation Section -->
-    {#if stats.last_eval}
+    {#if stats.last_evaluation}
       <hr class="divider" />
       <h2>Model Evaluation</h2>
 
@@ -258,31 +258,31 @@
         <div class="eval-card-header">
           <span class="opponent-label">vs Random</span>
         </div>
-        <div class="win-rate-value" style="color: {getWinRateColor(stats.last_eval.win_rate)}">
-          {formatPercent(stats.last_eval.win_rate)}
+        <div class="win-rate-value" style="color: {getWinRateColor(stats.last_evaluation.metrics['outcome/win_rate'])}">
+          {formatPercent(stats.last_evaluation.metrics['outcome/win_rate'])}
         </div>
         <div class="eval-details">
-          <span>Draw: {formatPercent(stats.last_eval.draw_rate)}</span>
-          <span>Loss: {formatPercent(stats.last_eval.loss_rate)}</span>
+          <span>Draw: {formatPercent(stats.last_evaluation.metrics['outcome/draw_rate'])}</span>
+          <span>Loss: {formatPercent(stats.last_evaluation.metrics['outcome/loss_rate'])}</span>
         </div>
       </div>
 
       <div class="stat-grid">
         <div class="stat">
           <span class="label">Evaluated Step</span>
-          <span class="value">{stats.last_eval.step.toLocaleString()}</span>
+          <span class="value">{stats.last_evaluation.step.toLocaleString()}</span>
         </div>
         <div class="stat">
           <span class="label">Games</span>
-          <span class="value">{stats.last_eval.games_played.toLocaleString()}</span>
+          <span class="value">{stats.last_evaluation.episodes.toLocaleString()}</span>
         </div>
         <div class="stat">
           <span class="label">Average Length</span>
-          <span class="value">{stats.last_eval.avg_game_length.toFixed(1)}</span>
+          <span class="value">{stats.last_evaluation.mean_episode_length.toFixed(1)}</span>
         </div>
         <div class="stat">
           <span class="label">Evaluated At</span>
-          <span class="value">{formatTimestamp(stats.last_eval.timestamp)}</span>
+          <span class="value">{formatTimestamp(stats.last_evaluation.timestamp)}</span>
         </div>
       </div>
 
@@ -297,10 +297,10 @@
               <circle
                 class="chart-point"
                 cx={chartX(evaluationHistory, index)}
-                cy={chartY(evalPoint.win_rate)}
+                cy={chartY(evalPoint.metrics['outcome/win_rate'])}
                 r="1.8"
               >
-                <title>Step {evalPoint.step}: {formatPercent(evalPoint.win_rate)}</title>
+                <title>Step {evalPoint.step}: {formatPercent(evalPoint.metrics['outcome/win_rate'])}</title>
               </circle>
             {/each}
           </svg>
