@@ -3,7 +3,7 @@ import { createServer } from 'vite';
 import { fileURLToPath } from 'node:url';
 import { definitions, fixture } from './preview-fixtures.mjs';
 
-let selected = 'connect4';
+let selected = Object.keys(definitions)[0];
 const server = await createServer({
   root: fileURLToPath(new URL('..', import.meta.url)),
   configFile: fileURLToPath(new URL('../vite.config.ts', import.meta.url)),
