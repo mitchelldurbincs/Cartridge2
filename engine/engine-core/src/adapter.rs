@@ -62,8 +62,11 @@ impl<E: Environment> ErasedEnvironment for EnvironmentAdapter<E> {
         self.environment.metadata()
     }
 
-    fn describe_discrete_action(&self, agent: crate::AgentId, action: u32)
-        -> Option<crate::ActionPresentation> {
+    fn describe_discrete_action(
+        &self,
+        agent: crate::AgentId,
+        action: u32,
+    ) -> Option<crate::ActionPresentation> {
         self.environment.describe_discrete_action(agent, action)
     }
 

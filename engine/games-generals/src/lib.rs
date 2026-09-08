@@ -168,10 +168,17 @@ impl BoardGame for Generals {
             action::Move::Wait => Some(ActionPresentation::named(action, "Wait")),
             action::Move::Step { from, dir } => {
                 let to = action::move_target(from, dir)?;
-                Some(ActionPresentation::new(action,
-                    format!("({}, {}) → ({}, {})", from / params::WIDTH + 1,
-                        from % params::WIDTH + 1, to / params::WIDTH + 1, to % params::WIDTH + 1),
-                    ActionTarget::Edge { from, to }))
+                Some(ActionPresentation::new(
+                    action,
+                    format!(
+                        "({}, {}) → ({}, {})",
+                        from / params::WIDTH + 1,
+                        from % params::WIDTH + 1,
+                        to / params::WIDTH + 1,
+                        to % params::WIDTH + 1
+                    ),
+                    ActionTarget::Edge { from, to },
+                ))
             }
         }
     }

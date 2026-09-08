@@ -119,7 +119,10 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             ));
         }
         let (result, diagnostics) = self.run_internal(rng, true)?;
-        Ok((result, diagnostics.expect("fresh analyzed search retains root evaluation")))
+        Ok((
+            result,
+            diagnostics.expect("fresh analyzed search retains root evaluation"),
+        ))
     }
 
     fn run_internal(
@@ -141,7 +144,9 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             let legal_mask = self.tree.get(root_id).legal_moves_mask.clone();
             let root_state = self.root_state.clone();
             let root_obs = self.root_obs.clone();
-            let eval = self.evaluator.evaluate(&root_obs, &legal_mask, self.num_actions)?;
+            let eval = self
+                .evaluator
+                .evaluate(&root_obs, &legal_mask, self.num_actions)?;
             self.expand_node_with_eval_counted(root_id, &root_state, &legal_mask, &eval)?;
             self.tree.backpropagate(root_id, eval.value);
             if inspect {
@@ -270,23 +275,32 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             } else {
                 self.config.temperature
             };
-            let selection = self.tree.root_policy(self.num_actions, selection_temperature);
-            let actions = root.legal_moves_mask.iter_ones().map(|action| {
-                let child = root.children.iter()
-                    .find(|(id, _)| *id == action as u32)
-                    .map(|(_, id)| self.tree.get(*id));
-                ActionDiagnostics {
-                    action: action as u32,
-                    network_prior: eval.policy[action],
-                    search_prior: child.map(|node| node.prior),
-                    visit_share: policy[action],
-                    selection_probability: selection[action],
-                    visits: child.map_or(0, |node| node.visit_count),
-                    q_value: child.filter(|node| node.visit_count > 0)
-                        .map(|node| -node.mean_value()),
-                    expanded: child.is_some(),
-                }
-            }).collect();
+            let selection = self
+                .tree
+                .root_policy(self.num_actions, selection_temperature);
+            let actions = root
+                .legal_moves_mask
+                .iter_ones()
+                .map(|action| {
+                    let child = root
+                        .children
+                        .iter()
+                        .find(|(id, _)| *id == action as u32)
+                        .map(|(_, id)| self.tree.get(*id));
+                    ActionDiagnostics {
+                        action: action as u32,
+                        network_prior: eval.policy[action],
+                        search_prior: child.map(|node| node.prior),
+                        visit_share: policy[action],
+                        selection_probability: selection[action],
+                        visits: child.map_or(0, |node| node.visit_count),
+                        q_value: child
+                            .filter(|node| node.visit_count > 0)
+                            .map(|node| -node.mean_value()),
+                        expanded: child.is_some(),
+                    }
+                })
+                .collect();
             RootDiagnostics {
                 network_value: eval.value,
                 actions,
@@ -297,13 +311,16 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             }
         });
 
-        Ok((SearchResult {
-            action,
-            policy,
-            value: root.mean_value(),
-            simulations: root.visit_count,
-            stats,
-        }, diagnostics))
+        Ok((
+            SearchResult {
+                action,
+                policy,
+                value: root.mean_value(),
+                simulations: root.visit_count,
+                stats,
+            },
+            diagnostics,
+        ))
     }
 
     /// Select a leaf node by traversing the tree using UCB.

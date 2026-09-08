@@ -428,7 +428,9 @@ impl BoardGame for Othello {
             Some(engine_core::ActionPresentation::named(action, "Pass"))
         } else if action < BOARD_SIZE as u32 {
             Some(engine_core::ActionPresentation::cell(action, COLS))
-        } else { None }
+        } else {
+            None
+        }
     }
 
     // reset/step mirror games-tictactoe and games-connect4; shared reward and

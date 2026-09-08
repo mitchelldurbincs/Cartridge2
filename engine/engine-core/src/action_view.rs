@@ -19,13 +19,20 @@ pub enum ActionTarget {
 
 impl ActionPresentation {
     pub fn new(action: u32, label: impl Into<String>, target: ActionTarget) -> Self {
-        Self { action, label: label.into(), target: Some(target) }
+        Self {
+            action,
+            label: label.into(),
+            target: Some(target),
+        }
     }
 
     pub fn cell(action: u32, width: usize) -> Self {
         let index = action as usize;
-        Self::new(action, format!("Row {}, column {}", index / width + 1, index % width + 1),
-            ActionTarget::Cell { index })
+        Self::new(
+            action,
+            format!("Row {}, column {}", index / width + 1, index % width + 1),
+            ActionTarget::Cell { index },
+        )
     }
 
     pub fn named(action: u32, name: &str) -> Self {

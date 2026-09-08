@@ -82,8 +82,13 @@ pub(crate) trait ErasedEnvironment: Send + Sync + std::fmt::Debug + 'static {
     fn engine_id(&self) -> EngineId;
     fn capabilities(&self) -> Capabilities;
     fn metadata(&self) -> EnvironmentMetadata;
-    fn describe_discrete_action(&self, _agent: AgentId, _action: u32)
-        -> Option<crate::ActionPresentation> { None }
+    fn describe_discrete_action(
+        &self,
+        _agent: AgentId,
+        _action: u32,
+    ) -> Option<crate::ActionPresentation> {
+        None
+    }
 
     fn reset(
         &mut self,

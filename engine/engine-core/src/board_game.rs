@@ -38,7 +38,9 @@ pub trait BoardGame: Send + Sync + std::fmt::Debug + 'static {
     fn engine_id(&self) -> EngineId;
     fn capabilities(&self) -> Capabilities;
     fn metadata(&self) -> EnvironmentMetadata;
-    fn describe_discrete_action(&self, _action: u32) -> Option<crate::ActionPresentation> { None }
+    fn describe_discrete_action(&self, _action: u32) -> Option<crate::ActionPresentation> {
+        None
+    }
     /// Start an episode, rejecting unsupported hints or invalid generated state.
     fn reset(
         &mut self,
@@ -122,8 +124,11 @@ impl<G: BoardGame> Environment for BoardGameEnvironment<G> {
         self.game.metadata()
     }
 
-    fn describe_discrete_action(&self, _agent: AgentId, action: u32)
-        -> Option<crate::ActionPresentation> {
+    fn describe_discrete_action(
+        &self,
+        _agent: AgentId,
+        action: u32,
+    ) -> Option<crate::ActionPresentation> {
         self.game.describe_discrete_action(action)
     }
 

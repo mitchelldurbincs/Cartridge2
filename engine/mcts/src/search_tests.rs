@@ -23,25 +23,51 @@ fn diagnostics_preserve_search_and_rng_for_all_selection_modes() {
         let evaluator = UniformEvaluator::new();
         let mut rng_left = ChaCha20Rng::seed_from_u64(77);
         let mut rng_right = rng_left.clone();
-        let plain = run_mcts(&mut left, &evaluator, config.clone(),
-            reset.state.clone(), reset.timestep.clone(), &mut rng_left).unwrap();
-        let mut search = MctsSearch::new(&mut right, &evaluator, config,
-            reset.state, reset.timestep).unwrap();
+        let plain = run_mcts(
+            &mut left,
+            &evaluator,
+            config.clone(),
+            reset.state.clone(),
+            reset.timestep.clone(),
+            &mut rng_left,
+        )
+        .unwrap();
+        let mut search =
+            MctsSearch::new(&mut right, &evaluator, config, reset.state, reset.timestep).unwrap();
         let (analyzed, diagnostics) = search.run_with_diagnostics(&mut rng_right).unwrap();
         assert_eq!(plain.action, analyzed.action);
         assert_eq!(plain.policy, analyzed.policy);
         assert_eq!(plain.value, analyzed.value);
         assert_eq!(plain.stats.total_evals, analyzed.stats.total_evals);
         assert_eq!(rng_left.next_u64(), rng_right.next_u64());
-        assert_eq!(diagnostics.root_visits, diagnostics.completed_simulations + 1);
-        assert_eq!(diagnostics.neural_evaluations, analyzed.stats.total_evals + 1);
-        let mass: f32 = diagnostics.actions.iter().map(|a| a.selection_probability).sum();
+        assert_eq!(
+            diagnostics.root_visits,
+            diagnostics.completed_simulations + 1
+        );
+        assert_eq!(
+            diagnostics.neural_evaluations,
+            analyzed.stats.total_evals + 1
+        );
+        let mass: f32 = diagnostics
+            .actions
+            .iter()
+            .map(|a| a.selection_probability)
+            .sum();
         assert!((mass - 1.0).abs() < 1e-5);
         for action in &diagnostics.actions {
             assert_eq!(action.visit_share, analyzed.policy[action.action as usize]);
-            if action.visits == 0 { assert_eq!(action.q_value, None); }
+            if action.visits == 0 {
+                assert_eq!(action.q_value, None);
+            }
             if temperature == 0.0 {
-                assert_eq!(action.selection_probability, if action.action == analyzed.action { 1.0 } else { 0.0 });
+                assert_eq!(
+                    action.selection_probability,
+                    if action.action == analyzed.action {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                );
             }
         }
     }
@@ -51,19 +77,34 @@ fn diagnostics_preserve_search_and_rng_for_all_selection_modes() {
 fn diagnostics_retain_legal_actions_pruned_from_tree() {
     struct SparseEvaluator;
     impl Evaluator for SparseEvaluator {
-        fn evaluate(&self, _: &[u8], mask: &LegalMask, count: usize)
-            -> Result<crate::EvalResult, crate::EvaluatorError> {
+        fn evaluate(
+            &self,
+            _: &[u8],
+            mask: &LegalMask,
+            count: usize,
+        ) -> Result<crate::EvalResult, crate::EvaluatorError> {
             let mut policy = vec![0.0; count];
             policy[mask.iter_ones().next().unwrap()] = 1.0;
-            Ok(crate::EvalResult { policy, value: 0.25 })
+            Ok(crate::EvalResult {
+                policy,
+                value: 0.25,
+            })
         }
     }
     let mut ctx = setup_tictactoe();
     let reset = ctx.reset(42, &[]).unwrap();
     let evaluator = SparseEvaluator;
-    let mut search = MctsSearch::new(&mut ctx, &evaluator, MctsConfig::for_testing(),
-        reset.state, reset.timestep).unwrap();
-    let (_, diagnostics) = search.run_with_diagnostics(&mut ChaCha20Rng::seed_from_u64(42)).unwrap();
+    let mut search = MctsSearch::new(
+        &mut ctx,
+        &evaluator,
+        MctsConfig::for_testing(),
+        reset.state,
+        reset.timestep,
+    )
+    .unwrap();
+    let (_, diagnostics) = search
+        .run_with_diagnostics(&mut ChaCha20Rng::seed_from_u64(42))
+        .unwrap();
     assert_eq!(diagnostics.network_value, 0.25);
     assert_eq!(diagnostics.actions.len(), 9);
     for action in diagnostics.actions.iter().skip(1) {
@@ -86,10 +127,26 @@ fn diagnostics_report_winning_action_from_root_perspective() {
         timestep = step.timestep;
     }
     let evaluator = UniformEvaluator::new();
-    let mut search = MctsSearch::new(&mut ctx, &evaluator,
-        MctsConfig::for_testing().with_simulations(200), state, timestep).unwrap();
-    let (_, diagnostics) = search.run_with_diagnostics(&mut ChaCha20Rng::seed_from_u64(42)).unwrap();
-    assert_eq!(diagnostics.actions.iter().find(|a| a.action == 2).unwrap().q_value, Some(1.0));
+    let mut search = MctsSearch::new(
+        &mut ctx,
+        &evaluator,
+        MctsConfig::for_testing().with_simulations(200),
+        state,
+        timestep,
+    )
+    .unwrap();
+    let (_, diagnostics) = search
+        .run_with_diagnostics(&mut ChaCha20Rng::seed_from_u64(42))
+        .unwrap();
+    assert_eq!(
+        diagnostics
+            .actions
+            .iter()
+            .find(|a| a.action == 2)
+            .unwrap()
+            .q_value,
+        Some(1.0)
+    );
 }
 
 fn active_legal_mask(timestep: &ErasedTimestep) -> &LegalMask {

@@ -101,9 +101,14 @@ impl Environment for CounterEnvironment {
             .with_description("Move a scalar counter to the target before the horizon")
     }
 
-    fn describe_discrete_action(&self, agent: AgentId, action: u32)
-        -> Option<engine_core::ActionPresentation> {
-        if agent != AGENT { return None; }
+    fn describe_discrete_action(
+        &self,
+        agent: AgentId,
+        action: u32,
+    ) -> Option<engine_core::ActionPresentation> {
+        if agent != AGENT {
+            return None;
+        }
         match action {
             0 => Some(engine_core::ActionPresentation::named(action, "Left")),
             1 => Some(engine_core::ActionPresentation::named(action, "Right")),
