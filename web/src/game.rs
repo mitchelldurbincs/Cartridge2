@@ -10,7 +10,7 @@ use engine_core::{
     Presentation, TransitionSource,
 };
 #[cfg(feature = "onnx")]
-use mcts::{run_mcts, MctsConfig, SharedOnnxEvaluator};
+use mcts::{MctsConfig, MctsSearch, SharedOnnxEvaluator};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 // Note: Uses std::sync::RwLock (not tokio) because this is shared with model_watcher
@@ -23,6 +23,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
 use crate::types::GameStateResponse;
+use crate::types::{DecisionAnalysis, PositionKey, PositionRecord};
+use std::collections::VecDeque;
+mod analysis;
 #[cfg(not(feature = "onnx"))]
 use crate::SharedOnnxEvaluator;
 
@@ -47,6 +50,10 @@ const DEFAULT_HUMAN_PLAYER: u8 = 1;
 
 /// A game session tracking current state
 pub struct GameSession {
+    session_id: String,
+    revision: u64,
+    history: VecDeque<PositionRecord>,
+    model_info: Arc<RwLock<crate::ModelInfo>>,
     ctx: EngineContext,
     /// Explicit board-game profile required by this AlphaZero web cartridge.
     board: BoardGameMetadata,
@@ -390,7 +397,11 @@ impl GameSession {
                 .map_err(|error| anyhow!("Environment '{env_id}' is unavailable: {error}"))?,
         );
 
-        Ok(Self {
+        let mut session = Self {
+            session_id: format!("{:032x}", rand::random::<u128>()),
+            revision: 0,
+            history: VecDeque::new(),
+            model_info: Arc::new(RwLock::new(crate::ModelInfo::default())),
             ctx,
             board,
             state: reset.state,
@@ -403,7 +414,9 @@ impl GameSession {
             mcts_config,
             #[cfg(feature = "onnx")]
             mcts_sim_ctx,
-        })
+        };
+        session.record_position()?;
+        Ok(session)
     }
 
     /// Player to act (1 or 2)
@@ -453,6 +466,14 @@ impl GameSession {
             ));
         }
         self.human_player = player;
+        if let Some(record) = self.history.back_mut() {
+            record.state.human_player = player;
+        }
+        // Refresh the status text as well as the selected seat.
+        let state = self.to_response()?;
+        if let Some(record) = self.history.back_mut() {
+            record.state = state;
+        }
         Ok(())
     }
 
@@ -464,7 +485,8 @@ impl GameSession {
 
     /// Make a player move
     pub fn player_move(&mut self, position: u32) -> Result<()> {
-        self.make_move(position)
+        let analysis = self.decision(position, crate::types::DecisionSource::Human);
+        self.apply_decision(position, analysis)
     }
 
     /// Make a bot move using MCTS if model is available, otherwise random
@@ -478,33 +500,50 @@ impl GameSession {
         // Snapshot the current model and release the reload lock before the
         // search. The clone pins this move to one model generation while a
         // concurrent hot reload can proceed immediately.
-        let evaluator = {
+        let (evaluator, checkpoint) = {
             let guard = self
                 .evaluator
                 .read()
                 .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
-            guard.clone()
+            // The filesystem and S3 writers acquire evaluator then model_info.
+            // Holding both read guards gives one consistent model generation.
+            let info = self
+                .model_info
+                .read()
+                .map_err(|e| anyhow!("Model info lock: {e}"))?;
+            let checkpoint = if guard.is_some() {
+                Some(crate::types::CheckpointIdentity {
+                    checkpoint_id: info
+                        .checkpoint_id
+                        .clone()
+                        .ok_or_else(|| anyhow!("Loaded evaluator has no checkpoint identity"))?,
+                    training_step: info.training_step,
+                })
+            } else {
+                None
+            };
+            (guard.clone(), checkpoint)
         };
 
-        let position = if let Some(evaluator) = evaluator {
+        let (position, analysis) = if let Some(evaluator) = evaluator {
             // Try to use MCTS with neural network
             debug!("Attempting MCTS for bot move");
 
-            let mcts_result = (|| -> Result<u32> {
+            let mcts_result = (|| -> Result<_> {
                 // Use pre-created simulation context (avoids repeated registry lookups)
                 let sim_ctx = self
                     .mcts_sim_ctx
                     .as_mut()
                     .ok_or_else(|| anyhow!("Simulation context not available"))?;
 
-                let result = run_mcts(
+                let mut search = MctsSearch::new(
                     sim_ctx,
                     &evaluator,
                     self.mcts_config.clone(),
                     self.state.clone(),
                     self.timestep.clone(),
-                    &mut self.rng,
                 )?;
+                let (result, diagnostics) = search.run_with_diagnostics(&mut self.rng)?;
 
                 debug!(
                     action = result.action,
@@ -513,22 +552,25 @@ impl GameSession {
                     "MCTS selected move"
                 );
 
-                Ok(result.action)
+                Ok((result, diagnostics))
             })();
 
-            mcts_result.map_err(|error| {
+            let (result, diagnostics) = mcts_result.map_err(|error| {
                 anyhow!(
                     "Loaded model failed during MCTS; refusing to hide the runtime error: {error}"
                 )
-            })?
+            })?;
+            let analysis = self.search_analysis(&result, &diagnostics, checkpoint);
+            (result.action, analysis)
         } else {
             // Fall back to random move
             debug!("No model loaded, using random move");
             use rand::seq::SliceRandom;
-            *legal.choose(&mut self.rng).unwrap()
+            let position = *legal.choose(&mut self.rng).unwrap();
+            (position, self.random_analysis(position, &legal))
         };
 
-        self.make_move(position)?;
+        self.apply_decision(position, analysis)?;
         Ok(position)
     }
 
@@ -544,7 +586,8 @@ impl GameSession {
         use rand::seq::SliceRandom;
         let position = *legal.choose(&mut self.rng).unwrap();
 
-        self.make_move(position)?;
+        let analysis = self.random_analysis(position, &legal);
+        self.apply_decision(position, analysis)?;
         Ok(position)
     }
 
@@ -567,6 +610,8 @@ impl GameSession {
         self.state = step.state;
         self.timestep = step.timestep;
         self.view = view;
+        self.revision += 1;
+        self.record_position()?;
 
         Ok(())
     }
@@ -593,6 +638,21 @@ impl GameSession {
         };
 
         Ok(GameStateResponse {
+            session_id: self.session_id.clone(),
+            revision: self.revision,
+            actions: self
+                .legal_moves()?
+                .into_iter()
+                .map(|action| {
+                    self.ctx
+                        .describe_discrete_action(AgentId::from(self.current_player()), action)
+                        .unwrap_or(engine_core::ActionPresentation {
+                            action,
+                            label: format!("Action {action}"),
+                            target: None,
+                        })
+                })
+                .collect(),
             cells: self.view.cells.clone(),
             current_player: self.current_player(),
             human_player: self.human_player,

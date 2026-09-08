@@ -252,6 +252,8 @@ jobs:
         continue-on-error: true
       - name: Svelte check (TypeScript)
         run: npm run check
+      - name: Frontend unit and component tests
+        run: npm test
       - name: Build
         run: npm run build
 
