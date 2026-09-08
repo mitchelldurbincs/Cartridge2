@@ -107,6 +107,7 @@ pub use evaluator::{EvalResult, Evaluator, EvaluatorError, UniformEvaluator};
 pub use node::{MctsNode, NodeId};
 pub use search::{run_mcts, MctsSearch, SearchError, SearchResult, SearchStats};
 pub use tree::{MctsTree, TreeStats};
+pub use types::{ActionDiagnostics, RootDiagnostics};
 
 #[cfg(feature = "onnx")]
 pub use onnx::{OnnxEvaluator, OnnxStats, SharedOnnxEvaluator};

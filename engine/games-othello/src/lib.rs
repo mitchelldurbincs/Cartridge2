@@ -423,6 +423,14 @@ impl BoardGame for Othello {
             ]))
     }
 
+    fn describe_discrete_action(&self, action: u32) -> Option<engine_core::ActionPresentation> {
+        if action == PASS_ACTION {
+            Some(engine_core::ActionPresentation::named(action, "Pass"))
+        } else if action < BOARD_SIZE as u32 {
+            Some(engine_core::ActionPresentation::cell(action, COLS))
+        } else { None }
+    }
+
     // reset/step mirror games-tictactoe and games-connect4; shared reward and
     // Validation helpers live in the explicit engine_core::board_profile API.
     fn reset(

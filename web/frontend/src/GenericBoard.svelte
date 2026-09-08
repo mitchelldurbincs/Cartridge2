@@ -1,5 +1,7 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import type { CellView, GameInfo } from './lib/api';
+  import { percent, targetMass, type ActionPresentation, type ActionAssessment, type ProbabilityMetric } from './lib/analysis';
 
   // ============================================================================
   // Layout Constants
@@ -53,6 +55,13 @@
     gameInfo: GameInfo;
     currentPlayer: number;
     onCellClick: (position: number) => void;
+    actionPresentations: ActionPresentation[];
+    assessments?: ActionAssessment[];
+    metric?: ProbabilityMetric;
+    readOnly?: boolean;
+    humanPlayer?: number;
+    positionKey?: string;
+    highlightedAction?: number | null;
   }
 
   let {
@@ -62,8 +71,32 @@
     lastBotMove,
     gameInfo,
     currentPlayer,
-    onCellClick
+    onCellClick,
+    actionPresentations,
+    assessments = [],
+    metric = 'visit_share',
+    readOnly = false,
+    humanPlayer = 1,
+    positionKey = '',
+    highlightedAction = null
   }: Props = $props();
+
+  const timers = new Set<ReturnType<typeof setTimeout>>();
+  function later(fn: () => void, delay: number) {
+    const timer = setTimeout(() => { timers.delete(timer); fn(); }, delay);
+    timers.add(timer);
+  }
+  onDestroy(() => { for (const timer of timers) clearTimeout(timer); });
+
+  function mass(kind: 'cell' | 'column' | 'source', index: number): number | null {
+    return targetMass(actionPresentations, assessments, metric, kind, index);
+  }
+  function heat(value: number | null): string {
+    return value == null ? '' : `background-color: rgba(20, 160, 134, ${0.12 + 0.76 * Math.sqrt(value)});`;
+  }
+  function highlighted(kind: 'cell' | 'column', index: number): boolean {
+    return actionPresentations.some(a => a.action === highlightedAction && a.target?.kind === kind && a.target.index === index);
+  }
 
   // The grid and drop-column renderers only care about occupancy, and both
   // predate the engine's richer cell projection. Deriving the flat owner array
@@ -94,7 +127,7 @@
     let classes = 'grid-cell';
     if (value === 1) classes += ' player1';
     if (value === 2) classes += ' player2';
-    if (value === 0 && legalMoves.includes(index) && !gameOver) classes += ' clickable';
+    if (value === 0 && legalMoves.includes(index) && !gameOver && !readOnly) classes += ' clickable';
     if (index === lastBotMove) classes += ' last-bot-move';
     return classes;
   }
@@ -112,7 +145,7 @@
   let botDroppingPiece: { column: number; row: number; player: number } | null = $state(null);
   let animatingCells: Set<number> = $state(new Set());
   // Track the last processed bot move to avoid re-triggering animation
-  let processedBotMove: number | null = $state(null);
+  let processedBotMove: string | null = $state(null);
 
   // Convert board array to 2D grid (row 0 at bottom for drop_column)
   function getDropCell(col: number, row: number): number {
@@ -132,7 +165,7 @@
 
   // Handle column click with animation
   function handleColumnClick(col: number) {
-    if (gameOver || !legalMoves.includes(col)) return;
+    if (readOnly || gameOver || !legalMoves.includes(col)) return;
 
     const landingRow = findLandingRow(col);
     if (landingRow === -1) return;
@@ -143,7 +176,7 @@
     // Trigger the actual move after a brief delay to show animation start
     // Note: droppingPiece is NOT cleared here - it will be cleared by the $effect
     // when the board updates with the new piece, preventing the "disappearing piece" gap
-    setTimeout(() => {
+    later(() => {
       onCellClick(col);
     }, DROP_ANIMATION_DELAY);
   }
@@ -192,24 +225,26 @@
 
   // Trigger drop animation for bot moves
   $effect(() => {
-    if (boardType === 'drop_column' && lastBotMove !== null && lastBotMove >= 0 && lastBotMove < width) {
+    if (!readOnly && boardType === 'drop_column' && lastBotMove !== null && lastBotMove >= 0 && lastBotMove < width) {
       // Only trigger if this is a new bot move we haven't processed yet
-      if (lastBotMove !== processedBotMove) {
-        processedBotMove = lastBotMove;
+      const moveKey = `${positionKey}:${lastBotMove}`;
+      if (moveKey !== processedBotMove) {
+        processedBotMove = moveKey;
         const col = lastBotMove;
-        const row = findPieceRow(col, 2); // Bot is player 2
+        const botPlayer = 3 - humanPlayer;
+        const row = findPieceRow(col, botPlayer);
 
         if (row >= 0) {
           // Start bot drop animation
-          botDroppingPiece = { column: col, row: row, player: 2 };
+          botDroppingPiece = { column: col, row: row, player: botPlayer };
 
           // Clear animation after it completes
-          setTimeout(() => {
+          later(() => {
             botDroppingPiece = null;
             // Also trigger the highlight effect after drop completes
             const index = row * width + col;
             animatingCells.add(index);
-            setTimeout(() => {
+            later(() => {
               animatingCells = new Set([...animatingCells].filter(i => i !== index));
             }, BOT_HIGHLIGHT_DURATION);
           }, DROP_ANIMATION_DELAY);
@@ -232,7 +267,7 @@
   }
 
   function isColumnClickable(col: number): boolean {
-    return !gameOver && legalMoves.includes(col) && !droppingPiece;
+    return !readOnly && !gameOver && legalMoves.includes(col) && !droppingPiece;
   }
 
   // Calculate the Y position for the dropping animation
@@ -259,10 +294,6 @@
   // a wait action at the end. So a click cannot be a move on its own: pick a
   // source tile first, then an adjacent target.
 
-  /** Direction offsets in the engine's canonical order: up, right, down, left. */
-  const GEN_DIR_DX = [0, 1, 0, -1];
-  const GEN_DIR_DY = [-1, 0, 1, 0];
-
   const GENERALS_MAX_SIZE = 440;
 
   let generalsCellSize = $derived(
@@ -272,45 +303,36 @@
 
   let selectedTile: number | null = $state(null);
 
-  /** The wait action is the last index; every other action is a (tile, dir) move. */
-  let waitAction = $derived(gameInfo.num_actions - 1);
-
-  function generalsAction(from: number, dir: number): number {
-    return from * 4 + dir;
-  }
+  let waitAction = $derived(actionPresentations.find(a => a.target?.kind === 'named' && a.target.name === 'Wait')?.action ?? null);
+  let edges = $derived(actionPresentations.flatMap(a => a.target?.kind === 'edge' ? [{ ...a, from: a.target.from, to: a.target.to }] : []));
+  let selectedEdges = $derived(edges.filter(a => a.from === selectedTile));
 
   /** A tile can be picked when at least one of its four moves is legal. */
   function isSourceTile(index: number): boolean {
     if (gameOver) return false;
-    return [0, 1, 2, 3].some((dir) => legalMoves.includes(generalsAction(index, dir)));
+    return edges.some(a => a.from === index && legalMoves.includes(a.action));
   }
 
-  /** Direction from `selectedTile` to `index`, or null if not adjacent. */
-  function directionTo(from: number, to: number): number | null {
-    const fx = from % width;
-    const fy = Math.floor(from / width);
-    for (let dir = 0; dir < 4; dir++) {
-      const nx = fx + GEN_DIR_DX[dir];
-      const ny = fy + GEN_DIR_DY[dir];
-      if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
-      if (ny * width + nx === to) return dir;
-    }
-    return null;
+  function edgeAction(from: number, to: number): number | null {
+    return edges.find(a => a.from === from && a.to === to)?.action ?? null;
   }
 
   function isTargetTile(index: number): boolean {
     if (selectedTile === null) return false;
-    const dir = directionTo(selectedTile, index);
-    return dir !== null && legalMoves.includes(generalsAction(selectedTile, dir));
+    const action = edgeAction(selectedTile, index);
+    return action !== null && legalMoves.includes(action);
   }
 
   function handleGeneralsClick(index: number) {
     if (gameOver) return;
+    if (readOnly) {
+      selectedTile = selectedTile === index ? null : isSourceTile(index) ? index : null;
+      return;
+    }
 
     if (selectedTile !== null) {
-      const dir = directionTo(selectedTile, index);
-      if (dir !== null && legalMoves.includes(generalsAction(selectedTile, dir))) {
-        const action = generalsAction(selectedTile, dir);
+      const action = edgeAction(selectedTile, index);
+      if (action !== null && legalMoves.includes(action)) {
         selectedTile = null;
         onCellClick(action);
         return;
@@ -325,7 +347,7 @@
   }
 
   function handleGeneralsWait() {
-    if (gameOver || !legalMoves.includes(waitAction)) return;
+    if (readOnly || gameOver || waitAction === null || !legalMoves.includes(waitAction)) return;
     selectedTile = null;
     onCellClick(waitAction);
   }
@@ -335,6 +357,18 @@
     void cells;
     selectedTile = null;
   });
+
+  $effect(() => {
+    const selected = edges.find(a => a.action === highlightedAction);
+    if (readOnly && selected) selectedTile = selected.from;
+  });
+
+  function edgeProbability(action: number): number | null {
+    return assessments.find(a => a.action.index === action)?.[metric] ?? null;
+  }
+  function directionGlyph(from: number, to: number): string {
+    return to === from - width ? '↑' : to === from + width ? '↓' : to > from ? '→' : '←';
+  }
 
   function getGeneralsCellClass(index: number, cell: CellView): string {
     let classes = `gen-cell gen-${cell.kind}`;
@@ -374,11 +408,14 @@
     {#each board as cell, i}
       <button
         class={getGridCellClass(i, cell)}
-        style="width: {gridCellSize}px; height: {gridCellSize}px; font-size: {gridFontSize}rem;"
+        class:inspected={highlighted('cell', i)}
+        style="width: {gridCellSize}px; height: {gridCellSize}px; font-size: {gridFontSize}rem; {heat(mass('cell', i))}"
         onclick={() => onCellClick(i)}
-        disabled={cell !== 0 || gameOver || !legalMoves.includes(i)}
+        disabled={readOnly || cell !== 0 || gameOver || !legalMoves.includes(i)}
+        aria-label={`Row ${Math.floor(i / width) + 1}, column ${i % width + 1}: ${getGridCellSymbol(cell) || 'empty'}${mass('cell', i) != null ? `, ${percent(mass('cell', i))}` : ''}`}
       >
         {getGridCellSymbol(cell)}
+        {#if mass('cell', i) != null}<span class="probability">{percent(mass('cell', i))}</span>{/if}
       </button>
     {/each}
   </div>
@@ -390,12 +427,14 @@
       {#each Array(width) as _, col}
         <button
           class="column-indicator"
+          class:inspected={highlighted('column', col)}
           class:clickable={isColumnClickable(col)}
-          style="width: {dropCellSize}px; height: {DROP_INDICATOR_HEIGHT}px;"
+          style="width: {dropCellSize}px; height: {DROP_INDICATOR_HEIGHT}px; {heat(mass('column', col))}"
           onclick={() => handleColumnClick(col)}
           disabled={!isColumnClickable(col)}
           aria-label={`Drop piece in column ${col + 1}`}
         >
+          {#if mass('column', col) != null}<span class="probability">{percent(mass('column', col))}</span>{/if}
           {#if isColumnClickable(col)}
             <div
               class={`hover-piece player${currentPlayer}-preview`}
@@ -470,19 +509,22 @@
       {#each cells as cell, i}
         <button
           class={getGeneralsCellClass(i, cell)}
-          style="width: {generalsCellSize}px; height: {generalsCellSize}px;"
+          style="width: {generalsCellSize}px; height: {generalsCellSize}px; {heat(mass('source', i))}"
           onclick={() => handleGeneralsClick(i)}
           disabled={gameOver}
           aria-label={`Tile ${i % width},${Math.floor(i / width)}`}
         >
           <span class="gen-terrain">{terrainGlyph(cell)}</span>
           <span class="gen-army">{armyLabel(cell)}</span>
+          {#if mass('source', i) != null}<span class="probability gen-probability">{percent(mass('source', i))}</span>{/if}
         </button>
       {/each}
     </div>
     <div class="generals-controls">
       <span class="generals-hint">
-        {#if gameOver}
+        {#if readOnly}
+          Source totals shown. Select a source to inspect directions; percentages stay global.
+        {:else if gameOver}
           Game over
         {:else if selectedTile === null}
           Pick one of your tiles to move from
@@ -493,11 +535,21 @@
       <button
         class="generals-wait"
         onclick={handleGeneralsWait}
-        disabled={gameOver || !legalMoves.includes(waitAction)}
+        disabled={readOnly || gameOver || waitAction === null || !legalMoves.includes(waitAction)}
       >
         Wait
       </button>
     </div>
+    {#if readOnly && selectedTile !== null}
+      <div class="direction-inspector" aria-label="Directional action probabilities">
+        {#each selectedEdges as edge}
+          <span class:inspected={edge.action === highlightedAction} title={edge.label}>
+            <strong>{directionGlyph(edge.from, edge.to)}</strong> {percent(edgeProbability(edge.action))}
+            <small>{edge.label}</small>
+          </span>
+        {/each}
+      </div>
+    {/if}
   </div>
 {:else}
   <!-- Fallback for unknown board types -->
@@ -507,6 +559,13 @@
 {/if}
 
 <style>
+  .grid-cell,.column-indicator { position: relative; }
+  .probability { position: absolute; bottom: 3px; left: 0; width: 100%; color: #fff; font-size: .7rem; font-weight: 600; text-shadow: 0 1px 3px #000; pointer-events: none; }
+  .gen-probability { font-size: .56rem; bottom: 1px; }
+  .inspected { outline: 2px solid #ffe082; outline-offset: -2px; }
+  .direction-inspector { display: flex; gap: .6rem; flex-wrap: wrap; justify-content: center; }
+  .direction-inspector span { border: 1px solid #596378; border-radius: 6px; padding: .5rem; color: #dbefe8; }
+  .direction-inspector strong { font-size: 1.5rem; } .direction-inspector small { display: block; font-size: .65rem; }
   /* ============================================================================
    * Grid Board Styles (TicTacToe, Othello)
    * ============================================================================ */

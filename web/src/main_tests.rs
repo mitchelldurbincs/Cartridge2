@@ -62,6 +62,28 @@ async fn test_health_endpoint() {
 }
 
 #[tokio::test]
+async fn history_records_intermediate_position_and_stale_moves_conflict() {
+    let state = create_test_state();
+    let app = create_app(state.clone());
+    let (_, body) = get(app.clone(), "/game/state").await;
+    let current: GameStateResponse = serde_json::from_str(&body).unwrap();
+    let request = serde_json::json!({ "position": 4,
+        "expected": { "session_id": current.session_id, "revision": current.revision } }).to_string();
+    let (status, _) = post_json(app.clone(), "/move", &request).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post_json(app.clone(), "/move", &request).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, body) = get(app.clone(), "/game/history").await;
+    assert_eq!(status, StatusCode::OK);
+    let history: crate::types::HistoryResponse = serde_json::from_str(&body).unwrap();
+    assert_eq!(history.records.len(), 3);
+    assert_eq!(history.records[1].state.cells[4].owner, 1);
+    assert_eq!(history.records[1].decision.as_ref().unwrap().position.revision, 1);
+    let (status, _) = get(app, "/game/history?session_id=stale").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
 async fn test_stats_endpoint_returns_default_only_when_projection_is_absent() {
     let directory = tempfile::tempdir().unwrap();
     let mut state = create_test_state();

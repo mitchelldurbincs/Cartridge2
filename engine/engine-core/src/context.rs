@@ -96,6 +96,15 @@ impl EngineContext {
         self.metadata.clone()
     }
 
+    pub fn describe_discrete_action(&self, agent: crate::AgentId, action: u32)
+        -> Option<crate::ActionPresentation> {
+        match self.action_space(agent) {
+            Some(crate::ActionSpace::Discrete { size }) if action < size =>
+                self.environment.describe_discrete_action(agent, action),
+            _ => None,
+        }
+    }
+
     pub fn presentation(
         &self,
         state: &[u8],

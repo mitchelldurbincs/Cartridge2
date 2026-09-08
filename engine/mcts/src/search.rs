@@ -22,7 +22,7 @@ use crate::evaluator::Evaluator;
 use crate::node::NodeId;
 use crate::sampling::{dirichlet_noise, sample_action};
 use crate::tree::MctsTree;
-use crate::types::{LeafResult, PendingLeaf};
+use crate::types::{ActionDiagnostics, LeafResult, PendingLeaf, RootDiagnostics};
 
 // Re-export the plain data types so the public API is unchanged.
 pub use crate::types::{SearchError, SearchResult, SearchStats};
@@ -104,8 +104,32 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
     /// interleaves with evaluated values instead of queuing the entire search
     /// from priors and virtual loss alone.
     pub fn run(&mut self, rng: &mut ChaCha20Rng) -> Result<SearchResult, SearchError> {
+        self.run_internal(rng, false).map(|(result, _)| result)
+    }
+
+    /// Inspect a fresh search without additional inference or RNG draws.
+    /// Existing collectors can keep using run(), which skips diagnostics.
+    pub fn run_with_diagnostics(
+        &mut self,
+        rng: &mut ChaCha20Rng,
+    ) -> Result<(SearchResult, RootDiagnostics), SearchError> {
+        if self.tree.get(self.tree.root()).is_expanded() {
+            return Err(SearchError::InvalidState(
+                "root diagnostics require a fresh search".into(),
+            ));
+        }
+        let (result, diagnostics) = self.run_internal(rng, true)?;
+        Ok((result, diagnostics.expect("fresh analyzed search retains root evaluation")))
+    }
+
+    fn run_internal(
+        &mut self,
+        rng: &mut ChaCha20Rng,
+        inspect: bool,
+    ) -> Result<(SearchResult, Option<RootDiagnostics>), SearchError> {
         let search_start = Instant::now();
         let mut stats = SearchStats::default();
+        let mut root_evaluation = None;
 
         // First, expand the root if needed (single NN call, special case).
         // Backpropagate the root evaluation so the root starts with one
@@ -117,8 +141,12 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             let legal_mask = self.tree.get(root_id).legal_moves_mask.clone();
             let root_state = self.root_state.clone();
             let root_obs = self.root_obs.clone();
-            let root_value = self.expand_node(root_id, &root_state, &root_obs, &legal_mask)?;
-            self.tree.backpropagate(root_id, root_value);
+            let eval = self.evaluator.evaluate(&root_obs, &legal_mask, self.num_actions)?;
+            self.expand_node_with_eval_counted(root_id, &root_state, &legal_mask, &eval)?;
+            self.tree.backpropagate(root_id, eval.value);
+            if inspect {
+                root_evaluation = Some(eval);
+            }
         }
 
         // Add Dirichlet noise to root if configured
@@ -234,13 +262,48 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             sample_action(&play_policy, rng)?
         };
 
-        Ok(SearchResult {
+        // Reconstruct only for diagnostics, using the exact same engine helper
+        // and tie-breaking as selection. This consumes no randomness.
+        let diagnostics = root_evaluation.map(|eval| {
+            let selection_temperature = if (self.config.temperature - 1.0).abs() < 1e-6 {
+                1.0
+            } else {
+                self.config.temperature
+            };
+            let selection = self.tree.root_policy(self.num_actions, selection_temperature);
+            let actions = root.legal_moves_mask.iter_ones().map(|action| {
+                let child = root.children.iter()
+                    .find(|(id, _)| *id == action as u32)
+                    .map(|(_, id)| self.tree.get(*id));
+                ActionDiagnostics {
+                    action: action as u32,
+                    network_prior: eval.policy[action],
+                    search_prior: child.map(|node| node.prior),
+                    visit_share: policy[action],
+                    selection_probability: selection[action],
+                    visits: child.map_or(0, |node| node.visit_count),
+                    q_value: child.filter(|node| node.visit_count > 0)
+                        .map(|node| -node.mean_value()),
+                    expanded: child.is_some(),
+                }
+            }).collect();
+            RootDiagnostics {
+                network_value: eval.value,
+                actions,
+                completed_simulations,
+                root_visits: root.visit_count,
+                neural_evaluations: stats.total_evals + 1,
+                temperature: self.config.temperature,
+            }
+        });
+
+        Ok((SearchResult {
             action,
             policy,
             value: root.mean_value(),
             simulations: root.visit_count,
             stats,
-        })
+        }, diagnostics))
     }
 
     /// Select a leaf node by traversing the tree using UCB.
@@ -334,33 +397,6 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
         }
 
         Ok((state, obs))
-    }
-
-    /// Expand a node by adding all legal children.
-    /// Returns the value estimate from the evaluator (to be used for backpropagation).
-    fn expand_node(
-        &mut self,
-        node_id: NodeId,
-        parent_state: &[u8],
-        parent_obs: &[u8],
-        legal_mask: &LegalMask,
-    ) -> Result<f32, SearchError> {
-        let node = self.tree.get(node_id);
-
-        // Don't expand terminal nodes
-        if node.is_terminal {
-            return Ok(node.terminal_value);
-        }
-
-        // Get policy AND value from evaluator (single NN call)
-        // We use the policy for child priors and return the value for backpropagation
-        let eval = self
-            .evaluator
-            .evaluate(parent_obs, legal_mask, self.num_actions)?;
-        self.expand_node_with_eval_counted(node_id, parent_state, legal_mask, &eval)?;
-
-        // Return the value estimate from this single evaluation
-        Ok(eval.value)
     }
 
     /// Evaluate and expand a batch of pending leaves with stats tracking.

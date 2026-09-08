@@ -191,7 +191,8 @@ async fn main() -> anyhow::Result<()> {
     let model_info = Arc::new(StdRwLock::new(ModelInfo::default()));
 
     // Create initial game session with shared evaluator
-    let session = GameSession::with_evaluator(&default_game, Arc::clone(&evaluator))?;
+    let session = GameSession::with_evaluator(&default_game, Arc::clone(&evaluator))?
+        .with_model_info(Arc::clone(&model_info));
 
     let state = Arc::new(AppState {
         session: Arc::new(Mutex::new(session)),

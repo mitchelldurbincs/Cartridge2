@@ -162,6 +162,20 @@ impl BoardGame for Generals {
             )
     }
 
+    fn describe_discrete_action(&self, action: u32) -> Option<engine_core::ActionPresentation> {
+        use engine_core::{ActionPresentation, ActionTarget};
+        match action::decode_move(action)? {
+            action::Move::Wait => Some(ActionPresentation::named(action, "Wait")),
+            action::Move::Step { from, dir } => {
+                let to = action::move_target(from, dir)?;
+                Some(ActionPresentation::new(action,
+                    format!("({}, {}) → ({}, {})", from / params::WIDTH + 1,
+                        from % params::WIDTH + 1, to / params::WIDTH + 1, to % params::WIDTH + 1),
+                    ActionTarget::Edge { from, to }))
+            }
+        }
+    }
+
     fn reset(
         &mut self,
         rng: &mut ChaCha20Rng,

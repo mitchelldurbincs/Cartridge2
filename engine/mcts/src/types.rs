@@ -118,3 +118,29 @@ pub struct SearchStats {
     /// Number of terminal nodes hit (no NN needed)
     pub terminal_hits: u32,
 }
+
+/// Optional root-only diagnostics. All action values use the root actor's
+/// perspective. These describe one search, not calibrated win probabilities.
+#[derive(Debug, Clone)]
+pub struct RootDiagnostics {
+    pub network_value: f32,
+    pub actions: Vec<ActionDiagnostics>,
+    pub completed_simulations: u32,
+    pub root_visits: u32,
+    /// Includes the initial root evaluation omitted by SearchStats.total_evals.
+    pub neural_evaluations: u32,
+    pub temperature: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActionDiagnostics {
+    pub action: u32,
+    pub network_prior: f32,
+    pub search_prior: Option<f32>,
+    pub visit_share: f32,
+    pub selection_probability: f32,
+    pub visits: u32,
+    /// None means unvisited, not an estimated draw/neutral value.
+    pub q_value: Option<f32>,
+    pub expanded: bool,
+}

@@ -565,6 +565,10 @@ pub trait Environment: Send + Sync + std::fmt::Debug + 'static {
     fn engine_id(&self) -> EngineId;
     fn capabilities(&self) -> Capabilities;
     fn metadata(&self) -> EnvironmentMetadata;
+    /// Optional labels/targets for finite discrete actions. Other action spaces
+    /// and environments without presentation support return None.
+    fn describe_discrete_action(&self, _agent: AgentId, _action: u32)
+        -> Option<crate::ActionPresentation> { None }
 
     fn reset(
         &mut self,
