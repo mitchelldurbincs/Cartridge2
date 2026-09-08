@@ -54,7 +54,7 @@
     lastBotMove: number | null;
     gameInfo: GameInfo;
     currentPlayer: number;
-    onCellClick: (position: number) => void;
+    onCellClick: (position: number) => void | Promise<void>;
     actionPresentations: ActionPresentation[];
     assessments?: ActionAssessment[];
     metric?: ProbabilityMetric;
@@ -165,7 +165,7 @@
 
   // Handle column click with animation
   function handleColumnClick(col: number) {
-    if (readOnly || gameOver || !legalMoves.includes(col)) return;
+    if (readOnly || gameOver || droppingPiece || !legalMoves.includes(col)) return;
 
     const landingRow = findLandingRow(col);
     if (landingRow === -1) return;
@@ -173,11 +173,11 @@
     // Start drop animation
     droppingPiece = { column: col, row: landingRow, player: currentPlayer };
 
-    // Trigger the actual move after a brief delay to show animation start
-    // Note: droppingPiece is NOT cleared here - it will be cleared by the $effect
-    // when the board updates with the new piece, preventing the "disappearing piece" gap
-    later(() => {
-      onCellClick(col);
+    // Keep the piece visible until the request settles. A failed move may leave
+    // the board unchanged, so the occupancy effect alone cannot clear it.
+    later(async () => {
+      try { await onCellClick(col); }
+      finally { droppingPiece = null; }
     }, DROP_ANIMATION_DELAY);
   }
 
@@ -289,10 +289,8 @@
   // Generals Board
   // ============================================================================
   //
-  // A Generals move is (tile, direction), encoded as `tile * 4 + dir` with
-  // dir 0=up, 1=right, 2=down, 3=left (see games-generals/src/action.rs), plus
-  // a wait action at the end. So a click cannot be a move on its own: pick a
-  // source tile first, then an adjacent target.
+  // The engine supplies source/target edges and named actions. A click picks
+  // the source first, then a target; the UI never encodes a Generals action.
 
   const GENERALS_MAX_SIZE = 440;
 

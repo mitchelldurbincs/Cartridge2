@@ -471,7 +471,9 @@ impl GameSession {
         }
         // Refresh the status text as well as the selected seat.
         let state = self.to_response()?;
-        if let Some(record) = self.history.back_mut() { record.state = state; }
+        if let Some(record) = self.history.back_mut() {
+            record.state = state;
+        }
         Ok(())
     }
 
@@ -505,14 +507,21 @@ impl GameSession {
                 .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
             // The filesystem and S3 writers acquire evaluator then model_info.
             // Holding both read guards gives one consistent model generation.
-            let info = self.model_info.read().map_err(|e| anyhow!("Model info lock: {e}"))?;
+            let info = self
+                .model_info
+                .read()
+                .map_err(|e| anyhow!("Model info lock: {e}"))?;
             let checkpoint = if guard.is_some() {
                 Some(crate::types::CheckpointIdentity {
-                    checkpoint_id: info.checkpoint_id.clone()
+                    checkpoint_id: info
+                        .checkpoint_id
+                        .clone()
                         .ok_or_else(|| anyhow!("Loaded evaluator has no checkpoint identity"))?,
                     training_step: info.training_step,
                 })
-            } else { None };
+            } else {
+                None
+            };
             (guard.clone(), checkpoint)
         };
 
@@ -631,12 +640,19 @@ impl GameSession {
         Ok(GameStateResponse {
             session_id: self.session_id.clone(),
             revision: self.revision,
-            actions: self.legal_moves()?.into_iter().map(|action| {
-                self.ctx.describe_discrete_action(AgentId::from(self.current_player()), action)
-                    .unwrap_or(engine_core::ActionPresentation {
-                        action, label: format!("Action {action}"), target: None,
-                    })
-            }).collect(),
+            actions: self
+                .legal_moves()?
+                .into_iter()
+                .map(|action| {
+                    self.ctx
+                        .describe_discrete_action(AgentId::from(self.current_player()), action)
+                        .unwrap_or(engine_core::ActionPresentation {
+                            action,
+                            label: format!("Action {action}"),
+                            target: None,
+                        })
+                })
+                .collect(),
             cells: self.view.cells.clone(),
             current_player: self.current_player(),
             human_player: self.human_player,

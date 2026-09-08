@@ -1,6 +1,6 @@
 //! Versioned decision data, separate from board rendering and training replay.
-use serde::{Deserialize, Serialize};
 use super::GameStateResponse;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,7 +35,10 @@ pub struct ActionAssessment {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ValueQuantity { ExpectedOutcome, DiscountedReturn }
+pub enum ValueQuantity {
+    ExpectedOutcome,
+    DiscountedReturn,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValueEstimate {
@@ -56,7 +59,12 @@ pub struct SearchEffort {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DecisionSource { AlphaZeroMcts, Random, Human, DqnQValues }
+pub enum DecisionSource {
+    AlphaZeroMcts,
+    Random,
+    Human,
+    DqnQValues,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionAnalysis {
@@ -99,8 +107,12 @@ mod tests {
 
     #[test]
     fn non_board_agent_zero_q_values_need_no_board_or_search() {
-        let value = ValueEstimate { value: 2.5, perspective_agent: 0,
-            quantity: ValueQuantity::DiscountedReturn, bounds: None };
+        let value = ValueEstimate {
+            value: 2.5,
+            perspective_agent: 0,
+            quantity: ValueQuantity::DiscountedReturn,
+            bounds: None,
+        };
         let data = serde_json::to_value(value).unwrap();
         assert_eq!(data["perspective_agent"], 0);
         assert_eq!(data["quantity"], "discounted_return");

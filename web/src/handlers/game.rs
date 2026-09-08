@@ -145,16 +145,30 @@ pub async fn get_history(
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<crate::types::HistoryResponse>, (StatusCode, String)> {
     let session = state.session.lock().await;
-    if query.session_id.as_ref().is_some_and(|id| *id != session.position_key().session_id) {
-        return Err((StatusCode::CONFLICT, "Session changed; reload the current position".into()));
+    if query
+        .session_id
+        .as_ref()
+        .is_some_and(|id| *id != session.position_key().session_id)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Session changed; reload the current position".into(),
+        ));
     }
-    Ok(Json(session.history(query.from_revision, query.limit.unwrap_or(64))))
+    Ok(Json(
+        session.history(query.from_revision, query.limit.unwrap_or(64)),
+    ))
 }
 
-fn check_position(session: &GameSession, expected: Option<&crate::types::PositionKey>)
-    -> Result<(), (StatusCode, String)> {
+fn check_position(
+    session: &GameSession,
+    expected: Option<&crate::types::PositionKey>,
+) -> Result<(), (StatusCode, String)> {
     if expected.is_some_and(|key| !session.matches_position(key)) {
-        return Err((StatusCode::CONFLICT, "Position changed; reload before making another move".into()));
+        return Err((
+            StatusCode::CONFLICT,
+            "Position changed; reload before making another move".into(),
+        ));
     }
     Ok(())
 }
@@ -501,7 +515,10 @@ mod tests {
 
     #[test]
     fn test_move_request_creation() {
-        let req = MoveRequest { position: 4, ..MoveRequest::default() };
+        let req = MoveRequest {
+            position: 4,
+            ..MoveRequest::default()
+        };
         assert_eq!(req.position, 4);
     }
 
