@@ -74,9 +74,9 @@ def decode_replay_batch(
             )
 
         values = np.frombuffer(record.payload, dtype="<f4")
-        invalid = np.flatnonzero(~np.isfinite(values))
-        if invalid.size:
-            value_index = int(invalid[0])
+        finite = np.isfinite(values)
+        if not finite.all():
+            value_index = int(np.flatnonzero(~finite)[0])
             raise ValueError(
                 f"Replay record {record.id!r} contains non-finite f32 at "
                 f"payload index {value_index}: {values[value_index]}"
@@ -85,9 +85,9 @@ def decode_replay_batch(
         observation = values[:obs_size]
         policy = values[obs_size : obs_size + num_actions]
         value = float(values[-1])
-        invalid_policy = np.flatnonzero((policy < 0.0) | (policy > 1.0))
-        if invalid_policy.size:
-            policy_index = int(invalid_policy[0])
+        invalid_policy = (policy < 0.0) | (policy > 1.0)
+        if invalid_policy.any():
+            policy_index = int(np.flatnonzero(invalid_policy)[0])
             raise ValueError(
                 f"Replay record {record.id!r} has policy[{policy_index}]="
                 f"{float(policy[policy_index])}, expected a probability in [0, 1]"
