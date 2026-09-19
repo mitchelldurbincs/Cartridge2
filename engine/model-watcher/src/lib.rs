@@ -10,14 +10,17 @@ use mcts::SharedOnnxEvaluator;
 use notify::{recommended_watcher, Event, EventKind, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 mod artifact;
 mod load;
+mod reload;
 
-use artifact::{read_filesystem_head, resolve_filesystem_head, run_head_path, ResolvedCheckpoint};
+use reload::{AcceptedHead, LoadOutcome, ReloadState};
+
+use artifact::{read_filesystem_head, resolve_filesystem_head, run_head_path};
 
 #[cfg(feature = "s3")]
 pub mod s3;
@@ -69,14 +72,6 @@ pub fn resolve_current_filesystem_model(
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoadOutcome {
-    Absent,
-    Unchanged,
-    Advanced,
-    Loaded,
-}
-
 /// Policy for selecting an inference checkpoint from the authoritative RunHead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelSelection {
@@ -86,20 +81,12 @@ pub enum ModelSelection {
     ChampionOrLatest,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AcceptedHead {
-    model_checkpoint_id: String,
-    run_commit_id: String,
-}
-
 pub struct ModelWatcher {
     model_root: PathBuf,
     model_spec: ModelLoadSpec,
     selection: ModelSelection,
-    evaluator: Arc<RwLock<Option<SharedOnnxEvaluator>>>,
-    accepted_head: Arc<RwLock<Option<AcceptedHead>>>,
+    state: ReloadState,
     poll_interval: Duration,
-    model_info: Arc<RwLock<ModelInfo>>,
 }
 
 impl ModelWatcher {
@@ -113,10 +100,8 @@ impl ModelWatcher {
             model_root: model_root.as_ref().to_path_buf(),
             model_spec,
             selection,
-            evaluator,
-            accepted_head: Arc::new(RwLock::new(None)),
+            state: ReloadState::new(evaluator),
             poll_interval: DEFAULT_POLL_INTERVAL,
-            model_info: Arc::new(RwLock::new(ModelInfo::default())),
         }
     }
 
@@ -130,7 +115,7 @@ impl ModelWatcher {
     }
 
     pub fn model_info(&self) -> Arc<RwLock<ModelInfo>> {
-        Arc::clone(&self.model_info)
+        self.state.model_info()
     }
 
     pub fn try_load_existing(&self) -> Result<bool> {
@@ -142,114 +127,20 @@ impl ModelWatcher {
             &self.model_root,
             &self.model_spec,
             self.selection,
-            &self.evaluator,
-            &self.accepted_head,
-            &self.model_info,
+            &self.state,
         )
-    }
-
-    fn current_accepted_head(
-        accepted_head: &Arc<RwLock<Option<AcceptedHead>>>,
-    ) -> Result<Option<AcceptedHead>> {
-        accepted_head
-            .read()
-            .map(|guard| guard.clone())
-            .map_err(|error| anyhow!("failed to read accepted run head: {error}"))
-    }
-
-    fn commit_candidate(
-        candidate: ResolvedCheckpoint,
-        new_evaluator: Option<SharedOnnxEvaluator>,
-        expected_accepted_head: Option<AcceptedHead>,
-        evaluator: &Arc<RwLock<Option<SharedOnnxEvaluator>>>,
-        accepted_head: &Arc<RwLock<Option<AcceptedHead>>>,
-        model_info: &Arc<RwLock<ModelInfo>>,
-    ) -> Result<LoadOutcome> {
-        let mut accepted_guard = accepted_head
-            .write()
-            .map_err(|error| anyhow!("failed to lock accepted run head: {error}"))?;
-        if accepted_guard
-            .as_ref()
-            .is_some_and(|accepted| accepted.run_commit_id == candidate.run_commit_id)
-        {
-            return Ok(LoadOutcome::Unchanged);
-        }
-        if *accepted_guard != expected_accepted_head {
-            debug!(
-                candidate_checkpoint = %candidate.checkpoint_id,
-                candidate_run_commit = %candidate.run_commit_id,
-                "Discarding candidate because another load advanced the accepted RunHead"
-            );
-            return Ok(LoadOutcome::Unchanged);
-        }
-        let mut evaluator_guard = evaluator
-            .write()
-            .map_err(|error| anyhow!("failed to lock model evaluator: {error}"))?;
-        let mut info_guard = model_info
-            .write()
-            .map_err(|error| anyhow!("failed to lock model information: {error}"))?;
-
-        if new_evaluator.is_none()
-            && (accepted_guard
-                .as_ref()
-                .is_none_or(|accepted| accepted.model_checkpoint_id != candidate.checkpoint_id)
-                || evaluator_guard.is_none())
-        {
-            return Err(anyhow!(
-                "cannot reuse an evaluator that does not match the selected checkpoint"
-            ));
-        }
-        let model_changed = new_evaluator.is_some();
-        let loaded_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0);
-        if let Some(new_evaluator) = new_evaluator {
-            *evaluator_guard = Some(new_evaluator);
-        }
-        *accepted_guard = Some(AcceptedHead {
-            model_checkpoint_id: candidate.checkpoint_id.clone(),
-            run_commit_id: candidate.run_commit_id.clone(),
-        });
-        if model_changed {
-            *info_guard = ModelInfo {
-                loaded: true,
-                checkpoint_id: Some(candidate.checkpoint_id.clone()),
-                model_sha256: Some(candidate.manifest.onnx.sha256.clone()),
-                path: Some(candidate.model_path.to_string_lossy().into_owned()),
-                loaded_at: Some(loaded_at),
-                training_step: Some(candidate.manifest.step),
-            };
-        }
-
-        info!(
-            checkpoint_id = %candidate.checkpoint_id,
-            run_commit_id = %candidate.run_commit_id,
-            model_sha256 = %candidate.manifest.onnx.sha256,
-            step = candidate.manifest.step,
-            path = %candidate.model_path.display(),
-            model_changed,
-            "Content-addressed RunHead accepted"
-        );
-        Ok(if model_changed {
-            LoadOutcome::Loaded
-        } else {
-            LoadOutcome::Advanced
-        })
     }
 
     fn load_current_static(
         model_root: &Path,
         model_spec: &ModelLoadSpec,
         selection: ModelSelection,
-        evaluator: &Arc<RwLock<Option<SharedOnnxEvaluator>>>,
-        accepted_head: &Arc<RwLock<Option<AcceptedHead>>>,
-        model_info: &Arc<RwLock<ModelInfo>>,
+        state: &ReloadState,
     ) -> Result<LoadOutcome> {
         let Some(head) = read_filesystem_head(model_root)? else {
             return Ok(LoadOutcome::Absent);
         };
-        let accepted = Self::current_accepted_head(accepted_head)?;
+        let accepted = state.accepted_head()?;
         if accepted
             .as_ref()
             .is_some_and(|accepted| accepted.run_commit_id == head.run_commit_id)
@@ -286,13 +177,15 @@ impl ModelWatcher {
             return Ok(LoadOutcome::Unchanged);
         }
 
-        Self::commit_candidate(
-            candidate,
+        state.commit_candidate(
+            AcceptedHead {
+                model_checkpoint_id: candidate.checkpoint_id,
+                run_commit_id: candidate.run_commit_id,
+            },
+            &candidate.manifest,
+            candidate.model_path.to_string_lossy().into_owned(),
             new_evaluator,
             accepted,
-            evaluator,
-            accepted_head,
-            model_info,
         )
     }
 
@@ -322,9 +215,7 @@ impl ModelWatcher {
         let event_root = self.model_root.clone();
         let event_spec = self.model_spec.clone();
         let event_selection = self.selection;
-        let event_evaluator = Arc::clone(&self.evaluator);
-        let event_accepted = Arc::clone(&self.accepted_head);
-        let event_info = Arc::clone(&self.model_info);
+        let event_state = self.state.clone();
         let event_updates = updates_tx.clone();
         tokio::spawn(async move {
             let _watcher = watcher;
@@ -340,9 +231,7 @@ impl ModelWatcher {
                     &event_root,
                     &event_spec,
                     event_selection,
-                    &event_evaluator,
-                    &event_accepted,
-                    &event_info,
+                    &event_state,
                 ) {
                     Ok(LoadOutcome::Loaded) => {
                         let _ = event_updates.send(()).await;
@@ -356,23 +245,15 @@ impl ModelWatcher {
         let poll_root = self.model_root.clone();
         let poll_spec = self.model_spec.clone();
         let poll_selection = self.selection;
-        let poll_evaluator = Arc::clone(&self.evaluator);
-        let poll_accepted = Arc::clone(&self.accepted_head);
-        let poll_info = Arc::clone(&self.model_info);
+        let poll_state = self.state.clone();
         let poll_interval = self.poll_interval;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(poll_interval);
             interval.tick().await;
             loop {
                 interval.tick().await;
-                match Self::load_current_static(
-                    &poll_root,
-                    &poll_spec,
-                    poll_selection,
-                    &poll_evaluator,
-                    &poll_accepted,
-                    &poll_info,
-                ) {
+                match Self::load_current_static(&poll_root, &poll_spec, poll_selection, &poll_state)
+                {
                     Ok(LoadOutcome::Loaded) => {
                         let _ = updates_tx.send(()).await;
                     }

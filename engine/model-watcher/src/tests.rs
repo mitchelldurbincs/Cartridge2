@@ -425,7 +425,7 @@ fn champion_selection_tracks_rejection_and_promotion_without_losing_head_generat
         Some(champion_evaluator)
     );
     assert_eq!(
-        watcher.accepted_head.read().unwrap().as_ref(),
+        watcher.state.accepted_head().unwrap().as_ref(),
         Some(&AcceptedHead {
             model_checkpoint_id: root_checkpoint.clone(),
             run_commit_id: rejected_commit.clone(),
@@ -466,7 +466,7 @@ fn champion_selection_tracks_rejection_and_promotion_without_losing_head_generat
 
     assert!(watcher.try_load_existing().unwrap());
     assert_eq!(
-        watcher.accepted_head.read().unwrap().as_ref(),
+        watcher.state.accepted_head().unwrap().as_ref(),
         Some(&AcceptedHead {
             model_checkpoint_id: promoted_checkpoint.clone(),
             run_commit_id: promoted_commit,
@@ -912,21 +912,25 @@ fn accepted_head_compare_and_set_prevents_overlapping_load_regression() {
         .unwrap();
 
     assert_eq!(
-        ModelWatcher::commit_candidate(
-            candidate_three,
-            Some(new_evaluator),
-            stale_expected,
-            &evaluator,
-            &watcher.accepted_head,
-            &watcher.model_info,
-        )
-        .unwrap(),
+        watcher
+            .state
+            .commit_candidate(
+                AcceptedHead {
+                    model_checkpoint_id: candidate_three.checkpoint_id,
+                    run_commit_id: candidate_three.run_commit_id,
+                },
+                &candidate_three.manifest,
+                candidate_three.model_path.to_string_lossy().into_owned(),
+                Some(new_evaluator),
+                stale_expected,
+            )
+            .unwrap(),
         LoadOutcome::Unchanged
     );
     assert_eq!(
         watcher
-            .accepted_head
-            .read()
+            .state
+            .accepted_head()
             .unwrap()
             .as_ref()
             .map(|head| head.run_commit_id.as_str()),

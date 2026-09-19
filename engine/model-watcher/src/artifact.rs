@@ -12,7 +12,7 @@ mod validation;
 
 pub(crate) use filesystem::{read_filesystem_head, run_head_path};
 pub(crate) use selection::resolve_filesystem_head;
-pub(crate) use types::ResolvedCheckpoint;
+pub(crate) use types::CheckpointManifestV1;
 
 #[cfg(any(test, feature = "s3"))]
 pub(crate) use checkpoint::validate_manifest;
@@ -27,7 +27,7 @@ pub(crate) use run_commit::parse_run_commit;
 #[cfg(feature = "s3")]
 pub(crate) use selection::select_inference_checkpoint;
 #[cfg(any(test, feature = "s3"))]
-pub(crate) use types::{CheckpointManifestV1, RunHeadV2};
+pub(crate) use types::RunHeadV2;
 #[cfg(feature = "s3")]
 pub(crate) use types::{ResolvedRunCommit, RUN_HEAD_CHANNEL};
 
