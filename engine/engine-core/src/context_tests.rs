@@ -19,6 +19,7 @@ enum Fault {
     Reward,
     Observation,
     Descriptors,
+    InvalidDescriptors,
     Environment,
     Encoding,
     Decoding,
@@ -79,7 +80,7 @@ impl MockEnvironment {
             }
             Fault::Encoding => return Err(ErasedEnvironmentError::Encoding("fixture".into())),
             Fault::Decoding => return Err(ErasedEnvironmentError::Decoding("fixture".into())),
-            Fault::None | Fault::Descriptors => {}
+            Fault::None | Fault::Descriptors | Fault::InvalidDescriptors => {}
         }
         Ok(())
     }
@@ -96,12 +97,10 @@ impl ErasedEnvironment for MockEnvironment {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             id: self.engine_id(),
-            contract_version: if matches!(self.fault, Fault::Descriptors)
-                && self.calls.load(Ordering::SeqCst) > 0
-            {
-                2
-            } else {
-                1
+            contract_version: match (self.fault, self.calls.load(Ordering::SeqCst) > 0) {
+                (Fault::Descriptors, true) => 2,
+                (Fault::InvalidDescriptors, true) => 0,
+                _ => 1,
             },
             encoding: Encoding {
                 observation: ObservationEncoding::Tensor {
@@ -156,6 +155,7 @@ impl ErasedEnvironment for MockEnvironment {
         &self,
         _state: &[u8],
     ) -> Result<Option<crate::Presentation>, ErasedEnvironmentError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(None)
     }
 }
@@ -304,28 +304,76 @@ fn all_transition_apis_preserve_validation_and_error_categories() {
 
 #[test]
 fn all_transition_apis_reject_descriptor_drift_before_invocation() {
-    for api in TransitionApi::ALL {
+    for (fault, expected) in descriptor_faults() {
+        for api in TransitionApi::ALL {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut context = EngineContext::from_erased(Box::new(MockEnvironment {
+                fault,
+                calls: calls.clone(),
+            }))
+            .unwrap();
+            // The first invocation changes the descriptor; the next must fail preflight.
+            context.reset(42, &[]).unwrap();
+            let original_state = vec![255; 16];
+            let original_timestep = MockEnvironment::timestep(0, TransitionSource::Reset);
+            let mut state = original_state.clone();
+            let mut timestep = original_timestep.clone();
+            let error = api
+                .invoke(&mut context, &mut state, &mut timestep)
+                .unwrap_err();
+            assert!(
+                matches!(error, ErasedEnvironmentError::ContractViolation(ref message)
+            if message == expected),
+                "{api:?} with {fault:?}: {error}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{api:?}");
+            assert_eq!(state, original_state, "{api:?}");
+            assert_eq!(timestep, original_timestep, "{api:?}");
+        }
+    }
+}
+
+fn descriptor_faults() -> [(Fault, &'static str); 2] {
+    [
+        (
+            Fault::Descriptors,
+            "environment descriptors changed after context construction",
+        ),
+        (
+            Fault::InvalidDescriptors,
+            "contract_version must be positive",
+        ),
+    ]
+}
+
+#[test]
+fn presentation_rejects_valid_and_invalid_descriptor_drift_before_invocation() {
+    for (fault, expected) in descriptor_faults() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut context = EngineContext::from_erased(Box::new(MockEnvironment {
-            fault: Fault::Descriptors,
+            fault,
             calls: calls.clone(),
         }))
         .unwrap();
-        // The first invocation changes the descriptor; the next must fail preflight.
-        context.reset(42, &[]).unwrap();
-        let original_state = vec![255; 16];
-        let original_timestep = MockEnvironment::timestep(0, TransitionSource::Reset);
-        let mut state = original_state.clone();
-        let mut timestep = original_timestep.clone();
-        let error = api
-            .invoke(&mut context, &mut state, &mut timestep)
-            .unwrap_err();
+        let reset = context.reset(42, &[]).unwrap();
+        let error = context.presentation(&reset.state).unwrap_err();
         assert!(
             matches!(error, ErasedEnvironmentError::ContractViolation(ref message)
-            if message == "environment descriptors changed after context construction")
+            if message == expected)
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "{api:?}");
-        assert_eq!(state, original_state, "{api:?}");
-        assert_eq!(timestep, original_timestep, "{api:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{fault:?}");
     }
+}
+
+#[test]
+fn context_rejects_invalid_descriptors_at_construction() {
+    let error = EngineContext::from_erased(Box::new(MockEnvironment {
+        fault: Fault::InvalidDescriptors,
+        calls: Arc::new(AtomicUsize::new(1)),
+    }))
+    .unwrap_err();
+    assert!(
+        matches!(error, ErasedEnvironmentError::ContractViolation(ref message)
+        if message == "contract_version must be positive")
+    );
 }
