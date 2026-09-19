@@ -225,6 +225,10 @@ impl BoardGame for TicTacToe {
             ]))
     }
 
+    fn describe_discrete_action(&self, action: u32) -> Option<engine_core::ActionPresentation> {
+        (action < 9).then(|| engine_core::ActionPresentation::cell(action, 3))
+    }
+
     // reset/step mirror games-connect4 and games-othello; shared reward and
     // Validation helpers live in the explicit engine_core::board_profile API.
     fn reset(

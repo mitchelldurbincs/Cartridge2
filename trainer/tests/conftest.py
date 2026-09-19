@@ -2,6 +2,11 @@ import os
 import sys
 from pathlib import Path
 
+import onnxruntime
+
+# Disable runtime telemetry before test collection creates any ONNX sessions.
+onnxruntime.disable_telemetry_events()
+
 # Ensure the package under trainer/src is importable without installation.
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"

@@ -2,133 +2,133 @@
   import { onMount } from 'svelte';
   import GenericBoard from './GenericBoard.svelte';
   import Stats from './Stats.svelte';
-  import { newGame, makeMove, getHealth, getGameInfo, getGames, getStats, type GameState, type MoveResponse, type GameInfo } from './lib/api';
+  import DecisionInspector from './DecisionInspector.svelte';
+  import { newGame, makeMove, getHealth, getGameInfo, getGames, getGameState, getHistory, type GameState, type GameInfo } from './lib/api';
+  import { boundAnalysis, samePosition, type HistoryResponse, type PositionKey, type ProbabilityMetric } from './lib/analysis';
 
   let gameState: GameState | null = $state(null);
   let gameInfo: GameInfo | null = $state(null);
   let availableGames: string[] = $state([]);
-  let selectedGame: string = $state('tictactoe');
+  let selectedGame = $state('tictactoe');
   let error: string | null = $state(null);
-  let loading: boolean = $state(false);
-  let serverOnline: boolean = $state(false);
+  let loading = $state(false);
+  let serverOnline = $state(false);
   let lastBotMove: number | null = $state(null);
+  let history: HistoryResponse | null = $state(null);
+  let viewedRevision: number | null = $state(null);
+  let highlightedAction: number | null = $state(null);
+  let metric: ProbabilityMetric = $state('visit_share');
+  let historyBusy = $state(false);
+  let historyRequest = 0;
+  let selectedRecord = $derived.by(() => viewedRevision == null ? null :
+    history?.records.find(record => record.state.revision === viewedRevision) ?? null);
+  let displayState = $derived(selectedRecord?.state ?? gameState);
+  let analysis = $derived(boundAnalysis(selectedRecord));
+  let isHistorical = $derived(selectedRecord !== null);
+  let namedActions = $derived.by(() => (gameState?.actions ?? []).filter(a => a.target?.kind === 'named' &&
+    (a.target.name !== 'Wait' || gameInfo?.board_type !== 'generals')));
+
+  function key(state: GameState): PositionKey { return { session_id: state.session_id, revision: state.revision }; }
+
+  async function refreshHistory(from?: number) {
+    if (!gameState) return;
+    const expected = key(gameState);
+    const request = ++historyRequest;
+    historyBusy = true;
+    try {
+      const response = await getHistory(expected.session_id, from);
+      if (request === historyRequest && gameState && samePosition(expected, gameState)) {
+        history = response;
+        if (viewedRevision != null && !response.records.some(r => r.state.revision === viewedRevision)) viewedRevision = null;
+      }
+    } finally { if (request === historyRequest) historyBusy = false; }
+  }
+
+  async function recoverPosition() {
+    try {
+      gameState = await getGameState();
+      viewedRevision = null;
+      lastBotMove = null;
+      highlightedAction = null;
+      await refreshHistory();
+    } catch (recoveryError) {
+      error = `${error ?? ''} Current position could not be refreshed: ${String(recoveryError)}`;
+    }
+  }
 
   onMount(async () => {
-    // Check server health
+    loading = true;
     try {
       await getHealth();
       serverOnline = true;
-      // Load available games
       availableGames = await getGames();
-
-      // The server exposes only the game it is configured for, and rejects
-      // requests for any other with a 403 — so start from what it offers
-      // rather than the hardcoded default, which otherwise makes a
-      // correctly-running backend look offline.
-      if (availableGames.length > 0) {
-        selectedGame = availableGames[0];
-      }
-
-      // Prefer the game currently being trained, when it is one on offer.
-      try {
-        const stats = await getStats();
-        if (stats.env_id && availableGames.includes(stats.env_id)) {
-          selectedGame = stats.env_id;
-        }
-      } catch {
-        // Stats not available, keep default
-      }
-
-      // Load game metadata
+      selectedGame = availableGames[0] ?? 'tictactoe';
       gameInfo = await getGameInfo(selectedGame);
-      // Start a new game with the selected game
-      gameState = await newGame('player', selectedGame);
-    } catch (e) {
-      serverOnline = false;
-      error = 'Cannot connect to server. Is the Rust backend running on :8080?';
-    }
+      // Opening another tab must not reset a running shared session.
+      gameState = await getGameState();
+      await refreshHistory();
+    } catch (e) { error = String(e); }
+    finally { loading = false; }
   });
 
   async function handleGameChange(event: Event) {
-    const target = event.target as HTMLSelectElement;
-    selectedGame = target.value;
-    loading = true;
-    error = null;
-    lastBotMove = null;
-    try {
-      gameInfo = await getGameInfo(selectedGame);
-      gameState = await newGame('player', selectedGame);
-    } catch (e) {
-      error = String(e);
-    }
-    loading = false;
+    selectedGame = (event.target as HTMLSelectElement).value;
+    try { gameInfo = await getGameInfo(selectedGame); await handleNewGame('player'); }
+    catch (e) { error = String(e); }
   }
 
   async function handleNewGame(first: 'player' | 'bot') {
+    if (loading) return;
     loading = true;
     error = null;
+    viewedRevision = null;
+    highlightedAction = null;
     lastBotMove = null;
     try {
-      gameState = await newGame(first, selectedGame);
-    } catch (e) {
-      error = String(e);
-    }
-    loading = false;
+      gameState = await newGame(first, selectedGame, gameState ? key(gameState) : undefined);
+      await refreshHistory();
+    } catch (e) { error = String(e); await recoverPosition(); }
+    finally { loading = false; }
   }
 
   async function handleCellClick(position: number) {
-    if (loading || !gameState || gameState.game_over) return;
-    if (gameState.current_player !== gameState.human_player) return; // Not player's turn
-    if (!gameState.legal_moves.includes(position)) return; // Illegal move
-
+    if (loading || isHistorical || !gameState || gameState.game_over ||
+      gameState.current_player !== gameState.human_player || !gameState.legal_moves.includes(position)) return;
     loading = true;
     error = null;
     try {
-      const response: MoveResponse = await makeMove(position);
+      const response = await makeMove(position, key(gameState));
       gameState = response;
       lastBotMove = response.bot_move;
+      await refreshHistory();
     } catch (e) {
       error = String(e);
-    }
-    loading = false;
+      // The human transition may have committed before a bot-search failure.
+      // Read authoritative state; never retry the player's move automatically.
+      await recoverPosition();
+    } finally { loading = false; }
   }
 
-  // Games with a pass action have one more action than board cells (e.g. Othello:
-  // 65 = 8*8 + 1), with pass as the last index. Games whose actions all map to
-  // board positions (TicTacToe) or columns (Connect 4) have no pass action.
-  function passAction(): number | null {
-    if (!gameInfo) return null;
-    const { board_width, board_height, num_actions } = gameInfo;
-    if (num_actions !== board_width * board_height + 1) return null;
-    return num_actions - 1;
-  }
+  function view(revision: number | null) { viewedRevision = revision; highlightedAction = null; }
 
-  // Check if pass action is available (for games like Othello)
-  function canPass(): boolean {
-    if (!gameState || gameState.game_over) return false;
-    if (gameState.current_player !== gameState.human_player) return false;
-    const pass = passAction();
-    return pass !== null && gameState.legal_moves.includes(pass);
-  }
-
-  // Handle pass action
-  async function handlePass() {
-    if (loading || !gameState || gameState.game_over) return;
-    if (gameState.current_player !== gameState.human_player) return;
-
-    const pass = passAction();
-    if (pass === null || !gameState.legal_moves.includes(pass)) return;
-
-    loading = true;
-    error = null;
+  async function lastDecision() {
     try {
-      const response: MoveResponse = await makeMove(pass);
-      gameState = response;
-      lastBotMove = response.bot_move;
-    } catch (e) {
-      error = String(e);
-    }
-    loading = false;
+      await refreshHistory();
+      const last = history?.records.slice().reverse().find(r => r.decision && r.decision.source !== 'human');
+      if (last) view(last.state.revision);
+    } catch (e) { error = String(e); }
+  }
+
+  async function navigate(direction: -1 | 1) {
+    if (!history || !gameState || historyBusy) return;
+    const target = (viewedRevision ?? gameState.revision) + direction;
+    if (target < history.first_available_revision || target > gameState.revision) return;
+    try {
+      if (!history.records.some(r => r.state.revision === target)) {
+        await refreshHistory(direction < 0 ? Math.max(history.first_available_revision, target - 63) : target);
+      }
+      if (history?.records.some(r => r.state.revision === target)) view(target);
+    } catch (e) { error = String(e); }
   }
 </script>
 
@@ -159,35 +159,55 @@
   {:else}
     <div class="game-container">
       <div class="game-section">
-        {#if gameState && gameInfo}
+        {#if gameState && gameInfo && displayState}
+          <nav class="history-controls" aria-label="Match history">
+            <button onclick={() => view(null)} class:active={!isHistorical}>Live</button>
+            <button onclick={lastDecision} disabled={loading || historyBusy || gameState.revision === 0}>Last bot decision</button>
+            <button aria-label="Previous position" onclick={() => navigate(-1)} disabled={loading || historyBusy || (viewedRevision ?? gameState.revision) <= (history?.first_available_revision ?? 0)}>←</button>
+            <select aria-label="History position" value={viewedRevision ?? ''} onchange={(e) => view(e.currentTarget.value === '' ? null : Number(e.currentTarget.value))} disabled={loading || historyBusy}>
+              <option value="">Live · {gameState.revision}</option>
+              {#each history?.records ?? [] as record}<option value={record.state.revision}>Position {record.state.revision}{record.decision ? ` · ${record.decision.source.replaceAll('_', ' ')}` : ''}</option>{/each}
+            </select>
+            <button aria-label="Next position" onclick={() => navigate(1)} disabled={loading || historyBusy || viewedRevision === null || viewedRevision >= gameState.revision}>→</button>
+          </nav>
+          {#if isHistorical}<p class="inspection-label">Position {displayState.revision} · read-only · {metric.replaceAll('_', ' ')}</p>{/if}
+          {#key `${displayState.session_id}:${isHistorical ? `history-${displayState.revision}` : 'live'}`}
           <GenericBoard
-            cells={gameState.cells}
-            legalMoves={gameState.legal_moves}
-            gameOver={gameState.game_over}
-            {lastBotMove}
+            cells={displayState.cells}
+            legalMoves={displayState.legal_moves}
+            gameOver={displayState.game_over}
+            lastBotMove={isHistorical ? null : lastBotMove}
             {gameInfo}
-            currentPlayer={gameState.current_player}
+            currentPlayer={displayState.current_player}
+            humanPlayer={displayState.human_player}
+            positionKey={`${displayState.session_id}:${displayState.revision}`}
+            actionPresentations={displayState.actions}
+            assessments={analysis?.actions ?? []}
+            {metric}
+            readOnly={isHistorical || loading}
+            {highlightedAction}
             onCellClick={handleCellClick}
           />
+          {/key}
 
           <div class="status"
                class:player1-wins={gameState.winner === 1}
                class:player2-wins={gameState.winner === 2}
                class:drop-column={gameInfo?.board_type === 'drop_column'}>
-            {gameState.message}
+            {isHistorical ? `Inspecting: ${displayState.message}` : gameState.message}
           </div>
 
           {#if error}
             <div class="error">{error}</div>
           {/if}
 
-          {#if canPass()}
+          {#if !isHistorical && !gameState.game_over && gameState.current_player === gameState.human_player}
             <div class="pass-section">
-              <button class="pass-button" onclick={handlePass} disabled={loading}>
-                Pass (No legal moves)
-              </button>
+              {#each namedActions as action}<button class="pass-button" onclick={() => handleCellClick(action.action)} disabled={loading}>{action.label}</button>{/each}
             </div>
           {/if}
+
+          {#if history && history.first_available_revision > 0}<p class="inspection-label">History retained from position {history.first_available_revision}; older positions were evicted.</p>{/if}
 
           <div class="controls">
             <button onclick={() => handleNewGame('player')} disabled={loading}>
@@ -203,6 +223,9 @@
       </div>
 
       <div class="stats-section">
+        <DecisionInspector decision={analysis} position={selectedRecord?.state ?? null}
+          presentations={selectedRecord?.state.actions ?? []} bind:metric
+          onAction={(action) => highlightedAction = action} />
         <Stats />
       </div>
     </div>
@@ -210,8 +233,13 @@
 </main>
 
 <style>
+  .history-controls { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: 1rem; justify-content: center; }
+  .history-controls button,.history-controls select { padding: .45rem; border-radius: 5px; border: 1px solid #50687c; background: #202e40; color: #e6eef7; }
+  .history-controls button { cursor: pointer; } .history-controls .active { border-color: #75d9ba; }
+  .history-controls button:disabled { opacity: .45; cursor: default; }
+  .inspection-label { color: #a9cdbf; font-size: .8rem; }
   main {
-    max-width: 900px;
+    max-width: 1250px;
     margin: 0 auto;
     padding: 2rem;
     text-align: center;

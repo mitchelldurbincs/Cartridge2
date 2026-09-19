@@ -76,7 +76,8 @@ export function formatStep(value: number): string {
   return Math.round(value).toString();
 }
 
-export function formatLoss(value: number): string {
+export function formatLoss(value: number | undefined): string {
+  if (value == null || !Number.isFinite(value)) return '—';
   if (value < 0.001) return value.toExponential(2);
   if (value < 0.01) return value.toFixed(4);
   if (value < 1) return value.toFixed(3);
@@ -110,13 +111,13 @@ export function createScales(
   const minStep = Math.min(...steps);
   const maxStep = Math.max(...steps);
 
-  const allLosses = data.flatMap((d) => [d.total_loss, d.policy_loss, d.value_loss]);
+  const allLosses = data.flatMap((d) => [d.metrics['loss/total'], d.metrics['loss/policy'], d.metrics['loss/value']]).filter(Number.isFinite);
   if (includeAvg100Data && includeAvg100Data.length > 0) {
     allLosses.push(...includeAvg100Data.map((d) => d.avg));
   }
 
-  const maxLoss = Math.max(...allLosses);
-  const minLoss = Math.min(...allLosses);
+  const maxLoss = allLosses.length ? Math.max(...allLosses) : 1;
+  const minLoss = allLosses.length ? Math.min(...allLosses) : 0;
   const yMax = maxLoss === 0 ? 1 : maxLoss * 1.1;
   const yMin = Math.max(0, minLoss * 0.9);
   const yRange = yMax - yMin || 1;
@@ -139,17 +140,22 @@ export function createScales(
 
 export function makePath(
   data: HistoryEntry[],
-  key: 'total_loss' | 'policy_loss' | 'value_loss',
+  key: 'loss/total' | 'loss/policy' | 'loss/value',
   xScale: (step: number) => number,
   yScale: (loss: number) => number
 ): string {
   const sorted = [...data].sort((a, b) => a.step - b.step);
+  let connected = false;
   return sorted
-    .map((d, i) => {
+    .map((d) => {
+      if (!Number.isFinite(d.metrics[key])) { connected = false; return ''; }
       const x = xScale(d.step);
-      const y = yScale(d[key]);
-      return `${i === 0 ? 'M' : 'L'} ${x} ${y}`;
+      const y = yScale(d.metrics[key]);
+      const command = connected ? 'L' : 'M';
+      connected = true;
+      return `${command} ${x} ${y}`;
     })
+    .filter(Boolean)
     .join(' ');
 }
 
@@ -177,13 +183,13 @@ export function computeRollingAverage(
   window: number = 100
 ): { step: number; avg: number }[] {
   if (data.length === 0) return [];
-  const sorted = [...data].sort((a, b) => a.step - b.step);
+  const sorted = data.filter(d => Number.isFinite(d.metrics['loss/total'])).sort((a, b) => a.step - b.step);
   const result: { step: number; avg: number }[] = [];
 
   for (let i = 0; i < sorted.length; i++) {
     const start = Math.max(0, i - window + 1);
     const windowData = sorted.slice(start, i + 1);
-    const avg = windowData.reduce((sum, d) => sum + d.total_loss, 0) / windowData.length;
+    const avg = windowData.reduce((sum, d) => sum + d.metrics['loss/total'], 0) / windowData.length;
     result.push({ step: sorted[i].step, avg });
   }
   return result;
@@ -234,9 +240,9 @@ export function buildChartData(options: BuildChartDataOptions): ChartData {
   );
 
   const paths: ChartPaths = {
-    total: makePath(sorted, 'total_loss', xScale, yScale),
-    policy: makePath(sorted, 'policy_loss', xScale, yScale),
-    value: makePath(sorted, 'value_loss', xScale, yScale),
+    total: makePath(sorted, 'loss/total', xScale, yScale),
+    policy: makePath(sorted, 'loss/policy', xScale, yScale),
+    value: makePath(sorted, 'loss/value', xScale, yScale),
   };
 
   if (includeAvg100) {
@@ -255,18 +261,18 @@ export function buildChartData(options: BuildChartDataOptions): ChartData {
 
   let points: ChartData['points'];
   if (includePoints) {
-    const makePoints = (key: 'total_loss' | 'policy_loss' | 'value_loss') =>
-      sorted.map((d) => ({
+    const makePoints = (key: 'loss/total' | 'loss/policy' | 'loss/value') =>
+      sorted.filter(d => Number.isFinite(d.metrics[key])).map((d) => ({
         x: xScale(d.step),
-        y: yScale(d[key]),
+        y: yScale(d.metrics[key]),
         step: d.step,
-        value: d[key],
+        value: d.metrics[key],
       }));
 
     points = {
-      total: makePoints('total_loss'),
-      policy: makePoints('policy_loss'),
-      value: makePoints('value_loss'),
+      total: makePoints('loss/total'),
+      policy: makePoints('loss/policy'),
+      value: makePoints('loss/value'),
     };
   }
 

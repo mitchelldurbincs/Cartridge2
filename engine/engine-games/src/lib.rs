@@ -56,6 +56,60 @@ mod tests {
     };
 
     #[test]
+    fn discrete_action_presentations_are_environment_owned() {
+        use engine_core::{ActionTarget, AgentId, EngineContext};
+        register_all_environments();
+        for (env, agent, action, target) in [
+            ("tictactoe", 1, 4, ActionTarget::Cell { index: 4 }),
+            ("connect4", 2, 6, ActionTarget::Column { index: 6 }),
+            (
+                "othello",
+                1,
+                64,
+                ActionTarget::Named {
+                    name: "Pass".into(),
+                },
+            ),
+            (
+                "generals_8x8",
+                2,
+                256,
+                ActionTarget::Named {
+                    name: "Wait".into(),
+                },
+            ),
+            (
+                "counter",
+                0,
+                1,
+                ActionTarget::Named {
+                    name: "Right".into(),
+                },
+            ),
+        ] {
+            let ctx = EngineContext::new(env).unwrap();
+            let view = ctx
+                .describe_discrete_action(AgentId(agent), action)
+                .unwrap();
+            assert_eq!(view.action, action);
+            assert_eq!(view.target, Some(target));
+            assert!(ctx
+                .describe_discrete_action(AgentId(agent), u32::MAX)
+                .is_none());
+        }
+        let ctx = EngineContext::new("generals_8x8").unwrap();
+        for (action, to) in [(36, 1), (37, 10), (38, 17), (39, 8)] {
+            assert_eq!(
+                ctx.describe_discrete_action(AgentId(1), action)
+                    .unwrap()
+                    .target,
+                Some(ActionTarget::Edge { from: 9, to })
+            );
+        }
+        assert!(ctx.describe_discrete_action(AgentId(1), 0).is_none()); // up off-board
+    }
+
+    #[test]
     fn test_register_all_environments() {
         register_all_environments();
 

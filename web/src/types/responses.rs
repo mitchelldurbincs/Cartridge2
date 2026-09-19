@@ -90,8 +90,14 @@ impl GameInfoResponse {
 }
 
 /// Current game state.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GameStateResponse {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub actions: Vec<engine_core::ActionPresentation>,
     /// Board cells, row-major, straight from the engine's `BoardView`. Each
     /// carries owner (0=empty, 1=player, 2=bot), terrain, and any per-cell
     /// quantity — the flat games leave the latter two at their defaults.

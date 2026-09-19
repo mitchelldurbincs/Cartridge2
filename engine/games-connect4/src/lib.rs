@@ -301,6 +301,18 @@ impl BoardGame for Connect4 {
             )
     }
 
+    fn describe_discrete_action(&self, action: u32) -> Option<engine_core::ActionPresentation> {
+        (action < COLS as u32).then(|| {
+            engine_core::ActionPresentation::new(
+                action,
+                format!("Column {}", action + 1),
+                engine_core::ActionTarget::Column {
+                    index: action as usize,
+                },
+            )
+        })
+    }
+
     // reset/step mirror games-tictactoe and games-othello; shared reward and
     // Validation helpers live in the explicit engine_core::board_profile API.
     fn reset(

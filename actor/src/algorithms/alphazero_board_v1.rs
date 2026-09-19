@@ -80,8 +80,8 @@ impl AlphaZeroCollectorConfig {
     }
 }
 
-fn decode_f32(bytes: &[u8]) -> f32 {
-    f32::from_le_bytes(bytes.try_into().expect("exact f32 chunk"))
+fn decode_f32(bytes: &[u8; 4]) -> f32 {
+    f32::from_le_bytes(*bytes)
 }
 
 pub(crate) fn encode_experience(
@@ -103,7 +103,9 @@ pub(crate) fn encode_experience(
         );
     }
     if let Some((index, value)) = observation
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(decode_f32)
         .enumerate()
         .find(|(_, value)| !value.is_finite())
@@ -218,7 +220,12 @@ mod tests {
     fn codec_has_exact_language_neutral_layout() {
         let payload =
             encode_experience(&observation(&[1.0, -2.0]), 2, &[0.25, 0.75], 2, -1.0).unwrap();
-        let values = payload.chunks_exact(4).map(decode_f32).collect::<Vec<_>>();
+        let values = payload
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(decode_f32)
+            .collect::<Vec<_>>();
         assert_eq!(values, vec![1.0, -2.0, 0.25, 0.75, -1.0]);
     }
 

@@ -410,8 +410,8 @@ pub(crate) fn validate_encoded_observation(
 
     match spec.dtype {
         TensorDType::F32LittleEndian => {
-            for chunk in data.chunks_exact(std::mem::size_of::<f32>()) {
-                let value = f32::from_le_bytes(chunk.try_into().expect("four-byte chunk"));
+            for chunk in data.as_chunks::<4>().0 {
+                let value = f32::from_le_bytes(*chunk);
                 if !value.is_finite() {
                     return Err(ErasedEnvironmentError::ContractViolation(format!(
                         "observation for agent {} contains a non-finite f32",

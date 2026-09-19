@@ -12,9 +12,12 @@ pub enum FirstPlayer {
 }
 
 /// Request to start a new game.
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewGameRequest {
+    /// Optional for legacy clients; the interactive UI always supplies this.
+    #[serde(default)]
+    pub expected: Option<super::PositionKey>,
     /// Who plays first: "player" or "bot"
     #[serde(default)]
     pub first: FirstPlayer,
@@ -24,9 +27,11 @@ pub struct NewGameRequest {
 }
 
 /// Request to make a move.
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MoveRequest {
+    #[serde(default)]
+    pub expected: Option<super::PositionKey>,
     /// Action index to play (game-specific: 0-8 for TicTacToe, 0-6 for
     /// Connect4, 0-256 for Generals — which is why this is not a u8)
     pub position: u32,

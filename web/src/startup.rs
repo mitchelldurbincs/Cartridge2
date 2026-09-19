@@ -199,6 +199,7 @@ pub fn create_app_with_cors(state: Arc<AppState>, allowed_origins: &[String]) ->
         .route("/game-info/:id", get(get_game_info))
         .route("/game/new", post(new_game))
         .route("/game/state", get(get_game_state))
+        .route("/game/history", get(crate::handlers::get_history))
         .route("/move", post(make_move))
         .route("/stats", get(get_stats))
         .route("/model", get(get_model_info))

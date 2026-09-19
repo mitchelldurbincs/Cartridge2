@@ -1,4 +1,5 @@
 // API client for the Cartridge2 backend
+import type { ActionPresentation, HistoryResponse, PositionKey } from './analysis';
 
 /** Terrain of a cell. Mirrors engine_core::board_profile::CellKind. */
 export type CellKind = 'normal' | 'general' | 'city' | 'mountain';
@@ -13,6 +14,9 @@ export interface CellView {
 }
 
 export interface GameState {
+  session_id: string;
+  revision: number;
+  actions: ActionPresentation[];
   cells: CellView[];
   current_player: number;
   human_player: number;
@@ -45,19 +49,15 @@ export interface MoveResponse extends GameState {
 
 export interface EvalStats {
   step: number;
-  win_rate: number;
-  draw_rate: number;
-  loss_rate: number;
-  games_played: number;
-  avg_game_length: number;
+  metrics: Record<string, number>;
+  episodes: number;
+  mean_episode_length: number;
   timestamp: number;
 }
 
 export interface HistoryEntry {
   step: number;
-  total_loss: number;
-  value_loss: number;
-  policy_loss: number;
+  metrics: Record<string, number>;
   learning_rate: number;
   grad_norm: number | null;
 }
@@ -65,17 +65,15 @@ export interface HistoryEntry {
 export interface TrainingStats {
   step: number;
   total_steps: number;
-  total_loss: number;
-  policy_loss: number;
-  value_loss: number;
+  metrics: Record<string, number>;
   samples_seen: number;
   replay_record_count: number;
   last_checkpoint: string;
   learning_rate: number;
   timestamp: number;
   env_id: string;
-  last_eval: EvalStats | null;
-  eval_history: EvalStats[];
+  last_evaluation: EvalStats | null;
+  evaluation_history: EvalStats[];
   history: HistoryEntry[];
 }
 
@@ -108,8 +106,8 @@ export async function getGameState(): Promise<GameState> {
   return res.json();
 }
 
-export async function newGame(first: 'player' | 'bot' = 'player', game?: string): Promise<GameState> {
-  const body: { first: string; game?: string } = { first };
+export async function newGame(first: 'player' | 'bot' = 'player', game?: string, expected?: PositionKey): Promise<GameState> {
+  const body: { first: string; game?: string; expected?: PositionKey } = { first, expected };
   if (game) {
     body.game = game;
   }
@@ -125,17 +123,27 @@ export async function newGame(first: 'player' | 'bot' = 'player', game?: string)
   return res.json();
 }
 
-export async function makeMove(position: number): Promise<MoveResponse> {
+export async function makeMove(position: number, expected: PositionKey): Promise<MoveResponse> {
   const res = await fetch(`${API_BASE}/move`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ position }),
+    body: JSON.stringify({ position, expected }),
   });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || 'Move failed');
   }
   return res.json();
+}
+
+export async function getHistory(sessionId: string, fromRevision?: number): Promise<HistoryResponse> {
+  const params = new URLSearchParams({ session_id: sessionId, limit: '64' });
+  if (fromRevision != null) params.set('from_revision', String(fromRevision));
+  const response = await fetch(`${API_BASE}/game/history?${params}`);
+  if (!response.ok) throw new Error('Session history changed or is unavailable; refresh the position.');
+  const result: HistoryResponse = await response.json();
+  if (result.schema_version !== 1 || result.session_id !== sessionId) throw new Error('Unsupported or stale history.');
+  return result;
 }
 
 export async function getStats(): Promise<TrainingStats> {

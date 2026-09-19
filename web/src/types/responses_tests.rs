@@ -167,6 +167,7 @@ fn test_game_state_response_serialization() {
         game_over: false,
         legal_moves: vec![0, 2, 5, 6],
         message: "Your turn".to_string(),
+        ..GameStateResponse::default()
     };
 
     let json = serde_json::to_string(&response).unwrap();
@@ -209,6 +210,7 @@ fn test_move_response_serialization_flattened() {
         game_over: false,
         legal_moves: vec![1, 2, 3, 5, 6, 7, 8],
         message: "Your turn".to_string(),
+        ..GameStateResponse::default()
     };
 
     let response = MoveResponse {

@@ -318,36 +318,19 @@ class PostgresReplayStore(ReplayStore):
                 # selection is smaller, fill the remainder with replacement
                 # after decoding the selected immutable rows.
                 sample_size = min(batch_size, selection_count)
-                sample_pct = min(
-                    100.0,
-                    (sample_size * 10.0 * 100.0) / selection_count,
-                )
                 cur.execute(
                     f"""
                     SELECT id, env_id, env_contract_version, algorithm_id,
                            experience_schema, collection_scope_id,
                            source_checkpoint_id, episode_id, step_number, payload
-                    FROM replay_records TABLESAMPLE SYSTEM(%s)
+                    FROM replay_records
                     WHERE {_SELECTION_WHERE}
+                    ORDER BY RANDOM()
                     LIMIT %s
                     """,
-                    (sample_pct, *self._selection_params, sample_size),
+                    (*self._selection_params, sample_size),
                 )
                 rows = cur.fetchall()
-                if len(rows) < sample_size:
-                    cur.execute(
-                        f"""
-                        SELECT id, env_id, env_contract_version, algorithm_id,
-                               experience_schema, collection_scope_id,
-                               source_checkpoint_id, episode_id, step_number, payload
-                        FROM replay_records
-                        WHERE {_SELECTION_WHERE}
-                        ORDER BY RANDOM()
-                        LIMIT %s
-                        """,
-                        (*self._selection_params, sample_size),
-                    )
-                    rows = cur.fetchall()
                 records = self._rows_to_records(rows)
         if not records:
             raise EmptyReplaySelectionError("cannot sample from an empty exact replay selection")

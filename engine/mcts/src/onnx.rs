@@ -381,9 +381,8 @@ impl OnnxEvaluator {
         }
 
         let mut result = Vec::with_capacity(self.obs_size);
-        for chunk in obs.chunks_exact(4) {
-            let bytes: [u8; 4] = chunk.try_into().unwrap();
-            result.push(f32::from_le_bytes(bytes));
+        for chunk in obs.as_chunks::<4>().0 {
+            result.push(f32::from_le_bytes(*chunk));
         }
         Ok(result)
     }

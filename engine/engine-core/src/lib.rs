@@ -6,6 +6,7 @@
 //! - `BoardGame`: explicitly narrow adapter contract for bundled board games
 //! - `EngineContext`: high-level API for running environments
 
+mod action_view;
 mod adapter;
 mod board_game;
 mod board_game_utils;
@@ -19,6 +20,7 @@ mod registry;
 pub mod typed;
 
 // Re-export main types for convenience
+pub use action_view::{ActionPresentation, ActionTarget};
 pub use board_view::Presentation;
 pub use context::{EngineContext, EngineContextError, ResetResult, StepResult};
 pub use erased::{EncodedObservation, ErasedEnvironmentError, ErasedTimestep};

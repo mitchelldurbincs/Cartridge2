@@ -118,7 +118,7 @@ jobs:
   rust-security-audit:
     name: Rust Security Audit
     runs-on: ubuntu-latest
-    # Gating, but with today's four known advisories listed explicitly so the
+    # Gating, with the remaining known advisory listed explicitly so the
     # gate catches anything NEW while the existing backlog stays visible
     # instead of silently suppressed. Each needs a semver-major dependency
     # bump, so none is a one-line fix; they are tracked as follow-up work:
@@ -127,18 +127,14 @@ jobs:
     #                      Clearing it means prometheus 0.14+, which drops
     #                      protobuf but changes the API used by
     #                      engine/metrics-common and web/src/metrics.rs.
-    #   RUSTSEC-2026-0098  rustls-webpki 0.101.7 <- rustls 0.21.12, reached only
-    #   RUSTSEC-2026-0099  through feature-gated deps (not in the default build
-    #   RUSTSEC-2026-0104  tree). Needs the rustls 0.23 chain.
+    # The legacy AWS HTTPS connector has been removed; the rustls-webpki
+    # exceptions are no longer needed. h2 is patched in all three lockfiles.
     #
     # Delete an entry the moment its upgrade lands. Do not add one without a
     # justification here, and do not reach for continue-on-error again.
     env:
       AUDIT_IGNORES: >-
         --ignore RUSTSEC-2024-0437
-        --ignore RUSTSEC-2026-0098
-        --ignore RUSTSEC-2026-0099
-        --ignore RUSTSEC-2026-0104
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -187,6 +183,22 @@ jobs:
   python-test:
     name: Python Tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: cartridge
+          POSTGRES_PASSWORD: cartridge
+          POSTGRES_DB: cartridge_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cartridge -d cartridge_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      CARTRIDGE_STORAGE_POSTGRES_URL: postgresql://cartridge:cartridge@localhost:5432/cartridge_test
     defaults:
       run:
         working-directory: trainer
@@ -252,8 +264,21 @@ jobs:
         continue-on-error: true
       - name: Svelte check (TypeScript)
         run: npm run check
+      - name: Frontend unit and component tests
+        run: npm test
       - name: Build
         run: npm run build
+      - name: Install browser for interaction tests
+        run: npx playwright install --with-deps chromium
+      - name: Browser interaction tests
+        run: npm run test:browser
+      - name: Preserve browser failure traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inspector-browser-results
+          path: web/frontend/test-results/
+          retention-days: 7
 
   # ============================================
   # Docker Build Validation

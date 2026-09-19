@@ -2,7 +2,7 @@
 
 use algorithm_core::BuiltinAlgorithm;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -132,6 +132,47 @@ pub async fn get_game_state(
     })?))
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryQuery {
+    session_id: Option<String>,
+    from_revision: Option<u64>,
+    limit: Option<usize>,
+}
+
+pub async fn get_history(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<crate::types::HistoryResponse>, (StatusCode, String)> {
+    let session = state.session.lock().await;
+    if query
+        .session_id
+        .as_ref()
+        .is_some_and(|id| *id != session.position_key().session_id)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Session changed; reload the current position".into(),
+        ));
+    }
+    Ok(Json(
+        session.history(query.from_revision, query.limit.unwrap_or(64)),
+    ))
+}
+
+fn check_position(
+    session: &GameSession,
+    expected: Option<&crate::types::PositionKey>,
+) -> Result<(), (StatusCode, String)> {
+    if expected.is_some_and(|key| !session.matches_position(key)) {
+        return Err((
+            StatusCode::CONFLICT,
+            "Position changed; reload before making another move".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Start a new game.
 /// Only allows creating the currently configured game type.
 /// Rejects requests to switch to a different game since the model
@@ -162,9 +203,12 @@ pub async fn new_game(
 
     let mut session = Arc::clone(&state.session).lock_owned().await;
 
+    check_position(&session, req.expected.as_ref())?;
+
     // Reset the game with shared evaluator (for hot-reloading)
     let replacement = GameSession::with_evaluator(&game_id, Arc::clone(&state.evaluator))
-        .map_err(|e| internal_error(&format!("Failed to create game '{}'", game_id), e))?;
+        .map_err(|e| internal_error(&format!("Failed to create game '{}'", game_id), e))?
+        .with_model_info(Arc::clone(&state.model_info));
     install_session(&mut session, replacement);
 
     // If bot goes first, bot is player 1, human is player 2
@@ -192,6 +236,7 @@ pub async fn make_move(
     Json(req): Json<MoveRequest>,
 ) -> Result<Json<MoveResponse>, (StatusCode, String)> {
     let mut session = Arc::clone(&state.session).lock_owned().await;
+    check_position(&session, req.expected.as_ref())?;
 
     // Check if game is over
     if session.is_game_over() {
@@ -408,6 +453,7 @@ mod tests {
             game_over: false,
             legal_moves: vec![0, 1, 2, 3, 4, 5, 6, 7, 8],
             message: "Your turn (X)".to_string(),
+            ..GameStateResponse::default()
         };
 
         assert_eq!(response.cells.len(), 9);
@@ -434,6 +480,7 @@ mod tests {
             game_over: true,
             legal_moves: vec![],
             message: "You win!".to_string(),
+            ..GameStateResponse::default()
         };
 
         assert!(response.game_over);
@@ -447,6 +494,7 @@ mod tests {
         let req = NewGameRequest {
             first: FirstPlayer::Player,
             game: None,
+            ..NewGameRequest::default()
         };
 
         assert_eq!(req.first, FirstPlayer::Player);
@@ -458,6 +506,7 @@ mod tests {
         let req = NewGameRequest {
             first: FirstPlayer::Bot,
             game: Some("tictactoe".to_string()),
+            ..NewGameRequest::default()
         };
 
         assert_eq!(req.first, FirstPlayer::Bot);
@@ -466,7 +515,10 @@ mod tests {
 
     #[test]
     fn test_move_request_creation() {
-        let req = MoveRequest { position: 4 };
+        let req = MoveRequest {
+            position: 4,
+            ..MoveRequest::default()
+        };
         assert_eq!(req.position, 4);
     }
 
@@ -485,6 +537,7 @@ mod tests {
             game_over: false,
             legal_moves: vec![1, 2, 3, 5, 6, 7, 8],
             message: "Your turn (X)".to_string(),
+            ..GameStateResponse::default()
         };
 
         let response = MoveResponse {
@@ -512,6 +565,7 @@ mod tests {
             game_over: true,
             legal_moves: vec![],
             message: "You win!".to_string(),
+            ..GameStateResponse::default()
         };
 
         let response = MoveResponse {
@@ -533,6 +587,7 @@ mod tests {
             game_over: false,
             legal_moves: vec![0, 1, 2],
             message: "Test".to_string(),
+            ..GameStateResponse::default()
         };
 
         let json = serde_json::to_string(&response);
@@ -594,6 +649,7 @@ mod tests {
             game_over: false,
             legal_moves: vec![1, 2, 3, 5, 6, 7, 8],
             message: "Your turn".to_string(),
+            ..GameStateResponse::default()
         };
 
         let response = MoveResponse {
