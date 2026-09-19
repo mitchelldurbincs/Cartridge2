@@ -13,15 +13,63 @@ const helpers = dataUrl(ts.transpileModule(
   readFileSync(new URL('../src/lib/analysis.ts', import.meta.url), 'utf8'),
   { compilerOptions: { module: ts.ModuleKind.ESNext } },
 ).outputText);
-async function component(name) {
+const componentUrls = new Map();
+function componentUrl(name) {
+  if (componentUrls.has(name)) return componentUrls.get(name);
   const { js } = compile(readFileSync(new URL(`../src/${name}.svelte`, import.meta.url), 'utf8'),
     { filename: `${name}.svelte`, generate: 'server' });
-  const code = js.code.replace(/from '(svelte(?:\/internal\/server)?|\.\/lib\/analysis)'/g,
-    (_, module) => `from '${module === './lib/analysis' ? helpers : import.meta.resolve(module)}'`);
-  return (await import(dataUrl(code))).default;
+  const code = js.code.replace(/from '(svelte(?:\/internal\/server)?|\.\/lib\/analysis|\.\/\w+\.svelte)'/g,
+    (_, module) => `from '${module.endsWith('.svelte') ? componentUrl(module.slice(2, -7)) :
+      module === './lib/analysis' ? helpers : import.meta.resolve(module)}'`);
+  const url = dataUrl(code);
+  componentUrls.set(name, url);
+  return url;
 }
-const Board = await component('GenericBoard');
-const Inspector = await component('DecisionInspector');
+const Board = (await import(componentUrl('GenericBoard'))).default;
+const Inspector = (await import(componentUrl('DecisionInspector'))).default;
+
+function generalsBoard(overrides = {}) {
+  const { info, state, history } = fixture('generals_8x8');
+  return render(Board, { props: {
+    cells: state.cells, legalMoves: state.legal_moves, gameOver: false,
+    lastBotMove: null, gameInfo: info, currentPlayer: state.current_player,
+    actionPresentations: state.actions, assessments: history.records[0].decision.actions,
+    onCellClick() { assert.fail('render cannot play'); }, ...overrides,
+  } }).body;
+}
+
+test('Generals renders terrain, armies, accessible tiles, and global source totals', () => {
+  const html = generalsBoard();
+  assert.equal([...html.matchAll(/aria-label="Tile /g)].length, 64);
+  assert.match(html, /aria-label="Tile 1,1"[^>]*>.*?★.*?12/s);
+  assert.match(html, /aria-label="Tile 3,3"[^>]*>.*?◉.*?20/s);
+  assert.match(html, /aria-label="Tile 5,5"[^>]*>.*?▲/s);
+  assert.match(html, /22\.2%/);
+  assert.match(html, /57\.8%/);
+  assert.equal([...html.matchAll(/class="probability /g)].length, 2);
+  assert.doesNotMatch(html, /<button[^>]*generals-wait[^>]*disabled/);
+});
+
+for (const [label, overrides] of [
+  ['read-only', { readOnly: true }],
+  ['game over', { gameOver: true }],
+  ['illegal Wait', { legalMoves: [36, 37] }],
+  ['missing Wait presentation', { actionPresentations: [] }],
+]) {
+  test(`Generals disables Wait when ${label}`, () => {
+    const html = generalsBoard(overrides);
+    assert.match(html, /<button[^>]*generals-wait[^>]*disabled/);
+    const disabledTiles = [...html.matchAll(/<button[^>]*disabled[^>]*aria-label="Tile /g)].length;
+    assert.equal(disabledTiles, overrides.gameOver ? 64 : 0);
+  });
+}
+
+test('Generals leaves missing probabilities absent and preserves genuine zeros', () => {
+  assert.doesNotMatch(generalsBoard({ assessments: [] }), /class="probability /);
+  const html = generalsBoard({ assessments: [{ action: { kind: 'discrete', index: 36 }, visit_share: 0 }] });
+  assert.match(html, /0\.0%/);
+  assert.equal([...html.matchAll(/class="probability /g)].length, 1);
+});
 
 for (const id of Object.keys(definitions)) {
   test(`${id}: recorded board and inspector render the same position`, () => {

@@ -7,7 +7,7 @@ import ts from 'typescript';
 // runner dependency and no generated files in the source tree.
 const source = readFileSync(new URL('../src/lib/analysis.ts', import.meta.url), 'utf8');
 const { outputText } = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext } });
-const { percent, samePosition, sortedActions, targetMass, boundAnalysis } =
+const { percent, probabilityHeat, samePosition, sortedActions, targetMass, boundAnalysis } =
   await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
 
 test('missing metrics are not zero; probabilities preserve their scale', () => {
@@ -15,6 +15,13 @@ test('missing metrics are not zero; probabilities preserve their scale', () => {
   assert.equal(percent(NaN), '—');
   assert.equal(percent(0), '0.0%');
   assert.equal(percent(0.25), '25.0%');
+});
+
+test('board heat preserves the shared probability scale and distinguishes missing from zero', () => {
+  assert.equal(probabilityHeat(null), '');
+  assert.equal(probabilityHeat(0), 'background-color: rgba(20, 160, 134, 0.12);');
+  assert.equal(probabilityHeat(0.25), 'background-color: rgba(20, 160, 134, 0.5);');
+  assert.equal(probabilityHeat(1), 'background-color: rgba(20, 160, 134, 0.88);');
 });
 
 test('session and revision both bind the analysis', () => {

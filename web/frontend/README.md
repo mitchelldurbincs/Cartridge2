@@ -27,7 +27,8 @@ The Rust backend must be running on port 8080 for the app to work. In developmen
 src/
 ├── main.ts                 # Entry point, hash-based SPA router
 ├── App.svelte              # Main page: game selector, board, controls
-├── GenericBoard.svelte     # grid, drop-column, and Generals renderers
+├── GenericBoard.svelte     # Renderer dispatch, grid and drop-column presentation
+├── GeneralsBoard.svelte    # Source/target selection and directional inspection
 ├── Stats.svelte            # Training stats display (polls /stats)
 ├── LossChart.svelte        # Canvas-based loss visualization chart
 ├── LossOverTimePage.svelte # Full-page training progress view
@@ -51,7 +52,13 @@ Hash-based SPA routing in `main.ts`:
 - **App.svelte** - Main game UI. On mount, checks server health, loads available games, auto-selects the game currently being trained. Handles game creation, move submission, and pass actions (for Othello).
 - **GenericBoard.svelte** - Renders the installed presentation types: `grid`
   (TicTacToe, Othello), `drop_column` (Connect 4), and `generals`. It adapts
-  layout from `GameInfo` supplied by the serving host.
+  layout from `GameInfo` supplied by the serving host and delegates Generals
+  presentation to `GeneralsBoard`.
+- **GeneralsBoard.svelte** - Owns terrain/army rendering, pending source
+  selection, legal target and Wait interactions, and read-only directional
+  inspection. It consumes the server's action presentations and reports action
+  IDs through the existing move callback; API requests and recovery remain in
+  `App`. Selection state and styles stay inside the renderer.
 - **Stats.svelte** - Polls the stats and model endpoints every 5 seconds and
   displays losses, replay-record count, content identities, basic evaluation
   results, and win rate by training step.
