@@ -64,6 +64,10 @@ export function percent(value: number | null | undefined): string {
   return value == null || !Number.isFinite(value) ? '—' : `${(value * 100).toFixed(1)}%`;
 }
 
+export function probabilityHeat(value: number | null): string {
+  return value == null ? '' : `background-color: rgba(20, 160, 134, ${0.12 + 0.76 * Math.sqrt(value)});`;
+}
+
 export function sortedActions(actions: ActionAssessment[], metric: ProbabilityMetric): ActionAssessment[] {
   return [...actions].sort((a, b) =>
     (b[metric] ?? -Infinity) - (a[metric] ?? -Infinity) || a.action.index - b.action.index);
