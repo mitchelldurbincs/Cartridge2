@@ -23,7 +23,7 @@ use engine_core::board_profile::LegalMask;
 use ort::{
     session::builder::SessionBuilder,
     session::Session,
-    value::{TensorElementType, Value, ValueType},
+    value::{DynValue, TensorElementType, Value, ValueType},
 };
 use tracing::debug;
 
@@ -270,6 +270,23 @@ impl OnnxEvaluator {
         Ok(())
     }
 
+    /// Borrow a required f32 output only after its runtime shape is validated.
+    /// Callers keep ownership of copies and the session lock's lifetime.
+    fn extract_output_tensor<'a>(
+        output: Option<&'a DynValue>,
+        name: &str,
+        tensor_label: &str,
+        expected_shape: &[usize],
+    ) -> Result<&'a [f32], EvaluatorError> {
+        let output =
+            output.ok_or_else(|| EvaluatorError::ModelError(format!("Missing {name} output")))?;
+        let (shape, data) = output.try_extract_tensor::<f32>().map_err(|e| {
+            EvaluatorError::ModelError(format!("Failed to extract {tensor_label} tensor: {e}"))
+        })?;
+        Self::validate_runtime_tensor(name, shape, data.len(), expected_shape)?;
+        Ok(data)
+    }
+
     fn from_session(
         session: Session,
         obs_size: usize,
@@ -508,33 +525,18 @@ impl Evaluator for OnnxEvaluator {
                 })?;
 
             // Extract policy logits - output is shape (1, action_size)
-            let policy_output = outputs.get("policy_logits").ok_or_else(|| {
-                EvaluatorError::ModelError("Missing policy_logits output".to_string())
-            })?;
-
-            let (policy_shape, policy_data) =
-                policy_output.try_extract_tensor::<f32>().map_err(|e| {
-                    EvaluatorError::ModelError(format!("Failed to extract policy tensor: {}", e))
-                })?;
-            Self::validate_runtime_tensor(
+            let policy_data = Self::extract_output_tensor(
+                outputs.get("policy_logits"),
                 "policy_logits",
-                policy_shape,
-                policy_data.len(),
+                "policy",
                 &[1, self.num_actions],
             )?;
 
             let policy_logits: Vec<f32> = policy_data.to_vec();
 
             // Extract value - output is shape (1, 1)
-            let value_output = outputs
-                .get("value")
-                .ok_or_else(|| EvaluatorError::ModelError("Missing value output".to_string()))?;
-
-            let (value_shape, value_data) =
-                value_output.try_extract_tensor::<f32>().map_err(|e| {
-                    EvaluatorError::ModelError(format!("Failed to extract value tensor: {}", e))
-                })?;
-            Self::validate_runtime_tensor("value", value_shape, value_data.len(), &[1, 1])?;
+            let value_data =
+                Self::extract_output_tensor(outputs.get("value"), "value", "value", &[1, 1])?;
 
             let value = value_data[0];
             (policy_logits, value)
@@ -566,8 +568,8 @@ impl Evaluator for OnnxEvaluator {
         Ok(EvalResult { policy, value })
     }
 
-    // The tensor-prep/session-lock/extract plumbing mirrors evaluate() above;
-    // kept separate because the outputs are batch- vs single-shaped.
+    // Keep batch preparation, output ownership, and stats accounting separate
+    // from evaluate(); both paths share borrowed output validation.
     fn evaluate_batch(
         &self,
         observations: &[&[u8]],
@@ -636,34 +638,18 @@ impl Evaluator for OnnxEvaluator {
                 })?;
 
             // Extract policy logits - output is shape (batch_size, action_size)
-            let policy_output = outputs.get("policy_logits").ok_or_else(|| {
-                EvaluatorError::ModelError("Missing policy_logits output".to_string())
-            })?;
-
-            let (policy_shape, policy_data) =
-                policy_output.try_extract_tensor::<f32>().map_err(|e| {
-                    EvaluatorError::ModelError(format!("Failed to extract policy tensor: {}", e))
-                })?;
-            Self::validate_runtime_tensor(
+            let policy_data = Self::extract_output_tensor(
+                outputs.get("policy_logits"),
                 "policy_logits",
-                policy_shape,
-                policy_data.len(),
+                "policy",
                 &[batch_size, self.num_actions],
             )?;
 
             // Extract value - output is shape (batch_size, 1)
-            let value_output = outputs
-                .get("value")
-                .ok_or_else(|| EvaluatorError::ModelError("Missing value output".to_string()))?;
-
-            let (value_shape, value_data) =
-                value_output.try_extract_tensor::<f32>().map_err(|e| {
-                    EvaluatorError::ModelError(format!("Failed to extract value tensor: {}", e))
-                })?;
-            Self::validate_runtime_tensor(
+            let value_data = Self::extract_output_tensor(
+                outputs.get("value"),
                 "value",
-                value_shape,
-                value_data.len(),
+                "value",
                 &[batch_size, 1],
             )?;
 
