@@ -9,7 +9,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
@@ -18,7 +18,8 @@ use crate::artifact::{
     validate_manifest, validate_run_commit_chain, validate_run_head, verify_blob_bytes,
     CheckpointManifestV1, ResolvedRunCommit, RunHeadV2, RUN_HEAD_CHANNEL,
 };
-use crate::{AcceptedHead, ModelInfo, ModelLoadSpec, ModelSelection};
+use crate::reload::{AcceptedHead, LoadOutcome, ReloadState};
+use crate::{ModelInfo, ModelLoadSpec, ModelSelection};
 
 #[cfg(test)]
 mod tests;
@@ -36,13 +37,6 @@ pub struct S3Config {
     pub cache_dir: PathBuf,
 }
 
-enum RemoteUpdate {
-    Absent,
-    Unchanged,
-    Advanced,
-    Loaded,
-}
-
 struct S3LoadContext<'a> {
     client: &'a Client,
     bucket: &'a str,
@@ -50,9 +44,7 @@ struct S3LoadContext<'a> {
     cache_dir: &'a Path,
     model_spec: &'a ModelLoadSpec,
     selection: ModelSelection,
-    evaluator: &'a Arc<RwLock<Option<SharedOnnxEvaluator>>>,
-    accepted_head: &'a Arc<RwLock<Option<AcceptedHead>>>,
-    model_info: &'a Arc<RwLock<ModelInfo>>,
+    state: &'a ReloadState,
 }
 
 pub struct S3ModelWatcher {
@@ -61,11 +53,9 @@ pub struct S3ModelWatcher {
     prefix: String,
     model_spec: ModelLoadSpec,
     selection: ModelSelection,
-    evaluator: Arc<RwLock<Option<SharedOnnxEvaluator>>>,
-    accepted_head: Arc<RwLock<Option<AcceptedHead>>>,
+    state: ReloadState,
     poll_interval: Duration,
     cache_dir: PathBuf,
-    model_info: Arc<RwLock<ModelInfo>>,
 }
 
 impl S3ModelWatcher {
@@ -108,11 +98,9 @@ impl S3ModelWatcher {
             prefix: config.prefix,
             model_spec,
             selection,
-            evaluator,
-            accepted_head: Arc::new(RwLock::new(None)),
+            state: ReloadState::new(evaluator),
             poll_interval: DEFAULT_S3_POLL_INTERVAL,
             cache_dir: config.cache_dir,
-            model_info: Arc::new(RwLock::new(ModelInfo::default())),
         })
     }
 
@@ -122,7 +110,7 @@ impl S3ModelWatcher {
     }
 
     pub fn model_info(&self) -> Arc<RwLock<ModelInfo>> {
-        Arc::clone(&self.model_info)
+        self.state.model_info()
     }
 
     fn run_head_key(prefix: &str) -> String {
@@ -254,7 +242,7 @@ impl S3ModelWatcher {
         Ok(reversed)
     }
 
-    async fn load_current(context: S3LoadContext<'_>) -> Result<RemoteUpdate> {
+    async fn load_current(context: S3LoadContext<'_>) -> Result<LoadOutcome> {
         let S3LoadContext {
             client,
             bucket,
@@ -262,25 +250,20 @@ impl S3ModelWatcher {
             cache_dir,
             model_spec,
             selection,
-            evaluator,
-            accepted_head,
-            model_info,
+            state,
         } = context;
         let run_head_key = Self::run_head_key(prefix);
         let Some(run_head_bytes) = Self::get_optional(client, bucket, &run_head_key).await? else {
-            return Ok(RemoteUpdate::Absent);
+            return Ok(LoadOutcome::Absent);
         };
         let run_head: RunHeadV2 = parse_canonical_json("S3 current run head", &run_head_bytes)?;
         validate_run_head(&run_head)?;
-        let accepted = accepted_head
-            .read()
-            .map_err(|error| anyhow!("failed to read accepted run head: {error}"))?
-            .clone();
+        let accepted = state.accepted_head()?;
         if accepted
             .as_ref()
             .is_some_and(|accepted| accepted.run_commit_id == run_head.run_commit_id)
         {
-            return Ok(RemoteUpdate::Unchanged);
+            return Ok(LoadOutcome::Unchanged);
         }
 
         let chain =
@@ -312,78 +295,19 @@ impl S3ModelWatcher {
                 current = %latest.checkpoint_id,
                 "Discarding stale S3 checkpoint candidate"
             );
-            return Ok(RemoteUpdate::Unchanged);
+            return Ok(LoadOutcome::Unchanged);
         }
 
-        let mut accepted_guard = accepted_head
-            .write()
-            .map_err(|error| anyhow!("failed to lock accepted run head: {error}"))?;
-        if accepted_guard
-            .as_ref()
-            .is_some_and(|value| value.run_commit_id == run_head.run_commit_id)
-        {
-            return Ok(RemoteUpdate::Unchanged);
-        }
-        if *accepted_guard != accepted {
-            debug!(
-                candidate_checkpoint = %run_head.checkpoint_id,
-                candidate_run_commit = %run_head.run_commit_id,
-                "Discarding S3 candidate after an accepted-head race"
-            );
-            return Ok(RemoteUpdate::Unchanged);
-        }
-        let mut evaluator_guard = evaluator
-            .write()
-            .map_err(|error| anyhow!("failed to lock model evaluator: {error}"))?;
-        let mut info_guard = model_info
-            .write()
-            .map_err(|error| anyhow!("failed to lock model information: {error}"))?;
-        if new_evaluator.is_none()
-            && (accepted_guard
-                .as_ref()
-                .is_none_or(|accepted| accepted.model_checkpoint_id != checkpoint_id)
-                || evaluator_guard.is_none())
-        {
-            return Err(anyhow!(
-                "cannot reuse an evaluator that does not match the selected S3 checkpoint"
-            ));
-        }
-        let model_changed = new_evaluator.is_some();
-        if let Some(new_evaluator) = new_evaluator {
-            *evaluator_guard = Some(new_evaluator);
-        }
-        *accepted_guard = Some(AcceptedHead {
-            model_checkpoint_id: checkpoint_id.clone(),
-            run_commit_id: run_head.run_commit_id.clone(),
-        });
-        if model_changed {
-            *info_guard = ModelInfo {
-                loaded: true,
-                checkpoint_id: Some(checkpoint_id.clone()),
-                model_sha256: Some(manifest.onnx.sha256.clone()),
-                path: Some(format!("s3://{bucket}/{model_key}")),
-                loaded_at: Some(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|duration| duration.as_secs())
-                        .unwrap_or(0),
-                ),
-                training_step: Some(manifest.step),
-            };
-        }
-        info!(
-            checkpoint_id = %checkpoint_id,
-            run_commit_id = %run_head.run_commit_id,
-            model_sha256 = %manifest.onnx.sha256,
-            step = manifest.step,
-            model_changed,
-            "Content-addressed S3 RunHead accepted"
-        );
-        Ok(if model_changed {
-            RemoteUpdate::Loaded
-        } else {
-            RemoteUpdate::Advanced
-        })
+        state.commit_candidate(
+            AcceptedHead {
+                model_checkpoint_id: checkpoint_id,
+                run_commit_id: run_head.run_commit_id,
+            },
+            &manifest,
+            format!("s3://{bucket}/{model_key}"),
+            new_evaluator,
+            accepted,
+        )
     }
 
     pub async fn try_load_existing(&self) -> Result<bool> {
@@ -395,12 +319,10 @@ impl S3ModelWatcher {
                 cache_dir: &self.cache_dir,
                 model_spec: &self.model_spec,
                 selection: self.selection,
-                evaluator: &self.evaluator,
-                accepted_head: &self.accepted_head,
-                model_info: &self.model_info,
+                state: &self.state,
             })
             .await?,
-            RemoteUpdate::Absent
+            LoadOutcome::Absent
         ))
     }
 
@@ -412,9 +334,7 @@ impl S3ModelWatcher {
         let cache_dir = self.cache_dir.clone();
         let model_spec = self.model_spec.clone();
         let selection = self.selection;
-        let evaluator = Arc::clone(&self.evaluator);
-        let accepted = Arc::clone(&self.accepted_head);
-        let model_info = Arc::clone(&self.model_info);
+        let state = self.state.clone();
         let poll_interval = self.poll_interval;
 
         tokio::spawn(async move {
@@ -428,17 +348,14 @@ impl S3ModelWatcher {
                     cache_dir: &cache_dir,
                     model_spec: &model_spec,
                     selection,
-                    evaluator: &evaluator,
-                    accepted_head: &accepted,
-                    model_info: &model_info,
+                    state: &state,
                 })
                 .await
                 {
-                    Ok(RemoteUpdate::Loaded) => {
+                    Ok(LoadOutcome::Loaded) => {
                         let _ = updates_tx.send(()).await;
                     }
-                    Ok(RemoteUpdate::Absent | RemoteUpdate::Unchanged | RemoteUpdate::Advanced) => {
-                    }
+                    Ok(LoadOutcome::Absent | LoadOutcome::Unchanged | LoadOutcome::Advanced) => {}
                     Err(error) => error!("Rejected S3 model channel update: {error}"),
                 }
             }
