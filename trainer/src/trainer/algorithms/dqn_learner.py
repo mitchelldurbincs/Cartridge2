@@ -31,7 +31,8 @@ from ..storage.evaluation import create_evaluation_repository
 from ..storage.publisher import ArtifactValidationError, create_checkpoint_publisher
 from ..storage.run_commit import RunCommitRepository, RunCommitV1
 from .dqn_config import DqnLearnerConfig
-from .dqn_v1 import ALGORITHM_ID, DESCRIPTOR, decode_replay_batch
+from .dqn_contract import ALGORITHM_ID, DESCRIPTOR
+from .dqn_replay import DqnReplayBatch, decode_replay_batch
 
 
 class DqnQNetwork(nn.Module):
@@ -157,7 +158,7 @@ class DqnLearner:
             self.parent_checkpoint_id = checkpoint.checkpoint_id
             self.start_step = checkpoint.manifest.step
 
-    def train_step(self, batch) -> tuple[float, float | None]:
+    def train_step(self, batch: DqnReplayBatch) -> tuple[float, float | None]:
         observations = torch.from_numpy(batch.observations).to(self.device)
         actions = torch.from_numpy(batch.actions).to(self.device)
         rewards = torch.from_numpy(batch.rewards).to(self.device)
