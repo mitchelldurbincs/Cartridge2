@@ -283,42 +283,54 @@ jobs:
   # ============================================
   # Docker Build Validation
   # ============================================
-  docker-build:
-    name: Docker Build Validation
+  docker-images:
+    name: Docker (${{ matrix.image }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: alphazero
+            context: .
+            file: ./Dockerfile.alphazero
+            build-args: CARGO_FEATURES=s3
+          - image: web
+            context: .
+            file: ./web/Dockerfile
+            build-args: CARGO_FEATURES=s3
+          - image: frontend
+            context: ./web/frontend
+            file: ./web/frontend/Dockerfile
+            build-args: ''
     steps:
       - uses: actions/checkout@v4
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Build AlphaZero image
+      - name: Build image
         uses: docker/build-push-action@v5
         with:
-          context: .
-          file: ./Dockerfile.alphazero
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
           push: false
-          tags: cartridge-alphazero:test
-          build-args: CARGO_FEATURES=s3
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - name: Build Web image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./web/Dockerfile
-          push: false
-          tags: cartridge-web:test
-          build-args: CARGO_FEATURES=s3
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - name: Build Frontend image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./web/frontend
-          file: ./web/frontend/Dockerfile
-          push: false
-          tags: cartridge-frontend:test
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: cartridge-${{ matrix.image }}:test
+          build-args: ${{ matrix.build-args }}
+          # The default scope is shared: each image overwrites the previous
+          # image's cache. Keep independent caches, including builder layers.
+          cache-from: type=gha,scope=cartridge-${{ matrix.image }}-linux-amd64
+          cache-to: type=gha,scope=cartridge-${{ matrix.image }}-linux-amd64,mode=max
+
+  # Preserve the existing required check name while the images run in parallel.
+  # always() makes a failed/cancelled/skipped build fail this gate, not skip it.
+  docker-build:
+    name: Docker Build Validation
+    needs: docker-images
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every image to build successfully
+        env:
+          RESULT: ${{ needs.docker-images.result }}
+        run: test "$RESULT" = success
 
   # ============================================
   # Secrets Scanning
