@@ -82,6 +82,10 @@ static-file service.
 cargo test --manifest-path web/Cargo.toml
 npm --prefix web/frontend test
 npm --prefix web/frontend run check
+# Install Chromium once, then run the browser interaction suite:
+cd web/frontend
+npx playwright install chromium
+npm run test:browser
 ```
 
 ### Decision inspector

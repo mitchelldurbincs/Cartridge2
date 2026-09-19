@@ -1,7 +1,7 @@
 // Start with `npm run preview:fixtures`. This uses local synthetic data only.
 import { createServer } from 'vite';
 import { fileURLToPath } from 'node:url';
-import { definitions, fixture } from './preview-fixtures.mjs';
+import { definitions, fixture, trainingStats } from './preview-fixtures.mjs';
 
 let selected = Object.keys(definitions)[0];
 const server = await createServer({
@@ -25,6 +25,10 @@ const server = await createServer({
       if (path.startsWith('/game-info/')) return res.end(JSON.stringify(fixture(path.split('/').pop()).info));
       if (path === '/game/state' || path === '/game/new') return res.end(JSON.stringify(data.state));
       if (path === '/game/history') return res.end(JSON.stringify(data.history));
+      if (path === '/stats') return res.end(JSON.stringify({ ...trainingStats, env_id: selected }));
+      if (path === '/model') return res.end(JSON.stringify({ loaded: false,
+        checkpoint_id: null, model_sha256: null, path: null, loaded_at: null,
+        training_step: null, status: 'UI test fixture — no model loaded' }));
       res.statusCode = 503;
       res.end(JSON.stringify({ error: 'Unavailable in UI-only fixture preview' }));
     });

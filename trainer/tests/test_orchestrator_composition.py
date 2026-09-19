@@ -330,6 +330,63 @@ class TestTraceComposition:
 
 
 class TestOrchestratorComposition:
+    @pytest.mark.parametrize("stage", ["actor", "learner", "checkpoint", "stats", "shutdown"])
+    def test_incomplete_iteration_fails_and_closes_resources(self, tmp_path, monkeypatch, stage):
+        buffers = []
+
+        def replay_factory(selection):
+            buffer = FakeReplayStore(selection)
+            buffers.append(buffer)
+            return buffer
+
+        monkeypatch.setattr(orchestrator_module, "create_replay_store", replay_factory)
+        actor_binary = tmp_path / "actor-stub"
+        actor_binary.touch()
+        config = LoopConfig(
+            iterations=1,
+            episodes_per_iteration=1,
+            steps_per_iteration=2,
+            data_dir=tmp_path / "data",
+            env_id="tictactoe",
+            actor_binary=actor_binary,
+            mcts_max_sims=50,
+            mcts_sim_ramp_rate=0,
+            eval_interval=0,
+        )
+        orchestrator = Orchestrator(config)
+
+        def run_actor(*args, **kwargs):
+            buffers[-1].records = 5
+            buffers[-1].episodes = 1
+            if stage == "shutdown":
+                orchestrator._shutdown_requested = True
+            return stage not in {"actor", "shutdown"}, 0.0
+
+        monkeypatch.setattr(orchestrator.actor_runner, "run", run_actor)
+        monkeypatch.setattr(
+            orchestrator,
+            "_run_trainer_deferred",
+            lambda *args: (
+                stage != "learner",
+                0.0,
+                None if stage == "checkpoint" else object(),
+                None if stage == "stats" else object(),
+            ),
+        )
+        finished = []
+        monkeypatch.setattr(orchestrator.wandb_logger, "finish", lambda: finished.append(True))
+
+        if stage == "shutdown":
+            orchestrator.run()
+        else:
+            with pytest.raises(RuntimeError, match="iteration 1 failed"):
+                orchestrator.run()
+
+        assert finished == [True]
+        assert all(buffer.close_calls == 1 for buffer in buffers)
+        assert orchestrator.eval_runner.checkpoints.resolve_run_head() is None
+        assert not (config.models_dir / "run-commits").exists()
+
     def test_stale_projection_without_head_is_discarded(self, tmp_path, monkeypatch):
         config = LoopConfig(data_dir=tmp_path / "data", env_id="tictactoe")
         config.loop_stats_path.parent.mkdir(parents=True, exist_ok=True)

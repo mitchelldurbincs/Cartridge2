@@ -410,7 +410,7 @@ class TestSelectionScopedSql:
 
         assert store.sample(3) == [record, record, record]
 
-        count_call, sampled_call, fallback_call = cursor.calls
+        count_call, sampled_call = cursor.calls
         selection_key = (
             TEST_PROFILE.env_id,
             TEST_PROFILE.env_contract_version,
@@ -421,10 +421,10 @@ class TestSelectionScopedSql:
         )
         assert "replay_records" in count_call[0]
         assert count_call[1] == selection_key
-        assert "FROM replay_records TABLESAMPLE" in sampled_call[0]
-        assert sampled_call[1] == (3.0, *selection_key, 3)
-        assert "FROM replay_records" in fallback_call[0]
-        assert fallback_call[1] == (*selection_key, 3)
+        assert "FROM replay_records" in sampled_call[0]
+        assert "ORDER BY RANDOM()" in sampled_call[0]
+        assert "TABLESAMPLE" not in sampled_call[0]
+        assert sampled_call[1] == (*selection_key, 3)
         assert all("ARRAY_AGG" not in sql and "MATERIALIZED" not in sql for sql, _ in cursor.calls)
         assert connection.checkouts == 1
 
@@ -557,6 +557,16 @@ class TestPostgresReplayStore:
         replay_store.store(record)
 
         assert replay_store.sample(8) == [record] * 8
+
+    def test_repeated_minibatches_reach_beyond_the_physical_prefix(self, replay_store):
+        replay_store.store_batch(
+            [make_record(record_id=f"sampling-{index}", step_number=index) for index in range(64)]
+        )
+        # The former TABLESAMPLE path sampled 100% of a small selection and
+        # then took its first eight physical rows on every call.
+        batches = [replay_store.sample(8) for _ in range(20)]
+        assert all(len({record.id for record in batch}) == 8 for batch in batches)
+        assert len({record.id for batch in batches for record in batch}) > 8
 
     def test_empty_selection_sample_fails_loudly(self, replay_store):
         with pytest.raises(EmptyReplaySelectionError, match="empty exact"):

@@ -34,6 +34,8 @@ htmlcov/
 node_modules/
 /web/frontend/dist/
 /web/frontend/.svelte-kit/
+/web/frontend/test-results/
+/web/frontend/playwright-report/
 .npm
 .pnpm-debug.log*
 

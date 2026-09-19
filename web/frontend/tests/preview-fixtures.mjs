@@ -5,6 +5,17 @@ export const definitions = {
   othello: ['Othello forced-pass fixture', 8, 8, 65, 'grid'],
   generals_8x8: ['Generals', 8, 8, 257, 'generals'],
 };
+export const trainingStats = {
+  step: 3, total_steps: 10, metrics: { 'loss/total': 0, 'loss/policy': 0, 'loss/value': 0 },
+  samples_seen: 96, replay_record_count: 64, last_checkpoint: 'fixture', learning_rate: .001,
+  timestamp: 1788865200, env_id: 'tictactoe', last_evaluation: null, evaluation_history: [],
+  history: [
+    { step: 1, metrics: { 'loss/total': 1, 'loss/policy': .8, 'loss/value': .2 }, learning_rate: .001, grad_norm: null },
+    { step: 2, metrics: { 'loss/total': .5 }, learning_rate: .001, grad_norm: null },
+    { step: 3, metrics: { 'loss/total': 0, 'loss/policy': 0, 'loss/value': 0 }, learning_rate: .001, grad_norm: null },
+  ],
+};
+
 export function fixture(id) {
   const [name, width, height, count, board_type] = definitions[id];
   const info = { env_id: id, display_name: name, board_width: width, board_height: height,

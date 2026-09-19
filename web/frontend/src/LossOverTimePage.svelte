@@ -142,8 +142,8 @@
   let hoverData = $derived(hoverIndex !== null && chartData.points && chartData.points.total[hoverIndex] ? {
     step: chartData.points.total[hoverIndex].step,
     total: chartData.points.total[hoverIndex].value,
-    policy: chartData.points.policy[hoverIndex]?.value,
-    value: chartData.points.value[hoverIndex]?.value,
+    policy: chartData.points.policy.find(p => p.step === chartData.points!.total[hoverIndex!].step)?.value,
+    value: chartData.points.value.find(p => p.step === chartData.points!.total[hoverIndex!].step)?.value,
     x: chartData.points.total[hoverIndex].x,
   } : null);
 </script>
@@ -301,22 +301,13 @@
               stroke="#fff"
               stroke-width="2"
             />
-            <circle
-              cx={hoverData.x}
-              cy={chartData.points.policy[hoverIndex!].y}
-              r="5"
-              fill={CHART_COLORS.policy}
-              stroke="#fff"
-              stroke-width="2"
-            />
-            <circle
-              cx={hoverData.x}
-              cy={chartData.points.value[hoverIndex!].y}
-              r="5"
-              fill={CHART_COLORS.value}
-              stroke="#fff"
-              stroke-width="2"
-            />
+            {#each ['policy', 'value'] as series}
+              {@const point = chartData.points[series as 'policy' | 'value'].find(p => p.step === hoverData.step)}
+              {#if point}
+                <circle cx={point.x} cy={point.y} r="5"
+                  fill={CHART_COLORS[series as 'policy' | 'value']} stroke="#fff" stroke-width="2" />
+              {/if}
+            {/each}
           {/if}
         </g>
 
@@ -388,15 +379,15 @@
           </div>
           <div class="stat">
             <span class="stat-label">Total Loss</span>
-            <span class="stat-value" style="color: {CHART_COLORS.total}">{formatLoss(latest.total_loss)}</span>
+            <span class="stat-value" style="color: {CHART_COLORS.total}">{formatLoss(latest.metrics['loss/total'])}</span>
           </div>
           <div class="stat">
             <span class="stat-label">Policy Loss</span>
-            <span class="stat-value" style="color: {CHART_COLORS.policy}">{formatLoss(latest.policy_loss)}</span>
+            <span class="stat-value" style="color: {CHART_COLORS.policy}">{formatLoss(latest.metrics['loss/policy'])}</span>
           </div>
           <div class="stat">
             <span class="stat-label">Value Loss</span>
-            <span class="stat-value" style="color: {CHART_COLORS.value}">{formatLoss(latest.value_loss)}</span>
+            <span class="stat-value" style="color: {CHART_COLORS.value}">{formatLoss(latest.metrics['loss/value'])}</span>
           </div>
           <div class="stat">
             <span class="stat-label">Data Points</span>

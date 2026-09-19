@@ -648,7 +648,9 @@ class Orchestrator(_CoreOrchestrator):
                 if self._shutdown_requested:
                     break
                 if self.run_iteration(iteration) is None:
-                    break
+                    if self._shutdown_requested:
+                        break
+                    raise RuntimeError(f"iteration {iteration} failed")
         finally:
             self.wandb_logger.finish()
             self._replay_buffer.close()
