@@ -9,7 +9,9 @@ from trainer.algorithms.alphazero_board_v1 import (
     ALGORITHM_ID,
     DESCRIPTOR,
     decode_replay_batch,
+    get_game_config,
 )
+from trainer.environment_catalog import get_environment
 from trainer.storage import ReplayProfile, ReplaySelection
 
 PROFILE = ReplayProfile(
@@ -76,6 +78,43 @@ def test_decoder_handles_an_empty_batch_without_storage_semantics():
     assert values.shape == (0,)
 
 
+@pytest.mark.parametrize("env_id", ["tictactoe", "connect4", "othello", "generals_8x8"])
+def test_decoder_preserves_payload_bits_for_registered_dimensions(env_id):
+    config = get_game_config(env_id)
+    selection = replace(
+        SELECTION,
+        profile=replace(
+            PROFILE,
+            env_id=env_id,
+            env_contract_version=get_environment(env_id).capabilities.contract_version,
+        ),
+    )
+    observation = np.linspace(-1, 1, config.obs_size, dtype="<f4")
+    observation[0] = -0.0
+    policy = np.zeros(config.num_actions, dtype="<f4")
+    policy[-1] = 1.0
+    value = np.asarray([-0.0], dtype="<f4")
+    encoded = observation.tobytes() + policy.tobytes() + value.tobytes()
+    batch = decode_replay_batch(
+        [
+            replace(
+                record(),
+                env_id=env_id,
+                env_contract_version=selection.profile.env_contract_version,
+                payload=encoded,
+            )
+        ],
+        selection=selection,
+        obs_size=config.obs_size,
+        num_actions=config.num_actions,
+    )
+    for actual, expected in zip(batch, (observation, policy, value), strict=True):
+        assert actual.dtype == np.float32
+        assert actual.flags.c_contiguous
+        assert actual.flags.writeable
+        np.testing.assert_array_equal(actual.reshape(-1).view(np.uint32), expected.view("<u4"))
+
+
 @pytest.mark.parametrize("size", [19, 20, 25])
 def test_decoder_requires_exact_payload_length(size):
     with pytest.raises(ValueError, match=rf"payload is {size} bytes.*exactly 24 bytes"):
@@ -94,6 +133,35 @@ def test_decoder_rejects_nonfinite_values_anywhere(values, index):
     encoded = np.asarray(values, dtype="<f4").tobytes()
     with pytest.raises(ValueError, match=rf"non-finite f32.*index {index}"):
         decode([record(encoded=encoded)])
+
+
+@pytest.mark.parametrize(
+    ("observation", "policy", "value", "error"),
+    [
+        # First nonfinite payload index wins, even over earlier policy errors.
+        ((0.0, np.inf, np.nan), (-0.5, 1.5), 2.0, "payload index 1: inf"),
+        ((0.0, 0.0, 0.0), (-0.5, np.nan), np.inf, "payload index 4: nan"),
+        # First invalid probability wins over the policy sum and value target.
+        ((0.0, 0.0, 0.0), (-0.5, 2.0), 2.0, "policy[0]=-0.5"),
+        ((0.0, 0.0, 0.0), (0.5, 2.0), 2.0, "policy[1]=2.0"),
+        ((0.0, 0.0, 0.0), (0.25, 0.25), 2.0, "policy sums to 0.5"),
+    ],
+)
+def test_decoder_preserves_first_invalid_index_and_validation_order(
+    observation, policy, value, error
+):
+    invalid = record(encoded=payload(observation=observation, policy=policy, value=value))
+    with pytest.raises(ValueError) as caught:
+        decode([record(record_id="valid"), invalid])
+    assert str(caught.value).startswith("Replay record 'record'")
+    assert error in str(caught.value)
+
+
+def test_decoder_reports_earlier_record_before_later_selection_error():
+    invalid_payload = record(record_id="first", encoded=payload(observation=(0.0, np.inf, 0.0)))
+    wrong_selection = replace(record(record_id="second"), collection_scope_id="c" * 64)
+    with pytest.raises(ValueError, match="Replay record 'first'.*payload index 1: inf"):
+        decode([invalid_payload, wrong_selection])
 
 
 @pytest.mark.parametrize(
