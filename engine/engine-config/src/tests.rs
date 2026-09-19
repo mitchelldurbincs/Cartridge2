@@ -6,6 +6,127 @@ use std::sync::Mutex;
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
+fn absent_and_empty_sections_use_canonical_defaults() {
+    let canonical = include_str!("../../../config.defaults.toml");
+    let expected = CentralConfig::default();
+    assert_eq!(
+        toml::from_str::<CentralConfig>(canonical).unwrap(),
+        expected
+    );
+    assert_eq!(toml::from_str::<CentralConfig>("").unwrap(), expected);
+
+    let defaults: toml::Table = toml::from_str(canonical).unwrap();
+    let mut empty_sections = String::new();
+    for section in defaults.keys() {
+        let empty_section = format!("[{section}]\n");
+        assert_eq!(
+            toml::from_str::<CentralConfig>(&empty_section).unwrap(),
+            expected,
+            "empty {section} section"
+        );
+        empty_sections.push_str(&empty_section);
+    }
+    assert_eq!(
+        toml::from_str::<CentralConfig>(&empty_sections).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn omitted_fields_in_present_sections_use_canonical_defaults() {
+    let defaults: toml::Table =
+        toml::from_str(include_str!("../../../config.defaults.toml")).unwrap();
+    let expected = CentralConfig::default();
+    for (section, values) in &defaults {
+        for field in values.as_table().unwrap().keys() {
+            let mut partial = defaults.clone();
+            partial[section].as_table_mut().unwrap().remove(field);
+            assert_eq!(
+                toml::from_str::<CentralConfig>(&toml::to_string(&partial).unwrap()).unwrap(),
+                expected,
+                "omitted {section}.{field}"
+            );
+        }
+    }
+}
+
+#[test]
+fn supplied_values_override_section_defaults() {
+    // Deserialization preserves explicit values, even when semantic validation
+    // will reject them later. False, zero, and empty are not missing values.
+    let source = r#"
+[common]
+data_dir = ""
+[algorithm]
+id = "dqn_v1"
+[training]
+iterations = 0
+learning_rate = 0.0
+[evaluation]
+eval_vs_random = false
+games = 0
+[actor]
+actor_id = "custom-actor"
+[web]
+port = 0
+allowed_origins = ["https://example.test"]
+[mcts]
+c_puct = 0.0
+[logging]
+include_timestamps = false
+[storage]
+postgres_url = ""
+s3_bucket = "test-bucket"
+s3_endpoint = "http://example.test"
+pool_idle_timeout = 0
+[wandb]
+project = ""
+tags = ["one", "two"]
+"#;
+    let mut expected = CentralConfig::default();
+    expected.common.data_dir = String::new();
+    expected.algorithm.id = "dqn_v1".into();
+    expected.training.iterations = 0;
+    expected.training.learning_rate = 0.0;
+    expected.evaluation.eval_vs_random = false;
+    expected.evaluation.games = 0;
+    expected.actor.actor_id = "custom-actor".into();
+    expected.web.port = 0;
+    expected.web.allowed_origins = vec!["https://example.test".into()];
+    expected.mcts.c_puct = 0.0;
+    expected.logging.include_timestamps = false;
+    expected.storage.postgres_url = Some(String::new());
+    expected.storage.s3_bucket = Some("test-bucket".into());
+    expected.storage.s3_endpoint = Some("http://example.test".into());
+    expected.storage.pool_idle_timeout = Some(0);
+    expected.wandb.project = String::new();
+    expected.wandb.tags = vec!["one".into(), "two".into()];
+    assert_eq!(toml::from_str::<CentralConfig>(source).unwrap(), expected);
+}
+
+#[test]
+fn section_defaults_do_not_mask_unknown_fields_or_wrong_types() {
+    let defaults: toml::Table =
+        toml::from_str(include_str!("../../../config.defaults.toml")).unwrap();
+    for (section, values) in &defaults {
+        let unknown = format!("[{section}]\nunknown_field = 1\n");
+        let error = toml::from_str::<CentralConfig>(&unknown).unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{section}");
+        for field in values.as_table().unwrap().keys() {
+            let wrong_type = format!("[{section}]\n{field} = {{}}\n");
+            assert!(
+                toml::from_str::<CentralConfig>(&wrong_type).is_err(),
+                "wrong type for {section}.{field}"
+            );
+        }
+    }
+    for field in ["s3_bucket", "s3_endpoint"] {
+        let wrong_type = format!("[storage]\n{field} = 1\n");
+        assert!(toml::from_str::<CentralConfig>(&wrong_type).is_err());
+    }
+}
+
+#[test]
 fn test_default_config() {
     let config = CentralConfig::default();
     assert_eq!(config.common.env_id, "tictactoe");
