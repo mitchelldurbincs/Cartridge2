@@ -10,9 +10,7 @@ from typing import Any
 from ..runtime_profile import RuntimeProfile
 from .artifact_codec import (
     ArtifactValidationError,
-    decode_canonical_json,
     require_digest,
-    sha256_bytes,
 )
 from .checkpoint_filesystem import FilesystemCheckpointPublisher
 from .checkpoint_types import CheckpointManifestV1, CheckpointRef, OnnxArtifactContract, RunHeadV2
@@ -21,6 +19,13 @@ from .checkpoint_validation import (
     validate_learner_state,
     validate_onnx_checkpoint,
     verified_blob,
+)
+from .run_objects import (
+    run_commit_relative_path,
+    run_preparation_relative_path,
+    validate_run_commit_publication,
+    validate_run_preparation_bytes,
+    validate_stored_run_commit,
 )
 
 _CONDITIONAL_WRITE_ATTEMPTS = 5
@@ -130,48 +135,28 @@ class S3CheckpointPublisher(FilesystemCheckpointPublisher):
         return self._get(self._key(f"manifests/sha256/{checkpoint_id}.json"))
 
     def publish_run_commit_bytes(self, run_commit_id: str, data: bytes) -> None:
-        require_digest(run_commit_id, field="run_commit_id")
-        if not isinstance(data, bytes):
-            raise ArtifactValidationError("Run commit must be bytes")
-        decode_canonical_json(data, context="run commit")
-        if sha256_bytes(data) != run_commit_id:
-            raise ArtifactValidationError("Run commit SHA-256 does not match its ID")
-        self._put_immutable(
-            self._key(f"run-commits/sha256/{run_commit_id}.json"),
-            data,
-            "application/json",
-        )
+        relative = run_commit_relative_path(run_commit_id)
+        validate_run_commit_publication(run_commit_id, data)
+        self._put_immutable(self._key(relative), data, "application/json")
 
     def read_run_commit_bytes(self, run_commit_id: str) -> bytes:
-        require_digest(run_commit_id, field="run_commit_id")
-        data = self._get(self._key(f"run-commits/sha256/{run_commit_id}.json"))
+        relative = run_commit_relative_path(run_commit_id)
+        data = self._get(self._key(relative))
         if data is None:
             raise ArtifactValidationError(f"Run commit does not exist: {run_commit_id}")
-        if sha256_bytes(data) != run_commit_id:
-            raise ArtifactValidationError("Run commit SHA-256 does not match its ID")
-        decode_canonical_json(data, context="run commit")
+        validate_stored_run_commit(run_commit_id, data)
         return data
 
     def publish_run_preparation_bytes(self, parent_run_commit_id: str | None, data: bytes) -> None:
-        if parent_run_commit_id is not None:
-            require_digest(parent_run_commit_id, field="parent_run_commit_id")
-        if not isinstance(data, bytes):
-            raise ArtifactValidationError("Run preparation must be bytes")
-        decode_canonical_json(data, context="run preparation")
-        name = "root" if parent_run_commit_id is None else parent_run_commit_id
-        self._put_immutable(
-            self._key(f"run-preparations/by-parent/{name}.json"),
-            data,
-            "application/json",
-        )
+        relative = run_preparation_relative_path(parent_run_commit_id)
+        validate_run_preparation_bytes(data)
+        self._put_immutable(self._key(relative), data, "application/json")
 
     def read_run_preparation_bytes(self, parent_run_commit_id: str | None) -> bytes | None:
-        if parent_run_commit_id is not None:
-            require_digest(parent_run_commit_id, field="parent_run_commit_id")
-        name = "root" if parent_run_commit_id is None else parent_run_commit_id
-        data = self._get(self._key(f"run-preparations/by-parent/{name}.json"))
+        relative = run_preparation_relative_path(parent_run_commit_id)
+        data = self._get(self._key(relative))
         if data is not None:
-            decode_canonical_json(data, context="run preparation")
+            validate_run_preparation_bytes(data)
         return data
 
     def run_head_commit_guard(self):

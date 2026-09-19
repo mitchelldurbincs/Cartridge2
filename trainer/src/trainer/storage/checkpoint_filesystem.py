@@ -7,7 +7,6 @@ from pathlib import Path
 
 from .artifact_codec import (
     ArtifactValidationError,
-    decode_canonical_json,
     require_digest,
     sha256_bytes,
 )
@@ -28,6 +27,13 @@ from .evaluation_repository import create_evaluation_repository
 from .filesystem_backend import atomic_replace, create_or_verify, directory_lock
 from .run_commit_repository import RunCommitRepository
 from .run_commit_types import RunCommitV1
+from .run_objects import (
+    run_commit_relative_path,
+    run_preparation_relative_path,
+    validate_run_commit_publication,
+    validate_run_preparation_bytes,
+    validate_stored_run_commit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,13 +54,6 @@ class FilesystemCheckpointPublisher:
     @property
     def _head_path(self) -> Path:
         return self.model_root / "channels" / "current.json"
-
-    def _run_commit_path(self, run_commit_id: str) -> Path:
-        return self.model_root / "run-commits" / "sha256" / f"{run_commit_id}.json"
-
-    def _run_preparation_path(self, parent_run_commit_id: str | None) -> Path:
-        name = "root" if parent_run_commit_id is None else parent_run_commit_id
-        return self.model_root / "run-preparations" / "by-parent" / f"{name}.json"
 
     def run_head_commit_guard(self):
         """Serialize the local read/validate/replace RunHead transaction."""
@@ -86,43 +85,31 @@ class FilesystemCheckpointPublisher:
         return RunHeadV2.from_bytes(target)
 
     def publish_run_commit_bytes(self, run_commit_id: str, data: bytes) -> None:
-        require_digest(run_commit_id, field="run_commit_id")
-        if not isinstance(data, bytes):
-            raise ArtifactValidationError("Run commit must be bytes")
-        decode_canonical_json(data, context="run commit")
-        if sha256_bytes(data) != run_commit_id:
-            raise ArtifactValidationError("Run commit SHA-256 does not match its ID")
-        create_or_verify(self._run_commit_path(run_commit_id), data)
+        relative = run_commit_relative_path(run_commit_id)
+        validate_run_commit_publication(run_commit_id, data)
+        create_or_verify(self.model_root / relative, data)
 
     def read_run_commit_bytes(self, run_commit_id: str) -> bytes:
-        require_digest(run_commit_id, field="run_commit_id")
-        path = self._run_commit_path(run_commit_id)
+        path = self.model_root / run_commit_relative_path(run_commit_id)
         if not path.is_file():
             raise ArtifactValidationError(f"Run commit does not exist: {run_commit_id}")
         data = path.read_bytes()
-        if sha256_bytes(data) != run_commit_id:
-            raise ArtifactValidationError("Run commit SHA-256 does not match its ID")
-        decode_canonical_json(data, context="run commit")
+        validate_stored_run_commit(run_commit_id, data)
         return data
 
     def publish_run_preparation_bytes(self, parent_run_commit_id: str | None, data: bytes) -> None:
-        if parent_run_commit_id is not None:
-            require_digest(parent_run_commit_id, field="parent_run_commit_id")
-        if not isinstance(data, bytes):
-            raise ArtifactValidationError("Run preparation must be bytes")
-        decode_canonical_json(data, context="run preparation")
-        create_or_verify(self._run_preparation_path(parent_run_commit_id), data)
+        relative = run_preparation_relative_path(parent_run_commit_id)
+        validate_run_preparation_bytes(data)
+        create_or_verify(self.model_root / relative, data)
 
     def read_run_preparation_bytes(self, parent_run_commit_id: str | None) -> bytes | None:
-        if parent_run_commit_id is not None:
-            require_digest(parent_run_commit_id, field="parent_run_commit_id")
-        path = self._run_preparation_path(parent_run_commit_id)
+        path = self.model_root / run_preparation_relative_path(parent_run_commit_id)
         if not path.exists():
             return None
         if not path.is_file():
             raise ArtifactValidationError(f"Run preparation must be a regular file: {path}")
         data = path.read_bytes()
-        decode_canonical_json(data, context="run preparation")
+        validate_run_preparation_bytes(data)
         return data
 
     def _read_manifest_bytes(self, checkpoint_id: str) -> bytes | None:

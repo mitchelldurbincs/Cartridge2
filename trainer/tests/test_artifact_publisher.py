@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 import json
 from dataclasses import replace
 from unittest.mock import patch
@@ -37,6 +36,8 @@ from trainer.storage.publisher import (
     validate_onnx_checkpoint,
 )
 from trainer.storage.run_commit import RunCommitRepository, RunCommitV1
+
+from .fake_s3 import FakeS3, S3Error
 
 CONTRACT = policy_value_artifact_contract(
     algorithm_id="alphazero_board_v1",
@@ -557,55 +558,6 @@ def test_strict_json_rejects_extra_fields_and_noncanonical_encoding(tmp_path, st
         CheckpointManifestV1.from_bytes(
             json.dumps(checkpoint.manifest.to_dict(), indent=2).encode()
         )
-
-
-class S3Error(Exception):
-    def __init__(self, code):
-        super().__init__(code)
-        self.response = {"Error": {"Code": code}}
-
-
-class FakeS3:
-    def __init__(self):
-        self.objects = {}
-        self.puts = []
-        self.fail_key = None
-
-    def get_object(self, *, Bucket, Key):
-        del Bucket
-        if Key not in self.objects:
-            raise S3Error("NoSuchKey")
-        data = self.objects[Key]
-        return {
-            "Body": io.BytesIO(data),
-            "ETag": f'"{sha256_bytes(data)}"',
-        }
-
-    def put_object(self, **kwargs):
-        key = kwargs["Key"]
-        if key == self.fail_key:
-            raise RuntimeError("S3 unavailable")
-        data = kwargs["Body"]
-        if hasattr(data, "read"):
-            data = data.read()
-        if kwargs.get("IfNoneMatch") == "*" and key in self.objects:
-            raise S3Error("PreconditionFailed")
-        if "IfMatch" in kwargs:
-            existing = self.objects.get(key)
-            etag = f'"{sha256_bytes(existing)}"' if existing is not None else None
-            if kwargs["IfMatch"] != etag:
-                raise S3Error("PreconditionFailed")
-        self.objects[key] = bytes(data)
-        self.puts.append(kwargs)
-
-    def list_objects_v2(self, *, Bucket, Prefix, ContinuationToken=None):
-        del Bucket
-        if ContinuationToken is not None:
-            raise AssertionError("fake listing is not paginated")
-        return {
-            "Contents": [{"Key": key} for key in sorted(self.objects) if key.startswith(Prefix)],
-            "IsTruncated": False,
-        }
 
 
 class ConflictOnceS3(FakeS3):
