@@ -47,6 +47,33 @@ fn play_moves(ctx: &mut EngineContext, seed: u64, moves: &[u32]) -> (Vec<u8>, Er
 // Full MCTS Search Benchmarks
 // =============================================================================
 
+fn bench_engine_context_step(c: &mut Criterion) {
+    engine_games::register_all_environments();
+    let mut group = c.benchmark_group("engine_context_step");
+    // Fixed opening snapshots isolate transition overhead from tree selection
+    // and inference. Include the non-board environment as a generic ABI case.
+    for env_id in ["counter", "tictactoe", "connect4"] {
+        group.bench_function(env_id, |b| {
+            let mut ctx = EngineContext::new(env_id).unwrap();
+            let reset = ctx.reset(42, &[]).unwrap();
+            let action = 0u32.to_le_bytes();
+            let mut state = Vec::new();
+            let mut timestep = ErasedTimestep::default();
+            b.iter(|| {
+                ctx.step_into(
+                    black_box(&reset.state),
+                    black_box(&action),
+                    &mut state,
+                    &mut timestep,
+                )
+                .unwrap();
+                black_box((&state, &timestep));
+            });
+        });
+    }
+    group.finish();
+}
+
 fn bench_mcts_search_simulations(c: &mut Criterion) {
     let mut group = c.benchmark_group("mcts_search_simulations");
 
@@ -526,6 +553,7 @@ fn bench_batch_sizes(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    bench_engine_context_step,
     bench_mcts_search_simulations,
     bench_mcts_connect4,
     bench_game_comparison,

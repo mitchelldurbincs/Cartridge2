@@ -67,8 +67,10 @@ impl EngineContext {
         let id = self.environment.engine_id();
         let capabilities = self.environment.capabilities();
         let metadata = self.environment.metadata();
-        contract::validate_descriptors(&id, &capabilities, &metadata)?;
         if id != self.id || capabilities != self.capabilities || metadata != self.metadata {
+            // Unchanged descriptors retain their construction-time validation.
+            // Validate drift before rejecting it to preserve specific contract errors.
+            contract::validate_descriptors(&id, &capabilities, &metadata)?;
             return Err(ErasedEnvironmentError::ContractViolation(
                 "environment descriptors changed after context construction".to_string(),
             ));
