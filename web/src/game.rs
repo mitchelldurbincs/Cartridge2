@@ -22,8 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(feature = "onnx")]
 use tracing::debug;
 
-use crate::types::GameStateResponse;
-use crate::types::{DecisionAnalysis, PositionKey, PositionRecord};
+use crate::types::{GameStateResponse, PositionRecord};
 use std::collections::VecDeque;
 mod analysis;
 #[cfg(not(feature = "onnx"))]
