@@ -167,8 +167,10 @@ impl DqnQPolicy {
             );
         }
         let values = observation
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte f32")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect::<Vec<_>>();
         if values.iter().any(|value| !value.is_finite()) {
             bail!("DQN observation contains non-finite values");
