@@ -1734,11 +1734,25 @@ GitHub Actions workflow:
 7. **python-test**: Pytest
 8. **python-security-audit**: pip-audit (non-blocking)
 9. **frontend**: Svelte check + build
-10. **docker-build**: Docker image build validation
+10. **docker-images / docker-build**: Parallel Docker image builds and aggregate validation
 11. **secrets-scan**: GitLeaks (non-blocking)
 
 The workflow is check-only and has read-only repository permissions; no job
 rewrites or commits to a branch.
+
+Docker builds run on separate runners for `alphazero`, `web`, and `frontend`.
+Each image imports and exports its own GitHub Actions cache scope with
+`mode=max`, retaining intermediate Rust dependency layers. Do not share the
+default scope: each image would overwrite the previous image's cache. A new
+scope needs one successful build to warm it; GitHub's branch access rules and
+cache eviction still apply. See [Docker's cache scope documentation](https://docs.docker.com/build/cache/backends/gha/#scope).
+
+The existing **Docker Build Validation** check succeeds only when all three
+image jobs succeed, preserving the branch-protection check name. The training
+image installs PyTorch before application inputs and installs the trainer
+before copying Rust binaries, so Rust-only changes retain Python installation
+layers. Its installed-package and real-engine evaluation smoke checks remain
+part of the image build.
 
 ---
 
