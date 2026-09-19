@@ -3,9 +3,10 @@
 From the repository root, with trainer dependencies installed:
     PYTHONPATH=trainer/src python trainer/benchmarks/bench_replay_decode.py
 
-Use --baseline-source with another checkout's alphazero_board_v1.py to alternate
-baseline/current samples in one process. Fixture construction, imports, and
-bitwise output comparisons are outside timing. No storage clients or training
+Use --baseline-source with another checkout's alphazero_replay.py (or the older
+alphazero_board_v1.py) to alternate baseline/current samples in one process.
+Fixture construction, imports, and bitwise output comparisons are outside
+timing. No storage clients or training
 processes are created. JSON includes CPU and wall-clock samples in ms/batch.
 """
 
@@ -23,9 +24,9 @@ import numpy as np
 from trainer.algorithms.alphazero_board_v1 import (
     ALGORITHM_ID,
     DESCRIPTOR,
-    decode_replay_batch,
     get_game_config,
 )
+from trainer.algorithms.alphazero_replay import decode_replay_batch
 from trainer.environment_catalog import get_environment
 from trainer.storage.base import ReplayProfile, ReplaySelection
 
@@ -43,7 +44,10 @@ def main() -> None:
     parser.add_argument("--warmup", type=positive_int, default=20)
     parser.add_argument("--samples", type=positive_int, default=21)
     parser.add_argument("--batches-per-sample", type=positive_int, default=50)
-    parser.add_argument("--baseline-source", help="path to baseline alphazero_board_v1.py")
+    parser.add_argument(
+        "--baseline-source",
+        help="path to baseline alphazero_replay.py (or older alphazero_board_v1.py)",
+    )
     args = parser.parse_args()
     decoders = {"current": decode_replay_batch}
     if args.baseline_source:

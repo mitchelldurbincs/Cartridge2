@@ -154,11 +154,10 @@ RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 WORKDIR /app
 
-# Copy actor binary from rust builder
-COPY --from=rust-builder /app/actor/target/release/actor /app/actor
-
-# Copy the evaluation binary (see ENV CARTRIDGE_EVAL_BINARY below)
-COPY --from=rust-builder /app/engine/target/release/cartridge-eval /app/cartridge-eval
+# Install CPU-only PyTorch before any application inputs (avoids ~700MB CUDA
+# download). Source and Rust binary changes must not invalidate this layer;
+# it can also run while the independent Rust stage compiles.
+RUN pip install --no-cache-dir --break-system-packages torch --index-url https://download.pytorch.org/whl/cpu
 
 # Copy config defaults (used by Python trainer)
 COPY config.defaults.toml ./
@@ -166,9 +165,6 @@ COPY config.defaults.toml ./
 # Copy trainer source and install
 COPY trainer/pyproject.toml trainer/README.md ./trainer/
 COPY trainer/src/ ./trainer/src/
-
-# Install CPU-only PyTorch (avoids ~700MB CUDA download)
-RUN pip install --no-cache-dir --break-system-packages torch --index-url https://download.pytorch.org/whl/cpu
 
 # Install trainer package (pulls in the pinned crucible orchestration core)
 RUN pip install --no-cache-dir --break-system-packages ./trainer
@@ -179,6 +175,11 @@ RUN pip install --no-cache-dir --break-system-packages ./trainer
 # a dropped crucible dependency) passes every CI job and fails only in
 # production, at container start.
 RUN python -c "import crucible; from trainer.algorithms.registry import get_algorithm; from trainer.environment_catalog import get_environment; algorithm = get_algorithm('alphazero_board_v1'); algorithm.compatibility(get_environment('tictactoe')).require_compatible()"
+
+# Copy Rust binaries after installing Python dependencies so Rust-only changes
+# retain those layers. The end-to-end smoke check below still validates both.
+COPY --from=rust-builder /app/actor/target/release/actor /app/actor
+COPY --from=rust-builder /app/engine/target/release/cartridge-eval /app/cartridge-eval
 
 # Set before the smoke check below so it resolves the binary exactly the way
 # the running container will, rather than via the fallback candidate paths.

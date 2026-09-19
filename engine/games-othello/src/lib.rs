@@ -60,17 +60,7 @@ pub const NUM_ACTIONS: usize = 65;
 /// Pass action index
 pub const PASS_ACTION: u32 = 64;
 
-/// The 8 direction vectors (dc, dr) used for move validation and flipping.
-const DIRECTIONS: [(isize, isize); 8] = [
-    (-1, -1),
-    (0, -1),
-    (1, -1),
-    (-1, 0),
-    (1, 0),
-    (-1, 1),
-    (0, 1),
-    (1, 1),
-];
+mod captures;
 
 /// Register Othello with the global game registry
 ///
@@ -132,46 +122,9 @@ impl State {
         row * COLS + col
     }
 
-    /// Convert index to (col, row)
-    #[inline]
-    fn idx_to_pos(idx: usize) -> (usize, usize) {
-        (idx % COLS, idx / COLS)
-    }
-
-    /// Check if a move is valid (must flip at least one opponent piece)
-    fn is_valid_move(&self, pos: usize) -> bool {
-        if self.board[pos] != 0 {
-            return false;
-        }
-
-        let (col, row) = Self::idx_to_pos(pos);
-        let player = self.current_player;
-        let opponent = opponent(player);
-
-        // Check all 8 directions
-        for (dc, dr) in DIRECTIONS {
-            let mut c = col as isize + dc;
-            let mut r = row as isize + dr;
-            let mut found_opponent = false;
-
-            // Move in this direction, looking for opponent pieces
-            while c >= 0 && c < COLS as isize && r >= 0 && r < ROWS as isize {
-                let cell = self.board[Self::pos(c as usize, r as usize)];
-                if cell == opponent {
-                    found_opponent = true;
-                    c += dc;
-                    r += dr;
-                } else if cell == player && found_opponent {
-                    // Found player piece after opponent pieces - valid move!
-                    return true;
-                } else {
-                    // Empty or no sandwich - invalid in this direction
-                    break;
-                }
-            }
-        }
-
-        false
+    /// Check if a move is valid (must flip at least one opponent piece).
+    fn is_valid_move(&self, position: usize) -> bool {
+        captures::has_capture(&self.board, self.current_player, position)
     }
 
     /// Get legal moves (positions that are empty and would flip at least one piece)
@@ -241,48 +194,28 @@ impl State {
             return new_state;
         }
 
-        let pos = action as usize;
-        if pos >= BOARD_SIZE || self.board[pos] != 0 || !self.is_valid_move(pos) {
+        let position = action as usize;
+        if position >= BOARD_SIZE {
+            return self.clone();
+        }
+        let player = self.current_player;
+        let mut captured = captures::captured_discs(&self.board, player, position);
+        if captured == 0 {
             return self.clone(); // Invalid move
         }
 
-        let (col, row) = Self::idx_to_pos(pos);
-        let player = self.current_player;
-        let opponent = opponent(player);
-
         let mut new_state = self.clone();
-        new_state.board[pos] = player;
+        new_state.board[position] = player;
         new_state.pass_count = 0; // Reset pass count on any board move
 
-        // Flip pieces in all 8 directions
-        for (dc, dr) in DIRECTIONS {
-            let mut to_flip: Vec<usize> = Vec::new();
-            let mut c = col as isize + dc;
-            let mut r = row as isize + dr;
-
-            // Collect opponent pieces in this direction
-            while c >= 0 && c < COLS as isize && r >= 0 && r < ROWS as isize {
-                let check_pos = Self::pos(c as usize, r as usize);
-                let cell = self.board[check_pos];
-
-                if cell == opponent {
-                    to_flip.push(check_pos);
-                    c += dc;
-                    r += dr;
-                } else if cell == player && !to_flip.is_empty() {
-                    // Found sandwich - flip all collected pieces
-                    for flip_pos in to_flip {
-                        new_state.board[flip_pos] = player;
-                    }
-                    break;
-                } else {
-                    break;
-                }
-            }
+        while captured != 0 {
+            let square = captured.trailing_zeros() as usize;
+            new_state.board[square] = player;
+            captured &= captured - 1;
         }
 
         // Switch player
-        new_state.current_player = opponent;
+        new_state.current_player = opponent(player);
 
         // Check if the new current player has any legal moves
         if !new_state.has_any_legal_moves() {

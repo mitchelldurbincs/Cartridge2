@@ -16,7 +16,7 @@ from ..stats import (
 from ..storage.publisher import validate_sha256_digest
 from .config import LoopConfig
 from .durable_json import write_json_durable
-from .eval_reporting import _validate_solver_history
+from .solver_reporting_validation import validate_solver_history
 
 _EVAL_RECORD_FIELDS = frozenset(
     {
@@ -306,7 +306,7 @@ class StatsManager:
         write_json_durable(self.config.eval_stats_path, {"evaluations": records})
 
     def save_solver_stats(self, solver_history: list[dict]) -> None:
-        records = _validate_solver_history(solver_history)
+        records = validate_solver_history(solver_history)
         write_json_durable(
             self.config.solver_stats_path,
             {"solver_evaluations": records},

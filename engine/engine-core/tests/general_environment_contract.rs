@@ -831,3 +831,60 @@ fn standard_continuous_codec_runs_end_to_end() {
     let terminal = context.step(&reset.state, &action).unwrap();
     assert_eq!(terminal.timestep.reward_for(AgentId(0)), Some(-0.75));
 }
+
+fn assert_transition_api_parity<E: Environment + Default>(actions: &[Vec<u8>]) {
+    let mut owned = EngineContext::from_environment(E::default()).unwrap();
+    let mut buffered = EngineContext::from_environment(E::default()).unwrap();
+    assert!(owned.metadata().board.is_none());
+    let mut state = vec![255; 16];
+    let mut timestep = engine_core::ErasedTimestep::default();
+
+    // Reuse outputs through complete episodes and reset them again, including
+    // fixtures that change their observation count and transition roster.
+    for seed in [42, 7, 42] {
+        let reset = owned.reset(seed, &[]).unwrap();
+        buffered
+            .reset_into(seed, &[], &mut state, &mut timestep)
+            .unwrap();
+        assert_eq!(state, reset.state);
+        assert_eq!(timestep, reset.timestep);
+        let mut owned_state = reset.state;
+        for action in actions {
+            let step = owned.step(&owned_state, action).unwrap();
+            let previous_state = state.clone();
+            buffered
+                .step_into(&previous_state, action, &mut state, &mut timestep)
+                .unwrap();
+            assert_eq!(state, step.state);
+            assert_eq!(timestep, step.timestep);
+            owned_state = step.state;
+        }
+    }
+}
+
+#[test]
+fn owned_and_buffer_apis_preserve_all_non_board_contracts() {
+    assert_transition_api_parity::<SimultaneousEnvironment>(&[[
+        1u32.to_le_bytes(),
+        0u32.to_le_bytes(),
+    ]
+    .concat()]);
+    assert_transition_api_parity::<ExplicitChanceEnvironment>(&[
+        vec![0, 7],
+        [vec![1], 1u32.to_le_bytes().to_vec()].concat(),
+    ]);
+    assert_transition_api_parity::<DynamicRosterEnvironment>(&[
+        0u32.to_le_bytes().to_vec(),
+        0u32.to_le_bytes().to_vec(),
+    ]);
+    assert_transition_api_parity::<MultiDiscreteEnvironment>(&[[
+        1u32.to_le_bytes(),
+        2u32.to_le_bytes(),
+    ]
+    .concat()]);
+    assert_transition_api_parity::<ContinuousEnvironment>(&[[
+        0.5f32.to_le_bytes(),
+        (-1.25f32).to_le_bytes(),
+    ]
+    .concat()]);
+}

@@ -1137,6 +1137,9 @@ web/
 │   ├── main.rs            # Thin entry point
 │   ├── startup.rs         # AppState, router, CORS, graceful shutdown
 │   ├── game.rs            # GameSession management
+│   ├── game/
+│   │   ├── validation.rs  # AlphaZero timestep/presentation boundary
+│   │   └── analysis.rs    # Decision diagnostics and bounded position history
 │   ├── metrics.rs         # Prometheus metrics
 │   ├── handlers/
 │   │   ├── game.rs        # Game endpoints
@@ -1194,6 +1197,13 @@ Bot AI:
 2. If model loaded: Run MCTS (200 sims, temp=0.5)
 3. If no model: Random legal move
 4. Execute the selected action and validate the next timestep/presentation
+
+`game/validation.rs` owns the board-serving boundary: reset and move execution
+both validate the transition source, two-seat outcomes, active observation and
+board presentation before installing the session position. Validation remains
+ordered so a malformed transition fails before presentation lookup; state,
+revision and history are updated only after this boundary succeeds. These are
+AlphaZero serving restrictions, not additions to the generic engine ABI.
 
 ### Frontend Components
 
@@ -1724,11 +1734,25 @@ GitHub Actions workflow:
 7. **python-test**: Pytest
 8. **python-security-audit**: pip-audit (non-blocking)
 9. **frontend**: Svelte check + build
-10. **docker-build**: Docker image build validation
+10. **docker-images / docker-build**: Parallel Docker image builds and aggregate validation
 11. **secrets-scan**: GitLeaks (non-blocking)
 
 The workflow is check-only and has read-only repository permissions; no job
 rewrites or commits to a branch.
+
+Docker builds run on separate runners for `alphazero`, `web`, and `frontend`.
+Each image imports and exports its own GitHub Actions cache scope with
+`mode=max`, retaining intermediate Rust dependency layers. Do not share the
+default scope: each image would overwrite the previous image's cache. A new
+scope needs one successful build to warm it; GitHub's branch access rules and
+cache eviction still apply. See [Docker's cache scope documentation](https://docs.docker.com/build/cache/backends/gha/#scope).
+
+The existing **Docker Build Validation** check succeeds only when all three
+image jobs succeed, preserving the branch-protection check name. The training
+image installs PyTorch before application inputs and installs the trainer
+before copying Rust binaries, so Rust-only changes retain Python installation
+layers. Its installed-package and real-engine evaluation smoke checks remain
+part of the image build.
 
 ---
 

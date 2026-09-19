@@ -5,10 +5,7 @@
 use algorithm_core::BuiltinAlgorithm;
 use anyhow::{anyhow, Result};
 use engine_core::board_profile::{BoardGameMetadata, BoardView};
-use engine_core::{
-    ActionAvailability, AgentId, Decision, EngineContext, EpisodeStatus, ErasedTimestep, LegalMask,
-    Presentation, TransitionSource,
-};
+use engine_core::{AgentId, EngineContext, EpisodeStatus, ErasedTimestep};
 #[cfg(feature = "onnx")]
 use mcts::{MctsConfig, MctsSearch, SharedOnnxEvaluator};
 use rand::SeedableRng;
@@ -25,8 +22,10 @@ use tracing::debug;
 use crate::types::{GameStateResponse, PositionRecord};
 use std::collections::VecDeque;
 mod analysis;
+mod validation;
 #[cfg(not(feature = "onnx"))]
 use crate::SharedOnnxEvaluator;
+use validation::{active_observation, validate_position, ExpectedTransition};
 
 // =============================================================================
 // Configuration Constants
@@ -85,271 +84,6 @@ pub struct GameSession {
     mcts_sim_ctx: Option<EngineContext>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ExpectedTransition {
-    Reset,
-    Agent(AgentId),
-}
-
-/// Narrow one generic timestep to the position shape this serving cartridge
-/// understands. Chance and simultaneous decisions are rejected here rather
-/// than being assigned a synthetic board player.
-fn active_observation(timestep: &ErasedTimestep) -> Result<(AgentId, &[u8], &LegalMask)> {
-    if timestep.episode != EpisodeStatus::Running {
-        return Err(anyhow!(
-            "AlphaZero board action selection requires a running episode, got {:?}",
-            timestep.episode
-        ));
-    }
-
-    let decision = timestep.decision.sole_agent().ok_or_else(|| {
-        anyhow!(
-            "AlphaZero board serving requires exactly one active decision agent, got {:?}",
-            timestep.decision
-        )
-    })?;
-    let active_agent = decision.agent_id;
-    if !matches!(active_agent, AgentId(1) | AgentId(2)) {
-        return Err(anyhow!(
-            "AlphaZero board serving only supports seats 1 and 2, got {}",
-            active_agent.0
-        ));
-    }
-
-    let observation = timestep.sole_observation()?;
-    if observation.agent_id != active_agent {
-        return Err(anyhow!(
-            "sole observation belongs to agent {}, but active decision belongs to agent {}",
-            observation.agent_id.0,
-            active_agent.0
-        ));
-    }
-    let ActionAvailability::DiscreteMask { mask } = &decision.availability else {
-        anyhow::bail!(
-            "AlphaZero board serving requires a discrete legal mask for agent {}",
-            active_agent.0
-        );
-    };
-    Ok((active_agent, observation.data.as_slice(), mask))
-}
-
-fn validate_two_player_outcomes(timestep: &ErasedTimestep) -> Result<()> {
-    if timestep.outcomes.len() != 2 {
-        return Err(anyhow!(
-            "AlphaZero board timestep requires exactly two per-agent outcomes, got {}",
-            timestep.outcomes.len()
-        ));
-    }
-
-    for agent_id in [AgentId(1), AgentId(2)] {
-        let matches = timestep
-            .outcomes
-            .iter()
-            .filter(|outcome| outcome.agent_id == agent_id)
-            .collect::<Vec<_>>();
-        if matches.len() != 1 {
-            return Err(anyhow!(
-                "AlphaZero board timestep requires exactly one outcome for agent {}, got {}",
-                agent_id.0,
-                matches.len()
-            ));
-        }
-        let outcome = matches[0];
-        if !outcome.reward.is_finite() {
-            return Err(anyhow!(
-                "AlphaZero board timestep has a non-finite reward for agent {}",
-                agent_id.0
-            ));
-        }
-        let flags_match = match timestep.episode {
-            EpisodeStatus::Running => !outcome.terminated && !outcome.truncated,
-            EpisodeStatus::Terminated => outcome.terminated && !outcome.truncated,
-            EpisodeStatus::Truncated => !outcome.terminated && outcome.truncated,
-        };
-        if !flags_match {
-            return Err(anyhow!(
-                "outcome flags for agent {} disagree with episode status {:?}",
-                agent_id.0,
-                timestep.episode
-            ));
-        }
-    }
-
-    let seat_one = timestep
-        .reward_for(AgentId(1))
-        .expect("validated outcome for seat 1");
-    let seat_two = timestep
-        .reward_for(AgentId(2))
-        .expect("validated outcome for seat 2");
-    match timestep.episode {
-        EpisodeStatus::Running | EpisodeStatus::Truncated if seat_one != 0.0 || seat_two != 0.0 => {
-            Err(anyhow!(
-                "AlphaZero terminal-only reward contract emitted ({seat_one}, {seat_two}) for {:?}",
-                timestep.episode
-            ))
-        }
-        EpisodeStatus::Terminated if (seat_one + seat_two).abs() > 1e-6 => Err(anyhow!(
-            "AlphaZero terminal rewards must be zero-sum, got ({seat_one}, {seat_two})"
-        )),
-        _ => Ok(()),
-    }
-}
-
-fn validate_timestep(timestep: &ErasedTimestep, expected: ExpectedTransition) -> Result<()> {
-    match (expected, &timestep.source) {
-        (ExpectedTransition::Reset, TransitionSource::Reset) => {}
-        (ExpectedTransition::Agent(expected_actor), TransitionSource::Agents { agent_ids })
-            if agent_ids.as_slice() == [expected_actor] => {}
-        (ExpectedTransition::Reset, source) => {
-            return Err(anyhow!(
-                "reset timestep has invalid transition source {source:?}"
-            ))
-        }
-        (ExpectedTransition::Agent(expected_actor), source) => {
-            return Err(anyhow!(
-                "step by agent {} has invalid transition source {source:?}",
-                expected_actor.0
-            ))
-        }
-    }
-
-    validate_two_player_outcomes(timestep)?;
-    match timestep.episode {
-        EpisodeStatus::Running => {
-            let (next_agent, _, _) = active_observation(timestep)?;
-            if let ExpectedTransition::Agent(actor) = expected {
-                if next_agent == actor {
-                    return Err(anyhow!(
-                        "alternating-turn board transition kept agent {} active",
-                        actor.0
-                    ));
-                }
-            }
-        }
-        EpisodeStatus::Terminated | EpisodeStatus::Truncated => {
-            if timestep.decision != Decision::None {
-                return Err(anyhow!(
-                    "completed board timestep must have no next decision, got {:?}",
-                    timestep.decision
-                ));
-            }
-            let observation = timestep.sole_observation()?;
-            if !matches!(observation.agent_id, AgentId(1) | AgentId(2)) {
-                return Err(anyhow!(
-                    "completed board observation belongs to unsupported agent {}",
-                    observation.agent_id.0
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn require_board_view(
-    ctx: &EngineContext,
-    state: &[u8],
-    timestep: &ErasedTimestep,
-    board: &BoardGameMetadata,
-) -> Result<BoardView> {
-    let view = require_board_presentation(ctx.presentation(state)?)?;
-
-    let expected_cells = board.board_size()?;
-    if view.cells.len() != expected_cells {
-        return Err(anyhow!(
-            "board presentation has {} cells, metadata declares {}x{} ({expected_cells} cells)",
-            view.cells.len(),
-            board.width,
-            board.height
-        ));
-    }
-    if !matches!(view.current_player, 1 | 2) {
-        return Err(anyhow!(
-            "board presentation current player must be seat 1 or 2, got {}",
-            view.current_player
-        ));
-    }
-    if view.cells.iter().any(|cell| cell.owner > 2) {
-        return Err(anyhow!(
-            "board presentation contains an owner outside seats 1 and 2"
-        ));
-    }
-    let observation = timestep.sole_observation()?;
-    if observation.agent_id.0 != u32::from(view.current_player) {
-        return Err(anyhow!(
-            "board presentation current player {} disagrees with sole observation agent {}",
-            view.current_player,
-            observation.agent_id.0
-        ));
-    }
-
-    match timestep.episode {
-        EpisodeStatus::Running => {
-            if view.winner != 0 {
-                return Err(anyhow!(
-                    "running episode has terminal board winner {}",
-                    view.winner
-                ));
-            }
-            let (active_agent, _, _) = active_observation(timestep)?;
-            if u32::from(view.current_player) != active_agent.0 {
-                return Err(anyhow!(
-                    "board presentation current player {} disagrees with active agent {}",
-                    view.current_player,
-                    active_agent.0
-                ));
-            }
-        }
-        EpisodeStatus::Terminated => {
-            if !matches!(view.winner, 1..=3) {
-                return Err(anyhow!(
-                    "terminated episode requires winner 1, 2, or draw marker 3, got {}",
-                    view.winner
-                ));
-            }
-            let seat_one = timestep
-                .reward_for(AgentId(1))
-                .ok_or_else(|| anyhow!("terminal board timestep is missing seat 1 reward"))?;
-            let seat_two = timestep
-                .reward_for(AgentId(2))
-                .ok_or_else(|| anyhow!("terminal board timestep is missing seat 2 reward"))?;
-            let rewards_match_winner = match view.winner {
-                1 => seat_one > 0.0 && seat_two < 0.0,
-                2 => seat_one < 0.0 && seat_two > 0.0,
-                3 => seat_one == 0.0 && seat_two == 0.0,
-                _ => unreachable!("winner range validated above"),
-            };
-            if !rewards_match_winner {
-                return Err(anyhow!(
-                    "board winner {} disagrees with per-agent rewards ({seat_one}, {seat_two})",
-                    view.winner
-                ));
-            }
-        }
-        EpisodeStatus::Truncated => {
-            if view.winner != 0 {
-                return Err(anyhow!(
-                    "truncated episode must not fabricate a winner, got {}",
-                    view.winner
-                ));
-            }
-        }
-    }
-
-    Ok(view)
-}
-
-fn require_board_presentation(presentation: Option<Presentation>) -> Result<BoardView> {
-    match presentation {
-        Some(Presentation::Board { view }) => Ok(view),
-        Some(Presentation::Custom { contract, .. }) => Err(anyhow!(
-            "AlphaZero web serving requires a board presentation, got custom contract '{contract}'"
-        )),
-        None => Err(anyhow!(
-            "AlphaZero web serving requires the environment to expose a board presentation"
-        )),
-    }
-}
-
 impl GameSession {
     /// Create a new game session with default (empty) evaluator.
     /// Used in tests; production code uses `with_evaluator` for hot-reloading.
@@ -380,8 +114,13 @@ impl GameSession {
             .as_nanos() as u64;
 
         let reset = ctx.reset(seed, &[])?;
-        validate_timestep(&reset.timestep, ExpectedTransition::Reset)?;
-        let view = require_board_view(&ctx, &reset.state, &reset.timestep, &board)?;
+        let view = validate_position(
+            &ctx,
+            &reset.state,
+            &reset.timestep,
+            &board,
+            ExpectedTransition::Reset,
+        )?;
 
         // Configure MCTS for playing (less exploration than training)
         #[cfg(feature = "onnx")]
@@ -601,8 +340,13 @@ impl GameSession {
         let action = position.to_le_bytes().to_vec();
 
         let step = self.ctx.step(&self.state, &action)?;
-        validate_timestep(&step.timestep, ExpectedTransition::Agent(actor))?;
-        let view = require_board_view(&self.ctx, &step.state, &step.timestep, &self.board)?;
+        let view = validate_position(
+            &self.ctx,
+            &step.state,
+            &step.timestep,
+            &self.board,
+            ExpectedTransition::Agent(actor),
+        )?;
 
         // Commit the new session position only after the complete transition
         // and presentation pass the AlphaZero-board boundary checks.
@@ -715,6 +459,49 @@ mod tests {
 
         // Position 4 is now occupied
         assert!(!session.is_legal_move(4).unwrap());
+        let before = serde_json::to_value(session.history(Some(0), 64)).unwrap();
+        let state = session.state.clone();
+        let timestep = session.timestep.clone();
+
+        assert_eq!(
+            session.player_move(4).unwrap_err().to_string(),
+            "illegal board action 4"
+        );
+        assert_eq!(session.state, state);
+        assert_eq!(session.timestep, timestep);
+        assert_eq!(
+            serde_json::to_value(session.history(Some(0), 64)).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn rejected_presentation_does_not_commit_position_or_history() {
+        engine_games::register_all_environments();
+        let mut session = GameSession::new("tictactoe").unwrap();
+        let response = serde_json::to_value(session.to_response().unwrap()).unwrap();
+        let history = serde_json::to_value(session.history(Some(0), 64)).unwrap();
+        let state = session.state.clone();
+        let timestep = session.timestep.clone();
+
+        // The engine step succeeds, but its projection cannot match this
+        // deliberately inconsistent session metadata.
+        session.board.width = 4;
+        assert_eq!(
+            session.player_move(4).unwrap_err().to_string(),
+            "board presentation has 9 cells, metadata declares 4x3 (12 cells)"
+        );
+
+        assert_eq!(session.state, state);
+        assert_eq!(session.timestep, timestep);
+        assert_eq!(
+            serde_json::to_value(session.to_response().unwrap()).unwrap(),
+            response
+        );
+        assert_eq!(
+            serde_json::to_value(session.history(Some(0), 64)).unwrap(),
+            history
+        );
     }
 
     #[test]
@@ -732,92 +519,5 @@ mod tests {
         assert_eq!(session.timestep.reward_for(AgentId(2)), Some(-1.0));
         assert!(session.is_game_over());
         assert!(session.legal_moves().unwrap().is_empty());
-    }
-
-    #[test]
-    fn legal_moves_rejects_a_missing_discrete_mask() {
-        engine_games::register_all_environments();
-
-        let mut session = GameSession::new("tictactoe").unwrap();
-        session.timestep.decision = Decision::single(AgentId(1), ActionAvailability::All);
-
-        assert!(session.legal_moves().is_err());
-        assert!(session.is_legal_move(0).is_err());
-    }
-
-    #[test]
-    fn active_position_rejects_chance_and_simultaneous_decisions() {
-        engine_games::register_all_environments();
-        let mut session = GameSession::new("tictactoe").unwrap();
-
-        session.timestep.decision = Decision::Chance;
-        assert!(session
-            .legal_moves()
-            .unwrap_err()
-            .to_string()
-            .contains("Chance"));
-
-        session.timestep.decision = Decision::agents([AgentId(1), AgentId(2)]);
-        assert!(session
-            .legal_moves()
-            .unwrap_err()
-            .to_string()
-            .contains("exactly one active decision agent"));
-    }
-
-    #[test]
-    fn active_position_requires_one_matching_observation() {
-        engine_games::register_all_environments();
-        let mut session = GameSession::new("tictactoe").unwrap();
-
-        session.timestep.observations[0].agent_id = AgentId(2);
-        assert!(session
-            .legal_moves()
-            .unwrap_err()
-            .to_string()
-            .contains("sole observation belongs to agent 2"));
-
-        session.timestep.observations.clear();
-        assert!(session
-            .legal_moves()
-            .unwrap_err()
-            .to_string()
-            .contains("exactly one observation"));
-    }
-
-    #[test]
-    fn timestep_validation_requires_per_agent_outcomes_matching_episode_status() {
-        engine_games::register_all_environments();
-        let session = GameSession::new("tictactoe").unwrap();
-        let mut timestep = session.timestep.clone();
-
-        timestep.outcomes.pop();
-        assert!(validate_timestep(&timestep, ExpectedTransition::Reset)
-            .unwrap_err()
-            .to_string()
-            .contains("exactly two per-agent outcomes"));
-
-        let mut timestep = session.timestep.clone();
-        timestep.outcomes[0].terminated = true;
-        assert!(validate_timestep(&timestep, ExpectedTransition::Reset)
-            .unwrap_err()
-            .to_string()
-            .contains("disagree with episode status"));
-    }
-
-    #[test]
-    fn board_serving_rejects_custom_or_missing_presentations() {
-        let custom = Presentation::Custom {
-            contract: "counter_text_v1".to_string(),
-            payload: Vec::new(),
-        };
-        assert!(require_board_presentation(Some(custom))
-            .unwrap_err()
-            .to_string()
-            .contains("custom contract 'counter_text_v1'"));
-        assert!(require_board_presentation(None)
-            .unwrap_err()
-            .to_string()
-            .contains("requires the environment to expose a board presentation"));
     }
 }

@@ -240,6 +240,45 @@ fn runtime_outputs_require_exact_shape_and_element_count() {
 }
 
 #[test]
+fn output_extraction_preserves_missing_type_and_shape_errors() {
+    let wrong_type = Value::from_array(([1usize, 3], vec![0.0f64; 3]))
+        .unwrap()
+        .into_dyn();
+    let wrong_shape = Value::from_array(([1usize, 3], vec![0.0f32; 3]))
+        .unwrap()
+        .into_dyn();
+
+    for (name, label) in [("policy_logits", "policy"), ("value", "value")] {
+        let missing = OnnxEvaluator::extract_output_tensor(None, name, label, &[2, 3]).unwrap_err();
+        assert!(matches!(&missing, EvaluatorError::ModelError(_)));
+        assert_eq!(
+            missing.to_string(),
+            format!("Model error: Missing {name} output")
+        );
+
+        // Both dtype and shape are wrong: extraction must fail before shape validation.
+        let type_error =
+            OnnxEvaluator::extract_output_tensor(Some(&wrong_type), name, label, &[2, 3])
+                .unwrap_err();
+        assert!(matches!(&type_error, EvaluatorError::ModelError(_)));
+        assert!(type_error
+            .to_string()
+            .starts_with(&format!("Model error: Failed to extract {label} tensor: ")));
+
+        let shape_error =
+            OnnxEvaluator::extract_output_tensor(Some(&wrong_shape), name, label, &[2, 3])
+                .unwrap_err();
+        assert!(matches!(&shape_error, EvaluatorError::ModelError(_)));
+        assert_eq!(
+            shape_error.to_string(),
+            format!(
+                "Model error: output '{name}' expected shape [2, 3] with 6 elements, found shape [1, 3] with 3 elements"
+            )
+        );
+    }
+}
+
+#[test]
 fn evaluation_rejects_action_mask_and_batch_cardinality_mismatches() {
     let expected = contract_test_identity();
     let evaluator =
@@ -271,6 +310,138 @@ fn evaluation_rejects_action_mask_and_batch_cardinality_mismatches() {
         .unwrap_err()
         .to_string();
     assert!(batch_error.contains("2 observations but 1 legal masks"));
+}
+
+fn observation(values: [f32; 3]) -> Vec<u8> {
+    values.into_iter().flat_map(f32::to_le_bytes).collect()
+}
+
+#[test]
+fn single_and_batched_inference_preserve_rows_masks_and_values() {
+    let evaluator =
+        OnnxEvaluator::load_from_bytes(CONTRACT_TEST_MODEL, 3, 3, 1, &contract_test_identity())
+            .unwrap();
+    // The fixture returns each observation as logits and its mean as value.
+    let observations = [
+        observation([0.0, 1.0, 2.0]),
+        observation([-2.0, -1.0, 0.0]),
+        observation([0.25, 0.5, 0.75]),
+    ];
+    let masks = [
+        LegalMask::from_u64(0b101, 3),
+        LegalMask::from_u64(0b010, 3),
+        LegalMask::new(3),
+    ];
+    let observations_ref: Vec<&[u8]> = observations.iter().map(Vec::as_slice).collect();
+    let masks_ref: Vec<&LegalMask> = masks.iter().collect();
+    let batch = evaluator
+        .evaluate_batch(&observations_ref, &masks_ref, 3)
+        .unwrap();
+    assert_eq!(batch.len(), 3);
+    assert_eq!(evaluator.get_stats().inference_count, 3);
+
+    for (index, expected_value) in [1.0, -1.0, 0.5].into_iter().enumerate() {
+        let single = evaluator
+            .evaluate(&observations[index], &masks[index], 3)
+            .unwrap();
+        let singleton = evaluator
+            .evaluate_batch(&[&observations[index]], &[&masks[index]], 3)
+            .unwrap();
+        assert_eq!(batch[index].policy, single.policy);
+        assert_eq!(singleton[0].policy, single.policy);
+        assert_eq!(batch[index].value, expected_value);
+        assert_eq!(single.value, expected_value);
+        assert_eq!(singleton[0].value, expected_value);
+    }
+    let lower_probability = (-2.0f32).exp() / ((-2.0f32).exp() + 1.0);
+    assert_eq!(batch[0].policy[0], lower_probability);
+    assert_eq!(batch[0].policy[1], 0.0);
+    assert!(batch[0].policy[2] > batch[0].policy[0]);
+    assert_eq!(batch[1].policy, [0.0, 1.0, 0.0]);
+    assert_eq!(batch[2].policy, [0.0; 3]);
+    assert_eq!(evaluator.get_stats().inference_count, 9);
+}
+
+#[test]
+fn inference_failures_preserve_error_order_and_do_not_count_partial_batches() {
+    let evaluator =
+        OnnxEvaluator::load_from_bytes(CONTRACT_TEST_MODEL, 3, 3, 1, &contract_test_identity())
+            .unwrap();
+    let mask = LegalMask::from_u64(0b110, 3);
+    let valid = observation([0.0; 3]);
+    let invalid_policy = observation([f32::NAN, 0.0, 0.0]);
+    let invalid_value = observation([2.0; 3]);
+
+    for (invalid, expected_single, expected_batch) in [
+        (
+            &invalid_policy,
+            "policy logit at action 0 is not finite: NaN",
+            "policy logit at action 0 is not finite: NaN",
+        ),
+        (
+            &invalid_value,
+            "value output at batch index 0 must be finite and in [-1, 1], got 2",
+            "value output at batch index 1 must be finite and in [-1, 1], got 2",
+        ),
+    ] {
+        // Policy finiteness is checked even for illegal actions, before value.
+        let error = evaluator.evaluate(invalid, &mask, 3).unwrap_err();
+        assert!(matches!(&error, EvaluatorError::EvaluationFailed(_)));
+        assert_eq!(
+            error.to_string(),
+            format!("Evaluation failed: {expected_single}")
+        );
+
+        let error = evaluator
+            .evaluate_batch(&[&valid, invalid], &[&mask, &mask], 3)
+            .unwrap_err();
+        assert!(matches!(&error, EvaluatorError::EvaluationFailed(_)));
+        assert_eq!(
+            error.to_string(),
+            format!("Evaluation failed: {expected_batch}")
+        );
+        let stats = evaluator.get_stats();
+        assert_eq!(stats.inference_count, 0);
+        assert_eq!(stats.total_prep_us, 0);
+        assert_eq!(stats.total_inference_us, 0);
+        assert_eq!(stats.total_post_us, 0);
+    }
+
+    let error = evaluator
+        .evaluate_batch(&[&invalid_value, &invalid_policy], &[&mask, &mask], 3)
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Evaluation failed: value output at batch index 0 must be finite and in [-1, 1], got 2"
+    );
+
+    // Rejected output must not poison the session for a later valid call.
+    evaluator.evaluate(&valid, &mask, 3).unwrap();
+    assert_eq!(evaluator.get_stats().inference_count, 1);
+}
+
+#[test]
+fn empty_batches_validate_the_request_without_running_inference() {
+    let evaluator =
+        OnnxEvaluator::load_from_bytes(CONTRACT_TEST_MODEL, 3, 3, 1, &contract_test_identity())
+            .unwrap();
+    assert!(evaluator.evaluate_batch(&[], &[], 3).unwrap().is_empty());
+    assert_eq!(evaluator.get_stats().inference_count, 0);
+
+    assert_eq!(
+        evaluator
+            .evaluate_batch(&[], &[], 4)
+            .unwrap_err()
+            .to_string(),
+        "Invalid state: Evaluator was loaded for 3 actions, batch evaluation requested 4"
+    );
+    assert_eq!(
+        evaluator
+            .evaluate_batch(&[], &[&LegalMask::all_legal(3)], 3)
+            .unwrap_err()
+            .to_string(),
+        "Invalid state: Batch has 0 observations but 1 legal masks"
+    );
 }
 
 #[test]

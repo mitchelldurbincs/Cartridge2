@@ -93,6 +93,133 @@ async fn history_records_intermediate_position_and_stale_moves_conflict() {
 }
 
 #[tokio::test]
+async fn rejected_requests_preserve_position_and_history_with_exact_errors() {
+    let app = create_app(create_test_state());
+    let before_state = get(app.clone(), "/game/state").await;
+    let before_history = get(app.clone(), "/game/history").await;
+    let cases = [
+        (
+            "/move",
+            serde_json::json!({"position": 9}),
+            StatusCode::BAD_REQUEST,
+            "Illegal move: position/column 9 is not valid",
+        ),
+        (
+            "/move",
+            serde_json::json!({"position": 9, "expected": {"session_id": "stale", "revision": 0}}),
+            StatusCode::CONFLICT,
+            "Position changed; reload before making another move",
+        ),
+        (
+            "/game/new",
+            serde_json::json!({"expected": {"session_id": "stale", "revision": 0}}),
+            StatusCode::CONFLICT,
+            "Position changed; reload before making another move",
+        ),
+        (
+            "/game/new",
+            serde_json::json!({"game": "connect4", "expected": {"session_id": "stale", "revision": 0}}),
+            StatusCode::FORBIDDEN,
+            "Cannot switch to game 'connect4': only the current game 'tictactoe' is available",
+        ),
+    ];
+    for (uri, request, status, message) in cases {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/plain; charset=utf-8"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), message.as_bytes());
+        assert_eq!(get(app.clone(), "/game/state").await, before_state);
+        assert_eq!(get(app.clone(), "/game/history").await, before_history);
+    }
+}
+
+#[tokio::test]
+async fn winning_move_preserves_flattened_response_and_terminal_history() {
+    let state = create_test_state();
+    let session_id = {
+        let mut session = state.session.lock().await;
+        for action in [0, 3, 1, 4] {
+            session.player_move(action).unwrap();
+        }
+        session.position_key().session_id
+    };
+    let app = create_app(state);
+    let (status, body) = post_json(app.clone(), "/move", r#"{"position":2}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    let cells = [1, 1, 1, 2, 2, 0, 0, 0, 0]
+        .map(|owner| serde_json::json!({"owner": owner, "kind": "normal", "value": 0}));
+    let expected = serde_json::json!({
+        "session_id": session_id, "revision": 5, "actions": [],
+        "cells": cells,
+        "current_player": 1, "human_player": 1, "winner": 1,
+        "game_over": true, "legal_moves": [], "message": "You win!", "bot_move": null,
+    });
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        expected
+    );
+    let (status, body) = get(app.clone(), "/game/history").await;
+    assert_eq!(status, StatusCode::OK);
+    let history: crate::types::HistoryResponse = serde_json::from_str(&body).unwrap();
+    assert_eq!(history.current_revision, 5);
+    assert_eq!(history.records.len(), 6);
+    assert!(history.records[4].decision.is_some());
+    assert!(history.records[5].decision.is_none());
+    assert_eq!(history.records[5].state.winner, 1);
+    assert_eq!(
+        post_json(app, "/move", r#"{"position":6}"#).await,
+        (StatusCode::BAD_REQUEST, "Game is already over".into())
+    );
+}
+
+#[cfg(feature = "onnx")]
+#[tokio::test]
+async fn failed_bot_move_keeps_the_committed_human_position_and_history() {
+    let state = create_test_state();
+    let evaluator = Arc::clone(&state.evaluator);
+    let _ = std::thread::spawn(move || {
+        let _guard = evaluator.write().unwrap();
+        panic!("poison the fixture evaluator lock");
+    })
+    .join();
+    let app = create_app(state);
+
+    assert_eq!(
+        post_json(app.clone(), "/move", r#"{"position":4}"#).await,
+        (StatusCode::INTERNAL_SERVER_ERROR,
+         "Bot move failed: Failed to acquire read lock: poisoned lock: another task failed inside".into())
+    );
+    let (status, body) = get(app.clone(), "/game/history").await;
+    assert_eq!(status, StatusCode::OK);
+    let history: crate::types::HistoryResponse = serde_json::from_str(&body).unwrap();
+    assert_eq!(history.current_revision, 1);
+    assert_eq!(history.records.len(), 2);
+    assert!(history.records[0].decision.is_some());
+    assert!(history.records[1].decision.is_none());
+    assert_eq!(history.records[1].state.cells[4].owner, 1);
+    assert_eq!(history.records[1].state.current_player, 2);
+    assert_eq!(
+        post_json(app, "/move", r#"{"position":0}"#).await,
+        (StatusCode::BAD_REQUEST, "Not your turn".into())
+    );
+}
+
+#[tokio::test]
 async fn test_stats_endpoint_returns_default_only_when_projection_is_absent() {
     let directory = tempfile::tempdir().unwrap();
     let mut state = create_test_state();

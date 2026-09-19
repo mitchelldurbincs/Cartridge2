@@ -22,8 +22,6 @@ pub struct EngineContext {
     id: EngineId,
     capabilities: Capabilities,
     metadata: EnvironmentMetadata,
-    state_buf: Vec<u8>,
-    timestep_buf: ErasedTimestep,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,8 +60,6 @@ impl EngineContext {
             id,
             capabilities,
             metadata,
-            state_buf: Vec::with_capacity(256),
-            timestep_buf: ErasedTimestep::default(),
         })
     }
 
@@ -117,44 +113,33 @@ impl EngineContext {
         self.environment.presentation(state)
     }
 
+    /// Reset with owned outputs, using the same validation as [`Self::reset_into`].
     pub fn reset(&mut self, seed: u64, hint: &[u8]) -> Result<ResetResult, ErasedEnvironmentError> {
-        self.validate_descriptors_unchanged()?;
-        self.state_buf.clear();
-        self.environment
-            .reset(seed, hint, &mut self.state_buf, &mut self.timestep_buf)?;
-        if self.timestep_buf.source != TransitionSource::Reset {
-            return Err(ErasedEnvironmentError::ContractViolation(
-                "reset must produce transition source=reset".to_string(),
-            ));
-        }
-        contract::validate_erased_timestep(&self.capabilities, &self.timestep_buf)?;
-        Ok(ResetResult {
-            state: self.state_buf.clone(),
-            timestep: self.timestep_buf.clone(),
-        })
+        let mut state = Vec::with_capacity(256);
+        let mut timestep = ErasedTimestep::default();
+        self.reset_into(seed, hint, &mut state, &mut timestep)?;
+        Ok(ResetResult { state, timestep })
     }
 
+    /// Step with owned outputs, using the same validation as [`Self::step_into`].
     pub fn step(
         &mut self,
         state: &[u8],
         action: &[u8],
     ) -> Result<StepResult, ErasedEnvironmentError> {
-        self.validate_descriptors_unchanged()?;
-        self.state_buf.clear();
-        self.environment
-            .step(state, action, &mut self.state_buf, &mut self.timestep_buf)?;
-        if self.timestep_buf.source == TransitionSource::Reset {
-            return Err(ErasedEnvironmentError::ContractViolation(
-                "step cannot produce transition source=reset".to_string(),
-            ));
-        }
-        contract::validate_erased_timestep(&self.capabilities, &self.timestep_buf)?;
+        let mut state_out = Vec::with_capacity(256);
+        let mut timestep = ErasedTimestep::default();
+        self.step_into(state, action, &mut state_out, &mut timestep)?;
         Ok(StepResult {
-            state: self.state_buf.clone(),
-            timestep: self.timestep_buf.clone(),
+            state: state_out,
+            timestep,
         })
     }
 
+    /// Reset into caller-owned buffers and validate the resulting transition.
+    ///
+    /// Outputs replace any previous contents on success. On error they may be
+    /// partially written and must not be used as a valid transition.
     pub fn reset_into(
         &mut self,
         seed: u64,
@@ -174,6 +159,10 @@ impl EngineContext {
         Ok(())
     }
 
+    /// Step into caller-owned buffers and validate the resulting transition.
+    ///
+    /// Outputs replace any previous contents on success. On error they may be
+    /// partially written and must not be used as a valid transition.
     pub fn step_into(
         &mut self,
         state: &[u8],

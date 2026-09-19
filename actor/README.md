@@ -70,7 +70,8 @@ Unknown IDs and incompatible pairs fail before model or database side effects.
 - `src/actor.rs`: `AlphaZeroCollector` episode generation and terminal-target encoding.
 - `src/mcts_policy.rs`: AlphaZero MCTS action selection and policy targets.
 - `src/dqn_actor.rs`: DQN epsilon-greedy collection and transition encoding.
-- `src/storage/postgres.rs`: pooled PostgreSQL persistence.
+- `src/storage/postgres.rs`: pooled, selection-bound PostgreSQL replay operations.
+- `src/storage/postgres/schema.rs`: transactional schema bootstrap and exact validation.
 - `src/stats.rs`: final structured collection, abandonment, and RSS telemetry.
 
 The AlphaZero collector requires `EnvironmentMetadata.board` and derives its

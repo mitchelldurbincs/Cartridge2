@@ -8,9 +8,9 @@ import pytest
 from trainer.algorithms.alphazero_board_v1 import (
     ALGORITHM_ID,
     DESCRIPTOR,
-    decode_replay_batch,
     get_game_config,
 )
+from trainer.algorithms.alphazero_replay import decode_replay_batch
 from trainer.environment_catalog import get_environment
 from trainer.storage import ReplayProfile, ReplaySelection
 
@@ -113,6 +113,32 @@ def test_decoder_preserves_payload_bits_for_registered_dimensions(env_id):
         assert actual.flags.c_contiguous
         assert actual.flags.writeable
         np.testing.assert_array_equal(actual.reshape(-1).view(np.uint32), expected.view("<u4"))
+
+
+def test_decoder_preserves_fixed_little_endian_payload():
+    encoded = bytes.fromhex("0000803f 00000040 00004040 0000803e 0000403f 000080bf")
+    observations, policies, values = decode([record(encoded=encoded)])
+    np.testing.assert_array_equal(observations, [[1.0, 2.0, 3.0]])
+    np.testing.assert_array_equal(policies, [[0.25, 0.75]])
+    np.testing.assert_array_equal(values, [-1.0])
+
+
+def test_decoder_accepts_policy_sum_within_tolerance_without_normalizing():
+    policy = (0.5, 0.5005)
+    _, policies, _ = decode([record(encoded=payload(policy=policy))])
+    np.testing.assert_array_equal(policies, np.asarray([policy], dtype=np.float32))
+    assert policies.sum(dtype=np.float32) != 1.0
+
+
+def test_decoder_rejects_policy_sum_just_outside_tolerance():
+    with pytest.raises(ValueError, match="policy sums to .*expected 1"):
+        decode([record(encoded=payload(policy=(0.5, 0.5011)))])
+
+
+def test_cartridge_preserves_replay_import():
+    from trainer.algorithms import alphazero_board_v1
+
+    assert alphazero_board_v1.decode_replay_batch is decode_replay_batch
 
 
 @pytest.mark.parametrize("size", [19, 20, 25])

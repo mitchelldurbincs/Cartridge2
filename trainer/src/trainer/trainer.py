@@ -28,10 +28,10 @@ from .algorithms import get_algorithm
 from .algorithms.alphazero_board_v1 import (
     ALGORITHM_ID,
     DESCRIPTOR,
-    decode_replay_batch,
     get_game_config,
 )
 from .algorithms.alphazero_config import AlphaZeroLearnerConfig
+from .algorithms.alphazero_replay import decode_replay_batch
 from .checkpoint import learner_config_sha256, restore_learner_state
 from .environment_catalog import get_environment
 from .lr_scheduler import LRConfig, WarmupCosineScheduler
