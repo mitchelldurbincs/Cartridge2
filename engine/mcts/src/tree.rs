@@ -74,19 +74,23 @@ impl MctsTree {
     /// Returns the NodeId of the best child.
     pub fn select_child(&self, node_id: NodeId, c_puct: f32) -> Option<NodeId> {
         let node = self.get(node_id);
+        // Empty and forced-move nodes need no child lookup or score calculation.
+        if node.children.len() <= 1 {
+            return node.children.first().map(|(_, id)| *id);
+        }
         // Pre-compute sqrt once instead of per-child comparison
         let parent_visits_sqrt = (node.visit_count as f32).sqrt();
 
         node.children
             .iter()
-            .max_by(|(_, id_a), (_, id_b)| {
-                let score_a = self.get(*id_a).ucb_score(parent_visits_sqrt, c_puct);
-                let score_b = self.get(*id_b).ucb_score(parent_visits_sqrt, c_puct);
+            // Score each child once, retaining the incumbent's score between comparisons.
+            .map(|(_, id)| (*id, self.get(*id).ucb_score(parent_visits_sqrt, c_puct)))
+            .max_by(|(_, score_a), (_, score_b)| {
                 score_a
-                    .partial_cmp(&score_b)
+                    .partial_cmp(score_b)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .map(|(_, id)| *id)
+            .map(|(id, _)| id)
     }
 
     /// Add a child to a parent node.
@@ -302,6 +306,65 @@ mod tests {
         // Initially, higher prior should win (UCB dominated by prior when unvisited)
         let best = tree.select_child(tree.root(), 1.0).unwrap();
         assert_eq!(best, NodeId(2)); // Second child has higher prior
+    }
+
+    #[test]
+    fn select_child_handles_empty_and_forced_moves() {
+        let mut tree = MctsTree::new(LegalMask::all_legal(1));
+        assert_eq!(tree.select_child(tree.root(), 1.25), None);
+
+        let child = tree.add_child(tree.root(), 0, 1.0, LegalMask::new(1), false, 0.0);
+        assert_eq!(tree.select_child(tree.root(), 1.25), Some(child));
+    }
+
+    #[test]
+    fn select_child_breaks_ties_by_child_order() {
+        let mut tree = MctsTree::new(LegalMask::all_legal(3));
+        let first = tree.add_child(tree.root(), 2, 0.25, LegalMask::new(3), false, 0.0);
+        tree.add_child(tree.root(), 1, 0.5, LegalMask::new(3), false, 0.0);
+        let last = tree.add_child(tree.root(), 0, 0.25, LegalMask::new(3), false, 0.0);
+
+        // Zero parent visits make all unvisited scores equal, despite different priors.
+        assert_eq!(tree.select_child(tree.root(), 1.25), Some(last));
+        tree.get_mut(tree.root()).children.reverse();
+        assert_eq!(tree.select_child(tree.root(), 1.25), Some(first));
+    }
+
+    #[test]
+    fn select_child_preserves_partial_order_comparisons() {
+        // An unordered comparison is a tie; max_by retains the later child.
+        for (scores, expected_index) in [
+            ([0.25, 0.75, -0.5], 1),
+            ([0.75, 0.25, 0.75], 2),
+            ([0.0, -0.0, 0.0], 2),
+            ([f32::NAN, 0.75, 0.25], 1),
+            ([0.75, f32::NAN, 0.25], 2),
+            ([0.25, 0.75, f32::NAN], 2),
+            ([f32::INFINITY, 0.75, f32::INFINITY], 2),
+            ([f32::NEG_INFINITY, -0.75, -0.25], 2),
+        ] {
+            let mut tree = MctsTree::new(LegalMask::all_legal(3));
+            tree.get_mut(tree.root()).visit_count = 3;
+            for (action, score) in scores.into_iter().enumerate() {
+                let child = tree.add_child(
+                    tree.root(),
+                    action as u32,
+                    0.0,
+                    LegalMask::new(3),
+                    false,
+                    0.0,
+                );
+                let child = tree.get_mut(child);
+                child.visit_count = 1;
+                child.value_sum = -score;
+            }
+            let expected = tree.get(tree.root()).children[expected_index].1;
+            assert_eq!(
+                tree.select_child(tree.root(), 1.25),
+                Some(expected),
+                "{scores:?}"
+            );
+        }
     }
 
     #[test]

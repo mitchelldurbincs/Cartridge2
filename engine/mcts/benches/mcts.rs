@@ -293,32 +293,34 @@ fn bench_tree_operations(c: &mut Criterion) {
         });
     });
 
-    // Benchmark child selection (UCB calculation)
-    group.bench_function("select_child", |b| {
-        // Pre-build a tree with children
-        let mut tree = MctsTree::new(LegalMask::all_legal(9));
+    // Include forced moves, board-game openings, and wider Generals positions.
+    for child_count in [1u32, 2, 7, 9, 37, 71, 257] {
+        group.bench_with_input(
+            BenchmarkId::new("select_child", child_count),
+            &child_count,
+            |b, &child_count| {
+                let mut tree = MctsTree::new(LegalMask::all_legal(child_count as usize));
+                let prior_total = (child_count * (child_count + 1) / 2) as f32;
 
-        // Add 9 children with varying priors and visit counts
-        for i in 0..9u32 {
-            let child_id = tree.add_child(
-                tree.root(),
-                i,
-                (i as f32 + 1.0) / 45.0, // Varying priors
-                LegalMask::all_legal(9),
-                false,
-                0.0,
-            );
-            // Simulate some visits
-            let child = tree.get_mut(child_id);
-            child.visit_count = (i + 1) * 10;
-            child.value_sum = (i as f32 - 4.0) * 0.1 * child.visit_count as f32;
-        }
+                for i in 0..child_count {
+                    let child_id = tree.add_child(
+                        tree.root(),
+                        i,
+                        (i as f32 + 1.0) / prior_total,
+                        LegalMask::all_legal(child_count as usize),
+                        false,
+                        0.0,
+                    );
+                    let child = tree.get_mut(child_id);
+                    child.visit_count = (i + 1) * 10;
+                    child.value_sum = ((i % 9) as f32 - 4.0) * 0.1 * child.visit_count as f32;
+                }
+                tree.get_mut(tree.root()).visit_count = child_count * (child_count + 1) / 2 * 10;
 
-        // Update root visit count
-        tree.get_mut(tree.root()).visit_count = 450;
-
-        b.iter(|| black_box(tree.select_child(tree.root(), 1.25)));
-    });
+                b.iter(|| black_box(black_box(&tree).select_child(tree.root(), black_box(1.25))));
+            },
+        );
+    }
 
     // Benchmark backpropagation
     group.bench_function("backpropagate_depth_5", |b| {
