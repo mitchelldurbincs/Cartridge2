@@ -1137,6 +1137,9 @@ web/
 │   ├── main.rs            # Thin entry point
 │   ├── startup.rs         # AppState, router, CORS, graceful shutdown
 │   ├── game.rs            # GameSession management
+│   ├── game/
+│   │   ├── validation.rs  # AlphaZero timestep/presentation boundary
+│   │   └── analysis.rs    # Decision diagnostics and bounded position history
 │   ├── metrics.rs         # Prometheus metrics
 │   ├── handlers/
 │   │   ├── game.rs        # Game endpoints
@@ -1194,6 +1197,13 @@ Bot AI:
 2. If model loaded: Run MCTS (200 sims, temp=0.5)
 3. If no model: Random legal move
 4. Execute the selected action and validate the next timestep/presentation
+
+`game/validation.rs` owns the board-serving boundary: reset and move execution
+both validate the transition source, two-seat outcomes, active observation and
+board presentation before installing the session position. Validation remains
+ordered so a malformed transition fails before presentation lookup; state,
+revision and history are updated only after this boundary succeeds. These are
+AlphaZero serving restrictions, not additions to the generic engine ABI.
 
 ### Frontend Components
 
