@@ -13,12 +13,14 @@ pub(crate) fn validate_run_commit_chain(
     let mut latest_orchestration: Option<&OrchestrationCommitV1> = None;
     let mut lineage_checkpoints = HashSet::new();
     let mut collection_scopes = HashSet::new();
-    for entry in chain {
+    for (index, entry) in chain.iter().enumerate() {
         validate_checkpoint_edge(entry, parent, &mut lineage_checkpoints)?;
         validate_run_mode(&entry.commit, parent)?;
         validate_orchestration_edge(
             entry,
             parent,
+            chain,
+            index,
             &mut latest_orchestration,
             &mut collection_scopes,
         )?;
@@ -116,6 +118,8 @@ fn validate_run_mode(commit: &RunCommitV1, parent: Option<&ResolvedRunCommit>) -
 fn validate_orchestration_edge<'a>(
     entry: &'a ResolvedRunCommit,
     parent: Option<&ResolvedRunCommit>,
+    chain: &[ResolvedRunCommit],
+    index: usize,
     latest: &mut Option<&'a OrchestrationCommitV1>,
     collection_scopes: &mut HashSet<&'a str>,
 ) -> Result<()> {
@@ -128,6 +132,7 @@ fn validate_orchestration_edge<'a>(
         {
             bail!("standalone RunCommit changed evaluation state");
         }
+        validate_inherited_eval_stats(commit, parent)?;
         return Ok(());
     };
     let recipe = commit
@@ -157,12 +162,24 @@ fn validate_orchestration_edge<'a>(
         bail!("orchestration training_steps does not match checkpoint progress");
     }
     validate_orchestration_chronology(orchestration, *latest)?;
+    let previous_evaluation = entry
+        .evaluation
+        .as_ref()
+        .and_then(|evidence| evidence.previous_evaluation_id.as_deref())
+        .and_then(|evaluation_id| {
+            chain[..index].iter().rev().find(|prior| {
+                prior.commit.evaluation_head_id.as_deref() == Some(evaluation_id)
+                    && prior.evaluation.is_some()
+            })
+        })
+        .and_then(|prior| prior.evaluation.as_ref());
     validate_orchestration_evaluation(
+        entry,
+        parent,
+        previous_evaluation,
         commit,
         orchestration,
         recipe,
-        inherited_champion,
-        inherited_evaluation,
     )?;
     *latest = Some(orchestration);
     Ok(())
@@ -188,12 +205,15 @@ fn validate_orchestration_chronology(
 }
 
 fn validate_orchestration_evaluation(
+    entry: &ResolvedRunCommit,
+    parent: Option<&ResolvedRunCommit>,
+    previous_evaluation: Option<&super::evaluation::EvaluationEvidenceV2>,
     commit: &RunCommitV1,
     orchestration: &OrchestrationCommitV1,
     recipe: &super::types::RunRecipeV1,
-    inherited_champion: Option<&super::types::ChampionReferenceV1>,
-    inherited_evaluation: Option<&String>,
 ) -> Result<()> {
+    let inherited_champion = parent.and_then(|value| value.commit.champion.as_ref());
+    let inherited_evaluation = parent.and_then(|value| value.commit.evaluation_head_id.as_ref());
     let scheduled = recipe.evaluation_interval != 0
         && orchestration
             .iteration
@@ -208,7 +228,21 @@ fn validate_orchestration_evaluation(
         if commit.evaluation_head_id.as_deref() != Some(evaluation_id.as_str()) {
             bail!("evaluated RunCommit does not select its evaluation as head");
         }
+        let evidence = entry
+            .evaluation
+            .as_ref()
+            .ok_or_else(|| anyhow!("evaluated RunCommit has no resolved immutable evidence"))?;
+        super::evaluation::bind_evaluation(
+            commit,
+            parent.map(|value| &value.commit),
+            evidence,
+            previous_evaluation,
+            evaluation_id,
+        )?;
     } else {
+        if entry.evaluation.is_some() {
+            bail!("non-evaluation RunCommit unexpectedly carries evaluation evidence");
+        }
         if orchestration.evaluation_seed.is_some() {
             bail!("non-evaluation orchestration cannot carry evaluation_seed");
         }
@@ -217,6 +251,20 @@ fn validate_orchestration_evaluation(
         {
             bail!("non-evaluation orchestration changed evaluation state");
         }
+        validate_inherited_eval_stats(commit, parent)?;
+    }
+    Ok(())
+}
+
+fn validate_inherited_eval_stats(
+    commit: &RunCommitV1,
+    parent: Option<&ResolvedRunCommit>,
+) -> Result<()> {
+    let inherited = parent.map_or(&[][..], |p| {
+        p.commit.stats_snapshot.stats.evaluation_history.as_slice()
+    });
+    if commit.stats_snapshot.stats.evaluation_history.as_slice() != inherited {
+        bail!("RunCommit stats evaluation history changed without random evaluation evidence");
     }
     Ok(())
 }

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -44,6 +47,32 @@ PROFILE = CheckpointProfileV1(
     model_contract="onnx_policy_value_v1",
 )
 CONFIG_SHA256 = "c" * 64
+
+
+def test_stats_import_succeeds_in_a_fresh_process(tmp_path):
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(source_root), existing_pythonpath) if part
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from trainer.stats import DEFAULT_MAX_EVAL_HISTORY; "
+            "from trainer.storage import CheckpointProfileV1; "
+            "assert DEFAULT_MAX_EVAL_HISTORY == 50; "
+            "assert CheckpointProfileV1.__name__ == 'CheckpointProfileV1'",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
 
 
 def checkpoint_ref(

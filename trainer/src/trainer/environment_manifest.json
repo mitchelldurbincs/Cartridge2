@@ -314,7 +314,7 @@
           "env_id": "generals_8x8",
           "build_id": "0.1.0"
         },
-        "contract_version": 3,
+        "contract_version": 4,
         "encoding": {
           "state": "generals_state:v1",
           "action": {
@@ -327,7 +327,7 @@
               "dimensions": [
                 {
                   "name": "channel",
-                  "size": 10
+                  "size": 12
                 },
                 {
                   "name": "row",

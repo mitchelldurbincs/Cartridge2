@@ -2,8 +2,8 @@
 #
 # Overnight synchronized AlphaZero training run (Connect4 by default).
 #
-# Runs the selected cartridge's `loop` command: each iteration clears the replay buffer,
-# generates self-play episodes with the current model, trains on them, and
+# Runs the selected cartridge's `loop` command: each iteration writes self-play
+# episodes to a fresh replay scope, trains on them with the current model, and
 # (every eval-interval iterations) evaluates + scores moves against the
 # bitbully perfect solver.
 #

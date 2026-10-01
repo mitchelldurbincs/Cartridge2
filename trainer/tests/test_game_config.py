@@ -291,7 +291,7 @@ class TestGeneralsConfig:
         assert config.board_width == 8
         assert config.board_height == 8
         assert config.num_actions == 257  # 64 tiles * 4 directions + wait
-        assert config.obs_size == 640
+        assert config.obs_size == 768
 
     def test_generals_uses_player_relative_resnet(self):
         config = get_game_config("generals_8x8")
@@ -299,9 +299,9 @@ class TestGeneralsConfig:
         assert config.network_type == "resnet"
         assert config.num_res_blocks == 6
         assert config.num_filters == 128
-        # 10 generals_obs:v2 planes, encoded own/enemy relative to the player to
-        # act and including the exact cap countdown.
-        assert config.obs_channels == 10
+        # 12 generals_obs:v3 planes, encoded relative to the player to act and
+        # including neutral armies plus the production phase.
+        assert config.obs_channels == 12
 
 
 class TestManifestIntegrity:

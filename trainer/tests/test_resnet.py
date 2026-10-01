@@ -162,11 +162,11 @@ class TestArbitraryChannels:
         np.testing.assert_allclose(actual_value, expected_value.numpy(), rtol=1e-4, atol=1e-5)
 
 
-def test_generals_v3_deep_resnet_export_passes_runtime_equivalence(tmp_path):
+def test_generals_v4_deep_resnet_export_passes_runtime_equivalence(tmp_path):
     environment = get_environment("generals_8x8")
     config = get_game_config(environment.env_id)
-    assert environment.contract_version == 3
-    assert config.obs_size == 640
+    assert environment.contract_version == 4
+    assert config.obs_size == 768
     assert config.num_actions == 257
     assert config.num_res_blocks == 6
     assert config.num_filters == 128
@@ -176,7 +176,7 @@ def test_generals_v3_deep_resnet_export_passes_runtime_equivalence(tmp_path):
 
     checkpoint_path = export_onnx_artifact(
         network=network,
-        output_path=tmp_path / "generals-v3.onnx",
+        output_path=tmp_path / "generals-v4.onnx",
         device=torch.device("cpu"),
         artifact_contract=policy_value_artifact_contract(
             algorithm_id="alphazero_board_v1",

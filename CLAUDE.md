@@ -169,7 +169,7 @@ Pure game logic library. No network I/O. Library-only design (no gRPC).
 - `games-othello/` - Othello implementation
 - `games-generals/` - Generals 8×8 implementation; see the crate's
   lib.rs for the ruleset (full-info, alternating turns, territory
-  adjudication, Markov-visible parity-randomized ply cap) and `generals_obs:v2` layout
+  adjudication, Markov-visible parity-randomized ply cap) and `generals_obs:v3` layout
 - `mcts/` - Monte Carlo Tree Search implementation; legal masks are
   dynamic-width (`LegalMask`) and read from the authoritative observation.
   Three diagnostic examples: `generals_policy_probe` (visit-distribution

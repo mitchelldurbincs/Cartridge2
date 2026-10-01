@@ -414,7 +414,7 @@ fn test_obs_shape_and_metadata_agree() {
     let meta = game.metadata();
     let board = meta.require_board().unwrap();
     assert_eq!(capabilities.contract_version, ENV_CONTRACT_VERSION);
-    assert_eq!(ENV_CONTRACT_VERSION, 3);
+    assert_eq!(ENV_CONTRACT_VERSION, 4);
     assert_eq!(capabilities.max_horizon, Some(MAX_TURNS * 2));
     assert_eq!(board.width, WIDTH);
     assert_eq!(board.height, HEIGHT);
@@ -457,6 +457,75 @@ fn test_obs_is_player_relative() {
     assert!(obs_p2.channels[BOARD_SIZE + g1] > 0.5);
     assert!(obs_p2.channels[7 * BOARD_SIZE + g2] > 0.5);
     assert!(obs_p2.channels[7 * BOARD_SIZE + g1] < -0.5);
+}
+
+#[test]
+fn test_neutral_defender_strength_is_observable_and_changes_capture() {
+    let mut strong = flat_state();
+    strong.tiles[0].army = 5;
+    strong.tiles[1] = Tile {
+        owner: 0,
+        army: 40,
+        kind: TileKind::City,
+    };
+    let mut weak = strong.clone();
+    weak.tiles[1].army = 1;
+
+    let strong_obs = GeneralsObs::from_state(&strong);
+    let weak_obs = GeneralsObs::from_state(&weak);
+    // Before this schema revision, these states had identical model input despite the
+    // defender strength changing the result of the same legal attack.
+    assert_eq!(
+        &strong_obs.channels[..10 * BOARD_SIZE],
+        &weak_obs.channels[..10 * BOARD_SIZE]
+    );
+    assert!(strong_obs.channels[10 * BOARD_SIZE + 1] > weak_obs.channels[10 * BOARD_SIZE + 1]);
+
+    let mut game = Generals::new();
+    game.step(&mut strong, encode_move(0, 1), &mut rng(1))
+        .unwrap();
+    game.step(&mut weak, encode_move(0, 1), &mut rng(1))
+        .unwrap();
+    assert_eq!(strong.tiles[1].owner, 0);
+    assert_eq!(weak.tiles[1].owner, 1);
+}
+
+#[test]
+fn test_production_phase_is_observable_for_equivalent_player_relative_states() {
+    let mut first = flat_state();
+    first.tiles[0].army = 5;
+    first.cap_plies -= 1;
+
+    let mut second = first.clone();
+    second.current_player = 2;
+    second.cap_plies += 1;
+    second.generals.swap(0, 1);
+    for tile in &mut second.tiles {
+        if tile.owner != 0 {
+            tile.owner = 3 - tile.owner;
+        }
+    }
+
+    let first_obs = GeneralsObs::from_state(&first);
+    let second_obs = GeneralsObs::from_state(&second);
+    // All prior planes collide: same relative position, round progress, and
+    // exact remaining-ply count, but only the second move triggers production.
+    assert_eq!(
+        &first_obs.channels[..11 * BOARD_SIZE],
+        &second_obs.channels[..11 * BOARD_SIZE]
+    );
+    assert!(first_obs.channels[11 * BOARD_SIZE..]
+        .iter()
+        .all(|value| *value == 0.0));
+    assert!(second_obs.channels[11 * BOARD_SIZE..]
+        .iter()
+        .all(|value| *value == 1.0));
+
+    let mut game = Generals::new();
+    game.step(&mut first, WAIT_ACTION, &mut rng(1)).unwrap();
+    game.step(&mut second, WAIT_ACTION, &mut rng(1)).unwrap();
+    assert_eq!(first.tiles[0].army, 5);
+    assert_eq!(second.tiles[0].army, 6);
 }
 
 #[test]

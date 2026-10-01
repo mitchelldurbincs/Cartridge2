@@ -1,7 +1,7 @@
 //! Tests for the MCTS search implementation.
 
 use super::*;
-use crate::evaluator::UniformEvaluator;
+use crate::evaluator::{EvalResult, EvaluatorError, UniformEvaluator};
 use crate::MctsConfigError;
 use engine_core::{ActionAvailability, ActionSpace};
 use rand::SeedableRng;
@@ -10,6 +10,196 @@ use tracing::trace;
 fn setup_tictactoe() -> EngineContext {
     engine_games::register_all_environments();
     EngineContext::new("tictactoe").unwrap()
+}
+
+#[derive(Clone, Copy)]
+enum BatchFault {
+    EvaluationError,
+    NonFiniteRootValue,
+    OutOfRangeRootValue,
+    NonFiniteBatchValue,
+    OutOfRangeBatchValue,
+    TooFewResults,
+    ExtraResult,
+    ShortPolicy,
+    NonFinitePolicy,
+    UnnormalizedPolicy,
+}
+
+struct FaultyBatchEvaluator(BatchFault);
+
+impl Evaluator for FaultyBatchEvaluator {
+    fn evaluate(
+        &self,
+        obs: &[u8],
+        mask: &LegalMask,
+        count: usize,
+    ) -> Result<EvalResult, EvaluatorError> {
+        let mut result = UniformEvaluator.evaluate(obs, mask, count)?;
+        match self.0 {
+            BatchFault::NonFiniteRootValue => result.value = f32::NAN,
+            BatchFault::OutOfRangeRootValue => result.value = 1.5,
+            _ => {}
+        }
+        Ok(result)
+    }
+
+    fn evaluate_batch(
+        &self,
+        observations: &[&[u8]],
+        masks: &[&LegalMask],
+        count: usize,
+    ) -> Result<Vec<EvalResult>, EvaluatorError> {
+        if matches!(self.0, BatchFault::EvaluationError) {
+            return Err(EvaluatorError::EvaluationFailed("synthetic failure".into()));
+        }
+        let mut results = observations
+            .iter()
+            .zip(masks)
+            .map(|(obs, mask)| UniformEvaluator.evaluate(obs, mask, count))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        match self.0 {
+            BatchFault::EvaluationError => unreachable!("handled before evaluating"),
+            BatchFault::NonFiniteBatchValue => results[0].value = f32::NAN,
+            BatchFault::OutOfRangeBatchValue => results[0].value = -1.5,
+            BatchFault::NonFiniteRootValue | BatchFault::OutOfRangeRootValue => {
+                unreachable!("root-only value fault")
+            }
+            BatchFault::TooFewResults => {
+                results.pop();
+            }
+            BatchFault::ExtraResult => results.push(results[0].clone()),
+            BatchFault::ShortPolicy => {
+                results[0].policy.pop();
+            }
+            BatchFault::NonFinitePolicy => results[0].policy[0] = f32::NAN,
+            BatchFault::UnnormalizedPolicy => results[0].policy.fill(0.0),
+        }
+        Ok(results)
+    }
+}
+
+#[test]
+fn evaluator_value_contract_is_checked_at_root_and_batch() {
+    for fault in [
+        BatchFault::NonFiniteRootValue,
+        BatchFault::OutOfRangeRootValue,
+        BatchFault::NonFiniteBatchValue,
+        BatchFault::OutOfRangeBatchValue,
+    ] {
+        let mut ctx = setup_tictactoe();
+        let reset = ctx.reset(42, &[]).unwrap();
+        let evaluator = FaultyBatchEvaluator(fault);
+        let mut search = MctsSearch::new(
+            &mut ctx,
+            &evaluator,
+            MctsConfig::for_testing().with_simulations(1),
+            reset.state,
+            reset.timestep,
+        )
+        .unwrap();
+
+        let error = search
+            .run(&mut ChaCha20Rng::seed_from_u64(77))
+            .expect_err("invalid evaluator values must fail before backpropagation");
+        assert!(matches!(
+            error,
+            SearchError::EvaluatorError(EvaluatorError::InvalidState(_))
+        ));
+        let root = search.tree().get(search.tree().root());
+        if matches!(
+            fault,
+            BatchFault::NonFiniteRootValue | BatchFault::OutOfRangeRootValue
+        ) {
+            assert_eq!(root.visit_count, 0);
+            assert!(root.children.is_empty());
+        } else {
+            assert_eq!(root.visit_count, 1);
+            assert_eq!(root.children.len(), 9);
+            for (_, child_id) in &root.children {
+                let child = search.tree().get(*child_id);
+                assert_eq!(child.visit_count, 0);
+                assert_eq!(child.value_sum, 0.0);
+                assert!(child.children.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn batch_evaluator_failure_restores_pending_virtual_losses() {
+    let mut ctx = setup_tictactoe();
+    let reset = ctx.reset(42, &[]).unwrap();
+    let evaluator = FaultyBatchEvaluator(BatchFault::EvaluationError);
+    let mut search = MctsSearch::new(
+        &mut ctx,
+        &evaluator,
+        MctsConfig::for_testing().with_simulations(1),
+        reset.state,
+        reset.timestep,
+    )
+    .unwrap();
+
+    let error = search
+        .run(&mut ChaCha20Rng::seed_from_u64(77))
+        .expect_err("evaluator failures must be returned");
+    assert!(matches!(
+        error,
+        SearchError::EvaluatorError(EvaluatorError::EvaluationFailed(_))
+    ));
+    let root = search.tree().get(search.tree().root());
+    assert_eq!(root.visit_count, 1);
+    assert_eq!(root.children.len(), 9);
+    for (_, child_id) in &root.children {
+        let child = search.tree().get(*child_id);
+        assert_eq!(child.visit_count, 0);
+        assert_eq!(child.value_sum, 0.0);
+        assert!(child.children.is_empty());
+    }
+}
+
+#[test]
+fn batch_evaluator_shape_errors_restore_pending_virtual_losses() {
+    for fault in [
+        BatchFault::TooFewResults,
+        BatchFault::ExtraResult,
+        BatchFault::ShortPolicy,
+        BatchFault::NonFinitePolicy,
+        BatchFault::UnnormalizedPolicy,
+    ] {
+        let mut ctx = setup_tictactoe();
+        let reset = ctx.reset(42, &[]).unwrap();
+        let evaluator = FaultyBatchEvaluator(fault);
+        let mut search = MctsSearch::new(
+            &mut ctx,
+            &evaluator,
+            MctsConfig::for_testing().with_simulations(1),
+            reset.state,
+            reset.timestep,
+        )
+        .unwrap();
+
+        let error = search
+            .run(&mut ChaCha20Rng::seed_from_u64(77))
+            .expect_err("malformed batch output must fail before expansion");
+        assert!(matches!(
+            error,
+            SearchError::EvaluatorError(EvaluatorError::InvalidState(_))
+        ));
+
+        // The root evaluation is retained, but the failed batch must not
+        // leave virtual loss on any child or partially expand one of them.
+        let root = search.tree().get(search.tree().root());
+        assert_eq!(root.visit_count, 1);
+        assert_eq!(root.children.len(), 9);
+        for (_, child_id) in &root.children {
+            let child = search.tree().get(*child_id);
+            assert_eq!(child.visit_count, 0);
+            assert_eq!(child.value_sum, 0.0);
+            assert!(child.children.is_empty());
+        }
+    }
 }
 
 #[test]

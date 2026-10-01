@@ -199,15 +199,121 @@ fn replace_with_evaluated_synchronized_commit(
     let mut commit: serde_json::Value = serde_json::from_slice(&original).unwrap();
     commit["run_recipe_id"] = serde_json::Value::String(sha256_hex(&canonical(recipe)));
     commit["run_recipe"] = recipe.clone();
-    let mut facts = orchestration(iteration, source_checkpoint_id);
-    facts["evaluation_seed"] = serde_json::json!(42);
-    facts["evaluation_id"] = serde_json::Value::String(selection.evaluation_id.to_string());
-    commit["orchestration"] = facts;
-    commit["evaluation_head_id"] = serde_json::Value::String(selection.evaluation_id.to_string());
-    commit["champion"] = serde_json::json!({
-        "checkpoint_id": selection.champion_checkpoint_id,
-        "evaluation_id": selection.champion_evaluation_id,
+    let promoted = selection.champion_evaluation_id == selection.evaluation_id;
+    if let Some(parent_id) = commit["parent_run_commit_id"].as_str() {
+        let parent: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(run_commit_path(root, parent_id)).unwrap())
+                .unwrap();
+        commit["evaluation_head_id"] = parent["evaluation_head_id"].clone();
+        commit["champion"] = parent["champion"].clone();
+        commit["stats_snapshot"]["stats"]["evaluation_history"] =
+            parent["stats_snapshot"]["stats"]["evaluation_history"].clone();
+        commit["stats_snapshot"]["stats"]["last_evaluation"] =
+            parent["stats_snapshot"]["stats"]["last_evaluation"].clone();
+    }
+    let previous_evaluation_id = commit["evaluation_head_id"].as_str().map(str::to_owned);
+    let champion_before = commit["champion"].clone();
+    if promoted {
+        assert_eq!(
+            selection.champion_checkpoint_id,
+            commit["checkpoint_id"].as_str().unwrap()
+        );
+    } else {
+        assert_eq!(
+            selection.champion_checkpoint_id,
+            champion_before["checkpoint_id"].as_str().unwrap()
+        );
+    }
+    let requested_games = if champion_before.is_null() {
+        serde_json::json!({"vs_champion":0,"vs_random":2,"candidate_solver":0,"champion_solver":0})
+    } else {
+        serde_json::json!({"vs_champion":2,"vs_random":2,"candidate_solver":0,"champion_solver":0})
+    };
+    let (candidate_wins, opponent_wins) = if promoted { (2, 0) } else { (0, 2) };
+    let vs_champion = if champion_before.is_null() {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!({
+            "games_played":2,"candidate_wins":candidate_wins,"opponent_wins":opponent_wins,"draws":0,
+                "candidate_wins_as_first":candidate_wins/2,"candidate_wins_as_second":candidate_wins-candidate_wins/2,
+                "opponent_wins_while_candidate_first":opponent_wins/2,"opponent_wins_while_candidate_second":opponent_wins-opponent_wins/2,
+            "average_game_length":1.0
+        })
+    };
+    let vs_random = serde_json::json!({
+        "games_played":2,"candidate_wins":2,"opponent_wins":0,"draws":0,
+        "candidate_wins_as_first":1,"candidate_wins_as_second":1,
+        "opponent_wins_while_candidate_first":0,"opponent_wins_while_candidate_second":0,
+        "average_game_length":1.0
     });
+    let start_seconds = iteration - 1;
+    let evaluation = serde_json::json!({
+        "schema_version":2,"profile":commit["profile"],"iteration":iteration,
+        "candidate_checkpoint_id":commit["checkpoint_id"],"previous_evaluation_id":previous_evaluation_id,
+        "champion_before":champion_before,
+        "recipe":{"simulations":0,"temperature":f64::from(0.2_f32),"promotion_metric":"win_rate","promotion_margin":0.0,"win_threshold":0.55,"seed":42,
+            "seat_schedule":{"kind":"alternating_v1","candidate_first":"even_game_indices","seed_rule":"base_plus_game_index"},"requested_games":requested_games},
+        "results":{"vs_champion":vs_champion,"vs_random":vs_random,"candidate_solver":null,"champion_solver":null},
+        "decision":{"promoted":promoted,"reason":"fixture"},
+        "started_at":format!("2026-01-01T00:00:{start_seconds:02}.100000Z"),
+        "completed_at":format!("2026-01-01T00:00:{start_seconds:02}.900000Z")
+    });
+    let evaluation_bytes = canonical(&evaluation);
+    let actual_evaluation_id = sha256_hex(&evaluation_bytes);
+    let evaluation_path = root
+        .join("evaluations/manifests/sha256")
+        .join(format!("{actual_evaluation_id}.json"));
+    std::fs::create_dir_all(evaluation_path.parent().unwrap()).unwrap();
+    std::fs::write(evaluation_path, evaluation_bytes).unwrap();
+    let mut facts = orchestration(iteration, source_checkpoint_id);
+    facts["evaluation_id"] = serde_json::Value::String(actual_evaluation_id.clone());
+    facts["evaluation_seed"] = serde_json::json!(42);
+    facts["eval_time_seconds"] = serde_json::json!(0.1);
+    facts["total_time_seconds"] = serde_json::json!(0.1);
+    facts["eval_win_rate"] = if champion_before.is_null() {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!(candidate_wins as f64 / 2.0)
+    };
+    facts["eval_draw_rate"] = if champion_before.is_null() {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!(0.0)
+    };
+    commit["orchestration"] = facts;
+    commit["evaluation_head_id"] = serde_json::Value::String(actual_evaluation_id.clone());
+    commit["champion"] = if promoted {
+        serde_json::json!({
+            "checkpoint_id": commit["checkpoint_id"],
+            "evaluation_id": actual_evaluation_id,
+        })
+    } else {
+        champion_before
+    };
+    let completion_epoch = 1_767_225_600.0 + (iteration - 1) as f64 + 0.9;
+    let projected = serde_json::json!({
+        "step":commit["stats_snapshot"]["step"],
+        "metrics":{"outcome/win_rate":1.0,"outcome/draw_rate":0.0,"outcome/loss_rate":0.0},
+        "episodes":2,"mean_episode_length":1.0,"timestamp":completion_epoch
+    });
+    commit["stats_snapshot"]["stats"]["evaluation_history"]
+        .as_array_mut()
+        .unwrap()
+        .push(projected.clone());
+    let len = commit["stats_snapshot"]["stats"]["evaluation_history"]
+        .as_array()
+        .unwrap()
+        .len();
+    if len > 50 {
+        commit["stats_snapshot"]["stats"]["evaluation_history"] = serde_json::json!(
+            commit["stats_snapshot"]["stats"]["evaluation_history"]
+                .as_array()
+                .unwrap()[len - 50..]
+        );
+    }
+    commit["stats_snapshot"]["stats"]["last_evaluation"] = projected;
+    commit["stats_id"] =
+        serde_json::Value::String(sha256_hex(&canonical(&commit["stats_snapshot"])));
     let bytes = canonical(&commit);
     let run_commit_id = sha256_hex(&bytes);
     std::fs::write(run_commit_path(root, &run_commit_id), bytes).unwrap();
@@ -480,6 +586,105 @@ fn champion_selection_tracks_rejection_and_promotion_without_losing_head_generat
             .checkpoint_id
             .as_deref(),
         Some(promoted_checkpoint.as_str())
+    );
+}
+
+#[test]
+fn watcher_rejects_evaluation_recipe_that_differs_from_run_recipe() {
+    let root = tempdir().unwrap();
+    let expected = identity("contract_test");
+    let checkpoint = publish_test_checkpoint(root.path(), CONTRACT_TEST_MODEL, &expected, 1);
+    let initial = read_filesystem_head(root.path()).unwrap().unwrap();
+    let mut recipe = synchronized_recipe();
+    recipe["evaluation_interval"] = serde_json::json!(1);
+    let fake_id = "d".repeat(64);
+    let commit_id = replace_with_evaluated_synchronized_commit(
+        root.path(),
+        &initial.run_commit_id,
+        &recipe,
+        1,
+        None,
+        EvaluationSelection {
+            evaluation_id: &fake_id,
+            champion_checkpoint_id: &checkpoint,
+            champion_evaluation_id: &fake_id,
+        },
+    );
+    let bytes = std::fs::read(run_commit_path(root.path(), &commit_id)).unwrap();
+    let mut commit: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let old_evaluation_id = commit["evaluation_head_id"].as_str().unwrap().to_owned();
+    let artifact_path = root
+        .path()
+        .join("evaluations/manifests/sha256")
+        .join(format!("{old_evaluation_id}.json"));
+    let artifact_bytes = std::fs::read(&artifact_path).unwrap();
+    let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_bytes).unwrap();
+    artifact["recipe"]["simulations"] = serde_json::json!(1);
+    let new_artifact_bytes = canonical(&artifact);
+    let new_evaluation_id = sha256_hex(&new_artifact_bytes);
+    std::fs::write(
+        root.path()
+            .join("evaluations/manifests/sha256")
+            .join(format!("{new_evaluation_id}.json")),
+        new_artifact_bytes,
+    )
+    .unwrap();
+    commit["evaluation_head_id"] = serde_json::Value::String(new_evaluation_id.clone());
+    commit["orchestration"]["evaluation_id"] = serde_json::Value::String(new_evaluation_id.clone());
+    commit["champion"]["evaluation_id"] = serde_json::Value::String(new_evaluation_id);
+    let bad_commit_bytes = canonical(&commit);
+    let bad_commit_id = sha256_hex(&bad_commit_bytes);
+    std::fs::write(
+        run_commit_path(root.path(), &bad_commit_id),
+        bad_commit_bytes,
+    )
+    .unwrap();
+    select_test_head(root.path(), &checkpoint, &bad_commit_id);
+    let watcher = ModelWatcher::new(
+        root.path(),
+        model_spec(expected),
+        ModelSelection::Latest,
+        Arc::new(RwLock::new(None)),
+    );
+    let error = watcher.try_load_existing().unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Evaluation evidence disagrees with immutable RunRecipe"),
+        "{error:#}"
+    );
+
+    artifact["recipe"]["simulations"] = serde_json::json!(0);
+    let valid_artifact_bytes = canonical(&artifact);
+    let valid_evaluation_id = sha256_hex(&valid_artifact_bytes);
+    std::fs::write(
+        root.path()
+            .join("evaluations/manifests/sha256")
+            .join(format!("{valid_evaluation_id}.json")),
+        valid_artifact_bytes,
+    )
+    .unwrap();
+    commit["evaluation_head_id"] = serde_json::Value::String(valid_evaluation_id.clone());
+    commit["orchestration"]["evaluation_id"] =
+        serde_json::Value::String(valid_evaluation_id.clone());
+    commit["champion"]["evaluation_id"] = serde_json::Value::String(valid_evaluation_id);
+    commit["stats_snapshot"]["stats"]["evaluation_history"][0]["metrics"]["outcome/win_rate"] =
+        serde_json::json!(0.5);
+    commit["stats_snapshot"]["stats"]["last_evaluation"] =
+        commit["stats_snapshot"]["stats"]["evaluation_history"][0].clone();
+    commit["stats_id"] =
+        serde_json::Value::String(sha256_hex(&canonical(&commit["stats_snapshot"])));
+    let malformed_stats_bytes = canonical(&commit);
+    let malformed_stats_commit_id = sha256_hex(&malformed_stats_bytes);
+    std::fs::write(
+        run_commit_path(root.path(), &malformed_stats_commit_id),
+        malformed_stats_bytes,
+    )
+    .unwrap();
+    select_test_head(root.path(), &checkpoint, &malformed_stats_commit_id);
+    let error = watcher.try_load_existing().unwrap_err();
+    assert!(
+        format!("{error:#}")
+            .contains("stats evaluation history disagrees with immutable evaluation evidence"),
+        "{error:#}"
     );
 }
 
