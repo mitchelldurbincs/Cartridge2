@@ -1,0 +1,87 @@
+# Standalone profile: never merge with the development Compose stack.
+name: cartridge-gpu-pilot
+services:
+  postgres:
+    image: postgres:16.15-bookworm@sha256:efedf3595f1d6f415c08568ba171029bf54052e754cc9f030e3f2412b21f3d67
+    restart: "no"
+    environment:
+      POSTGRES_USER: cartridge
+      POSTGRES_DB: cartridge
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - type: bind
+        source: ${PILOT_ROOT:?Set an absolute retained POSIX disk directory}/postgres
+        target: /var/lib/postgresql/data
+        bind:
+          create_host_path: false
+      - ./scripts/init-postgres.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U cartridge -d cartridge]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [pilot]
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+  trainer:
+    image: ${PILOT_IMAGE:?Set the tested CUDA image (use a registry digest on GCP)}
+    platform: linux/amd64
+    init: true
+    restart: "no"
+    read_only: true
+    tmpfs: [/tmp:size=1g]
+    stop_grace_period: 15s
+    entrypoint: [python, -m, trainer.supervise]
+    command:
+      - --timeout-seconds
+      - "900"
+      - --grace-seconds
+      - "10"
+      - --log-file
+      - /app/data/pilot-smoke.log
+      - --
+      - python
+      - -m
+      - trainer.pilot
+      - --device
+      - cuda
+      - --data-dir
+      - /app/data/connect4-smoke
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      CARTRIDGE_STORAGE_MODEL_BACKEND: filesystem
+      CARTRIDGE_PILOT_POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      WANDB_MODE: disabled
+      OMP_NUM_THREADS: "2"
+    depends_on:
+      postgres: {condition: service_healthy}
+    secrets: [postgres_password]
+    volumes:
+      - type: bind
+        source: ${PILOT_ROOT:?Set an absolute retained POSIX disk directory}/data
+        target: /app/data
+        bind:
+          create_host_path: false
+      - ./config.defaults.toml:/app/config.toml:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks: [pilot]
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+networks:
+  pilot:
+    internal: true
+secrets:
+  postgres_password:
+    file: ${PILOT_POSTGRES_PASSWORD_FILE:?Set an existing operator-managed password file}

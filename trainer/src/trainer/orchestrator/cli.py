@@ -310,6 +310,7 @@ def run_loop(config: LoopConfig) -> int:
     from .orchestrator import Orchestrator
 
     try:
+        config.resolve_device()  # fail before opening storage or launching actors
         prom_metrics.start_metrics_server(port=config.metrics_port)
         Orchestrator(config).run()
         return 0

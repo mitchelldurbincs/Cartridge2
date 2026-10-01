@@ -18,7 +18,7 @@
 # Stage 0: Rust toolchain (shared base)
 # ============================================
 # Using Ubuntu 24.04 for glibc >= 2.38 (required by onnxruntime prebuilt binaries)
-FROM ubuntu:24.04 AS rust-base
+FROM ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3 AS rust-base
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -120,7 +120,7 @@ RUN cargo build --release -p evaluator
 # Stage 2: Python Runtime with Actor Binary
 # ============================================
 # Using Ubuntu 24.04 for glibc >= 2.38 (required by onnxruntime prebuilt binaries)
-FROM ubuntu:24.04
+FROM ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3
 
 # Install Python and runtime dependencies
 RUN apt-get update && apt-get install -y \
@@ -154,10 +154,14 @@ RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 WORKDIR /app
 
-# Install CPU-only PyTorch before any application inputs (avoids ~700MB CUDA
-# download). Source and Rust binary changes must not invalidate this layer;
-# it can also run while the independent Rust stage compiles.
-RUN pip install --no-cache-dir --break-system-packages torch --index-url https://download.pytorch.org/whl/cpu
+# Keep CPU as the default; the pilot explicitly builds the CUDA 12.6 variant.
+# PyTorch wheels include CUDA userspace libraries. The host supplies the driver.
+ARG TORCH_ACCELERATOR=cpu
+COPY trainer/constraints-runtime.txt /app/constraints-runtime.txt
+RUN case "$TORCH_ACCELERATOR" in cpu|cu126) ;; *) exit 1 ;; esac \
+ && pip install --no-cache-dir --break-system-packages -c /app/constraints-runtime.txt \
+      torch==2.9.1 --index-url https://download.pytorch.org/whl/$TORCH_ACCELERATOR \
+ && python -c "import torch; assert torch.version.cuda == ('12.6' if '$TORCH_ACCELERATOR' == 'cu126' else None), torch.__version__"
 
 # Copy config defaults (used by Python trainer)
 COPY config.defaults.toml ./
@@ -167,7 +171,8 @@ COPY trainer/pyproject.toml trainer/README.md ./trainer/
 COPY trainer/src/ ./trainer/src/
 
 # Install trainer package (pulls in the pinned crucible orchestration core)
-RUN pip install --no-cache-dir --break-system-packages ./trainer
+RUN pip install --no-cache-dir --break-system-packages -c /app/constraints-runtime.txt ./trainer \
+ && pip check
 
 # Smoke-check the *installed* package. Nothing else does: the test suite puts
 # trainer/src on sys.path directly, and CI's docker-build job never runs the
@@ -194,6 +199,11 @@ from trainer.players import RandomPlayer; \
 print('eval binary:', find_eval_binary()); \
 r = evaluate(player1=RandomPlayer(), player2=RandomPlayer(), algorithm_id='alphazero_board_v1', env_id='tictactoe', num_games=2); \
 assert r.games_played == 2, r"
+
+# Synthetic CPU kernels + export + Rust ONNX consumer in both image variants.
+# This validates packaging on CPU CI; only a GPU host can validate CUDA kernels.
+RUN python -m trainer.supervise --timeout-seconds 120 --grace-seconds 5 -- \
+    python -c "from trainer.pilot import preflight; preflight('cpu')"
 
 # Create the root under which the trainer creates immutable runtime profiles:
 # profiles/{algorithm_id}/{env_id}/v{env_contract_version}.

@@ -319,19 +319,9 @@ class AlphaZeroLearnerConfig:
         }
 
     def resolve_device(self) -> str:
-        """Resolve 'auto' device to the best available: cuda > mps > cpu."""
-        if self.device != "auto":
-            return self.device
-        try:
-            import torch
+        from ..device import resolve_device
 
-            if torch.cuda.is_available():
-                return "cuda"
-            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                return "mps"
-        except ImportError:
-            pass
-        return "cpu"
+        return resolve_device(self.device)
 
     @classmethod
     def configure_parser(cls, parser: Any, overrides: dict[str, Any] | None = None) -> None:

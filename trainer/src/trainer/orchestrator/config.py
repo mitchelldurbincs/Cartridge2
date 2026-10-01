@@ -347,18 +347,9 @@ class LoopConfig:
         return self.profile_dir / "solver_stats.json"
 
     def resolve_device(self) -> str:
-        if self.device != "auto":
-            return self.device
-        try:
-            import torch
+        from ..device import resolve_device
 
-            if torch.cuda.is_available():
-                return "cuda"
-            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                return "mps"
-        except ImportError:
-            pass
-        return "cpu"
+        return resolve_device(self.device)
 
     def get_num_simulations(self, iteration: int) -> int:
         _u64(iteration, field_name="iteration", positive=True)
