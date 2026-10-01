@@ -133,6 +133,8 @@ pub struct ReplayRecord {
 }
 
 /// Algorithm-neutral replay persistence.
+// `async_trait` marks the boxed future must-use; the future's output is already must-use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 #[allow(dead_code)]
 pub trait ReplayStore: Send + Sync {
