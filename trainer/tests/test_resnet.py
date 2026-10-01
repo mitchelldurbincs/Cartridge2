@@ -195,7 +195,7 @@ def test_generals_v4_deep_resnet_export_passes_runtime_equivalence(tmp_path):
         [dim.dim_param or dim.dim_value for dim in item.type.tensor_type.shape.dim]
         for item in tensors
     ] == [
-        ["batch_size", 640],
+        ["batch_size", config.obs_size],
         ["batch_size", 257],
         ["batch_size", 1],
     ]
