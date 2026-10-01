@@ -39,7 +39,7 @@ docker build --platform linux/amd64 -f Dockerfile.alphazero \
 ```
 
 The base image is pinned by digest; `trainer/constraints-runtime.txt` pins Torch
-2.9.1 and the ONNX/export stack. The `cu126` wheel supplies CUDA 12.6 userspace
+2.11.0 and the ONNX/export stack. The `cu126` wheel supplies CUDA 12.6 userspace
 libraries; the host supplies the NVIDIA driver. The default image remains CPU.
 The image build checks its Torch flavor, `pip check`, installed-package imports,
 and a synthetic CPU backward/export/Rust-ONNX fixture. CI builds both variants;

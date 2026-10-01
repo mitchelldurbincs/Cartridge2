@@ -1,6 +1,6 @@
 # Shared CPU/CUDA image export stack. Torch wheel flavor is selected in Docker.
-torch==2.9.1
-numpy==2.2.6
-onnx==1.18.0
-onnxscript==0.4.0
-onnxruntime==1.23.2
+torch==2.11.0
+numpy==2.4.3
+onnx==1.21.0
+onnxscript==0.6.2
+onnxruntime==1.24.4

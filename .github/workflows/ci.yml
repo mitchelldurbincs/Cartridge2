@@ -220,7 +220,7 @@ jobs:
         # Pulls the pinned `crucible` orchestration core, which is declared in
         # trainer/pyproject.toml. Do not re-add an explicit crucible install
         # here: that pinned the SHA in two places, and the copies would drift.
-        run: pip install -e ".[dev]"
+        run: pip install -c constraints-runtime.txt -e ".[dev]"
       - name: Run pytest
         run: pytest
 

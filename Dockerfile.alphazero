@@ -160,7 +160,7 @@ ARG TORCH_ACCELERATOR=cpu
 COPY trainer/constraints-runtime.txt /app/constraints-runtime.txt
 RUN case "$TORCH_ACCELERATOR" in cpu|cu126) ;; *) exit 1 ;; esac \
  && pip install --no-cache-dir --break-system-packages -c /app/constraints-runtime.txt \
-      torch==2.9.1 --index-url https://download.pytorch.org/whl/$TORCH_ACCELERATOR \
+      torch --index-url https://download.pytorch.org/whl/$TORCH_ACCELERATOR \
  && python -c "import torch; assert torch.version.cuda == ('12.6' if '$TORCH_ACCELERATOR' == 'cu126' else None), torch.__version__"
 
 # Copy config defaults (used by Python trainer)
