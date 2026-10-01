@@ -16,13 +16,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-from .storage.publisher import (
+from .storage.artifact_codec import (
     ArtifactValidationError,
-    CheckpointProfileV1,
-    CheckpointRef,
     canonical_json_bytes,
     sha256_bytes,
     validate_sha256_digest,
+)
+from .storage.checkpoint_types import (
+    CheckpointProfileV1,
+    CheckpointRef,
 )
 
 logger = logging.getLogger(__name__)

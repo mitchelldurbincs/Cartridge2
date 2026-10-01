@@ -18,6 +18,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 /// Collector surface owned by an algorithm cartridge.
+// `async_trait` marks the boxed future must-use; the future's output is already must-use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait CollectorAlgorithm: Send + Sync {
     async fn run(&self) -> Result<()>;

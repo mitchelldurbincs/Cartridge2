@@ -114,11 +114,34 @@ pub(crate) fn resolve_filesystem_run_commit_chain(
         )?;
         let manifest =
             read_filesystem_manifest(model_root, &commit.checkpoint_id, expected_contract)?;
+        let evaluation = if let Some(evaluation_id) = commit
+            .orchestration
+            .as_ref()
+            .and_then(|o| o.evaluation_id.as_deref())
+        {
+            let path = model_root
+                .join("evaluations")
+                .join("manifests")
+                .join("sha256")
+                .join(format!("{evaluation_id}.json"));
+            let evidence_bytes = std::fs::read(&path).with_context(|| {
+                format!("failed to read immutable evaluation evidence {path:?}")
+            })?;
+            Some(super::evaluation::parse_evaluation(
+                "evaluation artifact",
+                evaluation_id,
+                &evidence_bytes,
+                &commit.profile,
+            )?)
+        } else {
+            None
+        };
         current_id = commit.parent_run_commit_id.clone();
         reversed.push(ResolvedRunCommit {
             run_commit_id,
             commit,
             manifest,
+            evaluation,
         });
     }
     reversed.reverse();

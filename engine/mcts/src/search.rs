@@ -18,7 +18,7 @@ use rand_chacha::ChaCha20Rng;
 use tracing::debug;
 
 use crate::config::MctsConfig;
-use crate::evaluator::Evaluator;
+use crate::evaluator::{EvalResult, Evaluator, EvaluatorError};
 use crate::node::NodeId;
 use crate::sampling::{dirichlet_noise, sample_action};
 use crate::tree::MctsTree;
@@ -147,6 +147,7 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
             let eval = self
                 .evaluator
                 .evaluate(&root_obs, &legal_mask, self.num_actions)?;
+            validate_evaluation_policy(&eval, &legal_mask, self.num_actions, 0)?;
             self.expand_node_with_eval_counted(root_id, &root_state, &legal_mask, &eval)?;
             self.tree.backpropagate(root_id, eval.value);
             if inspect {
@@ -434,9 +435,39 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
         // Single batched NN call - track inference time
         let inference_start = Instant::now();
         let results =
-            self.evaluator
-                .evaluate_batch(&observations, &legal_masks, self.num_actions)?;
+            match self
+                .evaluator
+                .evaluate_batch(&observations, &legal_masks, self.num_actions)
+            {
+                Ok(results) => results,
+                Err(error) => {
+                    self.restore_pending_virtual_losses(pending);
+                    return Err(SearchError::EvaluatorError(error));
+                }
+            };
         stats.inference_time_us += inference_start.elapsed().as_micros() as u64;
+
+        // Validate the whole response before mutating any node. Custom
+        // evaluators implement this public boundary, so neither output count
+        // nor policy width is guaranteed by the ONNX implementation's checks.
+        if results.len() != pending.len() {
+            self.restore_pending_virtual_losses(pending);
+            return Err(SearchError::EvaluatorError(EvaluatorError::InvalidState(
+                format!(
+                    "Batch evaluator returned {} results for {} pending leaves",
+                    results.len(),
+                    pending.len()
+                ),
+            )));
+        }
+        for (index, (leaf, eval)) in pending.iter().zip(&results).enumerate() {
+            if let Err(error) =
+                validate_evaluation_policy(eval, &leaf.legal_mask, self.num_actions, index)
+            {
+                self.restore_pending_virtual_losses(pending);
+                return Err(error);
+            }
+        }
 
         // Expand each node with its result and backpropagate
         for (leaf, eval) in pending.iter().zip(results.iter()) {
@@ -470,6 +501,16 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
         }
 
         Ok(())
+    }
+
+    /// Undo selection reservations if a batch cannot be applied. This leaves
+    /// every pending node in the same state it had before selection queued it.
+    fn restore_pending_virtual_losses(&mut self, pending: &[PendingLeaf]) {
+        for leaf in pending {
+            let node = self.tree.get_mut(leaf.node_id);
+            node.visit_count -= 1;
+            node.value_sum -= self.config.virtual_loss;
+        }
     }
 
     /// Expand a node using a pre-computed evaluation result, counting game steps.
@@ -570,6 +611,73 @@ impl<'a, E: Evaluator> MctsSearch<'a, E> {
     pub fn tree(&self) -> &MctsTree {
         &self.tree
     }
+}
+
+/// Check an evaluator result before it can affect tree priors or values. ONNX
+/// enforces this model-output contract; custom Evaluator implementations must
+/// satisfy it too.
+fn validate_evaluation_policy(
+    eval: &EvalResult,
+    legal_mask: &LegalMask,
+    num_actions: usize,
+    batch_index: usize,
+) -> Result<(), SearchError> {
+    if !eval.value.is_finite() || !(-1.0..=1.0).contains(&eval.value) {
+        return Err(SearchError::EvaluatorError(EvaluatorError::InvalidState(
+            format!(
+                "Value at batch index {batch_index} must be finite and in [-1, 1], got {}",
+                eval.value
+            ),
+        )));
+    }
+    if eval.policy.len() != num_actions {
+        return Err(SearchError::EvaluatorError(EvaluatorError::InvalidState(
+            format!(
+                "Policy at batch index {batch_index} has {} actions, expected {num_actions}",
+                eval.policy.len()
+            ),
+        )));
+    }
+    if let Some((action, value)) = eval
+        .policy
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite() || !(0.0..=1.0).contains(value))
+    {
+        return Err(SearchError::EvaluatorError(EvaluatorError::InvalidState(
+            format!(
+                "Policy at batch index {batch_index}, action {action} must be a finite probability in [0, 1], got {value}"
+            ),
+        )));
+    }
+    if legal_mask.count_ones() > 0 {
+        let mass: f32 = eval.policy.iter().sum();
+        if !mass.is_finite() || (mass - 1.0).abs() > 1e-3 {
+            return Err(SearchError::EvaluatorError(EvaluatorError::InvalidState(
+                format!(
+                    "Policy at batch index {batch_index} has probability mass {mass}, expected approximately 1"
+                ),
+            )));
+        }
+    }
+    // The trait describes policy entries for illegal moves as zero. Check
+    // this because those values would otherwise be silently ignored by tree
+    // expansion, masking an evaluator contract error.
+    if let Some((action, value)) = eval
+        .policy
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(action, value)| !legal_mask.is_legal(*action) && *value != 0.0)
+    {
+        return Err(SearchError::EvaluatorError(EvaluatorError::InvalidState(
+            format!(
+                "Policy at batch index {batch_index} assigns probability {value} to illegal action {action}"
+            ),
+        )));
+    }
+    Ok(())
 }
 
 fn effective_eval_batch_size(config: &MctsConfig) -> usize {

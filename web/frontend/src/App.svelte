@@ -11,6 +11,7 @@
   let availableGames: string[] = $state([]);
   let selectedGame = $state('tictactoe');
   let error: string | null = $state(null);
+  let bootstrapError: string | null = $state(null);
   let loading = $state(false);
   let serverOnline = $state(false);
   let lastBotMove: number | null = $state(null);
@@ -56,8 +57,11 @@
     }
   }
 
-  onMount(async () => {
+  async function initializeGame() {
     loading = true;
+    error = null;
+    bootstrapError = null;
+    serverOnline = false;
     try {
       await getHealth();
       serverOnline = true;
@@ -67,9 +71,11 @@
       // Opening another tab must not reset a running shared session.
       gameState = await getGameState();
       await refreshHistory();
-    } catch (e) { error = String(e); }
+    } catch (e) { bootstrapError = String(e); }
     finally { loading = false; }
-  });
+  }
+
+  onMount(() => { void initializeGame(); });
 
   async function handleGameChange(event: Event) {
     selectedGame = (event.target as HTMLSelectElement).value;
@@ -150,6 +156,13 @@
     <p class="game-description">{gameInfo.description}</p>
   {/if}
 
+  {#if bootstrapError}
+    <div class="error" role="alert">
+      <p>Could not load game: {bootstrapError}</p>
+      <button onclick={initializeGame} disabled={loading}>Retry</button>
+    </div>
+  {/if}
+
   {#if !serverOnline}
     <div class="error">
       <p>Cannot connect to server.</p>
@@ -217,7 +230,7 @@
               New Game (Bot First)
             </button>
           </div>
-        {:else}
+        {:else if !bootstrapError}
           <p>Loading game...</p>
         {/if}
       </div>

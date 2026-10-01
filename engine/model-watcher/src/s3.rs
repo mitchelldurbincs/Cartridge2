@@ -230,11 +230,28 @@ impl S3ModelWatcher {
             let manifest: CheckpointManifestV1 =
                 parse_canonical_json("S3 checkpoint manifest", &manifest_bytes)?;
             validate_manifest(&manifest, &model_spec.identity)?;
+            let evaluation = if let Some(evaluation_id) = commit
+                .orchestration
+                .as_ref()
+                .and_then(|o| o.evaluation_id.as_deref())
+            {
+                let key = format!("{prefix}/evaluations/manifests/sha256/{evaluation_id}.json");
+                let bytes = Self::get_required(client, bucket, &key).await?;
+                Some(crate::artifact::parse_evaluation(
+                    "S3 evaluation artifact",
+                    evaluation_id,
+                    &bytes,
+                    &commit.profile,
+                )?)
+            } else {
+                None
+            };
             current_id = commit.parent_run_commit_id.clone();
             reversed.push(ResolvedRunCommit {
                 run_commit_id,
                 commit,
                 manifest,
+                evaluation,
             });
         }
         reversed.reverse();

@@ -1,9 +1,9 @@
-//! Observation tensor encoding — schema `generals_obs:v2`.
+//! Observation tensor encoding — schema `generals_obs:v3`.
 //!
 //! Player-relative, full-information. Layout (all f32, flattened):
 //!
 //! ```text
-//! [ 10 spatial channels x 64 tiles = 640 ]
+//! [ 12 spatial channels x 64 tiles = 768 ]
 //!   ch0 own territory        (1.0 where owner == me)
 //!   ch1 enemy territory
 //!   ch2 neutral passable     (unowned, not mountain)
@@ -15,9 +15,11 @@
 //!   ch8 turn progress        (constant plane: round / MAX_TURNS)
 //!   ch9 plies remaining      (constant plane: remaining / (2 * MAX_TURNS),
 //!                              zero after termination)
+//!   ch10 neutral armies      log1p(army) / log1p(MAX_ARMY_NORM)
+//!   ch11 production next    (1.0 when the acting move ends the round)
 //! Action availability and the observing agent are carried by the generic
 //! timestep decision envelope, not duplicated in this tensor.
-//! obs_size = 640
+//! obs_size = 768
 //! ```
 //!
 //! "Own"/"enemy" are relative to the player to act (`current_player`), so
@@ -32,7 +34,7 @@ use crate::params::{BOARD_SIZE, MAX_ARMY_NORM, MAX_TURNS};
 use crate::State;
 
 /// Number of spatial channels.
-pub const NUM_CHANNELS: usize = 10;
+pub const NUM_CHANNELS: usize = 12;
 /// Flattened spatial section length.
 pub const CHANNELS_LEN: usize = NUM_CHANNELS * BOARD_SIZE;
 /// Total observation length in floats.
@@ -63,6 +65,16 @@ impl GeneralsObs {
 
         channels[8 * BOARD_SIZE..9 * BOARD_SIZE].fill(turn_progress);
         channels[9 * BOARD_SIZE..10 * BOARD_SIZE].fill(plies_remaining);
+        // Production follows player 2's move when the game remains active.
+        // This must be explicit because the player-relative board alone does
+        // not distinguish that decision phase from player 1's move.
+        channels[11 * BOARD_SIZE..12 * BOARD_SIZE].fill(
+            if state.winner == 0 && state.current_player == 2 {
+                1.0
+            } else {
+                0.0
+            },
+        );
 
         for (i, tile) in state.tiles.iter().enumerate().take(BOARD_SIZE) {
             let ch = |c: usize| c * BOARD_SIZE + i;
@@ -77,6 +89,7 @@ impl GeneralsObs {
                 channels[ch(4)] = (1.0 + tile.army as f32).ln() / norm;
             } else if !tile.is_mountain() {
                 channels[ch(2)] = 1.0;
+                channels[ch(10)] = (1.0 + tile.army as f32).ln() / norm;
             }
 
             match tile.kind {

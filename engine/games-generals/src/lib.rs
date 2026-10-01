@@ -57,7 +57,7 @@ use params::{BOARD_SIZE, MAX_TURNS, NUM_ACTIONS};
 use rules::{adjudicate_at_cap, apply_production, check_winner};
 
 /// Immutable environment contract revision for wire formats and semantics.
-pub const ENV_CONTRACT_VERSION: u32 = 3;
+pub const ENV_CONTRACT_VERSION: u32 = 4;
 
 /// Sentinel for an eliminated player's general index.
 const NO_GENERAL: u8 = u8::MAX;

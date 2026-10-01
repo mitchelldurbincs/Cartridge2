@@ -2,6 +2,7 @@
 
 mod checkpoint;
 mod codec;
+mod evaluation;
 mod filesystem;
 mod lineage;
 mod recipe;
@@ -10,6 +11,8 @@ mod selection;
 mod types;
 mod validation;
 
+#[cfg(feature = "s3")]
+pub(crate) use evaluation::parse_evaluation;
 pub(crate) use filesystem::{read_filesystem_head, run_head_path};
 pub(crate) use selection::resolve_filesystem_head;
 pub(crate) use types::CheckpointManifestV1;

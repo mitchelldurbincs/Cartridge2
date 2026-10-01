@@ -192,6 +192,7 @@ pub(crate) struct ResolvedRunCommit {
     pub run_commit_id: String,
     pub commit: RunCommitV1,
     pub manifest: CheckpointManifestV1,
+    pub evaluation: Option<super::evaluation::EvaluationEvidenceV2>,
 }
 
 #[derive(Debug, Clone)]

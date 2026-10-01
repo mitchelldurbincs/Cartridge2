@@ -90,7 +90,7 @@ cartridge (and a recurrent model contract where history is required).
 | TicTacToe | Complete | 3x3 | 9 | 29 | MLP (hidden 128) |
 | Connect 4 | Complete | 7x6 | 7 | 93 | ResNet 4x128 |
 | Othello | Complete | 8x8 | 65 (64 cells + pass) | 195 | ResNet 6x256 |
-| Generals 8x8 | Engine/trainer/web complete; not yet stronger than random | 8x8 | 257 (64 tiles x 4 dirs + wait) | 899 | ResNet 6x128, 10 planes |
+| Generals 8x8 | Engine/trainer/web complete; not yet stronger than random | 8x8 | 257 (64 tiles x 4 dirs + wait) | 1027 | ResNet 6x128, 12 planes |
 
 See [§3.6](#36-generals-8x8) for the Generals ruleset and why it departs from
 the real game.
@@ -486,8 +486,8 @@ between learning and not.
 |----------|-------|
 | Board | 8x8 grid |
 | Actions | 257 (64 tiles x 4 directions, + wait) |
-| Observation | 899 f32s (640 planes + 257 legal + 2 player) |
-| Obs channels | 10, **player-relative** |
+| Observation | 1027 f32s (768 planes + 257 legal + 2 player) |
+| Obs channels | 12, **player-relative** |
 | Network | ResNet 6 blocks x 128 filters |
 | Board Type | "generals" |
 | Max horizon | 400 plies |
@@ -521,13 +521,16 @@ or trainable:
   omniscient under it. The fog variant needs observation history — a recurrent
   policy or IS-MCTS — and gets its own env id, obs schema version, and algorithm.
 
-The observation schema is versioned `generals_obs:v2` and is player-relative:
-10 channels x 64 (own/enemy/neutral territory, own/enemy log-armies, cities,
-mountains, generals +1/-1, turn progress, exact normalized plies remaining).
+The observation schema is versioned `generals_obs:v3` and is player-relative:
+12 channels x 64 (own/enemy/neutral territory, own/enemy log-armies, cities,
+mountains, generals +1/-1, turn progress, exact normalized plies remaining,
+neutral log-armies, and the next-production indicator). The last two planes make
+previously hidden neutral-army counts and production phase Markov-visible.
 Because the planes are already seat-relative, the network must **not**
 additionally receive the player indicator — hence
 `player_relative_obs = true`. This schema change is Generals environment
-contract version 2; v1 models and replay are intentionally incompatible.
+contract version 4; prior contract profiles, models and replay are intentionally
+incompatible and are not reinterpreted as the new observation.
 
 **Current status.** The engine and trainer paths are complete and training runs
 end to end, but no model has yet beaten random at local compute scale.
@@ -1154,6 +1157,7 @@ web/
         ├── main.ts        # Router
         ├── App.svelte     # Main game page
         ├── GenericBoard.svelte    # Board rendering
+        ├── GeneralsBoard.svelte   # Generals board interaction and rendering
         ├── Stats.svelte           # Training stats
         ├── LossChart.svelte       # Loss visualization
         ├── LossOverTimePage.svelte # Full-screen charts
@@ -1173,6 +1177,7 @@ web/
 | `/game-info/:id` | GET | Game metadata (403 for non-current games) |
 | `/game/new` | POST | Start new game |
 | `/game/state` | GET | Get current board |
+| `/game/history` | GET | Get bounded history for a session |
 | `/move` | POST | Make player move + bot response |
 | `/stats` | GET | Training statistics |
 | `/model` | GET | Model info |
@@ -1211,6 +1216,7 @@ AlphaZero serving restrictions, not additions to the generic engine ABI.
 |-----------|---------|
 | `App.svelte` | Main page with game + stats |
 | `GenericBoard.svelte` | Renders grid or drop-column boards |
+| `GeneralsBoard.svelte` | Renders and handles Generals board interactions |
 | `Stats.svelte` | Training metrics, model status |
 | `LossChart.svelte` | Loss curve visualization |
 | `LossOverTimePage.svelte` | Full-screen interactive charts |
