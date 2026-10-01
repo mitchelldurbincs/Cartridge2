@@ -629,3 +629,10 @@ cargo clippy --manifest-path web/Cargo.toml
 ## License
 
 MIT
+
+### Bounded GPU pilot
+
+See [the single-host GPU pilot runbook](documentation/GPU_PILOT.md) for the pinned
+CUDA image, private persistent Compose profile, native CPU/MPS equivalents,
+checkpoint restart contract and first-GCP-run acceptance gates. This setup does
+not provision cloud resources; existing Terraform remains infrastructure-only.

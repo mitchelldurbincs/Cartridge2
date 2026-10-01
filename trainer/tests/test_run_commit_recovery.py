@@ -716,3 +716,100 @@ def test_changed_recipe_fails_before_replay_is_opened(tmp_path, staged_blobs, mo
     with pytest.raises(ArtifactValidationError, match="learner config"):
         Orchestrator(changed)
     assert opened is False
+
+
+@pytest.mark.parametrize("phase", ["collection", "learning", "evaluation"])
+def test_unprepared_attempt_is_abandoned_and_restart_repeats_only_uncommitted_iteration(
+    tmp_path, staged_blobs, monkeypatch, phase
+):
+    config = loop_config(tmp_path)
+    checkpoints, evaluations, commits, root, prepared = build_root(config, staged_blobs)
+    RunJournal(checkpoints, commits).publish(prepared)
+
+    class ScopedReplay(FakeReplayStore):
+        def count_episodes(self):
+            return 1
+
+        def count(self):
+            return 0
+
+    monkeypatch.setattr(orchestrator_module, "create_replay_store", lambda _: ScopedReplay())
+    interrupted = Orchestrator(config)  # recover iteration 1
+    root_head = checkpoints.resolve_run_head()
+    assert interrupted.config.start_iteration == 2
+    candidate = stage_checkpoint(
+        checkpoints,
+        staged_blobs,
+        step=2,
+        parent=root.checkpoint_id,
+        config_sha256=recipe_for(config).learner_config_sha256,
+    )
+    evaluation = replace(
+        evaluation_for(config, candidate, prepared.run_commit, iteration=2, promoted=False),
+        elapsed_seconds=0.0,
+    )
+    commit = commit_for(config, candidate, prepared.run_commit, iteration=2, evaluation=None)
+    attempted_steps = []
+
+    def learn(num_steps, start_step, selection):
+        attempted_steps.append(start_step)
+        assert selection.source_checkpoint_id == root.checkpoint_id
+        if phase == "learning":
+            return False, 0.0, None, None
+        return True, 0.0, candidate, commit.stats_snapshot
+
+    monkeypatch.setattr(
+        interrupted.actor_runner, "run", lambda *a, **kw: (phase != "collection", 0.0)
+    )
+    monkeypatch.setattr(interrupted, "_run_trainer_deferred", learn)
+    monkeypatch.setattr(
+        interrupted.eval_runner,
+        "prepare",
+        lambda *a: (_ for _ in ()).throw(InterruptedError("fixture kill")),
+    )
+    if phase == "evaluation":
+        with pytest.raises(InterruptedError):
+            interrupted.run_iteration(2)
+    else:
+        assert interrupted.run_iteration(2) is None
+    abandoned_scope = interrupted._active_replay_selection.collection_scope_id
+    assert checkpoints.resolve_run_head() == root_head
+    assert interrupted.run_journal.resolve(prepared.run_commit_id) is None
+    interrupted._replay_buffer.close()
+    interrupted.wandb_logger.finish()
+
+    resumed = Orchestrator(config)
+    assert resumed.config.start_iteration == 2
+    assert resumed._active_replay_selection.collection_scope_id != abandoned_scope
+    assert resumed._active_replay_selection.source_checkpoint_id == root.checkpoint_id
+    monkeypatch.setattr(resumed.actor_runner, "run", lambda *a, **kw: (True, 0.0))
+
+    def retry_learn(num_steps, start_step, selection):
+        assert start_step == 1  # orphaned learner step 2 is not resume authority
+        assert selection.collection_scope_id != abandoned_scope
+        return True, 0.0, candidate, commit.stats_snapshot
+
+    monkeypatch.setattr(resumed, "_run_trainer_deferred", retry_learn)
+    monkeypatch.setattr(resumed.eval_runner, "prepare", lambda *a: evaluation)
+    assert resumed.run_iteration(2).iteration == 2
+    chain = resumed._head_chain()
+    assert [ref.commit.orchestration.iteration for ref in chain] == [1, 2]
+    assert [ref.commit.stats_snapshot.binding.step for ref in chain] == [1, 2]
+    assert chain[-1].commit.orchestration.collection_scope_id != abandoned_scope
+    resumed._replay_buffer.close()
+    resumed.wandb_logger.finish()
+
+
+def test_completed_target_restart_does_not_collect_or_train(tmp_path, staged_blobs, monkeypatch):
+    config = loop_config(tmp_path, iterations=1, mcts_max_sims=1, mcts_sim_ramp_rate=0)
+    checkpoints, _, commits, _, prepared = build_root(config, staged_blobs)
+    RunJournal(checkpoints, commits).publish(prepared)
+    monkeypatch.setattr(orchestrator_module, "create_replay_store", lambda _: FakeReplayStore())
+    for _ in range(2):
+        restarted = Orchestrator(config)
+        monkeypatch.setattr(
+            restarted, "run_iteration", lambda *a: pytest.fail("target already met")
+        )
+        restarted.run()
+        assert checkpoints.resolve_run_head().run_commit_id == prepared.run_commit_id
+        assert len(restarted._head_chain()) == 1

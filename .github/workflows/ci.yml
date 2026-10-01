@@ -179,6 +179,13 @@ jobs:
         run: ruff check src/ tests/ smoke_test.py
       - name: Ruff format check
         run: ruff format --check src/ tests/ smoke_test.py
+      - name: Validate standalone pilot Compose
+        working-directory: .
+        env:
+          PILOT_ROOT: /tmp/cartridge-pilot-placeholder
+          PILOT_IMAGE: cartridge-alphazero:gpu-pilot
+          PILOT_POSTGRES_PASSWORD_FILE: /tmp/nonexistent-operator-secret
+        run: docker compose --env-file /dev/null -f docker-compose.pilot.yml config --quiet
 
   python-test:
     name: Python Tests
@@ -213,7 +220,7 @@ jobs:
         # Pulls the pinned `crucible` orchestration core, which is declared in
         # trainer/pyproject.toml. Do not re-add an explicit crucible install
         # here: that pinned the SHA in two places, and the copies would drift.
-        run: pip install -e ".[dev]"
+        run: pip install -c constraints-runtime.txt -e ".[dev]"
       - name: Run pytest
         run: pytest
 
@@ -294,6 +301,10 @@ jobs:
             context: .
             file: ./Dockerfile.alphazero
             build-args: CARGO_FEATURES=s3
+          - image: alphazero-cuda
+            context: .
+            file: ./Dockerfile.alphazero
+            build-args: TORCH_ACCELERATOR=cu126
           - image: web
             context: .
             file: ./web/Dockerfile

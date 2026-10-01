@@ -86,15 +86,9 @@ class DqnLearnerConfig:
             raise TypeError("replay_selection must be an explicit ReplaySelection")
 
     def resolve_device(self) -> str:
-        if self.device != "auto":
-            return self.device
-        import torch
+        from ..device import resolve_device
 
-        if torch.cuda.is_available():
-            return "cuda"
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return "mps"
-        return "cpu"
+        return resolve_device(self.device)
 
     def learner_recipe(self) -> dict[str, object]:
         return {
