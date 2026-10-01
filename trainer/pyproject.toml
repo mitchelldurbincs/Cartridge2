@@ -5,8 +5,8 @@ description = "Algorithm-cartridge trainer for Cartridge2"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    # Torch 2.9's dynamo exporter is tested with ONNX 1.18/ONNX Script 0.4;
-    # ONNX Runtime 1.18 is the first runtime in this stack with ONNX IR 10 support.
+    # The validated image/CI export stack is pinned in constraints-runtime.txt.
+    # These lower bounds describe package APIs, not tested runtime combinations.
     "torch>=2.9.0",
     "numpy>=1.24.0",
     "onnx>=1.18.0",
